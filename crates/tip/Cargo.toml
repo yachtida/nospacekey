@@ -1,0 +1,57 @@
+[package]
+name = "nospacekey_tip"
+version.workspace = true
+edition = "2021"
+
+[lib]
+name = "nospacekey_tip"
+crate-type = ["cdylib"]
+
+[dependencies]
+ipc = { path = "../ipc" }
+ids = { path = "../ids" }
+settings = { path = "../settings" }
+# windows 0.62 は windows-result 0.4 系。windows-registry 0.5 は 0.3 系を引き込み
+# Error 型が二重になって `?` 変換が壊れるため、0.62 と同世代の 0.6 に合わせる。
+windows-registry = "0.6"
+# windows 0.62 の #[implement] マクロは展開コードで `windows_core::...` を参照するため、
+# windows-core を直接依存に入れて extern crate 名 `windows_core` を解決可能にする。
+windows-core = "0.62"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant",
+  "Win32_System_LibraryLoader", "Win32_System_SystemServices",
+  "Win32_UI_TextServices", "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi",
+  # B-3: langbar GetIcon の DPI 取得（GetDpiForSystem）用。
+  "Win32_UI_HiDpi",
+  "Win32_System_RemoteDesktop", "Win32_System_Threading",
+  # A7: PowerRegisterSuspendResumeNotification（powrprof）でレジューム購読 — power.rs。
+  # DEVICE_NOTIFY_CALLBACK / PBT_APMRESUMEAUTOMATIC は Win32_UI_WindowsAndMessaging 側（既存）。
+  "Win32_System_Power",
+  "Win32_Graphics_Direct2D_Common",
+  # A 段（UI モダン化）: DComp 上の premultiplied swapchain に D2D/DWrite で描く＋DWM 角丸/アクリル。
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_DirectComposition", "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Dwm",
+]
+# NOTE: windows 0.62 has NO "implement" feature — the #[implement] macro is
+# exported unconditionally from windows-core and reachable via windows::core::implement.
+
+# A8: dead-pipe timeout 統合テスト用。named pipe を作る CreateNamedPipeW(Win32_System_Pipes)と
+# PIPE_ACCESS_DUPLEX(Win32_Storage_FileSystem)がテストにのみ必要なので dev-dependency で追加。
+# A': 遅延応答サーバの接続待ち ConnectNamedPipe(Win32_System_IO)も同経路で追加。
+# cargo は同一 crate の dep/dev-dep の feature を union してテストビルドへ渡す。
+[dev-dependencies.windows]
+version = "0.62"
+features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_IO"]
+
+# VERSIONINFO(②): build.rs が nospacekey_tip.dll に Win32 版リソースを埋める。winres の
+# 保守フォーク winresource は rc.exe(Windows SDK)を使うため dev 環境(with-dev-env.ps1)
+# のツールチェーンが前提。cfg(windows) 限定なので非 Windows ホストのビルドには影響しない。
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

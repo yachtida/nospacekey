@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>nospacekey 設定</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <nav class="sidebar">
+      <div class="brand">nospacekey</div>
+      <button class="nav-item active" data-page="general">一般</button>
+      <button class="nav-item" data-page="engine">変換エンジン</button>
+      <button class="nav-item" data-page="appearance">外観</button>
+      <button class="nav-item" data-page="keymap">キー設定</button>
+      <button class="nav-item" data-page="about">情報</button>
+    </nav>
+    <main class="content">
+      <section class="page active" id="page-general">
+        <h1>一般</h1>
+        <div class="card">
+          <div class="row">
+            <label for="g-default-direct">起動時の入力モード</label>
+            <div class="grow">
+              <label><input type="checkbox" id="g-default-direct" data-bind="default_direct">
+                起動時から半角英数(直接入力)で開始する（ターミナル/Vim 向け）</label>
+            </div>
+          </div>
+          <div class="row">
+            <label for="g-live">ライブ変換</label>
+            <div class="grow">
+              <label><input type="checkbox" id="g-live" data-bind="live_enabled">
+                入力中に自動で変換する</label>
+            </div>
+          </div>
+          <div class="row">
+            <label for="e-learning">変換学習</label>
+            <div class="grow">
+              <label><input type="checkbox" id="e-learning" data-bind="learning_enabled"> 変換履歴を学習する</label>
+              <div>
+                <button id="btn-clear-learning" type="button">学習履歴を消去…</button>
+                <span id="clear-learning-result"></span>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <label for="g-feedback">誤変換フィードバック</label>
+            <div class="grow">
+              <label><input type="checkbox" id="g-feedback" data-bind="feedback_enabled">
+                誤変換フィードバック記録を有効にする（記録キーは「キー設定」ページで変更できます。既定: Ctrl+変換 / Ctrl+/）</label>
+              <p class="hint">直前に確定した読みと文字列をローカルの feedback.jsonl に追記します。
+                外部送信はありません（既定オフ。反映にはアプリの再フォーカスが必要な場合があります）</p>
+            </div>
+          </div>
+          <div class="row">
+            <label for="e-number-fullwidth">数字の幅</label>
+            <div class="grow">
+              <label><input type="checkbox" id="e-number-fullwidth" data-bind="number_full_width"> かな入力で数字を全角にする</label>
+              <p class="hint">オンのとき、かな入力モードで打った数字を既定で全角（１２３）確定します。
+                変換候補で半角も選べます（既定オン。反映には新しい TIP 起動が必要な場合があります）</p>
+            </div>
+          </div>
+          <div class="row">
+            <label for="e-punct-fullwidth">句読点の幅</label>
+            <div class="grow">
+              <label><input type="checkbox" id="e-punct-fullwidth" data-bind="punctuation_full_width"> かな入力で句読点を全角にする</label>
+              <p class="hint">オンのとき、かな入力モードの「、。」を全角で確定します。オフで半角「,.」になります
+                （既定オン。反映には新しい TIP 起動が必要な場合があります）</p>
+            </div>
+          </div>
+          <div class="row">
+            <label for="e-symbol-fullwidth">記号の幅</label>
+            <div class="grow">
+              <label><input type="checkbox" id="e-symbol-fullwidth" data-bind="symbol_full_width"> かな入力で記号を全角にする</label>
+              <p class="hint">オンのとき、かな入力モードの記号（/ ? ~ : ; ! @ # ( ) 等）を全角（・？～：；！＠＃（）等）で入力します。
+                オフで半角のまま（既定オフ。「、。」は句読点の幅、長音の「ー」はこの設定と無関係。反映には新しい TIP 起動が必要な場合があります）</p>
+            </div>
+          </div>
+          <div class="row">
+            <label for="e-reading-monitor">読みモニタ</label>
+            <div class="grow">
+              <label><input type="checkbox" id="e-reading-monitor" data-bind="reading_monitor_enabled"> ライブ変換中に読み（ひらがな）を小窓で表示する</label>
+              <p class="hint">オンのとき、ライブ変換で漢字に置き換わって見えなくなる「今打っている読み」をキャレット上側の小窓に常時表示します。
+                候補ウィンドウ表示中は自動的に隠れます（既定オン。反映には新しい TIP 起動が必要な場合があります）</p>
+              <label><input type="checkbox" id="e-reading-monitor-accumulate" data-bind="reading_monitor_accumulate"> 自動確定後も読みを保持する</label>
+              <p class="hint">オンのとき、長文入力で先頭の文節が自動確定されても、読みモニタは Enter で全て確定するまで打った読みを累積表示し続けます
+                （既定オン。切り替えの反映には新しい TIP 起動が必要な場合があります）</p>
+              <label for="e-reading-monitor-max-chars">表示する最大文字数
+                <input type="number" id="e-reading-monitor-max-chars" data-bind="reading_monitor_max_chars" min="10" max="100" step="1" class="w-md">
+              </label>
+              <p class="hint">読みモニタの窓がこの文字数（全角換算）ぶんの幅で頭打ちになり、超えた分は先頭から隠れます
+                （10〜100、既定34。反映には新しい TIP 起動が必要な場合があります）</p>
+            </div>
+          </div>
+          <div class="row">
+            <label for="e-shift-latin">Shift+英字</label>
+            <div class="grow">
+              <label>
+                <select id="e-shift-latin" data-bind="shift_latin_mode">
+                  <option value="compose">英語入力モード（確定まで英字が続く）</option>
+                  <option value="commit">大文字をそのまま確定</option>
+                </select>
+              </label>
+              <p class="hint">かな入力中に Shift+英字を押したときの挙動です。「英語入力モード」は MS-IME 系
+                （Shift+A で「A」が未確定に入り、以降は小文字英字が続き、Enter で確定）。
+                「大文字をそのまま確定」は Google 日本語入力/ATOK 系です
+                （反映には新しい TIP 起動が必要な場合があります）。</p>
+            </div>
+          </div>
+          <div class="row">
+            <label for="e-ephemeral-enabled">一時かな入力</label>
+            <div class="grow">
+              <label><input type="checkbox" id="e-ephemeral-enabled" data-bind="ephemeral_enabled"> トリガキーで一時的にかな入力へ入り、確定で自動的に半角英数へ戻る</label>
+              <p class="hint">ターミナルや vim で「日本語モードの抜け忘れ」を防ぎます。トリガキーの変更は
+                「キー設定」ページの「一時かなモード開始」で行います（反映には新しい TIP 起動が必要な場合があります）。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section class="page" id="page-engine">
+        <h1>変換エンジン</h1>
+        <div class="card">
+          <h2>Zenzai（ニューラル変換）</h2>
+          <div class="row">
+            <label for="e-zenzai">Zenzai</label>
+            <div class="grow">
+              <label><input type="checkbox" id="e-zenzai" data-bind="zenzai_enabled"> 有効にする</label>
+            </div>
+          </div>
+          <div class="row">
+            <label>モデル</label>
+            <div class="grow">
+              <div id="zenzai-model-status" class="hint">確認中…</div>
+              <div class="hstack mt-6">
+                <button id="zenzai-download" type="button">モデルをダウンロード（約70MB）</button>
+                <button id="zenzai-download-cancel" type="button" hidden>キャンセル</button>
+                <span id="zenzai-download-status"></span>
+              </div>
+              <progress id="zenzai-download-progress" value="0" max="100" hidden></progress>
+              <p class="hint">
+                Zenzai（ニューラル変換）用のモデル <code>zenz-v3.1-small</code>（by Miwa-Keita）を
+                <a href="#" data-ext-url="https://huggingface.co/Miwa-Keita/zenz-v3.1-small-gguf">HuggingFace</a>
+                から取得し、<code>%LOCALAPPDATA%\nospacekey\models\</code> に保存します（管理者権限は不要）。
+                ライセンス:
+                <a href="#" data-ext-url="https://creativecommons.org/licenses/by-sa/4.0/">CC-BY-SA-4.0</a>。
+              </p>
+            </div>
+          </div>
+          <div class="row">
+            <label for="e-weight">重みパス(GGUF)</label>
+            <div class="grow">
+              <div class="hstack">
+                <input type="text" id="e-weight" data-bind="weight_path">
+                <button id="e-weight-browse" type="button">参照…</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <!-- LLM変換(外部API)のカードは開発凍結中につき非露出
+             (docs/superpowers/specs/2026-07-21-llm-freeze-design.md)。設定値は DTO 経由で温存。 -->
+      </section>
+      <section class="page" id="page-appearance">
+        <h1>外観</h1>
+        <div class="card">
+          <h2>テーマ</h2>
+          <div class="theme-cards" role="radiogroup" aria-label="テーマ">
+            <label class="theme-card"><input type="radio" name="theme" value="auto" data-bind="appearance.theme">
+              <span class="tc-title">自動</span><span class="tc-sub">OS のライト/ダークに追従</span></label>
+            <label class="theme-card"><input type="radio" name="theme" value="light" data-bind="appearance.theme">
+              <span class="tc-title">ライト</span><span class="tc-sub">常にライトパレット</span></label>
+            <label class="theme-card"><input type="radio" name="theme" value="dark" data-bind="appearance.theme">
+              <span class="tc-title">ダーク</span><span class="tc-sub">常にダークパレット</span></label>
+            <label class="theme-card"><input type="radio" name="theme" value="custom" data-bind="appearance.theme">
+              <span class="tc-title">カスタム</span><span class="tc-sub">ライト側パレットを常時使用</span></label>
+          </div>
+          <p class="hint" id="custom-note" hidden>
+            カスタムでは「ライト」タブのパレットが OS 設定に関わらず常に使われます。</p>
+          <span class="field-error" data-error-for="appearance.theme"></span>
+        </div>
+        <div class="card">
+          <h2>ウィンドウ</h2>
+          <div class="row">
+            <label>背景</label>
+            <div class="grow">
+              <label><input type="radio" name="backdrop" value="acrylic" data-bind="appearance.backdrop"> アクリル（半透明ぼかし）</label>
+              <label class="radio-gap"><input type="radio" name="backdrop" value="opaque" data-bind="appearance.backdrop"> 不透明</label>
+              <span class="field-error" data-error-for="appearance.backdrop"></span>
+            </div>
+          </div>
+          <div class="row">
+            <label>角</label>
+            <div class="grow">
+              <label><input type="radio" name="corner" value="round" data-bind="appearance.corner"> 角丸</label>
+              <label class="radio-gap"><input type="radio" name="corner" value="square" data-bind="appearance.corner"> 直角</label>
+              <span class="field-error" data-error-for="appearance.corner"></span>
+            </div>
+          </div>
+          <div class="row">
+            <label for="a-font">フォント</label>
+            <div class="grow hstack">
+              <input type="text" id="a-font" data-bind="appearance.font_family" list="font-list">
+              <datalist id="font-list">
+                <option value="Yu Gothic UI"><option value="Meiryo UI">
+                <option value="BIZ UDGothic"><option value="Noto Sans JP">
+              </datalist>
+              <input type="number" data-bind="appearance.font_point" min="6" max="24" step="0.5"
+                     class="w-sm" title="サイズ (pt)">
+            </div>
+          </div>
+          <span class="field-error" data-error-for="appearance.font_point"></span>
+        </div>
+        <div class="card">
+          <h2>パレット</h2>
+          <div class="pal-tabs">
+            <button type="button" class="pal-tab active" data-pal="light">ライト</button>
+            <button type="button" class="pal-tab" data-pal="dark">ダーク</button>
+            <button type="button" id="pal-reset">このパレットを既定に戻す</button>
+          </div>
+          <div id="pal-light"></div>
+          <div id="pal-dark" hidden></div>
+        </div>
+        <div class="card">
+          <h2>プレビュー</h2>
+          <div id="preview-host"></div>
+        </div>
+      </section>
+      <section class="page" id="page-keymap">
+        <h1>キー設定</h1>
+        <div class="card">
+          <p class="hint">各機能のキー割り当てを変更できます。反映には IME の切り替え
+            (別の入力方式へ切り替えて戻す)またはサインインし直しが必要です。</p>
+          <div id="keymap-rows"></div>
+          <div id="keymap-recorder" role="dialog" aria-modal="true" aria-label="キー割り当て" tabindex="-1" hidden>
+            <div class="sheet">
+              <p>キーを押してください…(Esc でキャンセル)</p>
+              <p class="hint" id="keymap-recorder-hint"></p>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section class="page" id="page-about">
+        <h1>情報</h1>
+        <div class="card">
+          <div class="row">
+            <label>バージョン</label>
+            <div class="grow hstack">
+              <span id="about-version">–</span>
+              <button id="about-check-update" type="button">更新を確認</button>
+            </div>
+          </div>
+          <div class="row">
+            <label>設定ファイル</label>
+            <div class="grow hstack">
+              <span id="about-path">–</span>
+              <button id="about-open-dir" type="button">フォルダを開く</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="row">
+            <label>リセット</label>
+            <div class="grow">
+              <button id="about-defaults" type="button">既定に戻す</button>
+              <p class="hint">全項目を既定値に戻します（「適用」を押すまで保存されません。API キーは適用時に削除確認あり）。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+      <footer class="actions">
+        <span id="dirty-indicator" hidden>未適用の変更があります</span>
+        <button id="apply-btn" class="primary">適用</button>
+        <button id="close-btn">閉じる</button>
+      </footer>
+    </main>
+  </div>
+  <div id="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

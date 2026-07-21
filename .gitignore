@@ -1,0 +1,25 @@
+/target
+/engine-host/.build
+/spike
+/last-test-logs
+*.dll
+*.lib
+*.pdb
+# SP2 Zenzai: build/runtime artifacts (large/binary, not committed)
+/.llama-build
+/engine-host/vendor
+/engine-host/models
+*.gguf
+# portable toolchains fetched locally (e.g. cmake zip)
+/.tools
+# SP6c distribution: staged self-contained runtime tree (assembled by scripts/stage-dist.ps1)
+/dist/
+# release pipeline outputs (scripts/release.ps1): compiled installer + versioned release tree
+/installer/Output/
+/release/
+
+# SDD scratch (ledger/reports) — not project history
+/.superpowers/
+
+# Tauri: auto-generated ACL schema files (regenerated from capabilities/*.json on build)
+/crates/config/gen/

@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "nospacekey 設定ウィンドウの既定権限",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:window:allow-destroy", "dialog:default"]
+}

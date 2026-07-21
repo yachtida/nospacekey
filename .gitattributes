@@ -1,0 +1,5 @@
+# Windows batch launchers must check out with CRLF on every machine,
+# regardless of the cloning VM's core.autocrlf setting. cmd.exe is most
+# reliable with CRLF; this removes any line-ending ambiguity.
+*.cmd text eol=crlf
+*.bat text eol=crlf

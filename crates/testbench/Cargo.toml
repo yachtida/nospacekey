@@ -1,0 +1,42 @@
+[package]
+name = "testbench"
+version.workspace = true
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "testbench"
+path = "src/main.rs"
+
+[dependencies]
+ids = { path = "../ids" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# #[implement(ITextStoreACP)] の展開コードが `windows_core::...` を参照するため、
+# tip と同様に windows-core を直接依存にして extern crate 名を解決可能にする。
+windows-core = "0.62"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  # ITextStoreACP_Impl トレイトは Com+Ole+Variant の cfg ゲート付き。
+  "Win32_UI_TextServices",
+  "Win32_System_Com",
+  "Win32_System_Ole",
+  "Win32_System_Variant",
+  "Win32_Foundation",
+  # HKL（ActivateProfile に HKL::default() を渡す）と VK 定数。
+  "Win32_UI_Input_KeyboardAndMouse",
+  # message-only 窓 / PeekMessage ポンプ。
+  "Win32_UI_WindowsAndMessaging",
+  # モジュール/プロシージャ解決。
+  "Win32_System_LibraryLoader",
+  # --own-desktop: ゲート専用デスクトップ(CreateDesktopW/SetThreadDesktop)。
+  # CreateDesktopW のシグネチャが DEVMODEW/SECURITY_ATTRIBUTES を含むため Gdi/Security も要る。
+  "Win32_System_StationsAndDesktops",
+  "Win32_Graphics_Gdi",
+  "Win32_Security",
+  # --own-desktop: lpDesktop 付き自己再起動(CreateProcessW/WaitForSingleObject/GetStdHandle)。
+  "Win32_System_Threading",
+  "Win32_System_Console",
+]

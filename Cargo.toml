@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/ids", "crates/ipc", "crates/tip", "crates/testbench", "crates/settings", "crates/config"]
+
+[workspace.package]
+# Single source of truth for the product version: edit here, nowhere else.
+# Crates inherit it via `version.workspace = true`; the three files Cargo cannot
+# reach (tauri.conf.json, installer/version.iss, BuildInfo.swift) are synced by
+# scripts/sync-version.ps1 and verified by crates/config/tests/version_consistency.rs.
+version = "1.0.0"
+repository = "https://github.com/yachtida/nospacekey"

@@ -1,0 +1,10 @@
+[package]
+name = "ids"
+version.workspace = true
+edition = "2021"
+publish = false
+
+[dependencies]
+# GUID 型と const fn from_u128 を使うためだけに windows-core を引く。
+# tip と同世代 0.62 に固定（版ドリフトで GUID 型が二重定義になるのを防ぐ）。
+windows-core = "0.62"

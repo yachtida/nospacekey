@@ -1,0 +1,15 @@
+﻿# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+# Template for scripts/release.ps1 phase 6. Publisher/PackageName derive from the
+# -PackageId argument (<Publisher>.<Product>); PackageUrl derives from -Repo.
+# ManifestType MUST be defaultLocale (pairs with DefaultLocale: ja-JP in the
+# version manifest; plain "locale" fails winget validate).
+PackageIdentifier: "{{PACKAGE_ID}}"
+PackageVersion: "{{VERSION}}"
+PackageLocale: ja-JP
+Publisher: "{{PUBLISHER}}"
+PackageName: "{{PACKAGE_NAME}}"
+PackageUrl: "{{PACKAGE_URL}}"
+License: MIT
+ShortDescription: ニューラルかな漢字変換エンジンを搭載した日本語入力システム (IME)
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

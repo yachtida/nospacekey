@@ -1,0 +1,434 @@
+/* Apple 風デザイントークン。ライト既定・ダークは media query で上書き。
+   モーションは「クリティカルダンピング（--ease-snap）を既定、跳ねる動き（--ease-pop）は
+   出現系のみ」という Apple Fluid Interfaces の指針に従う。 */
+:root {
+  --bg: #f5f5f7;
+  --panel: #ffffff;
+  --panel-input: #ffffff;
+  --sidebar: #ececee;
+  --text: #1d1d1f;
+  --text-sub: #86868b;
+  --border: rgba(0, 0, 0, 0.12);
+  --separator: rgba(0, 0, 0, 0.07);
+  --accent: #0071e3;
+  --accent-text: #ffffff;
+  --danger: #d70015;
+  --radius-lg: 12px;
+  --radius-md: 8px;
+  --radius-sm: 6px;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04), 0 2px 8px rgba(0, 0, 0, 0.04);
+  --shadow-float: 0 8px 28px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.08);
+  --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.25), 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+  /* モーダル背後の調光。ノブはダークでも白のまま（macOS スイッチと同じ） */
+  --scrim: rgba(0, 0, 0, 0.32);
+  --knob: #ffffff;
+  /* 半透明チローム（フッター・トースト）。content がこの下をスクロールする。 */
+  --material: rgba(245, 245, 247, 0.72);
+  --material-strong: rgba(255, 255, 255, 0.82);
+  /* スプリング近似イージング: snap = 減衰比1.0（オーバーシュートなし）/ pop = わずかに跳ねる */
+  --ease-snap: cubic-bezier(0.2, 0.9, 0.25, 1);
+  --ease-pop: cubic-bezier(0.34, 1.4, 0.44, 1);
+  --dur-press: 100ms;
+  --dur-quick: 180ms;
+  --dur-move: 320ms;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1e;
+    --panel: #2c2c2e;
+    --panel-input: #1c1c1e;
+    --sidebar: #232326;
+    --text: #f5f5f7;
+    --text-sub: #98989d;
+    --border: rgba(255, 255, 255, 0.16);
+    --separator: rgba(255, 255, 255, 0.08);
+    --accent: #0a84ff;
+    --accent-text: #ffffff;
+    --danger: #ff453a;
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3), 0 2px 8px rgba(0, 0, 0, 0.3);
+    --shadow-float: 0 8px 28px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
+    --material: rgba(28, 28, 30, 0.72);
+    --material-strong: rgba(44, 44, 46, 0.82);
+    --scrim: rgba(0, 0, 0, 0.45);
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  /* プラットフォームのシステムフォントを最優先（optical sizing / 字詰めテーブル込み） */
+  font-family: system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI",
+    "Yu Gothic UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+input, textarea { user-select: text; -webkit-user-select: text; }
+
+a, a:visited {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+a:hover { text-decoration-thickness: 2px; }
+
+.app { display: flex; height: 100vh; }
+
+/* ---- サイドバー: macOS システム設定風の選択ピル ---- */
+.sidebar {
+  width: 172px;
+  flex: none;
+  background: var(--sidebar);
+  border-right: 1px solid var(--separator);
+  padding: 14px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.brand {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.01em; /* 見出しサイズはトラッキングを締める */
+  padding: 4px 10px 14px;
+}
+.nav-item {
+  text-align: left;
+  padding: 7px 12px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: default;
+  box-shadow: none; /* button 基底の --shadow-card を打ち消す（ナビは面ではない） */
+  transition: background var(--dur-quick) var(--ease-snap),
+              transform var(--dur-press) ease-out;
+}
+.nav-item:hover { background: color-mix(in srgb, var(--text) 7%, transparent); }
+/* フィードバックは pointer-down で即時に（クリック完了を待たない） */
+.nav-item:active { transform: scale(0.97); }
+.nav-item.active { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+
+/* ---- コンテンツ。footer をコンテンツ上に浮かせるため relative + 下余白 ---- */
+.content { flex: 1; position: relative; overflow: hidden; }
+.page {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 22px 26px 84px; /* 下は浮遊フッターの分。コンテンツはフッターの下を潜る */
+  display: none;
+}
+.page.active {
+  display: block;
+  /* ページ入場: 出所（下）から短く立ち上がる。display 切替のたびに再生される */
+  animation: page-in var(--dur-move) var(--ease-snap);
+}
+@keyframes page-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+.page h1 {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.02em; /* 大きい見出しはネガティブトラッキング */
+  line-height: 1.15;       /* 見出しは行間を詰める */
+  margin: 0 0 16px;
+}
+
+/* ---- 設定カード: グループ化された白パネル（macOS 設定のリスト風） ---- */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--separator);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  padding: 4px 16px;
+  margin-bottom: 16px;
+}
+.card h2 {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em; /* 小さいラベルはトラッキングを開く */
+  text-transform: none;
+  color: var(--text-sub);
+  margin: 12px 0 4px;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--separator);
+}
+.row:last-child { border-bottom: none; }
+.row > label:first-child { flex: none; width: 140px; color: var(--text); }
+.row .grow { flex: 1; }
+.hint { color: var(--text-sub); font-size: 12px; margin: 2px 0 8px; }
+
+/* ---- 入力: 白地 + ヘアライン。フォーカスはアクセントのグロー ---- */
+input[type="text"], input[type="password"], input[type="number"], textarea, select {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  width: 100%;
+  transition: border-color var(--dur-quick) var(--ease-snap),
+              box-shadow var(--dur-quick) var(--ease-snap);
+}
+input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus,
+textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+textarea { resize: vertical; min-height: 64px; }
+
+/* キーボード操作のフォーカスリング（ボタン・ナビ・スイッチ） */
+button:focus-visible, .nav-item:focus-visible, input[type="checkbox"]:focus-visible,
+input[type="radio"]:focus-visible, .theme-card:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- チェックボックス → macOS 風スイッチ ----
+   ノブはわずかに跳ねる(--ease-pop)。トラック色はスナップ。CSS transition は
+   現在値から再アニメーションするので、連打しても途中から滑らかに反転する。 */
+input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 34px;
+  height: 20px;
+  flex: none;
+  margin: 0 6px 0 0;
+  vertical-align: -5px;
+  border: none;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 18%, transparent);
+  position: relative;
+  cursor: default;
+  transition: background var(--dur-quick) var(--ease-snap);
+}
+input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--knob);
+  box-shadow: var(--shadow-knob);
+  transition: transform 260ms var(--ease-pop), width var(--dur-press) ease-out;
+}
+input[type="checkbox"]:checked { background: var(--accent); }
+input[type="checkbox"]:checked::after { transform: translateX(14px); }
+/* 押下中はノブが伸びる（iOS スイッチの押し込み表現）。checked 時は右端を保つ */
+input[type="checkbox"]:active::after { width: 19px; }
+input[type="checkbox"]:checked:active::after { transform: translateX(11px); }
+
+input[type="radio"] { accent-color: var(--accent); }
+input[type="color"] {
+  width: 36px; height: 26px; padding: 0;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: none;
+}
+progress { accent-color: var(--accent); }
+
+/* ---- ボタン: 押下即時スケール（touch-down フィードバック） ---- */
+button {
+  font: inherit;
+  padding: 6px 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: default;
+  box-shadow: var(--shadow-card);
+  transition: transform var(--dur-press) ease-out,
+              background var(--dur-quick) var(--ease-snap);
+}
+button:hover { background: color-mix(in srgb, var(--text) 5%, var(--panel)); }
+button:active { transform: scale(0.97); }
+button:disabled { opacity: 0.5; transform: none; }
+button.primary {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: transparent;
+  font-weight: 600;
+}
+button.primary:hover { background: color-mix(in srgb, #000 12%, var(--accent)); }
+
+.field-error { color: var(--danger); font-size: 12px; margin-top: 2px; display: block; }
+.field-error:empty { display: none; }
+
+/* ---- レイアウトユーティリティ（インライン style 禁止の受け皿） ---- */
+.hstack { display: flex; gap: 8px; align-items: center; }
+.hstack > button { flex: none; }
+.mt-6 { margin-top: 6px; }
+.radio-gap { margin-left: 14px; }
+/* 幅指定は input の width:100% 既定より後に置いて上書きする */
+input.w-sm { width: 90px; }
+input.w-md { width: 140px; }
+
+#zenzai-download-progress { width: 100%; margin-top: 6px; }
+#about-path { word-break: break-all; }
+#pal-reset { margin-left: auto; }
+
+/* ---- 浮遊フッター: 半透明マテリアル。コンテンツがこの下をスクロールする ---- */
+.actions {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 26px;
+  background: var(--material);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  border-top: 1px solid var(--separator); /* ヘアラインのみ。強い分割線は使わない */
+  z-index: 5;
+}
+#dirty-indicator { color: var(--text-sub); font-size: 12px; margin-right: auto; }
+
+/* ---- トースト: ブラー材質のピル。下から跳ねて出現し、来た道（下）へ戻る ---- */
+#toast {
+  position: fixed;
+  left: 50%;
+  bottom: 72px;
+  transform: translateX(-50%);
+  background: var(--material-strong);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  color: var(--text);
+  border: 1px solid var(--separator);
+  padding: 8px 18px;
+  border-radius: 999px;
+  box-shadow: var(--shadow-float);
+  font-size: 12px;
+  font-weight: 500;
+  z-index: 10;
+  animation: toast-in 340ms var(--ease-pop);
+}
+#toast.hide { animation: toast-out 200ms var(--ease-snap) forwards; }
+#toast.error { background: var(--danger); border-color: transparent; color: var(--accent-text); }
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(14px) scale(0.92); }
+  to   { opacity: 1; transform: translateX(-50%); }
+}
+@keyframes toast-out {
+  to { opacity: 0; transform: translateX(-50%) translateY(10px) scale(0.96); }
+}
+
+/* ---- 外観ページ ---- */
+.theme-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding: 10px 0; }
+.theme-card {
+  display: flex; flex-direction: column; gap: 2px;
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: 10px 12px; cursor: default;
+  transition: transform var(--dur-press) ease-out,
+              border-color var(--dur-quick) var(--ease-snap),
+              box-shadow var(--dur-quick) var(--ease-snap);
+}
+.theme-card:active { transform: scale(0.97); }
+.theme-card:has(input:checked) {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1.5px var(--accent);
+}
+.theme-card input { position: absolute; opacity: 0; }
+.tc-title { font-weight: 600; }
+.tc-sub { font-size: 11px; color: var(--text-sub); }
+
+.pal-tabs { display: flex; gap: 6px; padding: 10px 0 4px; }
+.pal-tab { padding: 5px 14px; border-radius: 999px; }
+.pal-tab.active { background: var(--accent); color: var(--accent-text); border-color: transparent; }
+.pal-inputs { display: flex; align-items: center; gap: 8px; }
+.pal-inputs .hex { width: 92px; font-family: ui-monospace, Consolas, monospace; }
+
+/* ---- キー割り当てレコーダ: 中央シート + 調光スクリム（モーダルタスク） ---- */
+#keymap-recorder {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--scrim);
+  animation: scrim-in var(--dur-quick) ease-out;
+}
+#keymap-recorder[hidden] { display: none; }
+/* プログラム的フォーカスの受け皿（tabindex=-1）。全画面スクリムに既定のフォーカスリングが
+   出ると画面全体を縁取ってしまうため消す。キー操作の宛先はシート内の文言が示す。 */
+#keymap-recorder:focus { outline: none; }
+#keymap-recorder .sheet {
+  min-width: 280px;
+  padding: 20px 26px;
+  text-align: center;
+  background: var(--material-strong);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--separator);
+  border-radius: 14px;
+  box-shadow: var(--shadow-float);
+  /* materialize: ブラー材質がスケールとともに"実体化"して現れる */
+  animation: sheet-in 300ms var(--ease-pop);
+}
+#keymap-recorder .sheet p:first-child { font-weight: 600; margin: 0 0 6px; }
+@keyframes scrim-in { from { opacity: 0; } }
+@keyframes sheet-in {
+  from { opacity: 0; transform: scale(0.94) translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.keymap-value { display: inline-block; min-width: 120px; font-weight: 500; }
+
+/* ---- 候補ウィンドウプレビュー: 市松模様の上に実寸感のモックを重ねる ---- */
+.pv-backdrop {
+  padding: 22px;
+  border-radius: var(--radius-lg);
+  background:
+    repeating-conic-gradient(color-mix(in srgb, var(--text) 14%, transparent) 0% 25%, transparent 0% 50%)
+    0 0 / 22px 22px;
+  display: flex;
+  justify-content: center;
+}
+.pv-window { min-width: 180px; padding: 6px 4px; box-shadow: var(--shadow-float); }
+.pv-row { display: flex; align-items: baseline; gap: 10px; padding: 4px 12px; border-radius: 4px; }
+.pv-page { text-align: right; padding: 4px 12px 2px; }
+
+/* ---- アクセシビリティ: モーション・透明度・コントラストの好み ---- */
+/* reduced motion = 前庭刺激（移動・スケール）を落とし、理解を助ける不透明度変化は残す */
+@media (prefers-reduced-motion: reduce) {
+  .page.active { animation: reduced-fade 160ms ease; }
+  #toast { animation: reduced-fade 160ms ease; }
+  #toast.hide { animation: reduced-fade-out 120ms ease forwards; }
+  #keymap-recorder .sheet { animation: reduced-fade 160ms ease; }
+  .nav-item:active, button:active, .theme-card:active { transform: none; }
+  input[type="checkbox"]::after { transition-duration: 1ms; }
+  @keyframes reduced-fade { from { opacity: 0; } }
+  @keyframes reduced-fade-out { to { opacity: 0; } }
+}
+/* 透明を減らす = 材質を不透明に近づけ、ブラーを落とす */
+@media (prefers-reduced-transparency: reduce) {
+  .actions, #toast, #keymap-recorder .sheet {
+    background: var(--panel);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+/* 高コントラスト = ほぼ不透明の背景 + はっきりした境界 */
+@media (prefers-contrast: more) {
+  :root { --border: rgba(0, 0, 0, 0.5); --separator: rgba(0, 0, 0, 0.35); }
+  .actions, #toast, #keymap-recorder .sheet {
+    background: var(--panel);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+@media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+  :root { --border: rgba(255, 255, 255, 0.6); --separator: rgba(255, 255, 255, 0.4); }
+}

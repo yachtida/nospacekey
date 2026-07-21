@@ -1,0 +1,28 @@
+[package]
+name = "config"
+version.workspace = true
+repository.workspace = true
+edition = "2021"
+
+[[bin]]
+name = "NospacekeyConfig"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+settings = { path = "../settings" }
+ipc = { path = "../ipc" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+# Zenzai モデルのダウンロード。reqwest は既に tauri 経由でツリーにあるが TLS 無しでビルド
+# されているため、HTTPS を通すには TLS backend を明示する。native-tls は Windows で schannel
+# ＝OS 信頼ストアを使う（webpki-roots を同梱する rustls より軽く、企業ルートも尊重される）。
+reqwest = { version = "0.13", default-features = false, features = ["stream", "native-tls"] }
+futures-util = "0.3"
+sha2 = "0.10"
+hex = "0.4"

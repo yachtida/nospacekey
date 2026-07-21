@@ -1,0 +1,10 @@
+﻿# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+# Template for scripts/release.ps1 phase 6 -- placeholders are stamped from
+# -PackageId / -Version; the stamped copy lands in release\v<ver>\winget\<PackageId>.yaml.
+# (No literal double-brace placeholders in comments: the stamper treats any
+# surviving one as an unresolved-token error, by design.)
+PackageIdentifier: "{{PACKAGE_ID}}"
+PackageVersion: "{{VERSION}}"
+DefaultLocale: ja-JP
+ManifestType: version
+ManifestVersion: 1.6.0

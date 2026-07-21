@@ -1,0 +1,24 @@
+﻿# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+# Template for scripts/release.ps1 phase 6. ProductCode is auto-derived from the
+# AppId in installer/nospacekey.iss (Get-IssAppId) -- never hand-copied.
+PackageIdentifier: "{{PACKAGE_ID}}"
+PackageVersion: "{{VERSION}}"
+InstallerLocale: ja-JP
+Platform:
+  - Windows.Desktop
+MinimumOSVersion: 10.0.19041.0
+InstallerType: inno
+Scope: machine
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+UpgradeBehavior: install
+ElevationRequirement: elevationRequired
+ProductCode: "{{PRODUCT_CODE}}"
+Installers:
+  - Architecture: x64
+    InstallerUrl: "{{INSTALLER_URL}}"
+    InstallerSha256: {{SHA256}}
+ManifestType: installer
+ManifestVersion: 1.6.0
