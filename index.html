@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nospacekey — Space を押さない日本語入力</title>
+<meta name="description" content="もう、スペースを連打しない。打つだけで変換が追いかけてくる Windows 用日本語 IME。ライブ変換・一時日本語モード・ローカル完結・オープンソース(MIT)。">
+<meta property="og:title" content="nospacekey — Space を押さない日本語入力">
+<meta property="og:description" content="もう、スペースを連打しない。打つだけで変換が追いかけてくる Windows 用日本語 IME。">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://yachtida.github.io/nospacekey/">
+<meta property="og:image" content="https://yachtida.github.io/nospacekey/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://yachtida.github.io/nospacekey/og.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563EB'/%3E%3Ctext x='32' y='45' font-size='38' font-family='sans-serif' font-weight='700' fill='white' text-anchor='middle'%3Eあ%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@700;900&family=Noto+Sans+JP:wght@400;500;700&family=M+PLUS+1+Code:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --kami:#F7F8FA;      /* 紙 */
+    --sumi:#16181D;      /* 墨 */
+    --ao:#2563EB;        /* 変換青(候補選択) */
+    --ao-usui:#E8EFFD;
+    --hai:#9AA3B2;       /* 下線灰 */
+    --hai-usui:#E4E7EC;
+    --disp:"Zen Kaku Gothic New",'Hiragino Sans','Yu Gothic',sans-serif;
+    --body:"Noto Sans JP",'Hiragino Sans','Yu Gothic',sans-serif;
+    --mono:"M PLUS 1 Code",ui-monospace,Consolas,monospace;
+    /* CRT palette */
+    --crt-bg:#0A0F0C;
+    --crt-panel:#0E1611;
+    --crt-line:#1E3326;
+    --crt-fg:#B7E4C3;
+    --crt-green:#4ADE80;
+    --crt-bright:#A7F3C0;
+    --crt-dim:#527A5F;
+    --crt-amber:#FBBF24;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--kami);color:var(--sumi);
+    font-family:var(--body);font-size:16px;line-height:1.9;
+    -webkit-font-smoothing:antialiased;
+    transition:background .25s ease;
+  }
+  a{color:var(--ao);text-decoration:none}
+  a:hover{text-decoration:underline}
+  :focus-visible{outline:2px solid var(--ao);outline-offset:3px;border-radius:2px}
+  .wrap{max-width:940px;margin:0 auto;padding:0 24px}
+
+  /* ---- header + tabs ---- */
+  header{padding:26px 0 0}
+  .nav{display:flex;align-items:center;gap:14px}
+  .badge-a{
+    width:34px;height:34px;border-radius:9px;background:var(--ao);color:#fff;
+    display:grid;place-items:center;font-family:var(--disp);font-weight:900;font-size:19px;
+    box-shadow:0 2px 6px rgba(37,99,235,.28);flex:none;
+  }
+  .wordmark{font-family:var(--mono);font-weight:600;font-size:18px;letter-spacing:.02em}
+  .nav .sp{flex:1}
+  .nav a.gh{color:var(--sumi);font-size:14px;font-weight:500}
+  .tabs{display:flex;gap:4px;margin-top:22px;border-bottom:1.5px solid var(--hai-usui);align-items:flex-end}
+  .tab{
+    appearance:none;border:0;background:none;cursor:pointer;
+    font-family:var(--disp);font-weight:700;font-size:15px;color:var(--hai);
+    padding:10px 18px 12px;border-bottom:2.5px solid transparent;margin-bottom:-1.5px;
+  }
+  .tab:hover{color:var(--sumi)}
+  .tab[aria-selected="true"]{color:var(--ao);border-bottom-color:var(--ao)}
+  /* For Developers = CRT がこちら側へ侵食してきている */
+  .tab.devtab{
+    font-family:var(--mono);font-weight:600;
+    background:var(--crt-bg);color:var(--crt-green);
+    border:1px solid var(--crt-line);border-bottom:0;
+    border-radius:10px 10px 0 0;
+    margin-left:14px;margin-bottom:-1.5px;padding:12px 20px 14px;
+    text-shadow:0 0 10px rgba(74,222,128,.55);
+    box-shadow:0 -2px 18px rgba(74,222,128,.28);
+    position:relative;overflow:hidden;
+    animation:devglow 2.8s ease-in-out infinite;
+  }
+  @keyframes devglow{50%{box-shadow:0 -2px 30px rgba(74,222,128,.55)}}
+  .tab.devtab::after{
+    content:"";position:absolute;inset:0;pointer-events:none;
+    background:repeating-linear-gradient(0deg, rgba(0,0,0,.32) 0 1px, transparent 1px 3px);
+  }
+  .tab.devtab:hover{color:var(--crt-bright)}
+  .tab.devtab[aria-selected="true"]{color:var(--crt-bright);border-bottom-color:transparent}
+  .tab.devtab .cur{
+    display:inline-block;width:.55em;height:1em;background:var(--crt-green);
+    margin-left:7px;vertical-align:-.12em;
+    box-shadow:0 0 8px rgba(74,222,128,.7);
+    animation:blink 1.06s steps(1) infinite;
+  }
+  /* 開発者面では逆に、ホームタブ側に紙白が残る(鏡像の侵食) */
+  body.dev .tab:not(.devtab){
+    background:var(--kami);color:#5B6472;
+    border:1px solid var(--hai-usui);border-bottom:0;
+    border-radius:10px 10px 0 0;
+    margin-right:14px;margin-bottom:-1.5px;padding:12px 20px 14px;
+    box-shadow:0 -2px 16px rgba(247,248,250,.14);
+  }
+  body.dev .tab:not(.devtab):hover{color:var(--sumi)}
+
+  /* ---- hero(一般) ---- */
+  .hero{padding:56px 0 8px}
+  .hero h1{
+    font-family:var(--disp);font-weight:900;
+    font-size:clamp(34px,6.6vw,62px);line-height:1.4;letter-spacing:.01em;
+    margin-bottom:34px;
+  }
+  .hero h1 .no{color:var(--ao)}
+  .field{
+    background:#fff;border:1px solid var(--hai-usui);border-radius:16px;
+    padding:50px 38px 34px;box-shadow:0 1px 2px rgba(22,24,29,.04),0 12px 40px rgba(22,24,29,.05);
+    position:relative;
+  }
+  .field .label{
+    position:absolute;top:16px;left:38px;
+    font-family:var(--mono);font-size:12px;color:var(--hai);letter-spacing:.08em;
+  }
+  #typed{
+    font-family:var(--disp);font-weight:900;
+    font-size:clamp(24px,4.6vw,42px);line-height:1.6;letter-spacing:.01em;
+    min-height:2.4em;
+  }
+  .preedit{color:#3B4252;border-bottom:3px dotted var(--ao);padding-bottom:2px}
+  .caret{
+    display:inline-block;width:3px;height:1.05em;background:var(--ao);
+    vertical-align:-0.12em;margin-left:2px;
+    animation:blink 1.06s steps(1) infinite;
+  }
+  @keyframes blink{50%{opacity:0}}
+
+  /* Space 0 を主役に */
+  .scoreboard{
+    display:flex;align-items:stretch;gap:14px;margin-top:16px;flex-wrap:wrap;
+  }
+  .score{
+    background:#fff;border:1px solid var(--hai-usui);border-radius:16px;
+    padding:18px 26px 20px;display:flex;flex-direction:column;justify-content:center;
+  }
+  .score .k{font-family:var(--mono);font-size:12.5px;color:var(--hai);letter-spacing:.1em}
+  .score .v{font-family:var(--disp);font-weight:900;line-height:1.1}
+  .score.keys .v{font-size:40px;color:var(--sumi)}
+  .score.space{
+    flex:1;min-width:260px;background:var(--ao);border-color:var(--ao);
+    box-shadow:0 10px 30px rgba(37,99,235,.32);
+    flex-direction:row;align-items:center;gap:20px;
+  }
+  .score.space .k{color:#CFE0FF;font-size:14px}
+  .score.space .v{font-size:clamp(64px,9vw,96px);color:#fff}
+  .score.space .unit{font-family:var(--disp);font-weight:700;font-size:18px;color:#CFE0FF;align-self:flex-end;padding-bottom:14px}
+  .roman{margin-top:12px;font-family:var(--mono);font-size:13px;color:var(--hai);letter-spacing:.12em;min-height:1.4em;word-break:break-all}
+
+  .lede{padding:34px 0 10px;max-width:660px}
+  .lede p{font-size:17px;color:#3B4252}
+  .cta-row{display:flex;flex-wrap:wrap;gap:14px;padding:22px 0 0}
+  .btn{
+    display:inline-flex;align-items:center;gap:10px;
+    font-family:var(--disp);font-weight:700;font-size:16px;
+    padding:14px 26px;border-radius:12px;transition:transform .12s ease,box-shadow .12s ease;
+  }
+  .btn:hover{text-decoration:none;transform:translateY(-1px)}
+  .btn-dl{background:var(--ao);color:#fff;box-shadow:0 6px 18px rgba(37,99,235,.32)}
+  .btn-gh{border:1.5px solid var(--hai-usui);color:var(--sumi);background:#fff}
+  .note-sign{font-size:12.5px;color:var(--hai);padding-top:12px;max-width:560px}
+
+  /* ---- 候補ウィンドウ = 機能一覧 ---- */
+  section{padding:72px 0 0}
+  .eyebrow{font-family:var(--mono);font-size:12.5px;color:var(--ao);letter-spacing:.14em;margin-bottom:10px}
+  h2{font-family:var(--disp);font-weight:900;font-size:clamp(24px,3.6vw,32px);line-height:1.5;margin-bottom:26px}
+  .cand{
+    background:#fff;border:1px solid var(--hai-usui);border-radius:14px;overflow:hidden;
+    box-shadow:0 1px 2px rgba(22,24,29,.04),0 10px 30px rgba(22,24,29,.04);
+  }
+  .cand-item{display:flex;gap:18px;padding:18px 24px;border-top:1px solid var(--hai-usui);transition:background .12s;align-items:center}
+  .cand-item:first-child{border-top:0}
+  .cand-item:hover{background:var(--ao-usui)}
+  .cand-item .no{font-family:var(--mono);font-weight:600;color:var(--hai);width:1.4em;flex:none;padding-top:2px;align-self:flex-start}
+  .cand-item:hover .no{color:var(--ao)}
+  .cand-item .txt{flex:1}
+  .cand-item dt{font-family:var(--disp);font-weight:700;font-size:16.5px}
+  .cand-item dd{color:#3B4252;font-size:14.5px}
+  /* ミニ実例 */
+  .ex{
+    flex:none;width:300px;background:var(--kami);border:1px solid var(--hai-usui);
+    border-radius:10px;padding:12px 16px 13px;line-height:2;
+  }
+  .ex .r{display:block;font-family:var(--mono);font-size:10.5px;color:var(--hai);letter-spacing:.08em;margin-bottom:1px}
+  .ex .j{font-family:var(--disp);font-weight:700;font-size:15px;color:var(--sumi)}
+  .ex .arw{color:var(--ao);font-weight:700;padding:0 5px}
+  .ex .mb{
+    display:inline-block;min-width:24px;text-align:center;font-family:var(--mono);
+    font-weight:600;font-size:12px;border:1px solid var(--hai-usui);border-radius:5px;
+    padding:0 5px;background:#fff;color:#5B6472;vertical-align:1px;
+  }
+  .ex .mb.on{background:var(--ao);border-color:var(--ao);color:#fff}
+  .ex .sel{background:var(--ao-usui);border-radius:3px;padding:0 3px}
+  .ex .preedit{border-bottom-width:2px;padding-bottom:1px}
+  .ex kbd{font-size:12px;padding:1px 7px}
+  @media(max-width:760px){.cand-item{flex-wrap:wrap}.ex{width:100%}}
+  .cand-hint{font-family:var(--mono);font-size:12px;color:var(--hai);padding:10px 24px 12px;border-top:1px solid var(--hai-usui)}
+
+  /* ---- ローカル ---- */
+  .local-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  .local-card{background:#fff;border:1px solid var(--hai-usui);border-radius:14px;padding:24px}
+  .local-card h3{font-family:var(--disp);font-weight:700;font-size:16px;margin-bottom:8px}
+  .local-card p{font-size:14px;color:#3B4252}
+  .local-card .big{font-family:var(--disp);font-weight:900;font-size:30px;color:var(--ao);line-height:1.3}
+  @media(max-width:680px){.local-grid{grid-template-columns:1fr}}
+
+  /* ---- インストール ---- */
+  ol.steps{list-style:none;counter-reset:s}
+  ol.steps li{counter-increment:s;position:relative;padding:0 0 26px 58px}
+  ol.steps li::before{
+    content:counter(s);position:absolute;left:0;top:2px;
+    width:38px;height:38px;border-radius:10px;background:#fff;border:1.5px solid var(--hai-usui);
+    display:grid;place-items:center;font-family:var(--mono);font-weight:600;color:var(--ao);
+  }
+  ol.steps li::after{content:"";position:absolute;left:19px;top:46px;bottom:6px;border-left:2px dotted var(--hai-usui)}
+  ol.steps li:last-child::after{display:none}
+  ol.steps h3{font-family:var(--disp);font-weight:700;font-size:16.5px}
+  ol.steps p{font-size:14.5px;color:#3B4252;max-width:600px}
+  kbd{
+    font-family:var(--mono);font-size:.85em;background:#fff;border:1px solid var(--hai-usui);
+    border-bottom-width:2.5px;border-radius:6px;padding:2px 8px;white-space:nowrap;
+  }
+  code{font-family:var(--mono);font-size:.9em;background:#fff;border:1px solid var(--hai-usui);border-radius:5px;padding:1px 6px}
+
+  /* ---- footer ---- */
+  footer{margin-top:88px;border-top:1px solid var(--hai-usui);padding:36px 0 56px}
+  footer p{font-size:13px;color:var(--hai);max-width:680px}
+  footer p+p{margin-top:10px}
+  footer a{color:#5B6472;text-decoration:underline}
+
+  /* ================= CRT (For Developers) ================= */
+  body.dev{background:var(--crt-bg);color:var(--crt-fg)}
+  body.dev::before{
+    content:"";position:fixed;inset:0;pointer-events:none;z-index:40;
+    background:repeating-linear-gradient(0deg, rgba(0,0,0,.28) 0 1px, transparent 1px 3px);
+  }
+  body.dev .nav a.gh{color:var(--crt-fg)}
+  body.dev .badge-a{background:var(--crt-green);color:var(--crt-bg);box-shadow:0 0 14px rgba(74,222,128,.45)}
+  body.dev .wordmark{color:var(--crt-green);text-shadow:0 0 10px rgba(74,222,128,.4)}
+  body.dev .tabs{border-bottom-color:var(--crt-line)}
+  body.dev .tab.devtab[aria-selected="true"]{color:var(--crt-bright)}
+  body.dev footer{border-top-color:var(--crt-line)}
+  body.dev footer p{color:var(--crt-dim)}
+  body.dev footer a{color:var(--crt-fg)}
+  body.dev kbd{background:var(--crt-panel);border-color:var(--crt-line);color:var(--crt-bright)}
+  body.dev code{background:var(--crt-panel);border-color:var(--crt-line);color:var(--crt-bright)}
+
+  #panel-dev{font-family:var(--mono)}
+  #panel-dev section{padding:56px 0 0}
+  .banner{
+    font-family:var(--mono);font-size:clamp(5px,1.05vw,10px);line-height:1.25;
+    color:var(--crt-green);text-shadow:0 0 12px rgba(74,222,128,.5);
+    overflow-x:auto;white-space:pre;margin-top:44px;
+  }
+  .crt-tagline{margin-top:18px;color:var(--crt-fg);font-size:15px}
+  .crt-tagline .p{color:var(--crt-green)}
+  .cmd-h{
+    font-family:var(--mono);font-weight:600;font-size:clamp(17px,2.6vw,21px);
+    color:var(--crt-bright);margin-bottom:22px;text-shadow:0 0 10px rgba(74,222,128,.28);
+  }
+  .cmd-h .p{color:var(--crt-green)}
+  .cmd-h .dim{color:var(--crt-dim)}
+  .crt-term{
+    background:#050A07;border:1px solid var(--crt-line);border-radius:10px;overflow:hidden;
+    box-shadow:0 0 0 1px rgba(74,222,128,.06),0 18px 50px rgba(0,0,0,.5);
+  }
+  .crt-bar{
+    display:flex;align-items:center;gap:10px;
+    background:var(--crt-panel);border-bottom:1px solid var(--crt-line);
+    padding:9px 16px;font-size:12.5px;color:var(--crt-dim);
+  }
+  .crt-bar .sp{flex:1}
+  .ime-badge{
+    display:inline-block;min-width:30px;text-align:center;
+    font-weight:700;font-size:13px;border-radius:6px;padding:2px 8px;
+    background:#12211A;color:var(--crt-dim);border:1px solid var(--crt-line);
+    transition:all .15s ease;
+  }
+  .ime-badge.kana{background:var(--crt-green);color:var(--crt-bg);box-shadow:0 0 14px rgba(74,222,128,.6)}
+  .crt-screen{
+    padding:24px 26px 28px;font-size:clamp(13.5px,1.9vw,16px);line-height:2.15;
+    white-space:pre-wrap;word-break:break-all;min-height:9.5em;
+    color:var(--crt-fg);text-shadow:0 0 8px rgba(183,228,195,.22);
+  }
+  .crt-screen .p{color:var(--crt-green)}
+  .crt-screen .cm{color:var(--crt-dim);font-size:.82em}
+  .crt-screen .pre{color:#fff;border-bottom:2px dotted var(--crt-green);padding-bottom:1px}
+  .crt-screen .key{
+    display:inline-block;font-size:.72em;color:var(--crt-bg);background:var(--crt-green);
+    border-radius:4px;padding:0 7px;margin:0 5px;font-weight:700;vertical-align:1px;
+    box-shadow:0 0 10px rgba(74,222,128,.55);
+  }
+  .block{display:inline-block;width:.62em;height:1.15em;background:var(--crt-green);vertical-align:-.18em;margin-left:1px;animation:blink 1.06s steps(1) infinite;box-shadow:0 0 8px rgba(74,222,128,.6)}
+  .crt-note{margin-top:14px;color:var(--crt-dim);font-size:12.5px}
+
+  .crt-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  @media(max-width:760px){.crt-grid{grid-template-columns:1fr}}
+  .crt-card{
+    background:var(--crt-panel);border:1px solid var(--crt-line);border-radius:10px;
+    padding:22px;display:flex;flex-direction:column;gap:12px;
+  }
+  .crt-card .err{
+    color:var(--crt-amber);font-weight:600;font-size:14.5px;line-height:1.8;
+  }
+  .crt-card .err::before{content:"✗ ";color:#F87171}
+  .crt-card .ok{color:var(--crt-fg);font-size:13.5px;line-height:2}
+  .crt-card .ok::before{content:"✓ ";color:var(--crt-green)}
+  .crt-card .ok b{color:var(--crt-green);font-weight:700}
+
+  .crt-code{
+    background:#050A07;border:1px solid var(--crt-line);border-radius:10px;
+    padding:22px 26px;font-size:13.5px;line-height:2;overflow-x:auto;white-space:pre;
+    color:var(--crt-fg);
+  }
+  .crt-code .c{color:var(--crt-dim)}
+  .crt-code .s{color:var(--crt-amber)}
+  .crt-code .g{color:var(--crt-green)}
+  .crt-links{display:flex;flex-wrap:wrap;gap:14px;margin-top:20px}
+  .crt-btn{
+    font-family:var(--mono);font-weight:600;font-size:14.5px;
+    border:1px solid var(--crt-green);border-radius:8px;padding:12px 22px;
+    color:var(--crt-green);background:transparent;
+  }
+  .crt-btn:hover{background:rgba(74,222,128,.08);text-decoration:none}
+  .crt-btn.solid{background:var(--crt-green);color:var(--crt-bg);box-shadow:0 0 18px rgba(74,222,128,.4)}
+  .crt-btn.solid:hover{background:var(--crt-bright)}
+
+  @media(prefers-reduced-motion:reduce){
+    .caret,.block,.tab.devtab .cur{animation:none}
+    .tab.devtab{animation:none}
+    html{scroll-behavior:auto}
+  }
+</style>
+</head>
+<body>
+
+<header class="wrap">
+  <nav class="nav" aria-label="グローバル">
+    <span class="badge-a" aria-hidden="true">あ</span>
+    <span class="wordmark">nospacekey</span>
+    <span class="sp"></span>
+    <a class="gh" href="https://github.com/yachtida/nospacekey">GitHub</a>
+  </nav>
+  <div class="tabs" role="tablist" aria-label="表示切替">
+    <button class="tab" id="tab-general" role="tab" aria-selected="true" aria-controls="panel-general">ホーム</button>
+    <button class="tab devtab" id="tab-dev" role="tab" aria-selected="false" aria-controls="panel-dev">For Developers<span class="cur" aria-hidden="true"></span></button>
+  </div>
+</header>
+
+<main>
+<!-- ================= ホーム ================= -->
+<div id="panel-general" role="tabpanel" aria-labelledby="tab-general">
+  <div class="wrap hero">
+    <h1>もう、スペースを<br>連打しない<span class="no">。</span></h1>
+
+    <div class="field" aria-label="ライブ変換のデモ">
+      <span class="label">TEXT INPUT — LIVE CONVERSION</span>
+      <p id="typed" lang="ja"><span class="caret" aria-hidden="true"></span></p>
+      <div class="roman" id="roman" aria-hidden="true"></div>
+    </div>
+
+    <div class="scoreboard" aria-label="このデモの打鍵数">
+      <div class="score keys">
+        <span class="k">打鍵</span>
+        <span class="v" id="keys">0</span>
+      </div>
+      <div class="score space">
+        <div>
+          <span class="k">この間に押した Space</span>
+          <div><span class="v" id="space">0</span><span class="unit">回</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="lede">
+      <p>nospacekey は Windows 用のかな漢字変換 IME。打つだけで変換が追いかけてくる
+      <strong>ライブ変換</strong>で、「文節を区切って、変換して、確定して」というリズム
+      そのものをなくします。変換も学習もすべてこの PC の中で完結。オープンソース(MIT)。</p>
+    </div>
+
+    <div class="cta-row">
+      <a class="btn btn-dl" href="https://github.com/yachtida/nospacekey/releases/latest">⬇ ダウンロード(Windows 11 x64)</a>
+      <a class="btn btn-gh" href="#" data-goto-dev>For Developers →</a>
+    </div>
+    <p class="note-sign">現在の版は開発用自己署名です。実行時に SmartScreen の警告が出た場合は「詳細情報」→「実行」で続行できます。SHA-256 は各リリースの SHA256SUMS.txt で検証できます。</p>
+  </div>
+
+  <section class="wrap" id="features">
+    <p class="eyebrow">CANDIDATES</p>
+    <h2>できること</h2>
+    <div class="cand" role="list">
+      <div class="cand-item" role="listitem">
+        <span class="no">1</span>
+        <div class="txt"><dt>ライブ変換</dt>
+        <dd>打鍵に追随して自動で変換が進む。Space も Enter も、打ちたいときだけ。従来の Space 変換もそのまま使える。</dd></div>
+      </div>
+      <div class="cand-item" role="listitem">
+        <span class="no">2</span>
+        <div class="txt"><dt>一時日本語モード</dt>
+        <dd>F8(変更可)で日本語モードへ、確定した瞬間に半角英数へ自動復帰。IME の切り忘れが起きない。</dd></div>
+        <div class="ex"><span class="r">ephemeral kana</span>
+          <span class="j"><kbd>F8</kbd><span class="arw">→</span><span class="mb on">あ</span> <span class="preedit">メモ</span><span class="arw">→</span>確定<span class="arw">→</span><span class="mb">A</span></span></div>
+      </div>
+      <div class="cand-item" role="listitem">
+        <span class="no">3</span>
+        <div class="txt"><dt>モードレス再変換</dt>
+        <dd>半角英数のまま打って、あとから選んで変換キー。モード切替を意識しない入力へ。</dd></div>
+        <div class="ex"><span class="r">reconvert</span>
+          <span class="j"><span class="sel">kaigi</span> + <kbd>変換</kbd><span class="arw">→</span>会議</span></div>
+      </div>
+      <div class="cand-item" role="listitem">
+        <span class="no">4</span>
+        <div class="txt"><dt>修正変換(Tab)</dt>
+        <dd>打ち間違えた読みを Tab 一発で修復候補に。確定すると誤読みも学習し、次からは Space 変換だけで直る。</dd></div>
+        <div class="ex"><span class="r">typo repair</span>
+          <span class="j">こんんいちは + <kbd>Tab</kbd><span class="arw">→</span>こんにちは</span></div>
+      </div>
+      <div class="cand-item" role="listitem">
+        <span class="no">5</span>
+        <div class="txt"><dt>Zenzai ニューラル変換(opt-in)</dt>
+        <dd>GGUF モデルを置くと自動で有効化。文脈を読む変換をローカル CPU で。無ければ古典 LOUDS 変換で軽快に動く。</dd></div>
+      </div>
+      <div class="cand-hint">数字キーで候補を選ぶように、どれからでも。</div>
+    </div>
+  </section>
+
+  <section class="wrap" id="local">
+    <p class="eyebrow">LOCAL ONLY</p>
+    <h2>外に出ない</h2>
+    <div class="local-grid">
+      <div class="local-card">
+        <p class="big">0 件</p>
+        <h3>既定の外部送信</h3>
+        <p>入力内容・変換履歴・テレメトリ・クラッシュレポート、いずれも送信しない。</p>
+      </div>
+      <div class="local-card">
+        <p class="big">100%</p>
+        <h3>ローカル変換</h3>
+        <p>古典変換もニューラル変換(llama.cpp / CPU)もこの PC の中で実行。クラウド変換 API は存在しない。</p>
+      </div>
+      <div class="local-card">
+        <p class="big">MIT</p>
+        <h3>オープンソース</h3>
+        <p>TSF 層は Rust、変換エンジンホストは Swift。全コードを公開している。</p>
+      </div>
+    </div>
+    <p style="font-size:13.5px;color:#5B6472;padding-top:14px">詳細は <a href="https://github.com/yachtida/nospacekey/blob/master/PRIVACY.md">PRIVACY.md</a> / <a href="https://github.com/yachtida/nospacekey/blob/master/SECURITY.md">SECURITY.md</a></p>
+  </section>
+
+  <section class="wrap" id="install">
+    <p class="eyebrow">SETUP</p>
+    <h2>3 分ではじめる</h2>
+    <ol class="steps">
+      <li>
+        <h3>ダウンロード</h3>
+        <p><a href="https://github.com/yachtida/nospacekey/releases/latest">Releases</a> から <code>nospacekey-setup-&lt;version&gt;.exe</code> を取得。</p>
+      </li>
+      <li>
+        <h3>インストール</h3>
+        <p>exe を実行(管理者昇格が必要 — IME の登録はマシン単位のため)。SmartScreen が出たら「詳細情報」→「実行」。</p>
+      </li>
+      <li>
+        <h3><kbd>Win</kbd> + <kbd>Space</kbd> で「nospacekey」を選ぶ</h3>
+        <p>あとは打つだけ。Zenzai を使う場合は設定画面からモデルをダウンロード。</p>
+      </li>
+    </ol>
+  </section>
+</div>
+
+<!-- ================= For Developers (CRT) ================= -->
+<div id="panel-dev" role="tabpanel" aria-labelledby="tab-dev" hidden>
+  <div class="wrap">
+    <pre class="banner" aria-hidden="true">
+███╗   ██╗ ██████╗ ███████╗██████╗  █████╗  ██████╗███████╗██╗  ██╗███████╗██╗   ██╗
+████╗  ██║██╔═══██╗██╔════╝██╔══██╗██╔══██╗██╔════╝██╔════╝██║ ██╔╝██╔════╝╚██╗ ██╔╝
+██╔██╗ ██║██║   ██║███████╗██████╔╝███████║██║     █████╗  █████╔╝ █████╗   ╚████╔╝
+██║╚██╗██║██║   ██║╚════██║██╔═══╝ ██╔══██║██║     ██╔══╝  ██╔═██╗ ██╔══╝    ╚██╔╝
+██║ ╚████║╚██████╔╝███████║██║     ██║  ██║╚██████╗███████╗██║  ██╗███████╗   ██║
+╚═╝  ╚═══╝ ╚═════╝ ╚══════╝╚═╝     ╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝╚══════╝   ╚═╝</pre>
+    <p class="crt-tagline"><span class="p">$</span> 煩わしいモード切替からは、<b>おさらば</b>。</p>
+  </div>
+
+  <section class="wrap">
+    <h2 class="cmd-h"><span class="p">you@win:~$</span> demo --ephemeral-kana <span class="dim"># 一時日本語モード(F8)</span></h2>
+    <div class="crt-term">
+      <div class="crt-bar">
+        <span>tty1 — nospacekey</span><span class="sp"></span>
+        <span>IME</span><span class="ime-badge" id="dvBadge">A</span>
+      </div>
+      <div class="crt-screen" id="dvScreen" aria-label="一時日本語モードのターミナル実演"></div>
+    </div>
+    <p class="crt-note">[A]=半角英数 [あ]=一時日本語モード。F8 で入り、<b style="color:var(--crt-green)">確定した瞬間に自動で A へ戻る</b> — 切り忘れという状態が存在しない。トリガは設定でリバインド可。</p>
+  </section>
+
+  <section class="wrap">
+    <h2 class="cmd-h"><span class="p">you@win:~$</span> man japanese-ime <span class="dim"># 日本語 IME がつらい理由</span></h2>
+    <div class="crt-grid">
+      <div class="crt-card">
+        <p class="err">$ ｇｉｔ　ｓｔａｔｕｓ<br>command not found</p>
+        <p class="ok">切り忘れが<b>起きない</b>。普段は半角英数のまま、日本語は F8 の一時モードで打った分だけ。確定と同時に英数へ自動復帰する。</p>
+      </div>
+      <div class="crt-card">
+        <p class="err">error: expected ';' — 全角の「；」がコードに混入。全角スペースは diff でも見えない</p>
+        <p class="ok">そもそも<b>普段が半角英数</b>だから紛れ込む隙がない。日本語モード中ですら記号は<b>半角のまま</b>入る(全角にしたければ設定で)。</p>
+      </div>
+      <div class="crt-card">
+        <p class="err">会議の議事録係。変換と確定の合いの手で手が止まり、話に置いていかれる</p>
+        <p class="ok">ライブ変換で<b>打ちっぱなし</b> — 候補が出るだけでなく<b>確定まで自動</b>で進むから、Space/Enter の合いの手なしで話速に食らいつける。切り忘れゼロの一時日本語モードとこの組み合わせは、他にない。</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="wrap">
+    <h2 class="cmd-h"><span class="p">you@win:~$</span> cat keymap.json <span class="dim"># 全部リバインド可(設定GUI)</span></h2>
+    <div class="crt-code">{
+  <span class="s">"ephemeral"</span>:    <span class="s">"F8"</span>,        <span class="c">// 一時日本語モード</span>
+  <span class="s">"reconvert"</span>:    <span class="s">"Henkan"</span>,    <span class="c">// モードレス再変換</span>
+  <span class="s">"mode_toggle"</span>:  <span class="s">"Muhenkan"</span>,  <span class="c">// ひらがな ⇄ 半角英数</span>
+  <span class="s">"typo_repair"</span>:  <span class="s">"Tab"</span>,       <span class="c">// 修正変換</span>
+  <span class="s">"commit_undo"</span>:  <span class="s">"Ctrl+Backspace"</span>
+}
+<span class="c">// ほか計12機能。衝突は保存時に検出。起動時から半角英数で始める設定もある</span></div>
+  </section>
+
+  <section class="wrap">
+    <h2 class="cmd-h"><span class="p">you@win:~$</span> ./get-nospacekey</h2>
+    <div class="crt-links">
+      <a class="crt-btn solid" href="https://github.com/yachtida/nospacekey/releases/latest">↓ latest release</a>
+      <a class="crt-btn" href="https://github.com/yachtida/nospacekey">git clone github.com/yachtida/nospacekey</a>
+    </div>
+  </section>
+</div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>変換エンジン(<a href="https://github.com/azooKey/AzooKeyKanaKanjiConverter">AzooKeyKanaKanjiConverter</a>)と
+    Zenzai モデルは azooKey プロジェクトの成果物です(MIT / CC-BY-SA-4.0)。本プロジェクトは非公式であり、
+    不具合・質問は上流でなく <a href="https://github.com/yachtida/nospacekey/issues">当リポジトリの Issue</a> へお願いします。</p>
+    <p>本ソフトウェアは MIT License に基づき現状有姿(AS IS)・無保証で提供されます。使用または
+    使用不能から生じるいかなる損害についても、作者およびコントリビューターは一切の責任を負いません。
+    詳細は <a href="https://github.com/yachtida/nospacekey/blob/master/README.md">README の免責事項</a>を参照してください。</p>
+    <p>© 2026 nospacekey project contributors — MIT License</p>
+  </div>
+</footer>
+
+<script>
+(function(){
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  /* ---------- tabs ---------- */
+  const tabG = document.getElementById('tab-general');
+  const tabD = document.getElementById('tab-dev');
+  const panG = document.getElementById('panel-general');
+  const panD = document.getElementById('panel-dev');
+  function select(dev, pushHash){
+    document.body.classList.toggle('dev', dev);
+    tabG.setAttribute('aria-selected', String(!dev));
+    tabD.setAttribute('aria-selected', String(dev));
+    panG.hidden = dev; panD.hidden = !dev;
+    if (pushHash) history.replaceState(null, '', dev ? '#dev' : location.pathname);
+    window.scrollTo({top:0, behavior:'instant'});
+  }
+  tabG.addEventListener('click', () => select(false, true));
+  tabD.addEventListener('click', () => select(true, true));
+  document.querySelectorAll('[data-goto-dev]').forEach(a =>
+    a.addEventListener('click', e => { e.preventDefault(); select(true, true); }));
+  if (location.hash === '#dev') select(true, false);
+
+  /* ---------- ホーム: ライブ変換デモ ---------- */
+  const typed = document.getElementById('typed');
+  const romanEl = document.getElementById('roman');
+  const keysEl = document.getElementById('keys');
+  const caret = '<span class="caret" aria-hidden="true"></span>';
+  // 打つ文: スペースを押さずに、生産性を向上せよ。
+  const segs = [
+    {roman:'supe-suwo',  kana:['す','すぺ','すぺー','すぺーす','すぺーすを'], fin:'スペースを'},
+    {roman:'osazuni,',   kana:['お','おさ','おさず','おさずに','おさずに、'], fin:'押さずに、'},
+    {roman:'seisanseiwo',kana:['せ','せい','せいさ','せいさん','せいさんせ','せいさんせい','せいさんせいを'], fin:'生産性を'},
+    {roman:'koujouseyo', kana:['こ','こう','こうじ','こうじょ','こうじょう','こうじょうせ','こうじょうせよ'], fin:'向上せよ'},
+    {roman:'.',          kana:['。'], fin:'。'}
+  ];
+  const finalText = segs.map(s=>s.fin).join('');
+  let committed='', keys=0, romanLog='';
+  function render(pre){
+    typed.innerHTML = esc(committed) + (pre ? '<span class="preedit">'+esc(pre)+'</span>' : '') + caret;
+  }
+  async function typeSeg(seg){
+    const perKey = seg.kana.length>1 ? Math.max(1, Math.round(seg.roman.length/seg.kana.length)) : seg.roman.length;
+    let ri=0;
+    for (let i=0;i<seg.kana.length;i++){
+      const nk = Math.min(seg.roman.length, (i+1)*perKey);
+      while (ri<nk){ keys++; romanLog+=seg.roman[ri++]; }
+      if (i===seg.kana.length-1){ while(ri<seg.roman.length){ keys++; romanLog+=seg.roman[ri++]; } }
+      keysEl.textContent=keys; romanEl.textContent=romanLog;
+      render(seg.kana[i]);
+      await sleep(120+Math.random()*90);
+    }
+    if (seg.fin!==seg.kana[seg.kana.length-1]){
+      await sleep(260); render(seg.fin); await sleep(200);
+    }
+    committed+=seg.fin; render('');
+    romanLog+=' '; romanEl.textContent=romanLog;
+  }
+  async function runHome(){
+    for(;;){
+      committed=''; keys=0; romanLog='';
+      keysEl.textContent='0'; romanEl.textContent='';
+      render('');
+      await sleep(900);
+      for (const s of segs) await typeSeg(s);
+      await sleep(6500);
+    }
+  }
+  if (reduced){
+    typed.textContent = finalText;
+    keysEl.textContent = segs.reduce((n,s)=>n+s.roman.length,0);
+    romanEl.textContent = segs.map(s=>s.roman).join(' ');
+  } else { runHome(); }
+
+  /* ---------- Dev: 一時日本語モード ターミナル実演 ---------- */
+  const dvScreen = document.getElementById('dvScreen');
+  const dvBadge  = document.getElementById('dvBadge');
+  const P = '<span class="p">you@win</span>:~/proj$ ';
+  const block = '<span class="block" aria-hidden="true"></span>';
+  function badge(kana){
+    dvBadge.textContent = kana ? 'あ' : 'A';
+    dvBadge.classList.toggle('kana', kana);
+  }
+  function dvRender(lines, pre, cursor){
+    let html = lines.map(l=>l).join('\n');
+    if (pre !== null) html += '<span class="pre">'+esc(pre)+'</span>';
+    if (cursor) html += block;
+    dvScreen.innerHTML = html;
+  }
+  const kanaSteps = ['し','しょ','しょか','しょかい','しょかいり','しょかいりり','しょかいりりー','しょかいりりーす'];
+  const kanaFin = '初回リリース';
+  async function typeLatin(lines, base, text, cursor){
+    for (let i=1;i<=text.length;i++){
+      lines[lines.length-1] = base + esc(text.slice(0,i));
+      dvRender(lines, null, cursor);
+      await sleep(70+Math.random()*60);
+    }
+  }
+  async function runDev(){
+    for(;;){
+      badge(false);
+      const lines = [P];
+      dvRender(lines, null, true);
+      await sleep(1100);
+      // 1) コマンドは素のキー入力(半角英数)
+      await typeLatin(lines, P, 'git commit -m "', true);
+      await sleep(650);
+      // 2) F8 → 一時日本語モード
+      lines[lines.length-1] += '<span class="key">F8</span>';
+      badge(true);
+      dvRender(lines, '', true);
+      await sleep(700);
+      // 3) かな preedit → ライブ変換
+      const base = lines[lines.length-1];
+      for (const k of kanaSteps){
+        dvRender(lines, k, true); await sleep(135+Math.random()*80);
+      }
+      await sleep(300);
+      dvRender(lines, kanaFin, true);
+      await sleep(450);
+      // 4) Enter 確定 → その瞬間 A へ自動復帰
+      lines[lines.length-1] = base + esc(kanaFin);
+      badge(false);
+      lines[lines.length-1] += '"';
+      lines.push('<span class="cm"># ← 確定と同時に IME が [A] へ自動復帰。F8 は「押した分だけ」</span>');
+      lines.push(P);
+      dvRender(lines, null, true);
+      await sleep(1200);
+      // 5) 次の打鍵はそのままコマンド
+      await typeLatin(lines, P, 'git push', true);
+      lines.push('<span class="cm"># 切り忘れという状態が、そもそも存在しない</span>');
+      dvRender(lines, null, true);
+      await sleep(7000);
+    }
+  }
+  const dvStatic = () => {
+    badge(false);
+    dvScreen.innerHTML =
+      P + 'git commit -m "<span class="key">F8</span>' + esc(kanaFin) + '"\n' +
+      '<span class="cm"># ← 確定と同時に IME が [A] へ自動復帰。F8 は「押した分だけ」</span>\n' +
+      P + 'git push' + block + '\n' +
+      '<span class="cm"># 切り忘れという状態が、そもそも存在しない</span>';
+  };
+  if (reduced) dvStatic(); else runDev();
+})();
+</script>
+</body>
+</html>
