@@ -89,6 +89,52 @@
   footer p+p{margin-top:12px}
   footer a{color:var(--usuzumi)}
 
+  .hero{padding:88px 0 0}
+  .hero h1{margin-bottom:56px}
+
+  .demo{margin-bottom:40px}
+  .demo .roman{
+    font-family:var(--mono);font-size:12px;line-height:1.7;
+    color:var(--usuzumi);letter-spacing:.06em;
+    word-break:break-all;min-height:1.7em;margin-bottom:10px;
+  }
+  .demo .field{
+    border-top:1px solid var(--kei);border-bottom:1px solid var(--kei);
+    padding:22px 0;
+  }
+  .demo .text{
+    font-family:var(--mincho);font-weight:600;
+    font-size:clamp(24px,4.4vw,42px);line-height:1.6;letter-spacing:.02em;
+    font-feature-settings:"palt" 1;min-height:1.6em;
+  }
+  .demo .pre{border-bottom:2px dotted var(--ai);padding-bottom:2px}
+  .demo .caret{
+    display:inline-block;width:2px;height:1em;background:var(--ai);
+    vertical-align:-.1em;margin-left:3px;
+    animation:blink 1.06s steps(1) infinite;
+  }
+  .demo .count{
+    font-family:var(--mono);font-size:12px;color:var(--usuzumi);
+    letter-spacing:.06em;margin-top:10px;
+  }
+
+  .lede{margin-bottom:36px;font-size:16px}
+  .cta{display:flex;flex-wrap:wrap;gap:16px;align-items:center}
+  .btn{
+    font-family:var(--gothic);font-weight:500;font-size:15px;
+    padding:13px 26px;border-radius:4px;text-decoration:none;
+  }
+  .btn-p{background:var(--ai);color:var(--kami)}
+  .btn-s{border:1px solid var(--kei);color:var(--sumi)}
+  .meta{
+    font-family:var(--mono);font-size:12px;color:var(--usuzumi);
+    letter-spacing:.06em;margin-top:20px;
+  }
+
+  @media (prefers-reduced-motion: reduce){
+    .demo .caret{animation:none}
+  }
+
   @keyframes blink{50%{opacity:0}}
 </style>
 </head>
@@ -104,6 +150,26 @@
 </header>
 
 <main>
+  <div class="wrap hero">
+    <h1>Space を押さない。<br>モードと戦わない。</h1>
+
+    <div class="demo">
+      <p class="sr-only">デモ: 32 打鍵、Space 0 回で「変換キーの誤発火を修正した」まで変換が進む様子を再生しています。</p>
+      <div aria-hidden="true">
+        <div class="roman" id="roman"></div>
+        <div class="field"><div class="text" id="text"></div></div>
+        <div class="count" id="count">32 打鍵 · Space 0</div>
+      </div>
+    </div>
+
+    <p class="lede">Windows 用のかな漢字変換 IME。打鍵に追随して変換が進むライブ変換と、確定した瞬間に半角英数へ戻る一時日本語モードで、「モードを切り忘れる」という状態そのものをなくす。変換も学習もこの PC の中で完結する。</p>
+
+    <div class="cta">
+      <a class="btn btn-p" href="https://github.com/yachtida/nospacekey/releases/latest">ダウンロード</a>
+      <a class="btn btn-s" href="https://github.com/yachtida/nospacekey">GitHub</a>
+    </div>
+    <p class="meta">v1.1.0 · Windows 11 x64 · 約 31 MB · MIT</p>
+  </div>
 </main>
 
 <footer>
@@ -111,5 +177,76 @@
   </div>
 </footer>
 
+<script>
+(function(){
+  const reduce  = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const romanEl = document.getElementById('roman');
+  const textEl  = document.getElementById('text');
+  const countEl = document.getElementById('count');
+
+  // 打つ文「変換キーの誤発火を修正した」は v1.1.0 の実際の修正内容から取っている。
+  // 文節ごとに、かなが伸びる → 変換される → 確定する、の順で進む。
+  const SEGS = [
+    {roman:'henkanki-no',
+     kana:['へ','へん','へんか','へんかん','へんかんき','へんかんきー','へんかんきーの'],
+     fixed:'変換キーの'},
+    {roman:'gohakkawo',
+     kana:['ご','ごは','ごはっ','ごはっか','ごはっかを'],
+     fixed:'誤発火を'},
+    {roman:'shuuseishita',
+     kana:['しゅ','しゅう','しゅうせ','しゅうせい','しゅうせいし','しゅうせいした'],
+     fixed:'修正した'}
+  ];
+  const TOTAL = SEGS.reduce((n,s) => n + s.roman.length, 0);
+  const CARET = '<span class="caret"></span>';
+  const esc   = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  let done = '', roman = '', keys = 0;
+
+  // ローマ字は文節間でも連結する。区切りを入れないこと自体が「Space を押していない」証拠になる。
+  function paint(pre){
+    textEl.innerHTML  = esc(done) + (pre ? '<span class="pre">' + esc(pre) + '</span>' : '') + CARET;
+    romanEl.textContent = roman;
+    countEl.textContent = keys + ' 打鍵 · Space 0';
+  }
+
+  async function typeSeg(seg){
+    const n = seg.kana.length;
+    let ri = 0;
+    for (let i = 0; i < n; i++){
+      const upto = Math.round(seg.roman.length * (i + 1) / n);
+      while (ri < upto){ roman += seg.roman[ri++]; keys++; }
+      paint(seg.kana[i]);
+      await sleep(115 + Math.random() * 70);
+    }
+    while (ri < seg.roman.length){ roman += seg.roman[ri++]; keys++; }
+    await sleep(240);
+    paint(seg.fixed);
+    await sleep(260);
+    done += seg.fixed;
+    paint('');
+    await sleep(140);
+  }
+
+  async function loop(){
+    for(;;){
+      done = ''; roman = ''; keys = 0;
+      paint('');
+      await sleep(1000);
+      for (const s of SEGS) await typeSeg(s);
+      await sleep(8000);
+    }
+  }
+
+  if (reduce){
+    textEl.textContent  = SEGS.map(s => s.fixed).join('');
+    romanEl.textContent = SEGS.map(s => s.roman).join('');
+    countEl.textContent = TOTAL + ' 打鍵 · Space 0';
+  } else {
+    loop();
+  }
+})();
+</script>
 </body>
 </html>
