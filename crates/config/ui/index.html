@@ -128,6 +128,16 @@
             </div>
           </div>
           <div class="row">
+            <label for="e-zenzai-inference-limit">推論上限</label>
+            <div class="grow">
+              <input type="number" id="e-zenzai-inference-limit" data-bind="zenzai_inference_limit"
+                     min="1" max="10" step="1" class="w-md">
+              <span class="field-error" data-error-for="zenzai_inference_limit"></span>
+              <p class="hint">候補を並べ替えるニューラル推論の回数上限です。大きいほど文脈を考慮した
+                変換になりますが、変換が重くなります（1〜10、既定1。変更は入力先を切り替えると反映されます）。</p>
+            </div>
+          </div>
+          <div class="row">
             <label>モデル</label>
             <div class="grow">
               <div id="zenzai-model-status" class="hint">確認中…</div>
@@ -229,10 +239,13 @@
         <div class="card">
           <p class="hint">各機能のキー割り当てを変更できます。反映には IME の切り替え
             (別の入力方式へ切り替えて戻す)またはサインインし直しが必要です。</p>
+          <p class="hint">変換(henkan) は Space と 変換キーの両方に割当。無効化すると両方で変換しなくなります。</p>
           <div id="keymap-rows"></div>
           <div id="keymap-recorder" role="dialog" aria-modal="true" aria-label="キー割り当て" tabindex="-1" hidden>
             <div class="sheet">
               <p>キーを押してください…(Esc でキャンセル)</p>
+              <p class="hint">半角/全角キーはブラウザに届かないため、Enter またはクリックで割り当てます:</p>
+              <button id="keymap-chip-hz" type="button">半角/全角 を割り当て (Enter)</button>
               <p class="hint" id="keymap-recorder-hint"></p>
             </div>
           </div>

@@ -92,6 +92,18 @@ final class EngineHostHandlerTests: XCTestCase {
         XCTAssertEqual(resultTag(handler(1, body)), "Ok")
     }
 
+    // Zenzai 推論上限付き ReloadConfig が decode され、service の実効値に反映される
+    // （新 TIP → 新エンジン。weightURL nil でも ZenzaiConfig.resolve は limit を env から拾う）。
+    func testReloadConfigWithInferenceLimitAppliesToService() {
+        let svc = makeService()
+        let handler = makeEngineHandler(service: svc, serviceLock: NSLock())
+        let body = Data(#"{"method":"ReloadConfig","params":{"llm_enabled":false,"llm_api_key":"","llm_endpoint":"","llm_model":"","llm_prompt":"","llm_timeout_ms":15000,"zenzai_enabled":false,"zenzai_weight":"","zenzai_inference_limit":7}}"#.utf8)
+        XCTAssertEqual(resultTag(handler(1, body)), "Ok")
+        XCTAssertEqual(svc.zenzaiInferenceLimit, 7)
+    }
+    // 互換: zenzai_inference_limit 無しの旧 TIP からの ReloadConfig も従来どおり Ok
+    // （既存 testReloadConfigDispatchesToOk がそのまま担保 — フィールドを UInt32? にする理由）。
+
     // 修正変換(Tab): TypoConvert は decode→dispatch→Candidates のスモーク（Insert 後）。
     func testTypoConvertDispatchesToCandidates() throws {
         let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())

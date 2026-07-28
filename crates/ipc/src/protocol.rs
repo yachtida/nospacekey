@@ -101,6 +101,11 @@ pub enum Request {
         /// 修正変換の誤読み学習(合成ペア — 誤読み→修復表記)を有効化するか。
         /// engine env NOSPACEKEY_TYPO_LEARN と対。旧エンジンは未知キーとして無視する。
         typo_learn_enabled: bool,
+        /// Zenzai 推論上限（TIP がクランプ済みの 1..=10 を送る）。診断 env override（D6）時は
+        /// TIP が None を送りフィールド自体を省略＝エンジンは spawn 時 env のまま（env が勝つ）。
+        /// 旧 TIP も送らない（同じ省略形）。旧エンジンは未知キーとして無視する。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zenzai_inference_limit: Option<u32>,
     },
     /// Spec2: 学習履歴の消去（RAM+ディスク）。session を伴わないプロセス全体操作。
     /// Swift 側 Protocol.swift / EngineHost.swift と対で実装（一字一句一致規約）。
@@ -336,11 +341,12 @@ mod tests {
             zenzai_weight: "C:/w.gguf".into(),
             learning_enabled: true,
             typo_learn_enabled: true,
+            zenzai_inference_limit: Some(3),
         };
         let js = serde_json::to_string(&r).unwrap();
         assert_eq!(
             js,
-            r#"{"method":"ReloadConfig","params":{"llm_enabled":true,"llm_api_key":"sk-x","llm_endpoint":"https://e","llm_model":"gpt-4o-mini","llm_prompt":"p","llm_timeout_ms":15000,"zenzai_enabled":true,"zenzai_weight":"C:/w.gguf","learning_enabled":true,"typo_learn_enabled":true}}"#
+            r#"{"method":"ReloadConfig","params":{"llm_enabled":true,"llm_api_key":"sk-x","llm_endpoint":"https://e","llm_model":"gpt-4o-mini","llm_prompt":"p","llm_timeout_ms":15000,"zenzai_enabled":true,"zenzai_weight":"C:/w.gguf","learning_enabled":true,"typo_learn_enabled":true,"zenzai_inference_limit":3}}"#
         );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
@@ -359,6 +365,7 @@ mod tests {
             zenzai_weight: String::new(),
             learning_enabled: false,
             typo_learn_enabled: false,
+            zenzai_inference_limit: None,
         };
         let js = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
@@ -426,9 +433,26 @@ mod tests {
             zenzai_enabled: false, zenzai_weight: String::new(),
             learning_enabled: true,
             typo_learn_enabled: true,
+            zenzai_inference_limit: None,
         };
         let js = serde_json::to_string(&r).unwrap();
         assert!(js.contains(r#""learning_enabled":true"#), "wire に learning_enabled が載る: {js}");
+        assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
+    }
+
+    #[test]
+    fn reload_config_inference_limit_none_omits_field() {
+        // D6 env override 時/旧 TIP は None＝wire にフィールド自体が現れない（旧エンジン互換の既定形）。
+        let r = Request::ReloadConfig {
+            llm_enabled: false, llm_api_key: String::new(), llm_endpoint: String::new(),
+            llm_model: String::new(), llm_prompt: String::new(), llm_timeout_ms: 15000,
+            zenzai_enabled: true, zenzai_weight: String::new(),
+            learning_enabled: true, typo_learn_enabled: true,
+            zenzai_inference_limit: None,
+        };
+        let js = serde_json::to_string(&r).unwrap();
+        assert!(!js.contains("zenzai_inference_limit"), "None はフィールド省略: {js}");
+        // フィールド無し wire が None に decode される（旧 TIP 形の互換固定）。
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
 

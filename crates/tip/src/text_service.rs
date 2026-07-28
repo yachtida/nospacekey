@@ -46,6 +46,7 @@ use crate::globals::{ComObjectGuard, GUID_DISPLAY_ATTRIBUTE};
 use crate::input_state::InputState;
 use crate::input_state::InsertStyle;
 use crate::input_state::is_fresh_live;
+use crate::input_state::preedit_after_candidates_closed;
 use crate::input_state::ReconvertKind;
 use crate::llm_worker::{spawn_llm_worker, LlmOutcome, LlmSlot};
 
@@ -163,6 +164,15 @@ fn plan_start_session(result: std::io::Result<Response>) -> Option<i64> {
     }
 }
 
+/// EndSession 応答を ack として受理してよいか決める純関数。false＝接続破棄（drop_engine）。
+/// Why not(`Ok(_)` を一律受理する — 従来形): protocol.rs は request-id 相関を持たず、正しさは
+/// 要求/応答の交互性だけに依存する。想定外の型を ack として飲むと交互性が崩れていても検出できない。
+/// 他の op（`plan_start_session` / `engine_backspace` / `engine_convert`）は全て「期待した型以外は
+/// 破棄」で揃っており、EndSession だけ緩いのが規律の穴だった。
+fn end_session_ack_accepted(result: &std::io::Result<Response>) -> bool {
+    matches!(result, Ok(Response::Ok))
+}
+
 /// version handshake の判定（純関数）。StartSession 応答の proto（互換世代）から、この接続を
 /// どう扱うかを決める。副作用（Shutdown 送信・respawn・ログ）は呼び出し側 start_and_store が行う。
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -202,7 +212,11 @@ fn decide_handshake(proto: Option<u32>, already_attempted: bool) -> HandshakeAct
 /// **キー送信を維持する**判断（ユーザ承認）。将来のハードニング候補は
 /// GetNamedPipeServerProcessId によるサーバ像検証（送信前に正規エンジンか照合）。
 /// なお凍結中(settings::LLM_CONVERT_FROZEN)は llm_effective_enabled が false のためキーは流れない。
-fn build_reload_config(s: &settings::Settings, api_key_plain: Option<&str>) -> Request {
+fn build_reload_config(
+    s: &settings::Settings,
+    api_key_plain: Option<&str>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Request {
     let llm_on = settings::llm_effective_enabled(s);
     let (llm_api_key, llm_endpoint, llm_model, llm_prompt) = if llm_on {
         (
@@ -225,6 +239,13 @@ fn build_reload_config(s: &settings::Settings, api_key_plain: Option<&str>) -> R
         zenzai_weight: s.zenzai.weight_path.clone(),
         learning_enabled: s.learning.enabled,
         typo_learn_enabled: s.typo_correct.learn,
+        // D6: 診断 env が既に居るときは None（push 抑止＝spawn/reload とも env が勝つ。
+        // resolve_env_map の env_lookup 抑止と対）。居なければクランプ済み値を push する。
+        zenzai_inference_limit: if env_lookup("NOSPACEKEY_ZENZAI_INFERENCE_LIMIT").is_some() {
+            None
+        } else {
+            Some(s.zenzai.effective_inference_limit())
+        },
     }
 }
 
@@ -311,6 +332,11 @@ pub struct TextService {
     pub(crate) cand_state: Rc<RefCell<CandidateState>>,
     /// SP6a: Behavior(ホスト発)が確定/取消要求を書き込むスロット。drain_behavior が取り出す。
     pub(crate) behavior_outbox: Rc<RefCell<Option<BehaviorAction>>>,
+    /// キーボード以外（ホスト Behavior::SetSelection / 自前窓のマウスクリック）が選択を動かした
+    /// ことを示す一発フラグ。drain_behavior が消費して preedit を選択候補へ揃える。
+    /// 単一スロットの behavior_outbox に相乗りさせない — 保留中の Finalize を選択要求が
+    /// 上書きし、クリック確定が黙って消える（outbox は Option 1 枠しか無い）。
+    pub(crate) selection_dirty: Rc<Cell<bool>>,
     /// UU-4: TS の COM 操作中（RefCell 借用を保持しつつ presenter 経由でホストへ同期コール
     /// アウトしうる区間）にホストが Behavior 経由で再入して drain を呼んでも、借用衝突 panic を
     /// 起こさず保留→安全点で flush させる門（純粋ロジック＝単体テスト可能）。
@@ -490,8 +516,13 @@ impl TextService {
         let notify: Rc<dyn Fn()> = Rc::new(|| {
             crate::text_service::drain_behavior_via_tls();
         });
-        let candidate_ui =
-            RefCell::new(CandidatePresenter::new(cand_state.clone(), behavior_outbox.clone(), notify));
+        let selection_dirty: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let candidate_ui = RefCell::new(CandidatePresenter::new(
+            cand_state.clone(),
+            behavior_outbox.clone(),
+            selection_dirty.clone(),
+            notify,
+        ));
         Self {
             tid: Cell::new(0),
             thread_mgr: RefCell::new(None),
@@ -508,6 +539,7 @@ impl TextService {
             candidate_ui,
             cand_state,
             behavior_outbox,
+            selection_dirty,
             reentrancy: ReentrancyGate::new(),
             last_reading: RefCell::new(String::new()),
             monitor_committed_reading: RefCell::new(String::new()),
@@ -732,7 +764,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // は echo を出さない)、headless ハーネス item12(Shift+Tab→LLM 配線の echo 検証)はこれで
         // 通る=凍結中も配線コードの回帰を検出できる。
         // Why not(この1点で閉じる理由): 実行時の LLM 発動可否は Cell self.llm_enabled に集約されて
-        // おり(set は init の false とここだけ)、compute_hots / start_llm_convert ガード /
+        // おり(set は init の false とここだけ)、resolve_action / start_llm_convert ガード /
         // Shift+Tab 素通し判定は全てこの Cell を読む。Cell を経由しない LLM 経路や第2の set
         // サイトを足すと凍結が漏れる。
         let llm_on = settings::llm_effective_enabled(&s)
@@ -1263,7 +1295,9 @@ impl TextService_Impl {
         } else {
             settings::dpapi::decrypt(&s.llm.api_key_dpapi)
         };
-        let req = build_reload_config(&s, key_plain.as_ref().map(|z| z.as_str()));
+        let req = build_reload_config(&s, key_plain.as_ref().map(|z| z.as_str()), |k| {
+            std::env::var(k).ok()
+        });
         let result = {
             let mut guard = self.client.borrow_mut();
             let Some(client) = guard.as_mut() else { return; };
@@ -1727,6 +1761,15 @@ impl TextService_Impl {
         }
     }
 
+    /// `engine_live_convert` を呼んでよいか（設定 + 表記固定）。ライブ変換を参照する 3 経路
+    /// （VK_RETURN / `settle_active_input` / `restore_live_preedit`）が共有する唯一の入口。
+    pub(crate) fn should_consult_live_engine(&self) -> bool {
+        crate::input_state::should_consult_live_engine(
+            self.live_enabled.get(),
+            self.state.borrow().notation_fixed,
+        )
+    }
+
     /// ライブ変換を要求し (text, reading, committed) を得る。失敗なら None（劣化）し接続を破棄する。
     /// seq は要求に載せてエコーさせる（A1 では 1:1 のため鮮度判定は不要。A2 で is_fresh_live を使う）。
     /// `auto_commit` はエンジン側の自動確定（iOS nospacekey の先頭文節自動確定）を許可するか。
@@ -2086,7 +2129,8 @@ impl TextService_Impl {
             } else if !text.is_empty() {
                 self.state.borrow_mut().mark_good(&text);
                 *self.live_text.borrow_mut() = text.clone();
-                self.run_preedit(&ctx, &text);
+                // 表示だけ全角化（mark_good/live_text は半角のまま — 劣化時の確定素材だから）。
+                self.run_preedit(&ctx, &self.widen_display_text(&text));
             }
         }
     }
@@ -2130,6 +2174,41 @@ impl TextService_Impl {
         if session == 0 {
             return;
         }
+        // INV1: owe している応答を読み切ってから送る。
+        // Why not(従来どおりドレインせず送って失敗に任せる): desync はしない — `request_within` は
+        // pending 中の送信を I/O 前に `InvalidInput` で弾く（client.rs の規律チェック）ので、従来形は
+        // 必ず `end_session_failed` → `drop_engine` に落ちていた。問題は EndSession が届かないまま
+        // 接続が切れ、次打鍵が再接続＋StartSession（`ensure_engine` のフルコースは最悪 ~1.15s）を
+        // 払うこと。先にドレインすれば接続とセッションを保ったまま EndSession を届けられる。
+        // 代償は打鍵スレッドの追加ブロックで、owe 中の composition 終端に限り最悪
+        // IPC_TIMEOUT_FAST（ドレイン）＋同（送信）。空振り（StillPending）ならその待ちは丸ごと
+        // 無駄になるが、250ms で応答を返せない engine なら再接続は避けられない。
+        // Why not(StillPending を据え置いて次の要求で再ドレイン — insert/live_convert 形):
+        // composition 終端の呼び出しには同じセッションへ送る次の機会が無く、`ensure_engine →
+        // engine_end_session → ensure_session` でセッションを張り直す呼び方（`start_commit_undo` /
+        // `start_reconvert`）では `engine_session` を 0 にしないと直後の `ensure_session` が
+        // 早期 return して古いセッション（残り読み入り）を再利用する（defect#2）。どちらの
+        // 呼ばれ方でも据え置きは選べない。接続を捨てれば --persist サーバの切断ハンドラが
+        // 孤児セッションを掃除する（drop_engine のドキュメント参照）。
+        // Why not(client 不在でもドレインを通す): ドレイン対象は `self.client` 上の滞留フレームで、
+        // LLM ワーカへ move 中は読む先が無い。それでも通すと PENDING_MAX 超過枝が `Dropped` を
+        // 返し、下の `DrainOutcome::Dropped => return` で「復帰時に送り直す」None 枝に届かず
+        // セッション id を落とす。なお `pending_since` は client が Some のときしか立たない
+        // （`engine_insert`/`engine_live_convert` の TimedOut 枝はどちらも `guard.as_mut()?` の後）
+        // ので、その枝に入るには park 時点で `EngineClient::pending` が真だったことになり、その
+        // client は `spawn_llm_worker` の `request_within` が規律ガードで即失敗させて閉じる
+        // ＝到達手順は無い。よってこれは深層防御であり、既知の再現ケースは存在しない。
+        let parked_in_llm_worker = self.client.borrow().is_none();
+        if !parked_in_llm_worker {
+            match self.prepare_send("end_session", IPC_TIMEOUT_FAST) {
+                DrainOutcome::Proceed => {}
+                DrainOutcome::StillPending => {
+                    self.drop_engine();
+                    return;
+                }
+                DrainOutcome::Dropped => return,
+            }
+        }
         let result = {
             let mut guard = self.client.borrow_mut();
             guard.as_mut().map(|client| {
@@ -2138,11 +2217,12 @@ impl TextService_Impl {
         };
         self.engine_session.set(0);
         match result {
-            Some(Ok(_)) => {}
-            Some(Err(e)) => {
-                tip_log(&format!("end_session failed: {e:?}"));
-                tip_log("ev=degraded reason=end_session_failed");
-                self.drop_engine();
+            Some(r) => {
+                if !end_session_ack_accepted(&r) {
+                    tip_log(&format!("end_session failed: {r:?}"));
+                    tip_log("ev=degraded reason=end_session_failed");
+                    self.drop_engine();
+                }
             }
             None => {
                 // client は LLM ワーカへ move 済みで今は送れない。id を保留し、復帰時に EndSession を送る。
@@ -2154,7 +2234,11 @@ impl TextService_Impl {
     }
 
     /// client 復帰後（on_llm_outcome）に、保留していた EndSession を送って取り残しを掃除する。
-    /// Bug 1: engine_end_session と同様、失敗時は接続を破棄して応答フレームの滞留を防ぐ。
+    /// Bug 1: engine_end_session と同じ ack 判定（`end_session_ack_accepted`）を使い、受理外なら
+    /// 接続を破棄して応答フレームの滞留を防ぐ。
+    /// Why not(engine_end_session と同じ送信前ドレインも入れる): ここへ来る client は
+    /// `spawn_llm_worker` が **`request_within` 成功時だけ**返したものなので owe を持たない
+    /// （失敗時は client を返さず、on_llm_outcome の Err 枝が drop_engine するのでここへ来ない）。
     /// borrow は `result` ブロック内で完結させ、drop 後に `drop_engine` を呼ぶ（二重借用 panic 防止）。
     fn flush_pending_end_session(&self) {
         let session = self.pending_end_session.replace(0);
@@ -2167,10 +2251,12 @@ impl TextService_Impl {
                 timed_request(client, &Request::EndSession { session }, IPC_TIMEOUT_FAST, "end_session")
             })
         };
-        if let Some(Err(e)) = result {
-            tip_log(&format!("flush end_session failed: {e:?}"));
-            tip_log("ev=degraded reason=end_session_failed");
-            self.drop_engine();
+        if let Some(r) = result {
+            if !end_session_ack_accepted(&r) {
+                tip_log(&format!("flush end_session failed: {r:?}"));
+                tip_log("ev=degraded reason=end_session_failed");
+                self.drop_engine();
+            }
         }
     }
 
@@ -2242,14 +2328,79 @@ impl TextService_Impl {
         self.monitor_committed_reading.borrow_mut().clear();
     }
 
+    /// 選択中の候補を preedit へ書き戻す。選択を動かす全経路（キー/ホスト Behavior/マウス）が
+    /// 通る唯一の出口で、「インラインに見えている文字列＝Enter が確定する文字列」を保つ。
+    /// 文字列は cand_state から `resolve_commit` で取る — `string_at` だと sel 範囲外時の
+    /// フォールバック先が Enter（key_event_sink の候補確定）とズレて表示と確定が食い違う。
+    /// `showing` を見ずに呼ぶと、候補が閉じた後に保留 flush された選択要求が composition の
+    /// 無い状態で run_preedit を呼び、新規 composition をキャレット位置に開いてしまう。
+    pub(crate) fn sync_preedit_to_selection(&self, ctx: &ITfContext) {
+        if !self.showing.get() {
+            return;
+        }
+        // borrow は run_preedit（COM へ同期コールアウトする）より前で必ず落とす —
+        // ホスト再入で drain が cand_state を borrow し直す（drain_behavior_inner 参照）。
+        let pick = {
+            let st = self.cand_state.borrow();
+            st.resolve_commit(st.selected())
+        };
+        let Some((_, text)) = pick else { return; };
+        // 候補確定は幅を変えない契約（should_widen_digits が source=candidate を除外）なので、
+        // widen_display_text を通さない生の候補を出す。通すと「全角表示の preedit を半角で確定」
+        // が候補経路で再発する（trigger_convert の候補窓オープン時と同じ理由）。
+        self.run_preedit(ctx, &text);
+    }
+
+    /// 候補窓だけを閉じて composition を残す経路（Esc / Behavior::Abort）で、preedit を候補
+    /// プレビューからライブ変換表示へ描き戻す。閉じた後の確定はライブ変換結果を確定するので、
+    /// 送った先の候補を残すと `sync_preedit_to_selection` が立てた「見えている文字列＝確定する
+    /// 文字列」が閉じた瞬間に崩れる（従来は常に候補 0 が残り、ライブ結果と一致していたので
+    /// 見えていなかった）。
+    /// 幅の規則は `sync_preedit_to_selection` と**逆**でここは `widen_display_text` を通す —
+    /// 閉じた後の確定は source="live" で走り `should_widen_digits` が全角化する側だから。
+    /// Why not(表示中の `live_text` をそのまま描き戻す＝エンジン往復を省く): ライブ変換 ON で
+    /// 「変換キーが `arm_debounce` の 30ms 以内に来て `disarm_debounce` された」場合、`live_text`
+    /// は読みのまま残るのに Enter/settle は `engine_live_convert` を先に試す。読みを描き戻すと
+    /// 「かなが見えているのに漢字が確定される」ズレになる（Esc の往復 1 回より表示と確定の一致
+    /// を採る）。ライブ変換 OFF ならその Enter/settle も往復しないので、下の述語が両方を止める。
+    pub(crate) fn restore_live_preedit(&self, ctx: &ITfContext) {
+        // ライブ変換 OFF / 表記固定中は engine のライブ変換を参照しない（VK_RETURN / settle と同じ規律）。
+        let live = if self.should_consult_live_engine() {
+            let seq = self.state.borrow_mut().bump_live_seq();
+            // auto_commit=false: Esc は何も確定しないので、エンジンに読みを消費させてはいけない。
+            self.engine_live_convert(seq, false).map(|(t, _, _)| t)
+        } else {
+            None
+        };
+        let from_engine = live.as_deref().is_some_and(|t| !t.is_empty());
+        // borrow は widen_display_text/run_preedit（どちらも COM へ同期コールアウトする）より
+        // 前に必ず落とす（widen_commit_text の is_direct_mode 注記と同じ理由）。
+        let material = {
+            let live_text = self.live_text.borrow().clone();
+            let reading = self.last_reading.borrow().clone();
+            preedit_after_candidates_closed(live, &live_text, &reading)
+        };
+        let Some(text) = material else { return; };
+        if from_engine {
+            // 劣化素材を置き直さないと、Esc 後にエンジンが落ちたときの直確定が描き戻す前の
+            // 読みへ戻り、また表示と食い違う（`on_debounce_convert` が走ったのと同じ状態にする）。
+            self.state.borrow_mut().mark_good(&text);
+            *self.live_text.borrow_mut() = text.clone();
+        }
+        self.run_preedit(ctx, &self.widen_display_text(&text));
+    }
+
     /// 候補表示中に選択を `delta` だけ動かす（`move_selection` が循環＝端で巻き戻る）。
     /// 選択の唯一の真実源は cand_state（`move_selection`→presenter→cand_state が更新）。
-    /// `ev=candidate_move` を記録する。
+    /// `ev=candidate_move` を記録し、preedit を新しい選択候補へ描き直す。
     /// Space（前進）と上下矢印（↓=前進 / ↑=後退）で共有し、両経路が乖離しないようにする。
-    pub(crate) fn move_candidate(&self, delta: i32) {
+    /// `ctx` を引数で要求するのは、context を持たない呼び出し元が preedit 更新を伴わない
+    /// 選択移動を作れないようにするため（このバグの再発防止を型で縛る）。
+    pub(crate) fn move_candidate(&self, ctx: &ITfContext, delta: i32) {
         self.candidate_ui.borrow_mut().move_selection(delta);
-        let sel = self.candidate_ui.borrow().selected();
+        let sel = self.cand_state.borrow().selected();
         tip_log(&format!("ev=candidate_move sel={sel}"));
+        self.sync_preedit_to_selection(ctx);
     }
 
     /// 読みモニタの表示状態を現在の入力状態に同期する。表示条件の唯一の真実源は
@@ -2702,7 +2853,8 @@ impl TextService_Impl {
     pub(crate) fn drain_behavior(&self) {
         // ゲートが「保留（区間中）」を指示したら outbox は消費せず、保留フラグだけ立てて返す
         // （区間離脱後の安全点＝guarded の flush で処理＝確定ロスト防止）。
-        if self.reentrancy.signal_reentry(self.behavior_outbox.borrow().is_some()) {
+        let has_request = self.behavior_outbox.borrow().is_some() || self.selection_dirty.get();
+        if self.reentrancy.signal_reentry(has_request) {
             return;
         }
         // 借用未保持のトップレベル。inner が区間フラグを立てるので、その中の再入は保留され、
@@ -2712,15 +2864,25 @@ impl TextService_Impl {
     }
 
     /// drain の実体。区間フラグを立てて再入を保留させる。
-    /// outbox を**先に**取り出してから作用する（borrow 競合・再入防止）。
-    /// Finalize=現在選択候補を確定 / Abort=取消。いずれも Enter/Esc と同じ既存経路を再利用する。
+    /// outbox と選択フラグを**先に**取り出してから作用する（borrow 競合・再入防止）。
+    /// 選択移動=preedit を選択候補へ揃える / Finalize=現在選択候補を確定 / Abort=取消。
+    /// いずれも矢印キー・Enter・Esc と同じ既存経路を再利用する。
     /// 生きた context が無い（current_context=None）なら何もしない（劣化。panic させない）。
     fn drain_behavior_inner(&self) {
         let prev = self.reentrancy.enter();
         let _flag = InOperationGuard { gate: &self.reentrancy, prev };
         let action = self.behavior_outbox.borrow_mut().take();
-        let Some(action) = action else { return; };
+        let sync_selection = self.selection_dirty.replace(false);
+        if action.is_none() && !sync_selection {
+            return;
+        }
         let Some(ctx) = self.current_context.borrow().clone() else { return; };
+        // 選択同期は action より先。Finalize と同時に届いた場合でも「見えている文字列を確定する」
+        // 順序になり、確定直前だけ preedit が古いまま、という観測可能な隙間を作らない。
+        if sync_selection {
+            self.sync_preedit_to_selection(&ctx);
+        }
+        let Some(action) = action else { return; };
         match action {
             BehaviorAction::Finalize => {
                 // UU-4(#4): 保留された Finalize が「候補が既に閉じられた後」（例: Esc で hide したが
@@ -2748,6 +2910,7 @@ impl TextService_Impl {
                     self.candidate_ui.borrow_mut().hide();
                     self.showing.set(false);
                     tip_log("ev=candidates_hidden");
+                    self.restore_live_preedit(&ctx);
                 } else if self.state.borrow().composing {
                     self.disarm_debounce();
                     self.do_cancel(&ctx);
@@ -3331,7 +3494,7 @@ mod uu5_reload_config_tests {
         s.llm.timeout_ms = 12000;
         s.zenzai.enabled = true;
         s.zenzai.weight_path = "C:/w.gguf".into();
-        let req = build_reload_config(&s, Some("sk-x"));
+        let req = build_reload_config(&s, Some("sk-x"), |_| None);
         assert_eq!(
             req,
             Request::ReloadConfig {
@@ -3345,6 +3508,7 @@ mod uu5_reload_config_tests {
                 zenzai_weight: "C:/w.gguf".into(),
                 learning_enabled: true,
                 typo_learn_enabled: true,
+                zenzai_inference_limit: Some(1),
             }
         );
     }
@@ -3355,7 +3519,7 @@ mod uu5_reload_config_tests {
         let mut s = Settings::default();
         s.llm.enabled = false;
         s.llm.endpoint = "https://leak".into();
-        let req = build_reload_config(&s, Some("sk-should-not-leak"));
+        let req = build_reload_config(&s, Some("sk-should-not-leak"), |_| None);
         match req {
             Request::ReloadConfig { llm_enabled, llm_api_key, llm_endpoint, .. } => {
                 assert!(!llm_enabled);
@@ -3373,10 +3537,31 @@ mod uu5_reload_config_tests {
         s.llm.enabled = false;
         s.zenzai.enabled = false;
         s.zenzai.weight_path = String::new();
-        match build_reload_config(&s, None) {
+        match build_reload_config(&s, None, |_| None) {
             Request::ReloadConfig { zenzai_enabled, zenzai_weight, .. } => {
                 assert!(!zenzai_enabled);
                 assert_eq!(zenzai_weight, "");
+            }
+            _ => panic!("ReloadConfig を組み立てるはず"),
+        }
+    }
+
+    #[test]
+    fn inference_limit_pushes_clamped_value_or_defers_to_env_override() {
+        // D6: TIP env に診断 override が居るときは None（push 抑止）、居なければクランプ済み Some。
+        let mut s = Settings::default();
+        s.zenzai.inference_limit = 0; // 手編集異常値 → クランプで 1
+        match build_reload_config(&s, None, |_| None) {
+            Request::ReloadConfig { zenzai_inference_limit, .. } => {
+                assert_eq!(zenzai_inference_limit, Some(1));
+            }
+            _ => panic!("ReloadConfig を組み立てるはず"),
+        }
+        match build_reload_config(&s, None, |k| {
+            (k == "NOSPACEKEY_ZENZAI_INFERENCE_LIMIT").then(|| "5".to_string())
+        }) {
+            Request::ReloadConfig { zenzai_inference_limit, .. } => {
+                assert_eq!(zenzai_inference_limit, None);
             }
             _ => panic!("ReloadConfig を組み立てるはず"),
         }
@@ -3407,6 +3592,21 @@ mod a8_tests {
             plan_start_session(Ok(Response::Error { message: "x".into() })),
             None
         );
+    }
+
+    #[test]
+    fn end_session_ack_is_only_the_ok_response() {
+        use super::end_session_ack_accepted;
+        assert!(end_session_ack_accepted(&Ok(Response::Ok)));
+        // EndSession の ack は `Response::Ok` だけ。他 op と同じく「期待した型以外は破棄」。
+        assert!(!end_session_ack_accepted(&Ok(Response::Reading { reading: "にほんご".into() })));
+        assert!(!end_session_ack_accepted(&Ok(Response::LiveResult {
+            seq: 3, text: "日本語".into(), reading: "にほんご".into(), committed: None,
+        })));
+        assert!(!end_session_ack_accepted(&Ok(Response::Error { message: "x".into() })));
+        assert!(!end_session_ack_accepted(&Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut, "t"
+        ))));
     }
 
     #[test]

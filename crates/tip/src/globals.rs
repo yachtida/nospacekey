@@ -19,6 +19,10 @@ pub const GUID_PRESERVEDKEY_RECONVERT: GUID = GUID::from_u128(0x4006ec1a_2ef6_4f
 pub const GUID_PRESERVEDKEY_MODE_TOGGLE_US: GUID = GUID::from_u128(0x87a01c5a_b74f_47af_98a8_d5c588d6f747);
 /// US(ANSI)配列向け: 再変換（Alt+/）の preserved key 識別 GUID。一度確定したら変更しない。
 pub const GUID_PRESERVEDKEY_RECONVERT_US: GUID = GUID::from_u128(0x23822a23_3ca1_401e_9b1c_4bfa1e6f0efb);
+/// 半角/全角(0xF3)向け: モードトグルの preserved key 識別 GUID。一度確定したら変更しない。
+/// bare 0x1C/0x1D と同じく OS 拒否があり得る — 拒否/未配送ホストは OnKeyDown 救済
+/// (resolve_action の bare_special 経路)が受ける(spec §3)。
+pub const GUID_PRESERVEDKEY_MODE_TOGGLE_HZ: GUID = GUID::from_u128(0x3f8b6a92_1d47_4c05_8e2a_7b9c0d4e5f16);
 /// 品質ループ③: 誤変換フィードバック記録（Ctrl+変換 0x1C, JIS）の preserved key 識別 GUID。
 /// 既存4登録と衝突しない新 GUID。一度確定したら変更しない。
 pub const GUID_PRESERVEDKEY_FEEDBACK: GUID = GUID::from_u128(0x5b8ce2d1_7f3a_4d68_9a41_c1d20f6e3b57);

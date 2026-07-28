@@ -83,6 +83,9 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                 if let tl = p.typo_learn_enabled {
                     overrides["NOSPACEKEY_TYPO_LEARN"] = tl ? "1" : "0"
                 }
+                if let il = p.zenzai_inference_limit {
+                    overrides["NOSPACEKEY_ZENZAI_INFERENCE_LIMIT"] = String(il)
+                }
                 service.reload(overrides: overrides)
                 response = .ok
             case .clearLearning:

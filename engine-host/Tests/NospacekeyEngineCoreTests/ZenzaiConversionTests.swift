@@ -28,4 +28,35 @@ final class ZenzaiConversionTests: XCTestCase {
         let candidates = svc.convert(session: sid)
         XCTAssertTrue(candidates?.contains("日本語") ?? false, "expected 日本語 in \(String(describing: candidates))")
     }
+
+    /// audit H2 回帰: Zenzai 実稼働中のセッション切替（アプリ間フォーカス切替相当）は llama reset を
+    /// スキップするようになった（bindConverter の注記参照）。ここでは切替を往復させても変換・確定が
+    /// 正しく動き続けることを実走で確認する（スキップ自体の直接観測は ev=llama_reset_skipped ログの
+    /// 運用確認に委ねる — 上のテストの「実走の確証」と同じ限界注記）。
+    func testSessionSwitchKeepsConvertingWithRealModel() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let path = env["NOSPACEKEY_ZENZAI_WEIGHT"], FileManager.default.fileExists(atPath: path) else {
+            throw XCTSkip("NOSPACEKEY_ZENZAI_WEIGHT 未設定 or ファイル無し → Zenzai 統合テストを skip")
+        }
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: URL(fileURLWithPath: path), inferenceLimit: 1))
+        svc.startWarmUp()
+        let deadline = Date().addingTimeInterval(120)
+        while !svc.zenzaiReady && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+        XCTAssertTrue(svc.zenzaiReady, "warm-up（実モデルロード）が制限時間内に完了するはず")
+
+        // アプリ A で変換・確定 → アプリ B へ切替えて変換 → A へ戻って続きを変換。
+        let a = svc.startSession()
+        for ch in "kyouha" { _ = svc.insert(session: a, text: String(ch)) }
+        XCTAssertFalse(svc.convert(session: a)?.isEmpty ?? true, "A の初回変換が空")
+
+        let b = svc.startSession()   // 切替 1（reset スキップ経路）
+        for ch in "nihongo" { _ = svc.insert(session: b, text: String(ch)) }
+        let bCands = svc.convert(session: b)
+        XCTAssertTrue(bCands?.contains("日本語") ?? false, "expected 日本語 in \(String(describing: bCands))")
+        _ = svc.commit(session: b, index: bCands!.firstIndex(of: "日本語")!)
+
+        // 切替 2: A へ戻る。B の確定文脈（completedData 等）が残っていても Zenzai 経路は読まない。
+        for ch in "hare" { _ = svc.insert(session: a, text: String(ch)) }
+        XCTAssertFalse(svc.convert(session: a)?.isEmpty ?? true, "切替復帰後の A の変換が空")
+    }
 }

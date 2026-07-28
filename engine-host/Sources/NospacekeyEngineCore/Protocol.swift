@@ -57,6 +57,9 @@ enum Request: Decodable {
         // 修正変換(Tab): 誤読み学習(ADR-0002)のトグル。旧 TIP は送らないので Optional
         // （learning_enabled と同じ互換規約）。
         let typo_learn_enabled: Bool?
+        // Zenzai 推論上限。旧 TIP・診断 env override（D6）時の新 TIP は送らないので Optional
+        // （nil なら spawn 時 env のまま — learning_enabled と同じ互換規約）。
+        let zenzai_inference_limit: UInt32?
     }
 
     init(from decoder: Decoder) throws {

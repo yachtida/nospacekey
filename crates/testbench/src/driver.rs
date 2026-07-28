@@ -1059,10 +1059,12 @@ pub struct Item31Result { pub passed: bool, pub detail: String }
 ///   - 続く Ctrl+Backspace は not_armed → 何もせず素通し（アプリの単語削除に譲る）。
 /// 自己証明: eaten_last=false（cmd_modifier ゲートで素通し）AND CommitUndoShown 皆無。
 ///
-/// 亜種（C-1 settle 経路の armed 非残留）: `nihongo → Space → 無変換(0x1D) → Ctrl+Backspace`。
-///   - Space で候補確定 → 無変換（モードトグル）が settle_active_input 経由で
-///     source="candidate" 確定を経由しつつ、末尾の disarm_undo() で armed を必ず落とす
-///     （C-1 修正の実証: 「settle→commit_candidate で armed が立つ穴」を塞いだ回帰）。
+/// 亜種: `nihongo → Space → Enter(候補確定) → Home → Ctrl+Backspace`。
+///   - 2026-07-23 spec §9: 従来ここは「無変換(0x1D)=ModeToggle が settle 経由で確定+disarm」
+///     (C-1 回帰)を使っていたが、composing/native の 0x1D は NotationRotate(composing 継続・
+///     settle しない)へ意図変更されたため、確定は Enter・disarm は Home(part1 と同じ M-5 規律)
+///     で行う。settle 経路 disarm(C-1)のヘッドレス担保は item20(合成中 0xF3 トグル)と
+///     実機受入 item2 が引き継ぐ。
 ///   - 続く Ctrl+Backspace は not_armed → eaten=false AND CommitUndoShown なし。
 pub fn run_item31(host: &TsfHost) -> Item31Result {
     let pid = std::process::id();
@@ -1080,23 +1082,24 @@ pub fn run_item31(host: &TsfHost) -> Item31Result {
     let shown1 = evs1.iter().any(|e| matches!(e, Ev::CommitUndoShown { .. }));
     let part1_ok = !eaten1 && !shown1;
 
-    // ---- 亜種（C-1）: nihongo → Space → 無変換(0x1D) → Ctrl+Backspace ----
+    // ---- 亜種: nihongo → Space → Enter(候補確定) → Home(disarm) → Ctrl+Backspace ----
     host.store.reset();
     for k in typed("nihongo") { let _ = host.feed_key(k.0); }
     host.settle_debounce();
     let _ = host.feed_key(0x20); // Space: 候補表示
-    let _ = host.feed_key(0x1D); // 無変換（モードトグル）: settle_active_input 経由で確定＋disarm
+    let _ = host.feed_key(0x0D); // Enter: 候補確定(source=candidate)
+    let _ = host.feed_key(0x24); // Home: 非修飾・undo_hot でない → disarm(part1 と同じ M-5 規律)
     let base2 = read_events(pid).len();
     let eaten2 = host.feed_key_with_ctrl(0x08); // Ctrl+Backspace（not_armed → 素通し期待）
     let evs2: Vec<Ev> = read_events(pid).into_iter().skip(base2).collect();
     let shown2 = evs2.iter().any(|e| matches!(e, Ev::CommitUndoShown { .. }));
     let part2_ok = !eaten2 && !shown2;
-    let _ = host.set_native_mode(); // 無変換で direct 化した compartment を後続 item のため戻す
+    let _ = host.set_native_mode(); // 後続 item のため compartment を明示的に戻す(冪等)
 
     let passed = part1_ok && part2_ok;
     let detail = format!(
         "part1(a→Enter→Home→CtrlBS): eaten={eaten1} undo_shown={shown1} ok={part1_ok} | \
-         part2(nihongo→Space→無変換→CtrlBS): eaten={eaten2} undo_shown={shown2} ok={part2_ok}"
+         part2(nihongo→Space→Enter→Home→CtrlBS): eaten={eaten2} undo_shown={shown2} ok={part2_ok}"
     );
     Item31Result { passed, detail }
 }

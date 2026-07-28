@@ -77,7 +77,8 @@ public final class ConversionService: @unchecked Sendable {
     }
     /// 共有 converter を現在「合成中」として使っているセッション。別セッションが converter を
     /// 使う直前にリセットし、completedData/previousInputData 等の文脈が別セッションへ漏れるのを防ぐ
-    /// （同一セッション継続ならリセットしない＝部分確定の左文脈を保つ）。
+    /// （同一セッション継続ならリセットしない＝部分確定の左文脈を保つ。Zenzai 実稼働中は audit H2
+    /// によりリセット自体をスキップする — bindConverter の注記参照）。
     private var activeConverterSession: Int?
     /// 接続 id → その接続で作られたセッション id の集合。常駐サーバは複数 TIP クライアントが
     /// それぞれ別接続で同時接続しうる（NamedPipeServer は nMaxInstances=255）ため、切断時に掃除すべき
@@ -172,6 +173,9 @@ public final class ConversionService: @unchecked Sendable {
     /// Zenzai が有効か（重みが解決できたか）。
     public var zenzaiEnabled: Bool { config.weightURL != nil }
 
+    /// 実効の Zenzai 推論上限（観測/テスト用。config は private のため読み取り口を公開する）。
+    public var zenzaiInferenceLimit: Int { config.inferenceLimit }
+
     /// Plan4: ユーザ辞書(ワンショット移行 JSON)+組み込み日付テンプレートを converter へ載せる。
     /// `importDynamicUserDictionary` は**丸ごと置換**（DicdataStoreState が配列を代入するだけ）
     /// なので、テンプレートとインポート辞書を必ず1配列に結合して**1回だけ**呼ぶ。
@@ -197,8 +201,9 @@ public final class ConversionService: @unchecked Sendable {
     /// `overrides` は TIP が push した設定値（LLMConfig.resolve / ZenzaiConfig.resolve が読む env キー）。
     ///
     /// #2: `overrides` は丸ごと置換ではなく **実プロセス env に重ねる**。丸ごと置換すると spawn 時のみ
-    /// 効く env が消える — `NOSPACEKEY_LLM_ECHO`（テスト/診断の echo）、`NOSPACEKEY_ZENZAI_INFERENCE_LIMIT`、
-    /// および resolve_env_map が注入を控えて尊重している D6 の env override（push しないキーは env 側が勝つ）。
+    /// 効く env が消える — `NOSPACEKEY_LLM_ECHO`（テスト/診断の echo）、および resolve_env_map が注入を
+    /// 控えて尊重している D6 の env override（push しないキーは env 側が勝つ。例: 診断 env
+    /// `NOSPACEKEY_ZENZAI_INFERENCE_LIMIT` が居るとき TIP は本キーを push せず、この重ね方が env を生かす）。
     ///
     /// #1b: `converterLock` は warm-up がモデルロード中ずっと保持する（cold start ③でもこの構造は維持 —
     /// ロック外ロードは lib の可視性/共有状態の制約で不可。startWarmUp の注記参照）。ここでブロック
@@ -225,13 +230,17 @@ public final class ConversionService: @unchecked Sendable {
             // ＝保留分が「凍結」され、後で ON に戻すと古い保留分が書かれうる。先に保存して空にしておく。
             // 注: ライブラリの updateConfig(.nothing) は一時トライをクリアしない — LearningMemory.swift:645-650）。
             if self.learning.enabled && !newLearning.enabled { flushLearningLocked() }
+            // audit H2: Zenzai 有効→無効の切替時は一度だけフルリセットする。稼働中に bindConverter が
+            // （切替スパイク排除のため）温存してきた classic 分岐の文脈（completedData 等）と zenz の
+            // KV/zenzaiCache を、古典モードへ入る前に一掃する（以後の切替リセットは classic 規律に戻る）。
+            if self.config.weightURL != nil && newZenzai.weightURL == nil { converter.stopComposition() }
             self.learning = newLearning
             self.config = newZenzai
             self.llmClient = LLMClient(config: newLLM)
             self.autoCommit = AutoCommitStrength.resolve(environment: env)
             self.autoCommitMaxReading = AutoCommitLengthBackstop.resolve(environment: env)
             self.typoLearn = env["NOSPACEKEY_TYPO_LEARN"] != "0"
-            engineLog("ev=reload_config zenzai=\(newZenzai.weightURL != nil) llm=\(newLLM.enabled) learning=\(newLearning.enabled) auto_commit=\(self.autoCommit.rawValue) auto_commit_max_reading=\(self.autoCommitMaxReading) typo_learn=\(self.typoLearn)\n")
+            engineLog("ev=reload_config zenzai=\(newZenzai.weightURL != nil) inference_limit=\(newZenzai.inferenceLimit) llm=\(newLLM.enabled) learning=\(newLearning.enabled) auto_commit=\(self.autoCommit.rawValue) auto_commit_max_reading=\(self.autoCommitMaxReading) typo_learn=\(self.typoLearn)\n")
         } else {
             // warm-up/変換中。config は最新のまま（skip 安全）。次回接続で反映。
             engineLog("ev=reload_config skipped=busy\n")
@@ -278,17 +287,49 @@ public final class ConversionService: @unchecked Sendable {
         return rec.composing.convertTarget
     }
 
+    /// Zenzai が「実際にモデルロード済みで変換に使われている」か。**converterLock 保持中に呼ぶこと**
+    /// （config/zenzStatus 読みの規律）。weightURL と ready ゲートに加え、zenzStatus の成功形
+    /// （"load <url>" ちょうど — 失敗時は空白＋エラー説明が付く。KanaKanjiConverter.getModel
+    /// 0.11.x の形式）で判定する。壊れた重み等でロード失敗し古典へサイレント劣化している間は
+    /// false ＝ bindConverter は従来どおりリセットする（classic 分岐の文脈漏れ防止が優先）。
+    /// reload で Zenzai を新規有効化した直後も、初回の Zenzai 変換が成功するまでは false（安全側）。
+    private var isZenzaiOperationalLocked: Bool {
+        guard zenzaiReady, let weight = config.weightURL else { return false }
+        return converter.zenzStatus == "load \(weight.absoluteString)"
+    }
+
     /// 共有 converter を `session` 用に束ねる。直前に別セッションが使っていたら、その完了文脈
     /// （completedData/previousInputData/lattice）をリセットしてからにする（セッション間の漏れ防止）。
-    /// **converterLock 保持中に呼ぶこと**（stopComposition が converter を触るため）。
+    /// **converterLock 保持中に呼ぶこと**（stopComposition/zenzStatus が converter を触るため）。
+    ///
+    /// audit H2 (2026-07-18): Zenzai 実稼働中はこのリセットを**スキップ**する。stopComposition は
+    /// zenz.endSession()→reset_context()（llama_free＋llama_init_from_model）を誘発し、prevInput が
+    /// 空に戻るため、アプリ切替直後の 1 変換に KV 全再プリフィル分のレイテンシが上乗せされていた
+    /// （頻度はアプリ切替に比例）。スキップが安全な根拠（upstream 0.11.2 精読）:
+    /// - Zenzai 経路（convertToLattice の zenzai 分岐→all_zenzai）は completedData/previousInputData/
+    ///   lattice を一切**読まない**（読むのは classic 分岐のみ）＝残しても変換に混入しない。
+    /// - llama の KV キャッシュは get_logits が prevInput との共通接頭辞で毎回自己補正する
+    ///   （llama_kv_cache_seq_rm）ため reset_context は correctness に不要
+    ///   （PROGRESS 2026-07-08 バグ#3 実測の結論とも整合）。
+    /// - zenzaiCache（prefix 制約ヒント）は getNewConstraint が新しい読みに対し自己検証し、採用された
+    ///   制約も all_zenzai のループが現在の左文脈で zenz 再評価・自己修正する（stale ヒントの最悪影響は
+    ///   初回推論の反復増、次の入力でキャッシュは現セッションのものに置き換わる）。
+    /// 既知の許容: typoConvert の forceClassic 仮説変換だけは classic 分岐を通るため、未消費の
+    /// completedData（前セッションの確定）が afterComplete 経由で一度だけ修復候補の順位に影響しうる
+    /// （消費で自然消滅する一過性）。分離の完全性より切替スパイクの排除を優先する（audit H2 の修正案）。
+    /// Zenzai 有効→無効の reload 切替時は reload 側が一度フルリセットして残置状態を一掃する。
     private func bindConverter(to session: Int) {
         if let active = activeConverterSession, active != session {
-            // バグ#3 実測用: セッション切替の stopComposition は zenz.endSession()→reset_context()
-            // （llama_free＋llama_init_from_model）を誘発する。ここでは計数のみ — 修正は別トラック。
-            // M-2: Zenzai 無効（weightURL 無し＝zenz 不在で reset は no-op）では出さない（過大計上防止）。
-            // config 読みは converterLock 下（本メソッドの呼出契約）＝規律どおり。
-            if config.weightURL != nil { engineLog("ev=llama_reset reason=session_switch\n") }
-            converter.stopComposition()
+            if isZenzaiOperationalLocked {
+                // スキップの観測用（従来の ev=llama_reset reason=session_switch 計数と対になる）。
+                engineLog("ev=llama_reset_skipped reason=session_switch\n")
+            } else {
+                // 古典変換は classic 分岐（completedData/previousInputData/lattice）を読むため、
+                // Zenzai 非稼働時は従来どおりリセットして文脈漏れを防ぐ。この分岐では zenz は
+                // ほぼ常に未ロード（未DL/ロード失敗/ready前）で reset_context は走らない。
+                // 例外は reload で有効→無効へ切った後の残置 zenz だが、reset は文脈一掃として正当。
+                converter.stopComposition()
+            }
         }
         activeConverterSession = session
     }
@@ -598,7 +639,8 @@ public final class ConversionService: @unchecked Sendable {
         // 注意: ここで activeConverterSession を nil にしてはいけない。nil にすると次の残存セッションの
         // bindConverter が「アクティブ無し」と見なしてリセットをスキップし、終えたセッションの
         // completedData/previousInputData を引き継いでしまう。終えた id を保持したままにすれば、
-        // session id は単調増加で再利用されないため、次に別 id が converter を使うとき必ずリセットされる。
+        // session id は単調増加で再利用されないため、次に別 id が converter を使うとき必ず切替扱いになる
+        // （古典モードではリセット、Zenzai 実稼働中は audit H2 のスキップ — bindConverter の注記参照）。
         // 全セッションが消えた場合だけ下で proactively リセットする。
         //
         // 合成が1つも残っていなければ converter の合成状態をリセットする。commit() が

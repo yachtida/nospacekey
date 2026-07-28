@@ -95,7 +95,7 @@ function buildPaletteEditors() {
 // ---- キー設定 ----
 // [field, 表示名, 既定キーの表示, Alt可か]。field は SettingsDto.keymap のキーと一致。
 const KEYMAP_FUNCS = [
-  ["mode_toggle", "モードトグル(あ⇔A)", "無変換 / Alt+;", true],
+  ["mode_toggle", "モードトグル(あ⇔A)", "無変換 / Alt+; / 半角全角", true],
   ["reconvert", "再変換", "変換 / Alt+/", true],
   ["feedback", "誤変換フィードバック記録", "Ctrl+変換 / Ctrl+/", true],
   ["ephemeral", "一時かなモード開始", "F8", false], // 既定表示は keymapValueLabel が旧 trigger 設定から動的に出す
@@ -107,6 +107,8 @@ const KEYMAP_FUNCS = [
   ["to_hankaku_kana", "表記変換: 半角カナ", "F8", false],
   ["to_zenkaku_eisu", "表記変換: 全角英数", "F9", false],
   ["to_hankaku_eisu", "表記変換: 半角英数", "F10", false],
+  ["notation_rotate", "かな種別ローテーション", "無変換", false],
+  ["convert", "変換(henkan)", "Space / 変換", false],
 ];
 
 // 正規形("Ctrl+Shift+KeyJ")→ 表示用("Ctrl+Shift+J")。
@@ -114,7 +116,8 @@ function prettyChord(canonical) {
   return canonical.split("+").map((p) => {
     if (p.startsWith("Key")) return p.slice(3);
     if (p.startsWith("Digit")) return p.slice(5);
-    const names = { Convert: "変換", NonConvert: "無変換", Semicolon: ";", Equal: "=",
+    const names = { Convert: "変換", NonConvert: "無変換", HankakuZenkaku: "半角/全角",
+      Semicolon: ";", Equal: "=",
       Comma: ",", Minus: "-", Period: ".", Slash: "/", Backquote: "`",
       BracketLeft: "[", BracketRight: "]", Backslash: "\\", Quote: "'" };
     return names[p] ?? p;
@@ -133,9 +136,20 @@ function keymapValueLabel(field) {
   return prettyChord(v);
 }
 
+// convert(変換) は Space と 変換キーの両方に既定で載る（KeymapFunc::default_chords）。
+// レコーダーで片方だけ差し替えられると footgun になるため、他機能と違い自由録音は許さず
+// 「既定(両方) / 無効(none)」の二択トグルにする。
 function buildKeymapRows() {
   const host = document.getElementById("keymap-rows");
-  host.innerHTML = KEYMAP_FUNCS.map(([field, label]) => `
+  host.innerHTML = KEYMAP_FUNCS.map(([field, label]) => field === "convert" ? `
+    <div class="row">
+      <label>${label}</label>
+      <div class="grow">
+        <span class="keymap-value" id="keymap-value-${field}"></span>
+        <label><input type="checkbox" data-keymap-toggle="${field}"> 有効(既定: Space / 変換)</label>
+        <span class="field-error" data-error-for="keymap.${field}"></span>
+      </div>
+    </div>` : `
     <div class="row">
       <label>${label}</label>
       <div class="grow">
@@ -153,6 +167,12 @@ function buildKeymapRows() {
     b.addEventListener("click", () => { state.keymap[b.dataset.keymapNone] = "none"; markDirty(); renderKeymapValues(); }));
   host.querySelectorAll("[data-keymap-default]").forEach((b) =>
     b.addEventListener("click", () => { state.keymap[b.dataset.keymapDefault] = null; markDirty(); renderKeymapValues(); }));
+  host.querySelectorAll("[data-keymap-toggle]").forEach((cb) =>
+    cb.addEventListener("change", () => {
+      state.keymap[cb.dataset.keymapToggle] = cb.checked ? null : "none";
+      markDirty();
+      renderKeymapValues();
+    }));
 }
 
 function renderKeymapValues() {
@@ -160,6 +180,10 @@ function renderKeymapValues() {
     const el = document.getElementById(`keymap-value-${field}`);
     if (el) el.textContent = keymapValueLabel(field);
   }
+  // トグル(convert)の見た目も state と同期する（既定に戻す/適用後の再ロードでも反映するため）。
+  document.querySelectorAll("[data-keymap-toggle]").forEach((cb) => {
+    cb.checked = state.keymap[cb.dataset.keymapToggle] !== "none";
+  });
 }
 
 // KeyboardEvent.code が Rust 側語彙(settings::keymap)に載っているかの即時判定。
@@ -181,14 +205,32 @@ function startKeyRecording(field) {
   rec.hidden = false;
   document.getElementById("keymap-recorder-hint").textContent =
     KEYMAP_FUNCS.find(([f]) => f === field)[1];
-  // aria-modal="true" を宣言する以上、実フォーカスを移さないと支援技術はダイアログの
-  // 出現を読み上げない（フォーカストラップは録音用グローバル keydown が Tab ごと
-  // 捕捉するので別実装は不要）。閉じるときに開いた元のボタンへ返す。
+  // 初期フォーカスは chip(aria-modal 内の可視ボタンへの focus は AT のダイアログ読み上げも
+  // 満たす)。Tab は録音対象キー(typo_correct 既定 Tab)なのでフォーカス移動に使えない —
+  // focus 済みの chip を Enter で押せることがキーボードでの唯一の chip 起動経路になる。
+  // 閉じるときに開いた元のボタンへ返す。
   recorderReturnFocus = document.activeElement;
-  rec.focus();
+  document.getElementById("keymap-chip-hz").focus();
 }
+// 半角/全角はブラウザ(WebView)が IME トグルとして消費し keydown に現れないため、レコーダーの
+// 実打鍵では拾えない。chip ボタンで直接チョード値をセットする(spec §7.3)。
+function assignHankakuZenkaku() {
+  if (recordingField === null) return;
+  state.keymap[recordingField] = "HankakuZenkaku";
+  markDirty();
+  renderKeymapValues();
+  recordingField = null;
+  document.getElementById("keymap-recorder").hidden = true;
+  if (recorderReturnFocus && recorderReturnFocus.isConnected) recorderReturnFocus.focus();
+  recorderReturnFocus = null;
+}
+document.getElementById("keymap-chip-hz").addEventListener("click", assignHankakuZenkaku);
 window.addEventListener("keydown", (e) => {
   if (recordingField === null) return;
+  // chip にフォーカスがある間の Enter はボタン起動としてブラウザへ通す(preventDefault しない)。
+  // Enter は語彙外(recordableCode に無い)ので録音機能は何も失わない。Space は通さない
+  // (Ctrl+Space 等の録音対象。既定フォーカスが chip でも Space 系の録音は下で従来どおり処理)。
+  if (document.activeElement && document.activeElement.id === "keymap-chip-hz" && e.code === "Enter") return;
   e.preventDefault();
   e.stopPropagation();
   const stop = () => {

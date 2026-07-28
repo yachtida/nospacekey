@@ -39,9 +39,35 @@ pub fn llm_effective_enabled(s: &Settings) -> bool {
     llm_effective(s.llm.enabled)
 }
 
+/// Zenzai 推論上限の妥当範囲。クランプ(effective_inference_limit)と config の validate が
+/// 共有する唯一の境界定義（範囲の二重定義を作らない）。
+pub const ZENZAI_INFERENCE_LIMIT_RANGE: std::ops::RangeInclusive<u32> = 1..=10;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ZenzaiSettings { pub enabled: bool, #[serde(default)] pub weight_path: String }
-impl Default for ZenzaiSettings { fn default() -> Self { Self { enabled: true, weight_path: String::new() } } }
+pub struct ZenzaiSettings {
+    pub enabled: bool,
+    #[serde(default)]
+    pub weight_path: String,
+    /// Zenzai の候補再ランキング推論回数上限。engine env NOSPACEKEY_ZENZAI_INFERENCE_LIMIT と対。
+    #[serde(default = "default_zenzai_inference_limit")]
+    pub inference_limit: u32,
+}
+fn default_zenzai_inference_limit() -> u32 { 1 }
+impl Default for ZenzaiSettings {
+    fn default() -> Self {
+        Self { enabled: true, weight_path: String::new(), inference_limit: 1 }
+    }
+}
+impl ZenzaiSettings {
+    /// 手編集 settings.json の異常値（0/10000 等）を吸収する唯一の正規化点
+    /// （reading_monitor の effective_max_chars と同じ方針）。
+    pub fn effective_inference_limit(&self) -> u32 {
+        self.inference_limit.clamp(
+            *ZENZAI_INFERENCE_LIMIT_RANGE.start(),
+            *ZENZAI_INFERENCE_LIMIT_RANGE.end(),
+        )
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveSettings { pub enabled: bool }
@@ -505,6 +531,7 @@ pub fn resolve_env_map(
     }
     put("NOSPACEKEY_ZENZAI", if s.zenzai.enabled { "on".into() } else { "off".into() });
     if !s.zenzai.weight_path.is_empty() { put("NOSPACEKEY_ZENZAI_WEIGHT", s.zenzai.weight_path.clone()); }
+    put("NOSPACEKEY_ZENZAI_INFERENCE_LIMIT", s.zenzai.effective_inference_limit().to_string());
     put("NOSPACEKEY_LEARNING", if s.learning.enabled { "1".into() } else { "0".into() });
     put("NOSPACEKEY_TYPO_LEARN", if s.typo_correct.learn { "1".into() } else { "0".into() });
     out
@@ -559,6 +586,39 @@ mod tests {
         assert!(s.zenzai.enabled);
         assert!(s.live_conversion.enabled);
         assert_eq!(s.version, 2);
+    }
+    #[test]
+    fn zenzai_inference_limit_defaults_to_1_and_clamps() {
+        assert_eq!(Settings::default().zenzai.inference_limit, 1);
+        // 旧 settings.json（フィールド欠落）も 1 でロード（後方互換）。
+        let s = Settings::from_json_str(r#"{"version":2,"zenzai":{"enabled":true}}"#);
+        assert_eq!(s.zenzai.inference_limit, 1);
+        // 手編集の異常値はクランプ（唯一の正規化点）。
+        let mut z = ZenzaiSettings::default();
+        z.inference_limit = 0;
+        assert_eq!(z.effective_inference_limit(), 1);
+        z.inference_limit = 11;
+        assert_eq!(z.effective_inference_limit(), 10);
+        z.inference_limit = 5;
+        assert_eq!(z.effective_inference_limit(), 5);
+    }
+    #[test]
+    fn env_map_emits_zenzai_inference_limit_and_respects_env_override() {
+        let mut s = Settings::default();
+        s.zenzai.inference_limit = 7;
+        let map = resolve_env_map(&s, None, |_| None);
+        let get = |k: &str| map.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+        assert_eq!(get("NOSPACEKEY_ZENZAI_INFERENCE_LIMIT"), Some("7".into()));
+        // 範囲外はクランプ後の値を注入する。
+        s.zenzai.inference_limit = 0;
+        let map = resolve_env_map(&s, None, |_| None);
+        let get = |k: &str| map.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+        assert_eq!(get("NOSPACEKEY_ZENZAI_INFERENCE_LIMIT"), Some("1".into()));
+        // D6: 実プロセス env に既にあるキーは注入しない。
+        let map = resolve_env_map(&s, None, |k| {
+            (k == "NOSPACEKEY_ZENZAI_INFERENCE_LIMIT").then(|| "5".to_string())
+        });
+        assert!(map.iter().all(|(k, _)| k != "NOSPACEKEY_ZENZAI_INFERENCE_LIMIT"));
     }
     #[test]
     fn default_direct_defaults_false() {

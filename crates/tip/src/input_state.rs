@@ -10,10 +10,12 @@ pub struct InputState {
     pub live_seq: u64,        // ライブ変換要求のシーケンス番号（A2 の古い応答破棄用）
     pub llm_seq: u64,
     pub phase: Phase,
-    /// 打鍵作法 Task4: F6-F10 で表記を固定したか。true の間、Enter/settle は engine の
-    /// ライブ変換結果を参照せず表示中の live_text を直確定する（F7 のカタカナが engine の
-    /// 漢字結果で上書き確定されるのを防ぐ）。新たな打鍵/Backspace/確定/取消で解除。
-    pub notation_fixed: bool,
+    /// 打鍵作法 Task4: F6-F10 で表記を固定したか(Some=どの表記で固定したか)。Some の間、
+    /// Enter/settle は engine のライブ変換結果を参照せず表示中の live_text を直確定する
+    /// （F7 のカタカナが engine の漢字結果で上書き確定されるのを防ぐ）。新たな打鍵/
+    /// Backspace/確定/取消で解除。表記種別を持つのは NotationRotate(無変換連打)の巡回起点
+    /// 「現在の表記の次」に必要なため。
+    pub notation_fixed: Option<crate::keymap::Notation>,
     /// Shift英語モード(shift_latin=compose): raw 内で direct 挿入部分が始まるバイト位置。
     /// Some=英語モード中。bool でなく位置を持つのはセッション喪失リプレイ(split_replay)が
     /// かな部/英語部の style 分割に必要なため。合成終息(reset/reseed/raw 枯渇)で None。
@@ -42,7 +44,7 @@ impl InputState {
     pub fn on_char(&mut self, ch: char) -> Action {
         self.raw.push(ch);
         self.composing = true;
-        self.notation_fixed = false; // 新たな打鍵でライブ変換が再開する＝表記固定は解除
+        self.notation_fixed = None; // 新たな打鍵でライブ変換が再開する＝表記固定は解除
         Action::StartOrUpdatePreedit(self.raw.clone())
     }
     /// Shift英語モードの打鍵。最初の1打でモードを立て(raw の現在長=英語部分の開始位置)、
@@ -86,7 +88,7 @@ impl InputState {
                     self.latin_from = Some(self.raw.len());
                 }
             }
-            self.notation_fixed = false; // 読みが変わりライブ変換が再開する＝表記固定は解除
+            self.notation_fixed = None; // 読みが変わりライブ変換が再開する＝表記固定は解除
             Action::StartOrUpdatePreedit(self.raw.clone())
         } else { Action::Pass }
     }
@@ -94,7 +96,7 @@ impl InputState {
         self.raw.clear();
         self.composing = false;
         self.phase = Phase::Composing;
-        self.notation_fixed = false;
+        self.notation_fixed = None;
         self.latin_from = None;
         self.last_good_text.clear();
         self.last_good_raw_len = 0;
@@ -109,7 +111,7 @@ impl InputState {
         self.raw = remaining.to_string();
         self.composing = true;
         self.phase = Phase::Composing;
-        self.notation_fixed = false; // 残り読みのライブ変換が再開する（arm_debounce と対）
+        self.notation_fixed = None; // 残り読みのライブ変換が再開する（arm_debounce と対）
         self.latin_from = None; // 残り読みはかな＝英語モードは部分確定で終わる
         // 部分確定前(全読み時代)の last_good が残ると、直後の劣化で確定済み
         // テキストが二重に前置される。残り読みで記録し直す。
@@ -201,6 +203,21 @@ pub fn plan_commit(outcome: Option<(String, String)>, resolved_text: &str) -> Co
     }
 }
 
+/// ライブ変換のエンジン往復を行ってよいか。表示（`restore_live_preedit`）と確定
+/// （VK_RETURN / `settle_active_input`）の**両方**がこの単一述語を見る。false のとき各経路は
+/// `live=None` を渡し、表示中の `live_text` をそのまま確定・描き戻す。
+/// Why not(呼び出し側で live_enabled と notation_fixed を個別に見る): 3 経路が別々に条件を
+/// 持つと、片方だけ更新したときに「見えている文字列と確定される文字列」がずれる
+/// （`should_widen_digits` と同じ轍。0bdb0b9 の再発）。
+/// Why not(`plan_live_enter` の中で live_enabled を見る): エンジン往復には副作用
+/// （`bump_live_seq`・IPC）があるので、呼んだ後に結果を捨てるのでは止めたことにならない。
+pub fn should_consult_live_engine(
+    live_enabled: bool,
+    notation_fixed: Option<crate::keymap::Notation>,
+) -> bool {
+    live_enabled && notation_fixed.is_none()
+}
+
 /// 候補窓なし Enter（ライブ確定）の分岐を決める純関数（Spec2）。
 #[derive(Debug, PartialEq)]
 pub enum LiveEnterPlan {
@@ -220,6 +237,25 @@ pub fn plan_live_enter(live: Option<String>, live_text: &str, last_reading: &str
             LiveEnterPlan::DirectCommit { text }
         }
     }
+}
+
+/// 候補窓だけを閉じて composition を残す経路（Esc / Behavior::Abort）で preedit へ描き戻す文字列。
+/// Why not(`live` を取らず `plan_live_enter(None, ..)` の劣化枝だけを使う): ライブ変換 ON で
+/// 「変換キーが `arm_debounce` の 30ms 以内に来て `disarm_debounce` された」場合、`live_text` は
+/// 読みのまま残るのに閉じた後の Enter / settle は `engine_live_convert` を試す。劣化枝だけで
+/// 描き戻すと「かなが見えているのに漢字が確定される」ズレになる。確定側と同じ `live`
+/// （＝同じ `should_consult_live_engine` で決めたもの）を受けて同じ分岐を通す。
+/// Why not(空文字を返す): `run_preedit` を空文字で呼ぶと composition が空になり、直後の Enter が
+/// 何も確定しない見え方になる。素材が無いときは None＝preedit をそのままにする。
+pub fn preedit_after_candidates_closed(
+    live: Option<String>,
+    live_text: &str,
+    last_reading: &str,
+) -> Option<String> {
+    let text = match plan_live_enter(live, live_text, last_reading) {
+        LiveEnterPlan::EngineCommit { text } | LiveEnterPlan::DirectCommit { text } => text,
+    };
+    Some(text).filter(|t| !t.is_empty())
 }
 
 /// commit対象文字列を決める純関数（テスト可能）。エンジン失敗時は読みのまま確定する劣化動作。
@@ -375,8 +411,25 @@ pub fn to_zenkaku_digits(s: &str) -> String {
 
 /// 既定確定で数字を全角化するかの純判定。全角設定 ON かつ かなモード（!direct）かつ
 /// 候補の明示選択でない（source が "candidate"/"candidate_prefix" でない）とき true。
-pub fn should_widen_digits(number_full_width: bool, direct: bool, source: &str) -> bool {
-    number_full_width && !direct && !matches!(source, "candidate" | "candidate_prefix")
+/// preedit 表示側と確定側の**両方**がこの単一述語を見る（設計 2026-07-09 §4「表示（preedit）整合」）。
+/// Why not(確定側だけで判定する): 表示と確定が別々に幅を決めると「打っている間は半角なのに
+/// 確定したら全角」になる。実際 preedit 側の実装が落ちていて、その不一致が報告された。
+pub fn should_widen_digits(
+    number_full_width: bool, direct: bool, latin: bool,
+    notation_fixed: Option<crate::keymap::Notation>, source: &str,
+) -> bool {
+    // 表記固定のうち半角側（F10 半角英数 / 半角カナ）だけが数字幅の指定を兼ねる。
+    // Why not(notation_fixed.is_some() で一律に止める): F6/F7 は かな の表記を変えるだけなので、
+    // カタカナにした途端に数字が半角へ戻る＝設定「数字は全角」を無関係な操作が覆すことになる。
+    let halfwidth_notation = matches!(
+        notation_fixed,
+        Some(crate::keymap::Notation::HankakuEisu | crate::keymap::Notation::HankakuKana)
+    );
+    number_full_width
+        && !direct
+        && !latin
+        && !halfwidth_notation
+        && !matches!(source, "candidate" | "candidate_prefix")
 }
 
 /// エンジン Insert の挿入解釈(IPC style フィールドの TIP 内表現)。
@@ -612,6 +665,110 @@ mod tests {
         // エンジンが空文字を返したら劣化扱い（従来の .filter(!empty) と同値）。
         let p = plan_live_enter(Some(String::new()), "あ", "a");
         assert_eq!(p, LiveEnterPlan::DirectCommit { text: "あ".into() });
+    }
+
+    // ---- ライブ変換 OFF: 見えている読みがそのまま確定される（設定 OFF は OFF を意味する） ----
+
+    #[test]
+    fn live_conversion_off_never_consults_the_engine() {
+        assert!(should_consult_live_engine(true, None));
+        assert!(!should_consult_live_engine(false, None));
+    }
+    #[test]
+    fn notation_fixed_never_consults_the_engine_even_with_live_conversion_on() {
+        use crate::keymap::Notation;
+        assert!(!should_consult_live_engine(true, Some(Notation::Katakana)));
+        assert!(!should_consult_live_engine(false, Some(Notation::Katakana)));
+    }
+    /// 3 経路（VK_RETURN / settle / restore_live_preedit）が組み立てる `live` 素材を、述語を実際に
+    /// 通して再現するヘルパ。`None` を直に渡すとテストが「OFF なら live=None」を前提にしてしまい、
+    /// 述語が壊れても通る。
+    fn live_material(
+        live_enabled: bool,
+        notation_fixed: Option<crate::keymap::Notation>,
+        engine_would_say: &str,
+    ) -> Option<String> {
+        if should_consult_live_engine(live_enabled, notation_fixed) {
+            Some(engine_would_say.into())
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn live_conversion_off_commits_the_reading_shown_in_the_preedit() {
+        // OFF ではデバウンスが走らないので live_text は読みのまま＝画面に見えている文字列。
+        let p = plan_live_enter(live_material(false, None, "日本語"), "にほんご", "にほんご");
+        assert_eq!(p, LiveEnterPlan::DirectCommit { text: "にほんご".into() });
+    }
+    #[test]
+    fn live_conversion_off_shows_after_esc_exactly_what_enter_then_commits() {
+        // 表示側と確定側に同じ述語で作った素材を渡す＝候補窓を閉じた後の見た目と確定が一致する。
+        let lt = "にほんご";
+        let shown = preedit_after_candidates_closed(live_material(false, None, "日本語"), lt, "にほんご");
+        let committed = match plan_live_enter(live_material(false, None, "日本語"), lt, "にほんご") {
+            LiveEnterPlan::EngineCommit { text } | LiveEnterPlan::DirectCommit { text } => text,
+        };
+        assert_eq!(shown, Some(committed));
+        assert_eq!(shown, Some("にほんご".into()));
+    }
+    #[test]
+    fn fixed_notation_commits_the_displayed_katakana_whether_live_conversion_is_on_or_off() {
+        use crate::keymap::Notation;
+        // F7 のカタカナは live_text に載る＝ON/OFF どちらでも表記固定の見た目がそのまま確定される。
+        for on in [true, false] {
+            let live = live_material(on, Some(Notation::Katakana), "日本語");
+            assert_eq!(
+                plan_live_enter(live, "ニホンゴ", "にほんご"),
+                LiveEnterPlan::DirectCommit { text: "ニホンゴ".into() }
+            );
+        }
+    }
+    #[test]
+    fn live_conversion_on_still_commits_the_engine_result() {
+        let p = plan_live_enter(live_material(true, None, "日本語"), "にほんご", "にほんご");
+        assert_eq!(p, LiveEnterPlan::EngineCommit { text: "日本語".into() });
+    }
+    #[test]
+    fn live_conversion_on_shows_after_esc_exactly_what_enter_then_commits() {
+        let lt = "にほんご";
+        let shown = preedit_after_candidates_closed(live_material(true, None, "日本語"), lt, "にほんご");
+        let committed = match plan_live_enter(live_material(true, None, "日本語"), lt, "にほんご") {
+            LiveEnterPlan::EngineCommit { text } | LiveEnterPlan::DirectCommit { text } => text,
+        };
+        assert_eq!(shown, Some(committed));
+        assert_eq!(shown, Some("日本語".into()));
+    }
+
+    #[test]
+    fn closing_candidates_restores_the_preedit_to_what_enter_then_commits() {
+        // 閉じた後の Enter はエンジンのライブ変換結果を確定するので、描き戻しもそれになる。
+        assert_eq!(
+            preedit_after_candidates_closed(Some("日本語".into()), "にほんご", "にほんご"),
+            Some("日本語".into())
+        );
+    }
+    #[test]
+    fn closing_candidates_prefers_the_engine_result_over_the_stale_live_text() {
+        // デバウンス未発火では live_text は読みのまま残る。それを描き戻すと
+        // 「かなが見えているのに漢字が確定される」ので、確定側と同じくエンジン結果を優先する。
+        assert_eq!(
+            preedit_after_candidates_closed(Some("日本".into()), "にほん", "にほん"),
+            Some("日本".into())
+        );
+    }
+    #[test]
+    fn closing_candidates_falls_back_to_the_live_text_then_the_reading_when_the_engine_is_dead() {
+        assert_eq!(preedit_after_candidates_closed(None, "日本語", "にほんご"), Some("日本語".into()));
+        assert_eq!(preedit_after_candidates_closed(None, "", "にほんご"), Some("にほんご".into()));
+        assert_eq!(
+            preedit_after_candidates_closed(Some(String::new()), "", "にほんご"),
+            Some("にほんご".into())
+        );
+    }
+    #[test]
+    fn closing_candidates_leaves_the_preedit_alone_when_there_is_no_material() {
+        assert_eq!(preedit_after_candidates_closed(None, "", ""), None);
     }
 
     #[test]
@@ -883,40 +1040,70 @@ mod tests {
 
     #[test]
     fn should_widen_digits_only_on_default_native_commits() {
+        // 引数: (number_full_width, direct, latin, notation_fixed, source)
         // 全角ON・native・既定確定 → 全角化
-        assert!(should_widen_digits(true, false, "live"));
-        assert!(should_widen_digits(true, false, "live_prefix"));
-        assert!(should_widen_digits(true, false, "live_auto"));
+        assert!(should_widen_digits(true, false, false, None, "live"));
+        assert!(should_widen_digits(true, false, false, None, "live_prefix"));
+        assert!(should_widen_digits(true, false, false, None, "live_auto"));
         // 候補の明示選択は幅を変えない
-        assert!(!should_widen_digits(true, false, "candidate"));
-        assert!(!should_widen_digits(true, false, "candidate_prefix"));
+        assert!(!should_widen_digits(true, false, false, None, "candidate"));
+        assert!(!should_widen_digits(true, false, false, None, "candidate_prefix"));
         // settle 系（mode_toggle/navigate）は読みを確定するので既定確定＝全角化（候補選択のみ不変）。
-        assert!(should_widen_digits(true, false, "mode_toggle"));
-        assert!(should_widen_digits(true, false, "navigate"));
+        assert!(should_widen_digits(true, false, false, None, "mode_toggle"));
+        assert!(should_widen_digits(true, false, false, None, "navigate"));
         // 半角設定 OFF は変えない
-        assert!(!should_widen_digits(false, false, "live"));
+        assert!(!should_widen_digits(false, false, false, None, "live"));
         // direct モードは変えない
-        assert!(!should_widen_digits(true, true, "live"));
+        assert!(!should_widen_digits(true, true, false, None, "live"));
+    }
+
+    #[test]
+    fn latin_mode_keeps_digits_halfwidth() {
+        // 英語モード(Shift+英字)は生 ASCII を継ぎ足す＝「iPhone7」の 7 は半角のまま。
+        // 入力側がそう約束している以上、確定側が全角へ書き換えてはならない。
+        assert!(!should_widen_digits(true, false, /*latin=*/true, None, "live"));
+        assert!(!should_widen_digits(true, false, true, None, "live_auto"));
+        assert!(!should_widen_digits(true, false, true, None, "mode_toggle"));
+    }
+
+    #[test]
+    fn halfwidth_notation_keeps_digits_halfwidth() {
+        use crate::keymap::Notation;
+        // F10「半角英数」/半角カナで表記を固定した確定を全角へ書き換えるのは機能名と真逆。
+        assert!(!should_widen_digits(true, false, false, Some(Notation::HankakuEisu), "live"));
+        assert!(!should_widen_digits(true, false, false, Some(Notation::HankakuKana), "navigate"));
+    }
+
+    #[test]
+    fn fullwidth_and_kana_notations_still_widen_digits() {
+        use crate::keymap::Notation;
+        // F6/F7（ひらがな/カタカナ）は かな の表記を変えるだけで数字幅の指定ではない。
+        // ここまで半角へ倒すと「カタカナにしたら数字だけ半角に戻った」になる。
+        assert!(should_widen_digits(true, false, false, Some(Notation::Katakana), "live"));
+        assert!(should_widen_digits(true, false, false, Some(Notation::Hiragana), "live"));
+        // 全角英数は to_zenkaku_ascii が数字も全角化済み＝widen は no-op だが、判定としては全角側。
+        assert!(should_widen_digits(true, false, false, Some(Notation::ZenkakuEisu), "live"));
     }
 
     // ---- 打鍵作法 Task4: F6-F10 の表記固定ラッチ ----
 
     #[test]
     fn notation_fixed_cleared_by_typing_backspace_and_reset() {
+        use crate::keymap::Notation;
         let mut s = InputState::default();
         s.on_char('a');
-        s.notation_fixed = true;      // F7 等で表記固定（OnKeyDown の F キーアームが立てる）
+        s.notation_fixed = Some(Notation::Katakana); // F7 等で表記固定(OnKeyDown 側が立てる)
         s.on_char('b');
-        assert!(!s.notation_fixed, "新たな打鍵でライブ変換再開＝固定解除");
-        s.notation_fixed = true;
+        assert!(s.notation_fixed.is_none(), "新たな打鍵でライブ変換再開＝固定解除");
+        s.notation_fixed = Some(Notation::Katakana);
         s.on_backspace();
-        assert!(!s.notation_fixed, "Backspace で読みが変わる＝固定解除");
-        s.notation_fixed = true;
+        assert!(s.notation_fixed.is_none(), "Backspace で読みが変わる＝固定解除");
+        s.notation_fixed = Some(Notation::HankakuKana);
         s.reset();
-        assert!(!s.notation_fixed, "確定/取消の reset で固定解除");
-        s.notation_fixed = true;
+        assert!(s.notation_fixed.is_none(), "確定/取消の reset で固定解除");
+        s.notation_fixed = Some(Notation::Hiragana);
         s.reseed_after_partial_commit("ご");
-        assert!(!s.notation_fixed, "部分確定の reseed で固定解除（残り読みはライブ変換再開）");
+        assert!(s.notation_fixed.is_none(), "部分確定の reseed で固定解除（残り読みはライブ変換再開）");
     }
 
     // ---- Shift英語モード(shift_latin=compose): latin_from のライフサイクル ----

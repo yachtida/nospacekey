@@ -33,6 +33,8 @@ pub struct SettingsDto {
     pub timeout_ms: u32,
     pub zenzai_enabled: bool,
     pub weight_path: String,
+    /// Zenzai 推論上限（1〜10、既定1）。範囲外は validate が弾く（timeout_ms と同パターン）。
+    pub zenzai_inference_limit: u32,
     pub live_enabled: bool,
     pub default_direct: bool,
     pub learning_enabled: bool,
@@ -78,6 +80,7 @@ pub fn to_dto(s: &settings::Settings) -> SettingsDto {
         timeout_ms: s.llm.timeout_ms,
         zenzai_enabled: s.zenzai.enabled,
         weight_path: s.zenzai.weight_path.clone(),
+        zenzai_inference_limit: s.zenzai.inference_limit,
         live_enabled: s.live_conversion.enabled,
         default_direct: s.default_direct,
         learning_enabled: s.learning.enabled,
@@ -111,6 +114,16 @@ pub fn validate(dto: &SettingsDto) -> Vec<FieldError> {
                 "タイムアウトは {}〜{} ms の範囲で入力してください。",
                 TIMEOUT_MS_RANGE.start(),
                 TIMEOUT_MS_RANGE.end()
+            ),
+        });
+    }
+    if !settings::ZENZAI_INFERENCE_LIMIT_RANGE.contains(&dto.zenzai_inference_limit) {
+        errs.push(FieldError {
+            field: "zenzai_inference_limit".into(),
+            message: format!(
+                "推論上限は {}〜{} の範囲で入力してください。",
+                settings::ZENZAI_INFERENCE_LIMIT_RANGE.start(),
+                settings::ZENZAI_INFERENCE_LIMIT_RANGE.end()
             ),
         });
     }
@@ -246,6 +259,7 @@ pub fn apply_dto(
 
     s.zenzai.enabled = dto.zenzai_enabled;
     s.zenzai.weight_path = dto.weight_path;
+    s.zenzai.inference_limit = dto.zenzai_inference_limit; // validate 済み（範囲内）
     s.live_conversion.enabled = dto.live_enabled;
     s.default_direct = dto.default_direct;
     s.learning.enabled = dto.learning_enabled;
@@ -284,6 +298,25 @@ mod tests {
     fn to_dto_masks_key() {
         assert_eq!(to_dto(&settings::Settings::default()).api_key_input, "");
         assert_eq!(to_dto(&prev_with_key()).api_key_input, KEY_PLACEHOLDER);
+    }
+
+    #[test]
+    fn zenzai_inference_limit_roundtrips_and_validates() {
+        let mut dto = base_dto();
+        assert_eq!(dto.zenzai_inference_limit, 1, "既定は 1");
+        dto.zenzai_inference_limit = 7;
+        let s = apply_dto(dto.clone(), &settings::Settings::default(), |_| None).unwrap();
+        assert_eq!(s.zenzai.inference_limit, 7);
+        assert_eq!(to_dto(&s).zenzai_inference_limit, 7);
+        // 範囲外（0=空欄の NaN→0 化含む / 11）はフィールドエラー。
+        for bad in [0u32, 11] {
+            dto.zenzai_inference_limit = bad;
+            let errs = apply_dto(dto.clone(), &settings::Settings::default(), |_| None).unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.field == "zenzai_inference_limit"),
+                "{bad} は弾く: {errs:?}"
+            );
+        }
     }
 
     #[test]

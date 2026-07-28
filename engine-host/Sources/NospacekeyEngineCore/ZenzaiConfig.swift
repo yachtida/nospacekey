@@ -1,4 +1,5 @@
 import Foundation
+import WinSDK
 
 /// Zenzai の有効化・重みパス・推論上限を env と exe 隣の既定パスから解決する純粋ロジック。
 /// グローバル状態に触れず、`environment`/`exeDir`/`fileExists` を注入してユニットテスト可能にする。
@@ -16,19 +17,40 @@ public struct ZenzaiConfig: Equatable {
     /// 既定モデルファイル名（HuggingFace Miwa-Keita/zenz-v3.1-small-gguf）。
     public static let defaultWeightFileName = "ggml-model-Q5_K_M.gguf"
 
+    /// vendor の llama.cpp は AVX2 ベースラインでビルドされる（scripts/build-llama.ps1）ため、
+    /// AVX2 非搭載 CPU で重みをロードして推論すると 0xC000001D（不正命令）でプロセスごと即死し、
+    /// Zenzai どころか古典変換まで巻き添えになる（v1.0.0 の Core Ultra 実配布事故）。
+    /// llama 側に照会しない（ggml_cpu_has_avx2 は DLL ロード後でないと呼べず、判定したい状況は
+    /// まさにその DLL のコードを実行したくない状況）ので OS の CPU 機能照会で判定する。
+    /// Win10 2004 未満は PF_AVX2 が未定義で常に false になるが、その場合も古典変換への
+    /// graceful な退行であり、クラッシュ側に倒れることはない。
+    public static let runtimeCPUMeetsLlamaBaseline: Bool = {
+        let supported = IsProcessorFeaturePresent(DWORD(40 /* PF_AVX2_INSTRUCTIONS_AVAILABLE */))
+        if !supported {
+            engineLog("ev=zenzai_disabled reason=cpu_no_avx2\n")
+            return false
+        }
+        return true
+    }()
+
     /// 解決順:
     /// 1. env `NOSPACEKEY_ZENZAI=off`（大文字小文字不問）→ 強制古典（weightURL=nil）
-    /// 2. env `NOSPACEKEY_ZENZAI_WEIGHT` のパス
-    /// 3. 既定 `<exeDir>/models/ggml-model-Q5_K_M.gguf`
-    /// 2/3 の候補が実在すれば weightURL に採用、無ければ nil（古典）。
+    /// 2. CPU が llama ビルドのベースライン（AVX2）未満 → 強制古典（クラッシュ防止）
+    /// 3. env `NOSPACEKEY_ZENZAI_WEIGHT` のパス
+    /// 4. 既定 `<exeDir>/models/ggml-model-Q5_K_M.gguf`
+    /// 3/4 の候補が実在すれば weightURL に採用、無ければ nil（古典）。
     public static func resolve(
         exeDir: URL,
         environment: [String: String],
-        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
+        cpuMeetsLlamaBaseline: Bool = ZenzaiConfig.runtimeCPUMeetsLlamaBaseline
     ) -> ZenzaiConfig {
         let limit = environment["NOSPACEKEY_ZENZAI_INFERENCE_LIMIT"].flatMap(Int.init) ?? 1
 
         if environment["NOSPACEKEY_ZENZAI"]?.lowercased() == "off" {
+            return ZenzaiConfig(weightURL: nil, inferenceLimit: limit)
+        }
+        if !cpuMeetsLlamaBaseline {
             return ZenzaiConfig(weightURL: nil, inferenceLimit: limit)
         }
 

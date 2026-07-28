@@ -139,6 +139,30 @@ a:hover { text-decoration-thickness: 2px; }
   margin: 0 0 16px;
 }
 
+/* ---- スクロールバー: macOS オーバーレイ風の細ピル ----
+   scrollbar-color/scrollbar-width ではなく ::-webkit-scrollbar を使う。
+   併用すると Chromium(WebView2) は標準プロパティ側を優先して webkit 疑似要素を
+   無効化するため、丸み・ホバー拡大などの表現が全て失われる。
+   thumb 色は --text の color-mix なのでライト/ダークとも追加定義なしで追従する。 */
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb {
+  /* 透明ボーダー + content-box クリップで、実際の見た目は 6px のピルになる */
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 24%, transparent);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  border-width: 2px; /* ホバーで 8px に太る（macOS のオーバーレイ挙動の近似） */
+  background-color: color-mix(in srgb, var(--text) 38%, transparent);
+}
+::-webkit-scrollbar-thumb:active {
+  border-width: 2px;
+  background-color: color-mix(in srgb, var(--text) 50%, transparent);
+}
+
 /* ---- 設定カード: グループ化された白パネル（macOS 設定のリスト風） ---- */
 .card {
   background: var(--panel);

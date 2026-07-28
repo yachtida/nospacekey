@@ -15,7 +15,7 @@
 //! - ウィンドウクラスに `CS_DROPSHADOW` を付け、浮遊面（`--shadow-float` 相当）の影を出す。
 //! - 複数ページ（総件数 > MAX_VISIBLE_ROWS）ではヘアライン区切り＋「n / 総数」のフッターを出す。
 //! - 行のマウスクリックで候補を選択できる（WM_LBUTTONDOWN。表示状態と cand_state の両方を
-//!   更新し、プリエディットには触れない＝矢印キー選択と同じ副作用範囲）。
+//!   更新し、preedit も選択候補へ描き直す＝矢印キー選択と同じ副作用範囲）。
 //! - D2D パスでは出現/退場を短いフェード（DComp 駆動・theme.motion）で対称に演出する。
 //!
 //! HWND ライフサイクル・バックエンド判定・デバイスロスト回復などの共通骨格は
@@ -39,7 +39,7 @@
 //! `WindowState`（フォント含む）は `WM_NCDESTROY` で回収・破棄する。表示位置は呼び出し側の
 //! (x, y) を基準に、モニタの作業領域内へクランプして使う。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -303,6 +303,9 @@ struct WindowState {
     /// マウス選択の書き込み先（presenter/UIElement と共有する選択の真実源）。
     /// テスト用の `empty()` 経路では None（クリックは表示側のみ更新）。
     shared: Option<Rc<RefCell<CandidateState>>>,
+    /// クリックで選択が動いたことを text_service へ知らせる共有フラグ（preedit 同期の要求）。
+    /// `shared` と同じく `empty()` 経路では None。
+    selection_dirty: Option<Rc<Cell<bool>>>,
     /// 共有描画バックエンド（D2D/GDI・DWrite・GDI フォント・デバイスロストフラグ）。
     backend: Backend,
 }
@@ -328,28 +331,43 @@ unsafe fn window_state<'a>(hwnd: HWND) -> Option<&'a mut WindowState> {
 }
 
 /// マウスクリックによる候補選択。クリック行（可視ページ内）を絶対 index へ解決し、
-/// 表示状態と共有の選択真実源（cand_state）の両方へ書き込む。プリエディットには触れない
-/// ＝矢印キー選択（move_candidate）と同じ副作用範囲なので、確定時に整合する。
+/// 表示状態と共有の選択真実源（cand_state）の両方へ書き込み、preedit の描き直しを要求する
+/// ＝矢印キー選択（move_candidate）と同じ副作用範囲。
+/// preedit をここで直接書かないのは、`window_state` の可変借用を保持したままの WndProc 区間
+/// だから — 同期 edit session 中にホストが再入すると窓状態の二重可変借用になる。drain 経由なら
+/// 再入は借用未保持の安全点まで保留される。
 unsafe fn on_click(hwnd: HWND, y: i32) {
     let dpi = popup::window_dpi(hwnd);
-    let Some(state) = window_state(hwnd) else {
-        return;
+    let (abs, sync_requested) = {
+        let Some(state) = window_state(hwnd) else {
+            return;
+        };
+        let count = state.candidates.len();
+        let (start, end) = visible_range(state.selected, count, MAX_VISIBLE_ROWS);
+        let Some(row) = row_at_y(y, dpi, end - start) else {
+            return;
+        };
+        let abs = start + row;
+        if abs == state.selected {
+            return;
+        }
+        state.selected = abs;
+        if let Some(shared) = &state.shared {
+            shared.borrow_mut().set_selection(abs);
+        }
+        match &state.selection_dirty {
+            Some(dirty) => {
+                dirty.set(true);
+                (abs, true)
+            }
+            None => (abs, false),
+        }
     };
-    let count = state.candidates.len();
-    let (start, end) = visible_range(state.selected, count, MAX_VISIBLE_ROWS);
-    let Some(row) = row_at_y(y, dpi, end - start) else {
-        return;
-    };
-    let abs = start + row;
-    if abs == state.selected {
-        return;
-    }
-    state.selected = abs;
-    if let Some(shared) = &state.shared {
-        shared.borrow_mut().set_selection(abs);
-    }
     tip_log(&format!("ev=candidate_click sel={abs}"));
     let _ = InvalidateRect(Some(hwnd), None, true);
+    if sync_requested {
+        crate::text_service::drain_behavior_via_tls();
+    }
 }
 
 /// 候補ウィンドウのウィンドウプロシージャ。WM_PAINT を描画し、WM_LBUTTONDOWN で候補を選択、
@@ -360,12 +378,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             paint(hwnd);
             LRESULT(0)
         }
-        WM_LBUTTONDOWN => unsafe {
+        WM_LBUTTONDOWN => {
             // クライアント座標の y（HIWORD、符号付き）で行をヒットテストする。
             let y = ((lparam.0 as u32 >> 16) & 0xFFFF) as u16 as i16 as i32;
-            on_click(hwnd, y);
+            // クリックは preedit 更新（同期 edit session）まで走るので panic の可能性がある。
+            // extern "system" 境界へ巻き上げると UB なので、タイマ proc と同じく受け止める。
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                on_click(hwnd, y)
+            }));
             LRESULT(0)
-        },
+        }
         WM_TIMER => unsafe {
             if wparam.0 == HIDE_TIMER_ID {
                 let _ = KillTimer(Some(hwnd), HIDE_TIMER_ID);
@@ -690,6 +712,8 @@ pub struct CandidateWindow {
     /// マウス選択の書き込み先（presenter と共有する選択の真実源）。ensure_hwnd で
     /// WindowState へ複製し、WndProc のクリックハンドラが参照する。
     shared: Option<Rc<RefCell<CandidateState>>>,
+    /// クリック選択後に preedit を追随させるための共有フラグ（`shared` と同じ経路で複製する）。
+    selection_dirty: Option<Rc<Cell<bool>>>,
 }
 
 impl CandidateWindow {
@@ -702,14 +726,16 @@ impl CandidateWindow {
             // プレースホルダ。初回 show が settings 由来の Theme を渡して必ず上書きする。
             theme: crate::theme::Theme::default(),
             shared: None,
+            selection_dirty: None,
         }
     }
 
-    /// 選択の真実源（cand_state）を共有するウィンドウを構築する（presenter 用）。
-    /// マウスクリックによる選択がこの状態へ直接書き込まれる。
-    pub fn with_state(shared: Rc<RefCell<CandidateState>>) -> Self {
+    /// 選択の真実源（cand_state）と preedit 同期フラグを共有するウィンドウを構築する
+    /// （presenter 用）。マウスクリックによる選択がこの状態へ直接書き込まれる。
+    pub fn with_state(shared: Rc<RefCell<CandidateState>>, selection_dirty: Rc<Cell<bool>>) -> Self {
         let mut w = Self::empty();
         w.shared = Some(shared);
+        w.selection_dirty = Some(selection_dirty);
         w
     }
 
@@ -753,6 +779,7 @@ impl CandidateWindow {
                     selected: 0,
                     theme,
                     shared: self.shared.clone(),
+                    selection_dirty: self.selection_dirty.clone(),
                     backend: Backend::new(renderer),
                 }),
             );

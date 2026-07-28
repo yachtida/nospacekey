@@ -71,6 +71,46 @@ final class ZenzaiConfigTests: XCTestCase {
         XCTAssertEqual(cfg.inferenceLimit, 5)
     }
 
+    func testCPUBelowLlamaBaselineForcesClassicEvenWithExplicitWeight() {
+        let cfg = ZenzaiConfig.resolve(
+            exeDir: exe,
+            environment: ["NOSPACEKEY_ZENZAI_WEIGHT": #"C:\m.gguf"#],
+            fileExists: { _ in true },
+            cpuMeetsLlamaBaseline: false
+        )
+        XCTAssertNil(cfg.weightURL)
+    }
+
+    func testCPUBelowLlamaBaselineForcesClassicForDefaultPath() {
+        let cfg = ZenzaiConfig.resolve(
+            exeDir: exe,
+            environment: [:],
+            fileExists: { _ in true },
+            cpuMeetsLlamaBaseline: false
+        )
+        XCTAssertNil(cfg.weightURL)
+    }
+
+    func testCPUBelowLlamaBaselineKeepsInferenceLimitResolution() {
+        let cfg = ZenzaiConfig.resolve(
+            exeDir: exe,
+            environment: ["NOSPACEKEY_ZENZAI_INFERENCE_LIMIT": "5"],
+            fileExists: { _ in true },
+            cpuMeetsLlamaBaseline: false
+        )
+        XCTAssertEqual(cfg.inferenceLimit, 5)
+    }
+
+    func testCPUMeetingBaselineStillAdoptsWeight() {
+        let cfg = ZenzaiConfig.resolve(
+            exeDir: exe,
+            environment: ["NOSPACEKEY_ZENZAI_WEIGHT": #"C:\m.gguf"#],
+            fileExists: { $0 == #"C:\m.gguf"# },
+            cpuMeetsLlamaBaseline: true
+        )
+        XCTAssertEqual(cfg.weightURL, URL(fileURLWithPath: #"C:\m.gguf"#))
+    }
+
     func testInferenceLimitGarbageEnvFallsBackToDefault() {
         let cfg = ZenzaiConfig.resolve(
             exeDir: exe,

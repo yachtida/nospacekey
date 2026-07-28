@@ -28,6 +28,8 @@ pub struct CandidatePresenter {
     window: CandidateWindow,
     state: Rc<RefCell<CandidateState>>,
     outbox: Rc<RefCell<Option<BehaviorAction>>>,
+    /// ホスト/マウス発の選択移動を text_service へ知らせる共有フラグ（preedit 同期の要求）。
+    selection_dirty: Rc<Cell<bool>>,
     updated_flags: Rc<Cell<u32>>,
     notify: Rc<dyn Fn()>,
     ui_mgr: Option<ITfUIElementMgr>,
@@ -40,13 +42,14 @@ impl CandidatePresenter {
     pub fn new(
         state: Rc<RefCell<CandidateState>>,
         outbox: Rc<RefCell<Option<BehaviorAction>>>,
+        selection_dirty: Rc<Cell<bool>>,
         notify: Rc<dyn Fn()>,
     ) -> Self {
         Self {
-            // 選択の真実源（cand_state）を窓と共有する。窓側のマウスクリック選択が
-            // presenter を介さず cand_state へ直接書けるようにするため。
-            window: CandidateWindow::with_state(state.clone()),
-            state, outbox,
+            // 選択の真実源（cand_state）と preedit 同期フラグを窓と共有する。窓側のマウス
+            // クリック選択が presenter を介さず cand_state へ直接書けるようにするため。
+            window: CandidateWindow::with_state(state.clone(), selection_dirty.clone()),
+            state, outbox, selection_dirty,
             updated_flags: Rc::new(Cell::new(0)),
             notify,
             ui_mgr: None, element: None, element_id: None, pbshow: true,
@@ -72,7 +75,8 @@ impl CandidatePresenter {
         // #[implement(ITfCandidateListUIElementBehavior)] は Behavior 派生の COM
         // オブジェクトを生む。ITfUIElement へは Behavior 経由でアップキャストする。
         let behavior: ITfCandidateListUIElementBehavior = CandidateListUIElement::new(
-            self.state.clone(), self.outbox.clone(), self.updated_flags.clone(), self.notify.clone(),
+            self.state.clone(), self.outbox.clone(), self.selection_dirty.clone(),
+            self.updated_flags.clone(), self.notify.clone(),
         ).into();
         let element: ITfUIElement = behavior.into();
         let mut pbshow = BOOL::from(true);

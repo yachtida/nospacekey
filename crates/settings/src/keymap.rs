@@ -32,6 +32,10 @@ pub fn key_name_to_vk(name: &str) -> Option<u32> {
         "Period" => return Some(0xBE),
         "Slash" => return Some(0xBF),
         "Backquote" => return Some(0xC0),
+        // 半角/全角(JIS)。KeyboardEvent.code では Backquote 位置だが US の文字キー
+        // Backquote(VK_OEM_3)と意味衝突するため独自名。正準 VK は 0xF3(VK_OEM_AUTO —
+        // 0x19/0xF4 は tip 入口で 0xF3 へ正規化される。spec §3)。
+        "HankakuZenkaku" => return Some(0xF3),
         "BracketLeft" => return Some(0xDB),
         "Backslash" => return Some(0xDC),
         "BracketRight" => return Some(0xDD),
@@ -85,6 +89,7 @@ pub fn vk_to_key_name(vk: u32) -> Option<String> {
         0xDC => Some("Backslash".into()),
         0xDD => Some("BracketRight".into()),
         0xDE => Some("Quote".into()),
+        0xF3 => Some("HankakuZenkaku".into()),
         _ => None,
     }
 }
@@ -124,8 +129,8 @@ pub fn format_chord(c: &KeyChord) -> String {
     out
 }
 
-/// カスタマイズ対象のコマンド系 12 機能(spec §1)。宣言順が「手編集 JSON で同一文脈に
-/// 重複バインドがあったときの決定的優先順」を兼ねる。
+/// カスタマイズ対象のコマンド系 14 機能(spec §1、Convert 末尾＝優先順最下位)。宣言順が
+/// 「手編集 JSON で同一文脈に重複バインドがあったときの決定的優先順」を兼ねる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeymapFunc {
     ModeToggle,
@@ -140,14 +145,18 @@ pub enum KeymapFunc {
     ToHankakuKana,
     ToZenkakuEisu,
     ToHankakuEisu,
+    NotationRotate,
+    Convert,
 }
 
-pub const ALL_FUNCS: [KeymapFunc; 12] = [
+pub const ALL_FUNCS: [KeymapFunc; 14] = [
     KeymapFunc::ModeToggle, KeymapFunc::Reconvert, KeymapFunc::Feedback,
     KeymapFunc::Ephemeral, KeymapFunc::CommitUndo,
     KeymapFunc::TypoCorrect, KeymapFunc::LlmConvert,
     KeymapFunc::ToHiragana, KeymapFunc::ToKatakana, KeymapFunc::ToHankakuKana,
     KeymapFunc::ToZenkakuEisu, KeymapFunc::ToHankakuEisu,
+    KeymapFunc::NotationRotate,
+    KeymapFunc::Convert,
 ];
 
 /// 衝突判定の文脈グループ(spec §6)。Global(PreservedKey)は OS が先取りするため全グループと衝突扱い。
@@ -176,7 +185,8 @@ impl KeymapFunc {
             TypoCorrect => "typo_correct", LlmConvert => "llm_convert",
             ToHiragana => "to_hiragana", ToKatakana => "to_katakana",
             ToHankakuKana => "to_hankaku_kana", ToZenkakuEisu => "to_zenkaku_eisu",
-            ToHankakuEisu => "to_hankaku_eisu",
+            ToHankakuEisu => "to_hankaku_eisu", NotationRotate => "notation_rotate",
+            Convert => "convert",
         }
     }
     pub fn label_ja(self) -> &'static str {
@@ -188,8 +198,29 @@ impl KeymapFunc {
             LlmConvert => "外部LLM変換", ToHiragana => "表記変換: ひらがな",
             ToKatakana => "表記変換: カタカナ", ToHankakuKana => "表記変換: 半角カナ",
             ToZenkakuEisu => "表記変換: 全角英数", ToHankakuEisu => "表記変換: 半角英数",
+            NotationRotate => "かな種別ローテーション",
+            Convert => "変換(henkan)",
         }
     }
+    /// 衝突判定用の文脈グループ。`group()`(登録の関心)と分離する:
+    /// preserved 機能でも実効チョードが bare_special のときは OnKeyDown 文脈で判定する。
+    pub fn conflict_group(self, chord: KeyChord) -> FuncGroup {
+        use KeymapFunc::*;
+        if self.is_preserved() && bare_special(chord.vk, chord.ctrl, chord.shift, chord.alt) {
+            match self {
+                Reconvert => FuncGroup::Idle,
+                _ => FuncGroup::Global, // ModeToggle/Feedback は全文脈
+            }
+        } else {
+            self.group()
+        }
+    }
+}
+
+/// OS が PreservedKey 登録を拒否する(し得る)組込み特殊キー
+/// (変換 0x1C / 無変換 0x1D / 半角全角 0xF3 の無修飾)。
+pub fn bare_special(vk: u32, ctrl: bool, shift: bool, alt: bool) -> bool {
+    !ctrl && !shift && !alt && (vk == 0x1C || vk == 0x1D || vk == 0xF3)
 }
 
 /// 旧 ephemeral.trigger("f8"/"f9"/"f10") → チョード。未知は F8(旧 trigger_name_to_vk の既定と同じ)。
@@ -205,7 +236,13 @@ fn bare(vk: u32) -> KeyChord { KeyChord { vk, ctrl: false, shift: false, alt: fa
 pub fn default_chords(f: KeymapFunc, legacy_ephemeral_trigger: &str) -> Vec<KeyChord> {
     use KeymapFunc::*;
     match f {
-        ModeToggle => vec![bare(0x1D), KeyChord { alt: true, ..bare(0xBA) }],
+        ModeToggle => vec![
+            bare(0x1D),
+            KeyChord { alt: true, ..bare(0xBA) },
+            // 半角/全角(0xF3): Windows 標準 IME と同じく既定で IME トグル(spec §5.1)。
+            // 末尾追加 — [0] を単一チョード解決(sink_chord)の代表に使う既存契約を壊さない。
+            bare(0xF3),
+        ],
         Reconvert => vec![bare(0x1C), KeyChord { alt: true, ..bare(0xBF) }],
         Feedback => vec![KeyChord { ctrl: true, ..bare(0x1C) }, KeyChord { ctrl: true, ..bare(0xBF) }],
         Ephemeral => vec![legacy_ephemeral_chord(legacy_ephemeral_trigger)],
@@ -217,13 +254,15 @@ pub fn default_chords(f: KeymapFunc, legacy_ephemeral_trigger: &str) -> Vec<KeyC
         ToHankakuKana => vec![bare(0x77)],
         ToZenkakuEisu => vec![bare(0x78)],
         ToHankakuEisu => vec![bare(0x79)],
+        NotationRotate => vec![bare(0x1D)],
+        Convert => vec![bare(0x20), bare(0x1C)],
     }
 }
 
 /// 単独で割り当ててよいキーか(F1-F24/変換/無変換/Tab/Backspace)。それ以外の語彙
 /// (英字/数字/記号)は Ctrl 必須(spec §6)。
 fn standalone_ok(vk: u32) -> bool {
-    matches!(vk, 0x70..=0x87 | 0x1C | 0x1D | 0x08 | 0x09)
+    matches!(vk, 0x70..=0x87 | 0x1C | 0x1D | 0x08 | 0x09 | 0xF3)
 }
 
 /// 設定アプリ用の厳格検証。"none" は常に妥当。TIP 側は resolve_binding(劣化型)を使い、
@@ -264,7 +303,7 @@ pub fn resolve_binding(v: &Option<String>) -> Binding {
 
 /// 機能→バインド設定値。各フィールドは None=既定 / Some("none")=無効 / Some(チョード)=明示。
 /// None も JSON に null として書く(skip しない): 設定アプリの dirty 判定(JSON 文字列比較)が
-/// null と欠落を区別できないため、常に全 12 キーを出して表現を一意にする。
+/// null と欠落を区別できないため、常に全 14 キーを出して表現を一意にする。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KeymapSettings {
     #[serde(default)] pub mode_toggle: Option<String>,
@@ -279,6 +318,8 @@ pub struct KeymapSettings {
     #[serde(default)] pub to_hankaku_kana: Option<String>,
     #[serde(default)] pub to_zenkaku_eisu: Option<String>,
     #[serde(default)] pub to_hankaku_eisu: Option<String>,
+    #[serde(default)] pub notation_rotate: Option<String>,
+    #[serde(default)] pub convert: Option<String>,
 }
 
 impl KeymapSettings {
@@ -291,6 +332,8 @@ impl KeymapSettings {
             LlmConvert => &self.llm_convert, ToHiragana => &self.to_hiragana,
             ToKatakana => &self.to_katakana, ToHankakuKana => &self.to_hankaku_kana,
             ToZenkakuEisu => &self.to_zenkaku_eisu, ToHankakuEisu => &self.to_hankaku_eisu,
+            NotationRotate => &self.notation_rotate,
+            Convert => &self.convert,
         }
     }
 }
@@ -316,7 +359,7 @@ pub struct Conflict {
     pub chord: KeyChord,
 }
 
-/// 実効チョードの重複を検出する。entries は (機能, 設定値) の全 12 件。
+/// 実効チョードの重複を検出する。entries は (機能, 設定値) の全 14 件。
 /// feature off の機能(ephemeral/feedback/typo/llm)はチョードを持たない=衝突に参加しない。
 pub fn find_conflicts_in(
     entries: &[(KeymapFunc, Option<String>)],
@@ -353,10 +396,23 @@ pub fn find_conflicts_in(
     for i in 0..chords.len() {
         for j in i + 1..chords.len() {
             let ((fa, ca), (fb, cb)) = (chords[i], chords[j]);
-            let cross_group_ok = fa.group() != fb.group()
-                && fa.group() != FuncGroup::Global
-                && fb.group() != FuncGroup::Global;
-            if ca == cb && !cross_group_ok {
+            let (ga, gb) = (fa.conflict_group(ca), fb.conflict_group(cb));
+            let cross_group_ok = ga != gb && ga != FuncGroup::Global && gb != FuncGroup::Global;
+            // spec §6.2: bare_special チョードは OnKeyDown の文脈解決に載るため、
+            // Global × Composing の共有は実行時に決定的排他(変換中=Composing 優先/
+            // 待機中=Global)になる — 免除。受理される preserved chord(非 bare_special)は
+            // OnPreservedKey が全文脈で奪い Composing 側が沈黙するため免除しない。
+            // 免除対象の Global 側は **ModeToggle に限る**: 「変換中は Composing 優先」の救済経路
+            // (resolve_action の composing ブロック + OnPreservedKey 委譲)を持つのは ModeToggle
+            // だけ。Feedback も bare_special だと conflict_group=Global になるが救済経路が無く、
+            // 同キー共有は真の衝突(OnPreservedKey が composing でも先取り)なので免除しない。
+            let global_composing_exempt = bare_special(ca.vk, ca.ctrl, ca.shift, ca.alt)
+                && match (ga, gb) {
+                    (FuncGroup::Global, FuncGroup::Composing) => fa == ModeToggle,
+                    (FuncGroup::Composing, FuncGroup::Global) => fb == ModeToggle,
+                    _ => false,
+                };
+            if ca == cb && !cross_group_ok && !global_composing_exempt {
                 out.push(Conflict { a: fa, b: fb, chord: ca });
             }
         }
@@ -464,10 +520,11 @@ mod tests {
                    vec![KeyChord { vk: 0x09, ctrl: false, shift: true, alt: false }]);
         assert_eq!(default_chords(ToHiragana, "f8"), vec![KeyChord { vk: 0x75, ..f8 }]);
         assert_eq!(default_chords(ToHankakuEisu, "f8"), vec![KeyChord { vk: 0x79, ..f8 }]);
-        // Preserved 系は JIS/US の 2 チョード(text_service.rs の現行登録と同値)。
+        // Preserved 系: ModeToggle は JIS/US/半角全角 の 3 チョード、他は JIS/US の 2 チョード。
         assert_eq!(default_chords(ModeToggle, "f8"), vec![
             KeyChord { vk: 0x1D, ctrl: false, shift: false, alt: false },
             KeyChord { vk: 0xBA, ctrl: false, shift: false, alt: true },
+            KeyChord { vk: 0xF3, ctrl: false, shift: false, alt: false },
         ]);
         assert_eq!(default_chords(Reconvert, "f8"), vec![
             KeyChord { vk: 0x1C, ctrl: false, shift: false, alt: false },
@@ -553,5 +610,137 @@ mod tests {
         // 公開ラッパ find_conflicts は find_conflicts_in と同じ結果を返す。
         let km = KeymapSettings { to_hiragana: Some("F7".into()), ..Default::default() };
         assert_eq!(find_conflicts(&km, "f8", true, false, true, true).len(), 1);
+    }
+
+    #[test]
+    fn convert_func_is_registered() {
+        use KeymapFunc::Convert;
+        assert_eq!(ALL_FUNCS.len(), 14);
+        assert_eq!(ALL_FUNCS[13], Convert, "Convert は末尾(優先順が最も低い)");
+        assert_eq!(Convert.group(), FuncGroup::Composing);
+        assert_eq!(Convert.settings_field(), "convert");
+        assert!(!Convert.is_preserved());
+        assert!(!Convert.alt_allowed());
+        assert_eq!(default_chords(Convert, "f8"), vec![
+            KeyChord { vk: 0x20, ctrl: false, shift: false, alt: false },
+            KeyChord { vk: 0x1C, ctrl: false, shift: false, alt: false },
+        ]);
+        // clippy::field_reassign_with_default 回避のため struct update 構文で組み立てる。
+        let s = KeymapSettings { convert: Some("none".into()), ..Default::default() };
+        assert_eq!(s.get(Convert).as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn global_composing_bare_special_share_is_exempt() {
+        use KeymapFunc::*;
+        let none: Option<String> = None;
+        let all_default = || ALL_FUNCS.map(|f| (f, none.clone())).to_vec();
+        // 既定(14 機能全既定)は衝突 0 件: NotationRotate(bare 0x1D, Composing) ×
+        // ModeToggle(bare 0x1D, Global) は bare_special 免除(spec §6.2)。
+        assert!(find_conflicts_in(&all_default(), "f8", true, true, true, true).is_empty());
+        // 免除は bare_special 限定: ModeToggle を受理系チョード F7 にすると
+        // to_katakana(既定 F7) と衝突する(受理 preserved の全文脈シャドウ検出は維持)。
+        let mut e = all_default();
+        e.iter_mut().find(|(f, _)| *f == ModeToggle).unwrap().1 = Some("F7".into());
+        assert!(!find_conflicts_in(&e, "f8", true, true, true, true).is_empty());
+        // 免除は Global×Composing のみ。Composing 同士は衝突する:
+        let mut e = all_default();
+        e.iter_mut().find(|(f, _)| *f == NotationRotate).unwrap().1 = Some("Tab".into());
+        let c = find_conflicts_in(&e, "f8", true, true, true, true);
+        assert!(c.iter().any(|x| matches!((x.a, x.b),
+            (NotationRotate, TypoCorrect) | (TypoCorrect, NotationRotate))),
+            "NotationRotate=Tab × TypoCorrect=Tab(ともに Composing)は衝突: {c:?}");
+        // Global(bare 0x1D) × Idle は免除しない: Ephemeral を NonConvert にすると衝突。
+        let mut e = all_default();
+        e.iter_mut().find(|(f, _)| *f == Ephemeral).unwrap().1 = Some("NonConvert".into());
+        assert!(!find_conflicts_in(&e, "f8", true, true, true, true).is_empty(),
+            "ModeToggle(Global bare 0x1D) × Ephemeral(Idle 0x1D) は衝突のまま");
+        // 免除対象の Global は ModeToggle 限定。Feedback を bare NonConvert(0x1D)へ振ると
+        // NotationRotate(既定 0x1D, Composing)と同キーだが、Feedback には composing 救済経路が
+        // 無い(bare は OS 拒否/OnPreservedKey が composing でも先取り)ので衝突検出する。
+        let mut e = all_default();
+        e.iter_mut().find(|(f, _)| *f == Feedback).unwrap().1 = Some("NonConvert".into());
+        let c = find_conflicts_in(&e, "f8", true, true, true, true);
+        assert!(c.iter().any(|x| matches!((x.a, x.b),
+            (Feedback, NotationRotate) | (NotationRotate, Feedback))),
+            "Feedback(bare 0x1D) × NotationRotate(bare 0x1D) は免除せず衝突: {c:?}");
+    }
+
+    #[test]
+    fn mode_toggle_default_gains_hankaku_zenkaku() {
+        use KeymapFunc::ModeToggle;
+        assert_eq!(default_chords(ModeToggle, "f8"), vec![
+            KeyChord { vk: 0x1D, ctrl: false, shift: false, alt: false },
+            KeyChord { vk: 0xBA, ctrl: false, shift: false, alt: true },
+            KeyChord { vk: 0xF3, ctrl: false, shift: false, alt: false },
+        ]);
+    }
+
+    #[test]
+    fn notation_rotate_func_is_registered() {
+        use KeymapFunc::{Convert, NotationRotate};
+        assert_eq!(ALL_FUNCS.len(), 14);
+        assert_eq!(ALL_FUNCS[12], NotationRotate, "NotationRotate は Convert の直前");
+        assert_eq!(ALL_FUNCS[13], Convert, "Convert は末尾(優先順が最も低い)");
+        assert_eq!(NotationRotate.group(), FuncGroup::Composing);
+        assert_eq!(NotationRotate.settings_field(), "notation_rotate");
+        assert!(!NotationRotate.is_preserved());
+        assert!(!NotationRotate.alt_allowed());
+        assert_eq!(default_chords(NotationRotate, "f8"),
+                   vec![KeyChord { vk: 0x1D, ctrl: false, shift: false, alt: false }]);
+        let s = KeymapSettings { notation_rotate: Some("none".into()), ..Default::default() };
+        assert_eq!(s.get(NotationRotate).as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn hankaku_zenkaku_vocabulary_and_rules() {
+        // 語彙: 独自名 HankakuZenkaku ↔ 正準 VK 0xF3(spec §3)。
+        assert_eq!(key_name_to_vk("HankakuZenkaku"), Some(0xF3));
+        assert_eq!(vk_to_key_name(0xF3).as_deref(), Some("HankakuZenkaku"));
+        // bare_special: 0xF3 は OS 拒否され得る組込み特殊キー扱い(0x1C/0x1D と同格)。
+        assert!(bare_special(0xF3, false, false, false));
+        assert!(!bare_special(0xF3, false, false, true), "Alt 併用は bare でない");
+        // standalone_ok: 単独割当可(これが無いと validate_binding が Ctrl 要求で拒否 — spec §7.1)。
+        assert!(validate_binding(KeymapFunc::Ephemeral, "HankakuZenkaku").is_ok());
+        assert!(validate_binding(KeymapFunc::ModeToggle, "HankakuZenkaku").is_ok());
+        // パース/整形の往復。
+        assert_eq!(format_chord(&parse_chord("HankakuZenkaku").unwrap()), "HankakuZenkaku");
+    }
+
+    #[test]
+    fn conflict_group_is_per_chord_for_bare_special() {
+        use KeymapFunc::*;
+        let bare_1c = KeyChord { vk: 0x1C, ctrl: false, shift: false, alt: false };
+        let alt_slash = KeyChord { vk: 0xBF, ctrl: false, shift: false, alt: true };
+        let f7 = KeyChord { vk: 0x76, ctrl: false, shift: false, alt: false };
+        let bare_1d = KeyChord { vk: 0x1D, ctrl: false, shift: false, alt: false };
+        assert_eq!(Reconvert.conflict_group(bare_1c), FuncGroup::Idle);
+        assert_eq!(Reconvert.conflict_group(alt_slash), FuncGroup::Global);
+        assert_eq!(Reconvert.conflict_group(f7), FuncGroup::Global);
+        assert_eq!(ModeToggle.conflict_group(bare_1d), FuncGroup::Global);
+        assert_eq!(Convert.conflict_group(bare_1c), FuncGroup::Composing);
+    }
+
+    #[test]
+    fn default_keymap_has_no_conflicts() {
+        let km = KeymapSettings::default();
+        let c = find_conflicts(&km, "f8", true, true, true, true);
+        assert!(c.is_empty(), "既定は衝突ゼロ: {c:?}");
+    }
+
+    #[test]
+    fn conflicts_flag_real_overlaps_but_not_mode_disjoint() {
+        use KeymapFunc::*;
+        // clippy::field_reassign_with_default 回避のため struct update 構文で組み立てる。
+        let km = KeymapSettings { typo_correct: Some("Convert".into()), ..Default::default() }; // typo を bare 変換へ
+        let c = find_conflicts(&km, "f8", true, true, true, true);
+        assert!(c.iter().any(|x| (x.a==Convert && x.b==TypoCorrect) || (x.a==TypoCorrect && x.b==Convert)),
+            "Convert × Typo(同 0x1C, ともに Composing) は衝突: {c:?}");
+        assert!(!c.iter().any(|x| (x.a==Reconvert && x.b==TypoCorrect) || (x.a==TypoCorrect && x.b==Reconvert)),
+            "Reconvert-bare(Idle) × Typo(Composing) は文脈排他で衝突しない");
+        let km2 = KeymapSettings { reconvert: Some("F7".into()), ..Default::default() }; // 受理 preserved(非 bare_special)
+        let c2 = find_conflicts(&km2, "f8", true, true, true, true);
+        assert!(c2.iter().any(|x| (x.a==Reconvert && x.b==ToKatakana) || (x.a==ToKatakana && x.b==Reconvert)),
+            "reconvert=F7(Global) × to_katakana=F7 は衝突検出: {c2:?}");
     }
 }

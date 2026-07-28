@@ -8,7 +8,9 @@ pub enum Ev {
     CandidatesHidden,
     Commit { text: String, source: String },
     EngineSpawn { pid: u32, ok: bool },
-    Degraded { #[allow(dead_code)] reason: String }, // 診断用: 劣化理由を保持（現状未読）
+    /// 劣化した（reason=live_convert_pending / insert_failed …）。--keymap-smoke の live-off サブが
+    /// reason で「LiveConvert を叩いて遅かっただけの偽 PASS」を弾く。
+    Degraded { reason: String },
     /// 外部LLM変換要求が出た（Tab→start_llm_convert）。seq は世代。
     LlmRequest { #[allow(dead_code)] seq: u64 }, // 診断用: 世代 seq を保持（現状未読）
     /// 外部LLM結果が preedit へ適用された（on_llm_outcome の成功枝）。

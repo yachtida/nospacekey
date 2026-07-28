@@ -21,8 +21,15 @@ use crate::text_service::tip_log;
 pub enum BehaviorAction { Finalize, Abort }
 
 // --- COM 非依存のテスト可能ロジック ---
-pub(crate) fn behavior_set_selection(state: &Rc<RefCell<CandidateState>>, index: u32) {
+/// 選択要求は outbox ではなく専用フラグに立てる — outbox は Option 1 枠しか無く、
+/// 保留中の Finalize を上書きするとホスト発の確定が黙って消える。
+pub(crate) fn behavior_set_selection(
+    state: &Rc<RefCell<CandidateState>>,
+    selection_dirty: &Rc<Cell<bool>>,
+    index: u32,
+) {
     state.borrow_mut().set_selection(index as usize);
+    selection_dirty.set(true);
 }
 pub(crate) fn behavior_finalize(outbox: &Rc<RefCell<Option<BehaviorAction>>>) {
     *outbox.borrow_mut() = Some(BehaviorAction::Finalize);
@@ -35,6 +42,8 @@ pub(crate) fn behavior_abort(outbox: &Rc<RefCell<Option<BehaviorAction>>>) {
 pub struct CandidateListUIElement {
     state: Rc<RefCell<CandidateState>>,
     outbox: Rc<RefCell<Option<BehaviorAction>>>,
+    /// text_service と共有する選択同期フラグ。SetSelection が立て、drain が preedit へ反映する。
+    selection_dirty: Rc<Cell<bool>>,
     /// presenter と共有する更新フラグ。presenter が UpdateUIElement 前に立て、
     /// ホストの GetUpdatedFlags で read-and-clear する。
     updated_flags: Rc<Cell<u32>>,
@@ -49,10 +58,15 @@ impl CandidateListUIElement {
     pub fn new(
         state: Rc<RefCell<CandidateState>>,
         outbox: Rc<RefCell<Option<BehaviorAction>>>,
+        selection_dirty: Rc<Cell<bool>>,
         updated_flags: Rc<Cell<u32>>,
         notify: Rc<dyn Fn()>,
     ) -> Self {
-        Self { state, outbox, updated_flags, notify, shown: Cell::new(false), _guard: ComObjectGuard::new() }
+        Self {
+            state, outbox, selection_dirty, updated_flags, notify,
+            shown: Cell::new(false),
+            _guard: ComObjectGuard::new(),
+        }
     }
 }
 
@@ -90,7 +104,7 @@ impl ITfCandidateListUIElement_Impl for CandidateListUIElement_Impl {
 
 impl ITfCandidateListUIElementBehavior_Impl for CandidateListUIElement_Impl {
     fn SetSelection(&self, nindex: u32) -> Result<()> {
-        behavior_set_selection(&self.state, nindex);
+        behavior_set_selection(&self.state, &self.selection_dirty, nindex);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.notify)()));
         Ok(())
     }
@@ -141,21 +155,31 @@ impl ITfIntegratableCandidateListUIElement_Impl for CandidateListUIElement_Impl 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> (Rc<RefCell<CandidateState>>, Rc<RefCell<Option<BehaviorAction>>>) {
+    type Fixture = (Rc<RefCell<CandidateState>>, Rc<RefCell<Option<BehaviorAction>>>, Rc<Cell<bool>>);
+    fn fixture() -> Fixture {
         let st = Rc::new(RefCell::new(CandidateState::new()));
         st.borrow_mut().set(vec!["a".into(), "b".into(), "c".into()], 0);
-        (st, Rc::new(RefCell::new(None)))
+        (st, Rc::new(RefCell::new(None)), Rc::new(Cell::new(false)))
     }
     #[test]
-    fn set_selection_updates_state_no_outbox() {
-        let (st, ob) = fixture();
-        behavior_set_selection(&st, 2);
+    fn set_selection_updates_state_and_requests_preedit_sync_without_touching_outbox() {
+        let (st, ob, dirty) = fixture();
+        behavior_set_selection(&st, &dirty, 2);
         assert_eq!(st.borrow().selected(), 2);
-        assert_eq!(*ob.borrow(), None);
+        assert!(dirty.get(), "選択移動は preedit 同期を要求する");
+        assert_eq!(*ob.borrow(), None, "確定/取消スロットは選択移動で汚されない");
+    }
+    #[test]
+    fn set_selection_does_not_displace_a_pending_finalize() {
+        let (st, ob, dirty) = fixture();
+        behavior_finalize(&ob);
+        behavior_set_selection(&st, &dirty, 1);
+        assert_eq!(*ob.borrow(), Some(BehaviorAction::Finalize), "保留中の確定要求は残る");
+        assert!(dirty.get());
     }
     #[test]
     fn finalize_and_abort_post_outbox() {
-        let (_st, ob) = fixture();
+        let (_st, ob, _dirty) = fixture();
         behavior_finalize(&ob); assert_eq!(*ob.borrow(), Some(BehaviorAction::Finalize));
         behavior_abort(&ob);    assert_eq!(*ob.borrow(), Some(BehaviorAction::Abort));
     }

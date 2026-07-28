@@ -12,14 +12,16 @@ pub const ESC: Vk = Vk(0x1B, "Esc");
 pub const SPACE: Vk = Vk(0x20, "Space");
 pub const UP: Vk = Vk(0x26, "Up");
 pub const DOWN: Vk = Vk(0x28, "Down");
-pub const NONCONVERT: Vk = Vk(0x1D, "Muhenkan"); // モードトグル（OnPreservedKey 経由）
-pub const CONVERT: Vk = Vk(0x1C, "Convert"); // 再変換/henkan（Task4: 対象なし→ephemeral フォールバック）
+pub const NONCONVERT: Vk = Vk(0x1D, "Muhenkan"); // 待機中=モードトグル / 変換中=かなローテーション(2026-07-23 spec)。受理時は OnPreservedKey 委譲・拒否時は OnKeyDown — 両経路とも rotate 共有ヘルパ
+pub const HANKAKU_ZENKAKU: Vk = Vk(0xF3, "HankakuZenkaku"); // 半角/全角(正準 VK)。全文脈モードトグル
+pub const CONVERT: Vk = Vk(0x1C, "Convert"); // 再変換/henkan（Task5: 対象なし→eaten no-op、ephemeral には落ちない）
 pub const HOME: Vk = Vk(0x24, "Home");
 pub const OEM_PERIOD: Vk = Vk(0xBE, "OemPeriod"); // '.'（打鍵作法 Task3: idle 全角直接確定）
 pub const OEM_MINUS: Vk = Vk(0xBD, "OemMinus"); // '-'（かな合成中 → 長音符 ー）
 pub const OEM_SLASH: Vk = Vk(0xBF, "Oem2Slash"); // '/'（かな合成中 → 全角中点 ・）
 pub const F7: Vk = Vk(0x76, "F7"); // 表記変換: カタカナ（打鍵作法 Task4）
 pub const F8: Vk = Vk(0x77, "F8"); // ephemeral かなトリガ（既定）
+pub const F10: Vk = Vk(0x79, "F10"); // 表記変換: 半角英数（既定 bare 0x79）
 pub const F11: Vk = Vk(0x7A, "F11"); // keymap リマップ検証用（--keymap-smoke: to_katakana の付け替え先）
 pub fn ch(c: char) -> Vk { Vk(0x41 + (c as u32 - 'a' as u32), "Char") } // a..z
 /// 数字キー VK（メイン行 0-9）。`d` は 0..=9。
@@ -43,6 +45,9 @@ pub struct Scenario {
 }
 
 fn has_activate(evs: &[Ev]) -> bool { evs.iter().any(|e| matches!(e, Ev::Activate)) }
+/// 半角数字 `0-9` を含むか。数字幅の検証用（全角は `０-９` = U+FF10..U+FF19）。
+fn has_hankaku_digit(s: &str) -> bool { s.chars().any(|c| c.is_ascii_digit()) }
+fn has_zenkaku_digit(s: &str) -> bool { s.chars().any(|c| ('０'..='９').contains(&c)) }
 fn candidates_contains(evs: &[Ev], want: &str) -> bool {
     evs.iter().any(|e| matches!(e, Ev::CandidatesShown { list, .. } if list.iter().any(|x| x == want)))
 }
@@ -142,7 +147,9 @@ pub fn all() -> Vec<Scenario> {
                 }
                 Ok(())
             } },
-        // item20: 合成中にモードトグル（無変換 0x1D）→ 開いていた合成が確定されて畳まれる（UU-3 回帰）。
+        // item20: 合成中にモードトグル（半角/全角 0xF3）→ 開いていた合成が確定されて畳まれる（UU-3 回帰
+        // ＋ 2026-07-23 spec §5.2）。従来は無変換 0x1D だったが、合成中の 0x1D は かなローテーション
+        // (NotationRotate)へ意図変更されたため、合成中モードトグルの検証キーは 0xF3 に移した。
         // 旧実装ではモードだけ切り替わり composition が孤立（direct 側で Enter/Esc/BS が素通しになり
         // preedit を閉じる手段がなくなる）。conversion-mode compartment は同一の実 ITfThreadMgr 上＝
         // プロセス共有なので、シナリオ毎に新しい TsfHost を作っても direct のまま残り他 item へ波及する。
@@ -151,7 +158,7 @@ pub fn all() -> Vec<Scenario> {
         // (b) preedit が空（composition が畳まれた）、(c) committed=="日本語"
         // （nihongo のライブ変換確定。item2 が同じ値を preedit で固定済みなので model 差異は無い）。
         Scenario { item: 20, name: "mode toggle mid-composition commits preedit",
-            keys: { let mut k = typed("nihongo"); k.push(NONCONVERT); k },
+            keys: { let mut k = typed("nihongo"); k.push(HANKAKU_ZENKAKU); k },
             expect: |c, _f, p, evs, _l| {
                 if !evs.iter().any(|e| matches!(e, Ev::Commit { source, .. } if source == "mode_toggle")) {
                     return Err("ev=commit source=mode_toggle が出ていない（トグル前の settle が走っていない）".into());
@@ -362,13 +369,28 @@ pub fn all() -> Vec<Scenario> {
                 if exited && f.is_empty() { Ok(()) }
                 else { Err(format!("exited={exited} full={f:?}（Esc 破棄＋direct 復帰が不成立）")) }
             } },
-        // item36: direct idle で VK_CONVERT（再変換対象なし。headless doc は空）→ ephemeral 開始へ
-        // フォールバック（Task4）。実機 Terminal では読み戻し失敗で同じく reconverting=false になる。
-        Scenario { item: 36, name: "convert with no reconvert target falls back to ephemeral",
+        // item36（Task5: 反転）: direct idle で VK_CONVERT（再変換対象なし。headless doc は空）は
+        // resolve_action(0x1C)=Reconvert が claim し続けるが、対象が無いので start_reconvert は
+        // 何もしない eaten no-op になる（ephemeral には決して落ちない — 変換キーから resolve_action
+        // が Ephemeral を返す経路は無い）。旧実装はここで ephemeral へフォールバックしていたが、
+        // Task4 でその経路自体を削除したため、EphemeralEnter を要求する旧 assert は恒久 FAIL に
+        // なっていた。反転して「EphemeralEnter/EphemeralExit のどちらも出ない」ことを要求する
+        // （eaten_last==false は assert しない — 既定 reconvert が消費する no-op なので true が正しい）。
+        // 再変換「対象あり」の正シグナル（henkan/再変換が実際に動くこと）は driver::run_item13/
+        // run_item17 が非回帰として別途担保する（本 item だけでは「完全 no-op」でも通ってしまい
+        // 弱いため、削除・改変しない）。
+        Scenario { item: 36, name: "convert with no reconvert target is eaten no-op (not ephemeral)",
             keys: vec![CONVERT],
-            expect: |_c, _f, _p, evs, _l| {
-                if evs.iter().any(|e| matches!(e, Ev::EphemeralEnter)) { Ok(()) }
-                else { Err("no EphemeralEnter after empty convert".into()) }
+            expect: |_c, _f, _p, evs, eaten_last| {
+                let entered = evs.iter().any(|e| matches!(e, Ev::EphemeralEnter));
+                let exited = evs.iter().any(|e| matches!(e, Ev::EphemeralExit));
+                if entered || exited {
+                    return Err(format!("entered={entered} exited={exited}（ephemeral に落ちている＝旧フォールバックの再発）"));
+                }
+                if !eaten_last {
+                    return Err("eaten_last=false（変換キーが素通しされている＝Reconvert が claim していない）".into());
+                }
+                Ok(())
             } },
         // item37: Task8(a/空素通し) — ephemeral 開始直後、何も打たず Enter だけ押すと
         // ephemeral_idle_abort が idle（composing=false, showing=false）で「かなモードが素通しする
@@ -407,8 +429,10 @@ pub fn all() -> Vec<Scenario> {
         // (d) committed が非空（トグル前の settle でライブ確定が実際に走った）。確定文字列の
         // 具体値は「ni」のライブ変換 top-1 が model 依存（item2/7 と同じ注意）なので固定しない
         // （本 item の本質は昇格＝mode_toggle の着地であって確定文字列の内容ではない）。
+        // 2026-07-23 spec: トグルキーは 0x1D→0xF3 へ差し替え(合成中 0x1D は NotationRotate に
+        // 意図変更。ephemeral かなも compartment=NATIVE の合成中なので rotate が先取りする)。
         Scenario { item: 38, name: "toggle mid-ephemeral promotes to persistent kana",
-            keys: { let mut k = vec![F8]; k.extend(typed("ni")); k.push(NONCONVERT); k },
+            keys: { let mut k = vec![F8]; k.extend(typed("ni")); k.push(HANKAKU_ZENKAKU); k },
             expect: |c, _f, _p, evs, _l| {
                 let entered = evs.iter().any(|e| matches!(e, Ev::EphemeralEnter));
                 let exited = evs.iter().any(|e| matches!(e, Ev::EphemeralExit));
@@ -504,6 +528,153 @@ pub fn all() -> Vec<Scenario> {
                     _ if !hide_after_commit => Err("確定後に ev=reading_monitor action=hide が出ていない（窓が残留）".into()),
                     _ => Ok(()),
                 }
+            } },
+        // item43: ephemeral 開始直後の1打鍵目が数字でも ephemeral を維持する（数字始まりの回帰）。
+        // item37(Enter=素通しキー→abort する)の対極。かなモードは idle の無修飾数字を食って
+        // composition を開始する(will_handle_gated ②)ので、数字は abort 対象ではない。
+        // 旧実装は ephemeral_idle_abort が素の will_handle を見ており数字を「素通しキー」と誤判定、
+        // 1打鍵目で direct へ落ちたうえ同じ打鍵が composition を開いて compartment とねじれ、
+        // 以後どの打鍵も preedit へ届かなくなった（モード切替でしか復帰できない）。
+        // 自己証明: (a) EphemeralEnter が出る（F8 開始）、(b) EphemeralExit が**出ない**
+        // （数字で抜けていない — 旧実装はここで出た）、(c) preedit 非空（数字が読みに入った）、
+        // (d) eaten_last=true（数字が食われている＝アプリへ素通ししていない）。
+        // 先頭の HANKAKU_ZENKAKU はモードトグル: ランナーは各 item 後に set_native_mode() する
+        // (main.rs)ので開始時は NATIVE だが、Ephemeral の解決は direct 必須(keymap.rs
+        // `i.ephemeral_enabled && i.direct && idle`)。これを挟まないと F8 が Ephemeral にならず
+        // 「ev=ephemeral_enter が出ていない」で偽 RED になる。
+        // digit(1)=0x31 は VK_1..=VK_9 アーム(=報告された「数字から開始」)、digit(0)=0x30 は
+        // is_text_vk アーム — 別々の dispatch アームを1本で駆動する。
+        Scenario { item: 43, name: "ephemeral survives digit-first input and starts composition",
+            keys: vec![HANKAKU_ZENKAKU, F8, digit(1), digit(0)],
+            expect: |_c, _f, p, evs, eaten_last| {
+                if !evs.iter().any(|e| matches!(e, Ev::EphemeralEnter)) {
+                    return Err("ev=ephemeral_enter が出ていない（F8 が開始トリガとして食われていない）".into());
+                }
+                if evs.iter().any(|e| matches!(e, Ev::EphemeralExit)) {
+                    return Err("ev=ephemeral_exit が出ている（数字で ephemeral を誤って抜けた）".into());
+                }
+                if p.is_empty() {
+                    return Err("preedit 空（数字が composition に入っていない）".into());
+                }
+                if !eaten_last {
+                    return Err("eaten_last=false（数字が素通しされている＝かなが食っていない）".into());
+                }
+                Ok(())
+            } },
+        // item44/45 は「preedit の幅」と「確定の幅」を別々に固定し、対で
+        // 「表示＝確定」を挟み込む。片方だけでは不一致を捕まえられない — 報告された不具合は
+        // 「preedit 半角／確定 全角」で、どちらの単独アサートも通ってしまう。
+        // 幅は設定 `number.full_width` 依存（既定 true）。--scenarios は fixture を書かず実ユーザーの
+        // settings.json を読むので、半角設定の機体ではこの2本だけが赤くなる（item33 は設定非依存）。
+        // 肯定・否定の両方を張るのは、エンジンが数字を別語へ変換して「数字ゼロ」になったときに
+        // 否定アサートだけだと空振り PASS するため。
+        Scenario { item: 44, name: "preedit shows digits fullwidth while composing",
+            keys: vec![digit(2), digit(0), digit(2), digit(4)],
+            expect: |_c, _f, p, _e, _l| {
+                if p.is_empty() { return Err("preedit 空（数字が composition に入っていない）".into()); }
+                if !has_zenkaku_digit(p) {
+                    return Err(format!("preedit={p:?} に全角数字が無い（表示側の全角化が効いていない）"));
+                }
+                if has_hankaku_digit(p) {
+                    return Err(format!("preedit={p:?} に半角数字が残っている（確定は全角なので見た目が食い違う）"));
+                }
+                Ok(())
+            } },
+        Scenario { item: 45, name: "default commit widens digits to fullwidth",
+            keys: { let mut k = vec![digit(2), digit(0), digit(2), digit(4)]; k.push(ENTER); k },
+            expect: |c, _f, _p, _e, _l| {
+                if c.is_empty() { return Err("committed 空（Enter で確定していない）".into()); }
+                if !has_zenkaku_digit(c) {
+                    return Err(format!("committed={c:?} に全角数字が無い（既定確定は全角のはず）"));
+                }
+                if has_hankaku_digit(c) {
+                    return Err(format!("committed={c:?} に半角数字が残っている（既定確定は全角のはず）"));
+                }
+                Ok(())
+            } },
+        // item45: F10「半角英数」で表記を固定した確定は半角のまま。
+        // 旧実装は notation_fixed を無視して widen_commit_text が上乗せされ、
+        // preedit `nihon123` → 確定 `nihon１２３` と機能名に反していた。
+        Scenario { item: 46, name: "hankaku-eisu notation keeps digits halfwidth through commit",
+            keys: {
+                let mut k = typed("nihon");
+                k.extend(vec![digit(1), digit(2), digit(3), F10, ENTER]);
+                k
+            },
+            expect: |c, _f, _p, _e, _l| {
+                if c.is_empty() { return Err("committed 空（Enter で確定していない）".into()); }
+                if has_zenkaku_digit(c) {
+                    return Err(format!("committed={c:?} に全角数字がある（半角英数固定なのに全角化された）"));
+                }
+                if !has_hankaku_digit(c) {
+                    return Err(format!("committed={c:?} に半角数字が無い（F10 の表記固定が効いていない）"));
+                }
+                Ok(())
+            } },
+        // item47: 候補の選択を動かしたら、アプリ側に見えているインライン（preedit）もその候補になる。
+        // 実機報告「Space で候補窓のハイライトは動くのに本文の文字が変わらない」の回帰。
+        // item4 は同じ打鍵なのに ev=candidate_move の発火だけを見ており、この不具合を通してしまった
+        // ので、そちらは素の smoke のまま残し、preedit の追随はこの item で挟む。
+        Scenario { item: 47, name: "preedit follows the selected candidate while space cycles",
+            keys: { let mut k = typed("nihongo"); k.push(SPACE); k.push(SPACE); k },
+            expect: |_c, _f, p, evs, _l| {
+                // 前提1: 候補が 2 件以上。1 件だと選択が循環して sel=0 のままになり、
+                // 下のアサートが「追随していない」と誤報する偽 FAIL になる（item10 と同じ作法）。
+                let list = evs.iter().find_map(|e| match e {
+                    Ev::CandidatesShown { n, list, .. } if *n >= 2 && list.len() >= 2 => Some(list.clone()),
+                    _ => None,
+                }).ok_or("候補が 2 件以上出ていない（2 回目の Space で sel 0→1 に動ける前提が崩れる）")?;
+                // 前提2: 候補 0 と 1 が別文字列であること。同一だと preedit が候補 0 のまま
+                // 固まっていても最終アサートが通り、壊れた実装のまま空振り PASS する。
+                if list[0] == list[1] {
+                    return Err(format!("候補 0/1 が同一文字列 {:?}（preedit の追随を判定できない）", list[0]));
+                }
+                // 選択そのものは動いたか。ここで落ちるなら原因は preedit ではなくキー配線側。
+                if !evs.iter().any(|e| matches!(e, Ev::CandidateMove { sel: 1 })) {
+                    return Err("2 回目の Space で選択が 0→1 に動いていない（ev=candidate_move sel=1 が無い）".into());
+                }
+                if p != list[1] {
+                    return Err(format!(
+                        "preedit={:?} != 選択中の候補 {:?}（選択だけ動いてインラインが追随していない）",
+                        p, list[1]
+                    ));
+                }
+                Ok(())
+            } },
+        // item48: 候補を送ってから Esc で候補窓だけ閉じると、インラインは「閉じた後の Enter が
+        // 確定する文字列」＝ライブ変換結果へ戻る。item47 で preedit が選択へ追随するように
+        // なった結果、Esc がそれを残すと「送った先の候補が見えたままライブ結果が確定される」
+        // ズレが実際に観測できるようになったため、その回帰をここで塞ぐ。
+        // item6 は Esc×2 の取消（文書が空）を見るだけで、1 回目の Esc 直後の表示を見ていない。
+        Scenario { item: 48, name: "esc closes candidates and puts the inline text back to the live conversion",
+            keys: { let mut k = typed("nihongo"); k.push(SPACE); k.push(SPACE); k.push(ESC); k },
+            expect: |_c, _f, p, evs, _l| {
+                let list = evs.iter().find_map(|e| match e {
+                    Ev::CandidatesShown { n, list, .. } if *n >= 2 && list.len() >= 2 => Some(list.clone()),
+                    _ => None,
+                }).ok_or("候補が 2 件以上出ていない（2 回目の Space で sel 0→1 に動ける前提が崩れる）")?;
+                // 前提: 送った先の候補がライブ変換結果と別文字列であること。同一だと preedit が
+                // 候補のまま残っていても下のアサートが通り、壊れた実装のまま空振り PASS する。
+                if list[1] == "日本語" {
+                    return Err(format!("候補 1 が {:?}＝ライブ変換結果と同一（Esc の描き戻しを判定できない）", list[1]));
+                }
+                if !evs.iter().any(|e| matches!(e, Ev::CandidateMove { sel: 1 })) {
+                    return Err("2 回目の Space で選択が 0→1 に動いていない（ev=candidate_move sel=1 が無い）".into());
+                }
+                if !evs.iter().any(|e| matches!(e, Ev::CandidatesHidden)) {
+                    return Err("Esc で候補窓が閉じていない（ev=candidates_hidden が無い）".into());
+                }
+                // item2/item5 が定める "nihongo" のライブ変換結果。Esc 後の Enter はこれを確定する
+                // ので、見えている文字列もこれでなければ「見た目と確定が違う」ことになる。
+                // 直値で固定できるのは、描き戻しがデバウンス（ヘッドレスでは打鍵中に発火しない）
+                // ではなく Esc 内の engine_live_convert で素材を取るため。
+                if p != "日本語" {
+                    return Err(format!(
+                        "preedit={:?} != 日本語（Esc で候補プレビューが残り、確定される文字列と食い違う）",
+                        p
+                    ));
+                }
+                Ok(())
             } },
     ]
 }
