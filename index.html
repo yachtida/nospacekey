@@ -220,7 +220,6 @@
       paint(seg.kana[i]);
       await sleep(115 + Math.random() * 70);
     }
-    while (ri < seg.roman.length){ roman += seg.roman[ri++]; keys++; }
     await sleep(240);
     paint(seg.fixed);
     await sleep(260);
