@@ -135,6 +135,18 @@
     .demo .caret{animation:none}
   }
 
+  .why{display:flex;flex-direction:column;gap:44px}
+  .why .sym{
+    font-family:var(--mono);font-size:13.5px;line-height:1.85;
+    color:var(--shu);white-space:pre-wrap;word-break:break-word;
+    margin-bottom:12px;
+  }
+  .why .quote{
+    font-size:15px;color:var(--usuzumi);
+    border-left:2px solid var(--kei);padding-left:16px;margin-bottom:12px;
+  }
+  .why p{font-size:15.5px}
+
   @keyframes blink{50%{opacity:0}}
 </style>
 </head>
@@ -170,6 +182,25 @@
     </div>
     <p class="meta">v1.1.0 · Windows 11 x64 · 約 31 MB · MIT</p>
   </div>
+
+  <section class="wrap">
+    <h2>日本語 IME が、開発者につらい理由</h2>
+    <div class="why">
+      <div>
+        <p class="sym">$ ｇｉｔ　ｓｔａｔｕｓ
+command not found</p>
+        <p>普段は半角英数のまま。<kbd>F8</kbd> で入った日本語は、確定した瞬間に英数へ戻る。切り忘れという状態が存在しない。</p>
+      </div>
+      <div>
+        <p class="sym">error: expected `;`, found `；`</p>
+        <p>日本語モードの最中でも、記号は半角のまま入る。全角にしたければ設定で選べる。</p>
+      </div>
+      <div>
+        <p class="quote">議事録を取っていると、変換と確定の合いの手で手が止まる</p>
+        <p>ライブ変換は候補を出すだけでなく、確定まで自動で進む。</p>
+      </div>
+    </div>
+  </section>
 </main>
 
 <footer>
