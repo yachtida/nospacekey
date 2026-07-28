@@ -147,6 +147,25 @@
   }
   .why p{font-size:15.5px}
 
+  table{border-collapse:collapse;width:100%;font-size:15px}
+  td{
+    text-align:left;vertical-align:top;padding:16px 0;
+    border-bottom:1px solid var(--kei);
+  }
+  td:first-child{width:11em;padding-right:24px;font-weight:500}
+  td b{font-weight:500}
+  @media (max-width:620px){
+    table,tbody,tr,td{display:block}
+    td{border:0;padding:2px 0}
+    td:first-child{width:auto;padding-right:0;color:var(--usuzumi)}
+    tr{display:block;padding:14px 0;border-bottom:1px solid var(--kei)}
+  }
+  .note{font-size:13px;color:var(--usuzumi);margin-top:20px;max-width:34em}
+
+  .privacy{list-style:none;max-width:34em}
+  .privacy li{position:relative;padding-left:1.3em;margin-bottom:12px;font-size:15.5px}
+  .privacy li::before{content:"—";position:absolute;left:0;color:var(--usuzumi)}
+
   @keyframes blink{50%{opacity:0}}
 </style>
 </head>
@@ -200,6 +219,32 @@ command not found</pre>
         <p>ライブ変換は候補を出すだけでなく、確定まで自動で進む。</p>
       </div>
     </div>
+  </section>
+
+  <section class="wrap">
+    <h2>打てば、こうなる</h2>
+    <table>
+      <tbody>
+        <tr><td>そのまま打ち続ける</td><td><b>ライブ変換</b> — 打鍵に追随して変換が進み、確定まで自動。従来の Space 変換もそのまま使える</td></tr>
+        <tr><td><kbd>F8</kbd></td><td><b>一時日本語モード</b> — 確定した瞬間に半角英数へ復帰する</td></tr>
+        <tr><td>選択して <kbd>変換</kbd></td><td><b>モードレス再変換</b> — 半角英数で打ったローマ字を、あとから日本語にする</td></tr>
+        <tr><td><kbd>Tab</kbd></td><td><b>修正変換</b> — 「こんんいちは」を修復。誤読みごと学習し、次からは通常の変換で直る</td></tr>
+        <tr><td><kbd>Shift</kbd> + 英字</td><td>文中に英単語をそのまま混ぜる</td></tr>
+        <tr><td>(opt-in)</td><td><b>Zenzai</b> — GGUF モデルを置くと、文脈を読む変換がローカル CPU で動く。無ければ古典 LOUDS 変換</td></tr>
+      </tbody>
+    </table>
+    <p class="note">キーは 12 機能すべて設定 GUI でリバインドでき、衝突は保存時に検出される。起動時から半角英数で始める設定もある。</p>
+  </section>
+
+  <section class="wrap">
+    <h2>IME は、あなたが打つすべてを見ている</h2>
+    <ul class="privacy">
+      <li>入力内容・変換履歴・テレメトリ・クラッシュレポートのいずれも送信しない。クラウド変換 API は存在しない。</li>
+      <li>変換も学習も、古典 LOUDS もニューラル(llama.cpp / CPU)も、この PC の中だけで動く。</li>
+      <li>パスワード欄では変換も学習もしない。</li>
+      <li>全コードを公開している(MIT)。TSF 層は Rust、変換エンジンホストは Swift。</li>
+    </ul>
+    <p class="note"><a href="https://github.com/yachtida/nospacekey/blob/master/PRIVACY.md">PRIVACY.md</a> / <a href="https://github.com/yachtida/nospacekey/blob/master/SECURITY.md">SECURITY.md</a></p>
   </section>
 </main>
 
