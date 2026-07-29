@@ -164,6 +164,23 @@
   .privacy li{position:relative;padding-left:1.3em;margin-bottom:12px;font-size:15.5px}
   .privacy li::before{content:"—";position:absolute;left:0;color:var(--usuzumi)}
 
+  ol.steps{list-style:none;counter-reset:s;margin-bottom:36px}
+  ol.steps li{
+    counter-increment:s;position:relative;
+    padding:0 0 24px 46px;max-width:34em;font-size:15.5px;
+  }
+  ol.steps li::before{
+    content:counter(s);position:absolute;left:0;top:4px;
+    width:28px;height:28px;display:grid;place-items:center;
+    border:1px solid var(--kei);
+    font-family:var(--mono);font-size:13px;color:var(--usuzumi);
+  }
+  pre.sh{
+    font-family:var(--mono);font-size:13px;line-height:1.9;
+    border-top:1px solid var(--kei);border-bottom:1px solid var(--kei);
+    padding:16px 0;overflow-x:auto;
+  }
+
   @keyframes blink{50%{opacity:0}}
 </style>
 </head>
@@ -242,10 +259,23 @@ command not found</pre>
     </ul>
     <p class="note"><a href="https://github.com/yachtida/nospacekey/blob/master/PRIVACY.md">PRIVACY.md</a> / <a href="https://github.com/yachtida/nospacekey/blob/master/SECURITY.md">SECURITY.md</a></p>
   </section>
+
+  <section class="wrap">
+    <h2>入れる</h2>
+    <ol class="steps">
+      <li><a href="https://github.com/yachtida/nospacekey/releases/latest">Releases</a> から <code>nospacekey-setup-1.1.0-devsigned.exe</code> を取得する。</li>
+      <li>実行する。IME の登録はマシン単位のため管理者昇格を求められる。開発用の自己署名なので SmartScreen の警告が出る —「詳細情報」→「実行」で続行できる。</li>
+      <li><kbd>Win</kbd> + <kbd>Space</kbd> で「nospacekey」を選ぶ。</li>
+    </ol>
+    <pre class="sh">&gt; Get-FileHash .\nospacekey-setup-1.1.0-devsigned.exe -Algorithm SHA256</pre>
+    <p class="note">出力を、リリースに添付された <code>SHA256SUMS.txt</code> と照合できる。</p>
+  </section>
 </main>
 
 <footer>
   <div class="wrap">
+    <p>変換エンジン <a href="https://github.com/azooKey/AzooKeyKanaKanjiConverter">AzooKeyKanaKanjiConverter</a>、モデル <a href="https://huggingface.co/Miwa-Keita/zenz-v3.1-small-gguf">zenz-v3.1-small</a>、推論に <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> を使っている。azooKey とは独立した非公式プロジェクトで、不具合や質問は <a href="https://github.com/yachtida/nospacekey/issues">当リポジトリの Issue</a> へ。</p>
+    <p>MIT License に基づき現状有姿・無保証で提供される(<a href="https://github.com/yachtida/nospacekey/blob/master/README.md">免責事項</a>)。© 2026 nospacekey project contributors</p>
   </div>
 </footer>
 
