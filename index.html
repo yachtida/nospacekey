@@ -5,6 +5,7 @@
      ファイル名 (3) pre.sh の Get-FileHash のファイル名 (4) og.png の再生成。
      機能の個数など、ソースを見ないと確かめられない数はページに書かないこと。 -->
 <meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>nospacekey — Space を押さない。モードと戦わない。</title>
 <meta name="description" content="打鍵に追随して変換が進むライブ変換と、確定した瞬間に半角英数へ戻る一時日本語モード。Windows 用のかな漢字変換 IME。変換も学習もローカル完結、オープンソース(MIT)。">
@@ -13,6 +14,9 @@
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://yachtida.github.io/nospacekey/">
 <meta property="og:image" content="https://yachtida.github.io/nospacekey/og.png">
+<meta property="og:image:alt" content="Space を押さない。モードと戦わない。 — nospacekey">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://yachtida.github.io/nospacekey/og.png">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%231D3A6B'/%3E%3Ctext x='32' y='46' font-size='40' font-family='serif' fill='%23FCFCFA' text-anchor='middle'%3Eあ%3C/text%3E%3C/svg%3E">
@@ -21,6 +25,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500&family=Zen+Old+Mincho:wght@600&display=swap" rel="stylesheet">
 <style>
   :root{
+    color-scheme:light dark;
     --kami:#FCFCFA;
     --sumi:#14161A;
     --usuzumi:#6B7280;
@@ -208,8 +213,8 @@
     <div class="demo">
       <p class="sr-only">デモ: 32 打鍵、Space 0 回で「変換キーの誤発火を修正した」まで変換が進む様子を再生しています。</p>
       <div aria-hidden="true">
-        <div class="roman" id="roman"></div>
-        <div class="field"><div class="text" id="text"></div></div>
+        <div class="roman" id="roman">henkanki-nogohakkawoshuuseishita</div>
+        <div class="field"><div class="text" id="text">変換キーの誤発火を修正した</div></div>
         <div class="count" id="count">32 打鍵 · Space 0</div>
       </div>
     </div>
@@ -227,11 +232,13 @@
     <h2>日本語 IME が、開発者につらい理由</h2>
     <div class="why">
       <div>
+        <p class="sr-only">コマンドが全角で入力されてしまった例。</p>
         <pre class="sym">$ ｇｉｔ　ｓｔａｔｕｓ
 command not found</pre>
         <p>普段は半角英数のまま。<kbd>F8</kbd> で入った日本語は、確定した瞬間に英数へ戻る。切り忘れという状態が存在しない。</p>
       </div>
       <div>
+        <p class="sr-only">セミコロンが全角になってしまった例。</p>
         <pre class="sym">error: expected `;`, found `；`</pre>
         <p>日本語モードの最中でも、記号は半角のまま入る。全角にしたければ設定で選べる。</p>
       </div>
@@ -273,7 +280,7 @@ command not found</pre>
       <li>実行する。IME の登録はマシン単位のため管理者昇格を求められる。開発用の自己署名なので SmartScreen の警告が出る —「詳細情報」→「実行」で続行できる。</li>
       <li><kbd>Win</kbd> + <kbd>Space</kbd> で「nospacekey」を選ぶ。</li>
     </ol>
-    <pre class="sh">&gt; Get-FileHash .\nospacekey-setup-1.1.0-devsigned.exe -Algorithm SHA256</pre>
+    <pre class="sh" tabindex="0" aria-label="ダウンロードしたファイルのハッシュを確認するコマンド">&gt; Get-FileHash .\nospacekey-setup-1.1.0-devsigned.exe -Algorithm SHA256</pre>
     <p class="note">出力を、リリースに添付された <code>SHA256SUMS.txt</code> と照合できる。</p>
   </section>
 </main>
@@ -287,7 +294,8 @@ command not found</pre>
 
 <script>
 (function(){
-  const reduce  = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
+  let reduce = motionQuery.matches;
   const romanEl = document.getElementById('roman');
   const textEl  = document.getElementById('text');
   const countEl = document.getElementById('count');
@@ -323,6 +331,7 @@ command not found</pre>
     const n = seg.kana.length;
     let ri = 0;
     for (let i = 0; i < n; i++){
+      if (reduce) return;
       const upto = Math.round(seg.roman.length * (i + 1) / n);
       while (ri < upto){ roman += seg.roman[ri++]; keys++; }
       paint(seg.kana[i]);
@@ -338,13 +347,19 @@ command not found</pre>
 
   async function loop(){
     for(;;){
+      if (reduce) return;
       done = ''; roman = ''; keys = 0;
       paint('');
       await sleep(1000);
-      for (const s of SEGS) await typeSeg(s);
+      for (const s of SEGS){ if (reduce) return; await typeSeg(s); }
       await sleep(8000);
     }
   }
+
+  // OS 設定は起動後にも変わりうる。切り替わった瞬間 reduce を更新し、
+  // 上のチェックポイントでループを止める(CSS のキャレット点滅は
+  // メディアクエリ自体が効くので、ここでは JS の打鍵ループだけ止めればよい)。
+  motionQuery.addEventListener('change', e => { reduce = e.matches; });
 
   if (reduce){
     textEl.textContent  = SEGS.map(s => s.fixed).join('');
