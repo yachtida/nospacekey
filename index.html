@@ -148,14 +148,13 @@
   .why p{font-size:15.5px}
 
   .spec{
-    display:grid;grid-template-columns:11em 1fr;
-    column-gap:24px;font-size:15px;
+    display:grid;grid-template-columns:11em 1fr;font-size:15px;
   }
-  .spec dt{padding:16px 0;border-bottom:1px solid var(--kei);font-weight:500}
+  .spec dt{padding:16px 24px 16px 0;border-bottom:1px solid var(--kei);font-weight:500}
   .spec dd{padding:16px 0;border-bottom:1px solid var(--kei)}
   .spec b{font-weight:500}
   @media (max-width:620px){
-    .spec{grid-template-columns:1fr;column-gap:0}
+    .spec{grid-template-columns:1fr}
     .spec dt{padding:14px 0 0;border-bottom:0;color:var(--usuzumi)}
     .spec dd{padding:2px 0 14px}
   }
