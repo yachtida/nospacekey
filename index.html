@@ -3,8 +3,8 @@
 <head>
 <!-- リリースのたびに直す箇所: (1) p.meta のバージョン行 (2) 入れる ステップ 1 の
      ファイル名 (3) pre.sh の Get-FileHash のファイル名 (4) og.png の再生成。
-     デモ文(script 内 SEGS)を変えたら: sr-only の説明文と、noscript 用の静的
-     #roman/#text/#count の打鍵数もあわせて直す(3 箇所が同じ 32 を持っている)。
+     デモ文(script 内 SEGS)を変えたら: sr-only の説明文と、JS 無効時にそのまま
+     表示される初期 HTML の #roman/#text/#count もあわせて直す(3 箇所が同じ 32 を持っている)。
      機能の個数など、ソースを見ないと確かめられない数はページに書かないこと。 -->
 <meta charset="utf-8">
 <meta name="referrer" content="no-referrer">
@@ -120,10 +120,15 @@
   }
   .demo .text{
     font-family:var(--mincho);font-weight:600;
-    /* 下限 20px: 320px 幅(内容 272px)で 13 文字の確定文が 1 行に収まる上限。
-       24px だと 2 行に折れ、min-height:1.6em が破れてアニメーション中に高さが暴れる。 */
+    /* 下限 20px + 狭幅だけ 2 行分の min-height(下の media query)。アニメーション中の
+       最長行は確定文(13 字)ではなく done+pre の 16 字(「変換キーの誤発火を」+「しゅうせいした」)
+       なので、374px 未満では 20px でも折り返す。折り返し自体は許し、高さを 2 行で
+       固定して「min-height が破れて毎サイクル上下する」ことだけを防ぐ。 */
     font-size:clamp(20px,4.4vw,42px);line-height:1.6;letter-spacing:.02em;
     font-feature-settings:"palt" 1;min-height:1.6em;
+  }
+  @media (max-width:380px){
+    .demo .text{min-height:3.2em}
   }
   .demo .pre{border-bottom:2px dotted var(--ai);padding-bottom:2px}
   .demo .caret{
@@ -189,6 +194,10 @@
   .privacy li::before{
     content:"";position:absolute;left:0;top:.95em;
     width:.85em;height:1px;background:var(--usuzumi);
+  }
+  /* 強制カラーモードは background を消すので、線をシステム色で描き直す。 */
+  @media (forced-colors:active){
+    .privacy li::before{background:CanvasText}
   }
 
   ol.steps{list-style:none;counter-reset:s;margin-bottom:36px}
@@ -282,7 +291,7 @@
     <h2>IME は、あなたが打つすべてを見ている</h2>
     <ul class="privacy" role="list">
       <li>入力内容・変換履歴・テレメトリ・クラッシュレポートのいずれも送信しない。クラウド変換 API は存在しない。</li>
-      <li>ネットワークに出るのは、インストール時に Zenzai モデルを Hugging Face から取得するときだけ。インストーラのチェックで外せる。</li>
+      <li>ネットワークに出るのは、Zenzai モデルを Hugging Face から取得するときだけ。取得はインストーラのチェック(外せる)か、設定 GUI での明示的なダウンロード操作に限られる。</li>
       <li>変換も学習も、古典 LOUDS もニューラル(llama.cpp / CPU)も、この PC の中だけで動く。</li>
       <li>パスワード欄では変換も学習もしない。</li>
       <li>全コードを公開している(MIT)。TSF 層は Rust、変換エンジンホストは Swift。</li>
@@ -298,9 +307,10 @@
       <li><kbd>Win</kbd> + <kbd>Space</kbd> で「nospacekey」を選ぶ。</li>
     </ol>
     <!-- role="group": pre の暗黙ロール generic には aria-label を置けない(ARIA 1.2 で
-         禁止、AT が名前を公開しない)。プロンプト記号を書かないのは、コピペ実行時に
-         PowerShell が > をリダイレクトとして解釈するため。 -->
-    <pre class="sh" lang="en" tabindex="0" role="group" aria-label="ダウンロードしたファイルのハッシュを確認するコマンド">Get-FileHash .\nospacekey-setup-1.1.0-devsigned.exe -Algorithm SHA256</pre>
+         禁止、AT が名前を公開しない)。lang="en" は内側の code だけに付ける — pre に
+         付けるとアクセシブル名(日本語)が英語音声で読まれる。プロンプト記号を書かない
+         のは、コピペ実行時に PowerShell が > をリダイレクトとして解釈するため。 -->
+    <pre class="sh" tabindex="0" role="group" aria-label="ダウンロードしたファイルのハッシュを確認するコマンド"><code lang="en">Get-FileHash .\nospacekey-setup-1.1.0-devsigned.exe -Algorithm SHA256</code></pre>
     <p class="note">出力を、リリースに添付された <code>SHA256SUMS.txt</code> と照合できる。</p>
     <p class="note">動作環境は Windows 10 / 11 の x64。32bit アプリへの入力は未対応。Zenzai を使う場合は AVX2 対応 CPU が必要。</p>
   </section>
@@ -341,13 +351,17 @@
   let done = '', roman = '', keys = 0;
 
   // ローマ字は文節間でも連結する。区切りを入れないこと自体が「Space を押していない」証拠になる。
-  function paint(pre){
+  // g の検査を呼び出し側に任せないこと: typeSeg の確定フェーズ(await の合間)だけで
+  // 640ms あり、そこで reduce に切り替わると renderFinal() の直後に古い paint が
+  // DOM を上書きして未確定表示のまま止まる。描画の門でまとめて塞ぐ。
+  function paint(pre, g){
+    if (g !== gen) return;
     textEl.innerHTML  = esc(done) + (pre ? '<span class="pre">' + esc(pre) + '</span>' : '') + CARET;
     romanEl.textContent = roman;
     countEl.textContent = keys + ' 打鍵 · Space 0';
   }
 
-  // 完成状態の静的描画。noscript 用のプリレンダ HTML と同じ内容を出す。
+  // 完成状態の静的描画。初期 HTML(JS 無効時にそのまま見える)と同じ内容を出す。
   // reduce への切替はループの単純停止ではダメ: 未確定のかな(.pre 下線)と中途の
   // 打鍵数が画面に残り、製品が確定しないままになるという誤った印象を与える。
   // 必ずこの完成状態へ着地させる。
@@ -368,14 +382,14 @@
       if (g !== gen) return;
       const upto = Math.round(seg.roman.length * (i + 1) / n);
       while (ri < upto){ roman += seg.roman[ri++]; keys++; }
-      paint(seg.kana[i]);
+      paint(seg.kana[i], g);
       await sleep(115 + Math.random() * 70);
     }
     await sleep(240);
-    paint(seg.fixed);
+    paint(seg.fixed, g);
     await sleep(260);
     done += seg.fixed;
-    paint('');
+    paint('', g);
     await sleep(140);
   }
 
@@ -389,7 +403,7 @@
       hold = 8000;
       if (g !== gen) return;
       done = ''; roman = ''; keys = 0;
-      paint('');
+      paint('', g);
       await sleep(1000);
       for (const s of SEGS){ if (g !== gen) return; await typeSeg(s, g); }
     }
