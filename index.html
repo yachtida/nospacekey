@@ -1,8 +1,7 @@
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-<!-- リリースのたびに直す箇所: (1) p.meta のバージョン行 (2) 入れる ステップ 1 の
-     ファイル名 (3) pre.sh の Get-FileHash のファイル名 (4) og.png の再生成。
+<!-- リリースのたびに直す箇所: (1) p.meta のバージョン行 (2) og.png の再生成。
      デモ文(script 内 SEGS)を変えたら: JS 無効時にそのまま表示される初期 HTML
      (#roman/#text/#count)もあわせて直す。リテラル 32(打鍵数)は sr-only の説明文と
      #count の 2 箇所にあり、#roman の文字列長もこれと一致させること。
@@ -209,8 +208,8 @@
   .why p{font-size:15.5px}
 
   .spec{
-    /* 12em: 最長 dt「そのまま打ち続ける」(9 字) + padding 24px に、フォント代替
-       (Noto Sans JP 未ロード時)の字送り差を吸収する余白を足した値。11em では 6px しか余らない。 */
+    /* 12em: 最長 dt「一時日本語モード」(8 字 = 120px) + padding 24px に、フォント代替
+       (Noto Sans JP 未ロード時)の字送り差を吸収する余白を足した値。 */
     display:grid;grid-template-columns:12em 1fr;font-size:15px;
   }
   .spec dt{padding:16px 24px 16px 0;border-bottom:1px solid var(--kei);font-weight:500}
@@ -234,23 +233,6 @@
   /* 強制カラーモードは background を消すので、線をシステム色で描き直す。 */
   @media (forced-colors:active){
     .privacy li::before{background:CanvasText}
-  }
-
-  ol.steps{list-style:none;counter-reset:s;margin-bottom:36px}
-  ol.steps li{
-    counter-increment:s;position:relative;
-    padding:0 0 24px 46px;max-width:34em;font-size:15.5px;
-  }
-  ol.steps li::before{
-    content:counter(s);position:absolute;left:0;top:4px;
-    width:28px;height:28px;display:grid;place-items:center;
-    border:1px solid var(--kei);
-    font-family:var(--mono);font-size:13px;color:var(--usuzumi);
-  }
-  pre.sh{
-    font-family:var(--mono);font-size:13px;line-height:1.9;
-    border-top:1px solid var(--kei);border-bottom:1px solid var(--kei);
-    padding:16px 0;overflow-x:auto;
   }
 
   @keyframes blink{50%{opacity:0}}
@@ -315,12 +297,12 @@ command not found</pre>
   <section class="wrap">
     <h2>打てば、こうなる</h2>
     <dl class="spec">
-      <dt>そのまま打ち続ける</dt><dd><b>ライブ変換</b> — 打鍵に追随して変換が進み、確定まで自動。従来の Space 変換もそのまま使える</dd>
-      <dt><kbd>F8</kbd></dt><dd><b>一時日本語モード</b> — 確定した瞬間に半角英数へ復帰する</dd>
-      <dt>選択して <kbd>変換</kbd></dt><dd><b>モードレス再変換</b> — 半角英数で打ったローマ字を、あとから日本語にする</dd>
-      <dt><kbd>Tab</kbd></dt><dd><b>修正変換</b> — 「こんんいちは」を修復。誤読みごと学習し、次からは通常の変換で直る</dd>
-      <dt><kbd>Shift</kbd> + 英字</dt><dd>文中に英単語をそのまま混ぜる</dd>
-      <dt>(選択式)</dt><dd><b>Zenzai</b> — 文脈を読むニューラル変換がローカル CPU(要 AVX2)で動く。モデル(GGUF、約 70 MB)はインストーラが既定で取得する — チェックを外せば古典 LOUDS 変換のみ</dd>
+      <dt>ライブ変換</dt><dd>そのまま打ち続けるだけで変換が進み、確定まで自動。従来の Space 変換もそのまま使える</dd>
+      <dt>一時日本語モード</dt><dd><kbd>F8</kbd> で日本語に入り、確定した瞬間に半角英数へ復帰する</dd>
+      <dt>モードレス再変換</dt><dd>半角英数で打ったローマ字を選択して <kbd>変換</kbd> — あとから日本語にできる</dd>
+      <dt>修正変換</dt><dd>「こんんいちは」を <kbd>Tab</kbd> で修復。誤読みごと学習し、次からは通常の変換で直る</dd>
+      <dt>英単語の混在</dt><dd><kbd>Shift</kbd> + 英字で、文中に英単語をそのまま混ぜる</dd>
+      <dt>Zenzai(選択式)</dt><dd>文脈を読むニューラル変換がローカル CPU(要 AVX2)で動く。モデル(GGUF、約 70 MB)はインストーラが既定で取得する — チェックを外せば古典 LOUDS 変換のみ</dd>
     </dl>
     <p class="note">機能キーの割り当ては設定 GUI で変えられ(割り当て先は列挙されたキーから選ぶ)、衝突は保存時に検出される。IME に切り替えた直後を半角英数で始める設定もある。</p>
   </section>
@@ -337,21 +319,6 @@ command not found</pre>
     <p class="note"><a href="https://github.com/yachtida/nospacekey/blob/master/PRIVACY.md">PRIVACY.md</a> / <a href="https://github.com/yachtida/nospacekey/blob/master/SECURITY.md">SECURITY.md</a></p>
   </section>
 
-  <section class="wrap">
-    <h2>入れる</h2>
-    <ol class="steps" role="list">
-      <li><a href="https://github.com/yachtida/nospacekey/releases/latest">Releases</a> から <code>nospacekey-setup-1.1.0-devsigned.exe</code> を取得する。</li>
-      <li>実行する。IME の登録はマシン単位のため管理者昇格を求められる。開発用の自己署名なので SmartScreen の警告が出る —「詳細情報」→「実行」で続行できる。</li>
-      <li><kbd>Win</kbd> + <kbd>Space</kbd> で「nospacekey」を選ぶ。</li>
-    </ol>
-    <!-- role="group": pre の暗黙ロール generic には aria-label を置けない(ARIA 1.2 で
-         禁止、AT が名前を公開しない)。lang="en" は内側の code だけに付ける — pre に
-         付けるとアクセシブル名(日本語)が英語音声で読まれる。プロンプト記号を書かない
-         のは、コピペ実行時に PowerShell が > をリダイレクトとして解釈するため。 -->
-    <pre class="sh" tabindex="0" role="group" aria-label="ダウンロードしたファイルのハッシュを確認するコマンド"><code lang="en">Get-FileHash .\nospacekey-setup-1.1.0-devsigned.exe -Algorithm SHA256</code></pre>
-    <p class="note">出力を、リリースに添付された <code>SHA256SUMS.txt</code> と照合できる。</p>
-    <p class="note">動作環境は Windows 10 / 11 の x64。32bit アプリへの入力は未対応。Zenzai を使う場合は AVX2 対応 CPU が必要。</p>
-  </section>
 </main>
 
 <footer>
