@@ -3,6 +3,8 @@
 <head>
 <!-- リリースのたびに直す箇所: (1) p.meta のバージョン行 (2) 入れる ステップ 1 の
      ファイル名 (3) pre.sh の Get-FileHash のファイル名 (4) og.png の再生成。
+     デモ文(script 内 SEGS)を変えたら: sr-only の説明文と、noscript 用の静的
+     #roman/#text/#count の打鍵数もあわせて直す(3 箇所が同じ 32 を持っている)。
      機能の個数など、ソースを見ないと確かめられない数はページに書かないこと。 -->
 <meta charset="utf-8">
 <meta name="referrer" content="no-referrer">
@@ -12,7 +14,10 @@
 <meta property="og:title" content="nospacekey — Space を押さない。モードと戦わない。">
 <meta property="og:description" content="打鍵に追随して変換が進むライブ変換と、確定した瞬間に半角英数へ戻る一時日本語モード。Windows 用のかな漢字変換 IME。">
 <meta property="og:type" content="website">
+<link rel="canonical" href="https://yachtida.github.io/nospacekey/">
 <meta property="og:url" content="https://yachtida.github.io/nospacekey/">
+<meta property="og:site_name" content="nospacekey">
+<meta property="og:locale" content="ja_JP">
 <meta property="og:image" content="https://yachtida.github.io/nospacekey/og.png">
 <meta property="og:image:alt" content="Space を押さない。モードと戦わない。 — nospacekey">
 <meta property="og:image:width" content="1200">
@@ -62,7 +67,7 @@
   :focus-visible{outline:2px solid var(--ai);outline-offset:3px}
   .sr-only{
     position:absolute;width:1px;height:1px;padding:0;margin:-1px;
-    overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0;
+    overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0;
   }
 
   h1{
@@ -115,7 +120,9 @@
   }
   .demo .text{
     font-family:var(--mincho);font-weight:600;
-    font-size:clamp(24px,4.4vw,42px);line-height:1.6;letter-spacing:.02em;
+    /* 下限 20px: 320px 幅(内容 272px)で 13 文字の確定文が 1 行に収まる上限。
+       24px だと 2 行に折れ、min-height:1.6em が破れてアニメーション中に高さが暴れる。 */
+    font-size:clamp(20px,4.4vw,42px);line-height:1.6;letter-spacing:.02em;
     font-feature-settings:"palt" 1;min-height:1.6em;
   }
   .demo .pre{border-bottom:2px dotted var(--ai);padding-bottom:2px}
@@ -136,7 +143,9 @@
     padding:13px 26px;border-radius:4px;text-decoration:none;
   }
   .btn-p{background:var(--ai);color:var(--kami)}
-  .btn-s{border:1px solid var(--kei);color:var(--sumi)}
+  /* 境界色に --kei を使わないこと: 罫線用の 1.25:1 では WCAG 1.4.11(非テキスト 3:1)を
+     割り、コントロールの唯一の視覚境界が消える環境が出る。--usuzumi は両テーマで 3:1 超。 */
+  .btn-s{border:1px solid var(--usuzumi);color:var(--sumi)}
   .meta{
     font-family:var(--mono);font-size:12px;color:var(--usuzumi);
     letter-spacing:.06em;margin-top:20px;
@@ -159,7 +168,9 @@
   .why p{font-size:15.5px}
 
   .spec{
-    display:grid;grid-template-columns:11em 1fr;font-size:15px;
+    /* 12em: 最長 dt「そのまま打ち続ける」(9 字) + padding 24px に、フォント代替
+       (Noto Sans JP 未ロード時)の字送り差を吸収する余白を足した値。11em では 6px しか余らない。 */
+    display:grid;grid-template-columns:12em 1fr;font-size:15px;
   }
   .spec dt{padding:16px 24px 16px 0;border-bottom:1px solid var(--kei);font-weight:500}
   .spec dd{padding:16px 0;border-bottom:1px solid var(--kei)}
@@ -173,7 +184,12 @@
 
   .privacy{list-style:none;max-width:34em}
   .privacy li{position:relative;padding-left:1.3em;margin-bottom:12px;font-size:15.5px}
-  .privacy li::before{content:"—";position:absolute;left:0;color:var(--usuzumi)}
+  /* content:"—" にしないこと: 生成文字はスクリーンリーダーが各項目の頭で「ダッシュ」と
+     読み上げるノイズになる。同じ見た目を空 content + 背景線で作る。 */
+  .privacy li::before{
+    content:"";position:absolute;left:0;top:.95em;
+    width:.85em;height:1px;background:var(--usuzumi);
+  }
 
   ol.steps{list-style:none;counter-reset:s;margin-bottom:36px}
   ol.steps li{
@@ -211,7 +227,7 @@
     <h1>Space を押さない。<br>モードと戦わない。</h1>
 
     <div class="demo">
-      <p class="sr-only">デモ: 32 打鍵、Space 0 回で「変換キーの誤発火を修正した」まで変換が進む様子を再生しています。</p>
+      <p class="sr-only">デモ: 「変換キーの誤発火を修正した」が 32 打鍵・Space 0 回で入力される例。</p>
       <div aria-hidden="true">
         <div class="roman" id="roman">henkanki-nogohakkawoshuuseishita</div>
         <div class="field"><div class="text" id="text">変換キーの誤発火を修正した</div></div>
@@ -225,7 +241,7 @@
       <a class="btn btn-p" href="https://github.com/yachtida/nospacekey/releases/latest">ダウンロード</a>
       <a class="btn btn-s" href="https://github.com/yachtida/nospacekey">GitHub</a>
     </div>
-    <p class="meta">v1.1.0 · Windows 11 x64 · 約 31 MB · MIT</p>
+    <p class="meta">v1.1.0 · Windows 10 / 11 x64 · 約 31 MB · MIT</p>
   </div>
 
   <section class="wrap">
@@ -234,13 +250,13 @@
       <div>
         <p class="sr-only">コマンドが全角で入力されてしまった例。</p>
         <pre class="sym">$ ｇｉｔ　ｓｔａｔｕｓ
-command not found</pre>
+<span lang="en">command not found</span></pre>
         <p>普段は半角英数のまま。<kbd>F8</kbd> で入った日本語は、確定した瞬間に英数へ戻る。切り忘れという状態が存在しない。</p>
       </div>
       <div>
         <p class="sr-only">セミコロンが全角になってしまった例。</p>
         <pre class="sym">error: expected `;`, found `；`</pre>
-        <p>日本語モードの最中でも、記号は半角のまま入る。全角にしたければ設定で選べる。</p>
+        <p>日本語モードの最中でも、<code>;</code> のような記号は半角のまま入る。記号・句読点・数字の幅は、それぞれ設定で選べる。</p>
       </div>
       <div>
         <p class="quote">議事録を取っていると、変換と確定の合いの手で手が止まる</p>
@@ -257,15 +273,16 @@ command not found</pre>
       <dt>選択して <kbd>変換</kbd></dt><dd><b>モードレス再変換</b> — 半角英数で打ったローマ字を、あとから日本語にする</dd>
       <dt><kbd>Tab</kbd></dt><dd><b>修正変換</b> — 「こんんいちは」を修復。誤読みごと学習し、次からは通常の変換で直る</dd>
       <dt><kbd>Shift</kbd> + 英字</dt><dd>文中に英単語をそのまま混ぜる</dd>
-      <dt>(opt-in)</dt><dd><b>Zenzai</b> — GGUF モデルを置くと、文脈を読む変換がローカル CPU で動く。無ければ古典 LOUDS 変換</dd>
+      <dt>(選択式)</dt><dd><b>Zenzai</b> — 文脈を読むニューラル変換がローカル CPU(要 AVX2)で動く。モデル(GGUF、約 70 MB)はインストーラが既定で取得する — チェックを外せば古典 LOUDS 変換のみ</dd>
     </dl>
-    <p class="note">キーは設定 GUI ですべてリバインドでき、衝突は保存時に検出される。起動時から半角英数で始める設定もある。</p>
+    <p class="note">機能キーの割り当ては設定 GUI で変えられ(割り当て先は列挙されたキーから選ぶ)、衝突は保存時に検出される。IME に切り替えた直後を半角英数で始める設定もある。</p>
   </section>
 
   <section class="wrap">
     <h2>IME は、あなたが打つすべてを見ている</h2>
-    <ul class="privacy">
+    <ul class="privacy" role="list">
       <li>入力内容・変換履歴・テレメトリ・クラッシュレポートのいずれも送信しない。クラウド変換 API は存在しない。</li>
+      <li>ネットワークに出るのは、インストール時に Zenzai モデルを Hugging Face から取得するときだけ。インストーラのチェックで外せる。</li>
       <li>変換も学習も、古典 LOUDS もニューラル(llama.cpp / CPU)も、この PC の中だけで動く。</li>
       <li>パスワード欄では変換も学習もしない。</li>
       <li>全コードを公開している(MIT)。TSF 層は Rust、変換エンジンホストは Swift。</li>
@@ -275,27 +292,30 @@ command not found</pre>
 
   <section class="wrap">
     <h2>入れる</h2>
-    <ol class="steps">
+    <ol class="steps" role="list">
       <li><a href="https://github.com/yachtida/nospacekey/releases/latest">Releases</a> から <code>nospacekey-setup-1.1.0-devsigned.exe</code> を取得する。</li>
       <li>実行する。IME の登録はマシン単位のため管理者昇格を求められる。開発用の自己署名なので SmartScreen の警告が出る —「詳細情報」→「実行」で続行できる。</li>
       <li><kbd>Win</kbd> + <kbd>Space</kbd> で「nospacekey」を選ぶ。</li>
     </ol>
-    <pre class="sh" tabindex="0" aria-label="ダウンロードしたファイルのハッシュを確認するコマンド">&gt; Get-FileHash .\nospacekey-setup-1.1.0-devsigned.exe -Algorithm SHA256</pre>
+    <!-- role="group": pre の暗黙ロール generic には aria-label を置けない(ARIA 1.2 で
+         禁止、AT が名前を公開しない)。プロンプト記号を書かないのは、コピペ実行時に
+         PowerShell が > をリダイレクトとして解釈するため。 -->
+    <pre class="sh" lang="en" tabindex="0" role="group" aria-label="ダウンロードしたファイルのハッシュを確認するコマンド">Get-FileHash .\nospacekey-setup-1.1.0-devsigned.exe -Algorithm SHA256</pre>
     <p class="note">出力を、リリースに添付された <code>SHA256SUMS.txt</code> と照合できる。</p>
+    <p class="note">動作環境は Windows 10 / 11 の x64。32bit アプリへの入力は未対応。Zenzai を使う場合は AVX2 対応 CPU が必要。</p>
   </section>
 </main>
 
 <footer>
   <div class="wrap">
-    <p>変換エンジン <a href="https://github.com/azooKey/AzooKeyKanaKanjiConverter">AzooKeyKanaKanjiConverter</a>、モデル <a href="https://huggingface.co/Miwa-Keita/zenz-v3.1-small-gguf">zenz-v3.1-small</a>、推論に <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> を使っている。azooKey とは独立した非公式プロジェクトで、不具合や質問は <a href="https://github.com/yachtida/nospacekey/issues">当リポジトリの Issue</a> へ。</p>
-    <p>MIT License に基づき現状有姿・無保証で提供される(<a href="https://github.com/yachtida/nospacekey/blob/master/README.md">免責事項</a>)。© 2026 nospacekey project contributors</p>
+    <p>変換エンジン <a href="https://github.com/azooKey/AzooKeyKanaKanjiConverter">AzooKeyKanaKanjiConverter</a>、モデル <a href="https://huggingface.co/Miwa-Keita/zenz-v3.1-small-gguf">zenz-v3.1-small</a>(CC-BY-SA-4.0)、推論に <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> を使っている。ほかの帰属表示は <a href="https://github.com/yachtida/nospacekey/blob/master/THIRD-PARTY-NOTICES.md">THIRD-PARTY-NOTICES</a> に。azooKey とは独立した非公式プロジェクトで、不具合や質問は <a href="https://github.com/yachtida/nospacekey/issues">当リポジトリの Issue</a> へ。</p>
+    <p>MIT License に基づき現状有姿・無保証で提供される(<a href="https://github.com/yachtida/nospacekey/blob/master/README.md#免責事項">免責事項</a>)。© 2026 nospacekey project contributors</p>
   </div>
 </footer>
 
 <script>
 (function(){
   const motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
-  let reduce = motionQuery.matches;
   const romanEl = document.getElementById('roman');
   const textEl  = document.getElementById('text');
   const countEl = document.getElementById('count');
@@ -327,11 +347,25 @@ command not found</pre>
     countEl.textContent = keys + ' 打鍵 · Space 0';
   }
 
-  async function typeSeg(seg){
+  // 完成状態の静的描画。noscript 用のプリレンダ HTML と同じ内容を出す。
+  // reduce への切替はループの単純停止ではダメ: 未確定のかな(.pre 下線)と中途の
+  // 打鍵数が画面に残り、製品が確定しないままになるという誤った印象を与える。
+  // 必ずこの完成状態へ着地させる。
+  function renderFinal(){
+    textEl.textContent  = SEGS.map(s => s.fixed).join('');
+    romanEl.textContent = SEGS.map(s => s.roman).join('');
+    countEl.textContent = TOTAL + ' 打鍵 · Space 0';
+  }
+
+  // 世代トークン。reduce の往復(OFF→ON→OFF)で loop が複数走ると DOM を取り合うため、
+  // boolean フラグでなく「自分が最新世代か」で各ループを自壊させる。
+  let gen = 0;
+
+  async function typeSeg(seg, g){
     const n = seg.kana.length;
     let ri = 0;
     for (let i = 0; i < n; i++){
-      if (reduce) return;
+      if (g !== gen) return;
       const upto = Math.round(seg.roman.length * (i + 1) / n);
       while (ri < upto){ roman += seg.roman[ri++]; keys++; }
       paint(seg.kana[i]);
@@ -346,25 +380,34 @@ command not found</pre>
   }
 
   async function loop(){
+    const g = ++gen;
+    // 初回はプリレンダの完成文をしばらく見せてから打ち始める。いきなり paint('') すると
+    // 読み込み直後に内容が 1 秒消える瞬きになる。
+    let hold = 2200;
     for(;;){
-      if (reduce) return;
+      await sleep(hold);
+      hold = 8000;
+      if (g !== gen) return;
       done = ''; roman = ''; keys = 0;
       paint('');
       await sleep(1000);
-      for (const s of SEGS){ if (reduce) return; await typeSeg(s); }
-      await sleep(8000);
+      for (const s of SEGS){ if (g !== gen) return; await typeSeg(s, g); }
     }
   }
 
-  // OS 設定は起動後にも変わりうる。切り替わった瞬間 reduce を更新し、
-  // 上のチェックポイントでループを止める(CSS のキャレット点滅は
-  // メディアクエリ自体が効くので、ここでは JS の打鍵ループだけ止めればよい)。
-  motionQuery.addEventListener('change', e => { reduce = e.matches; });
+  // OS 設定は起動後にも変わりうる。reduce になった瞬間、走行中ループを世代で無効化して
+  // 完成状態へ描き直す(CSS のキャレット点滅はメディアクエリ自体が効く)。解除されたら
+  // ループを再開する。addListener 分岐は addEventListener 未実装の旧 Safari 向け —
+  // ここで TypeError を投げると IIFE ごと死んで初回の loop() にすら到達しない。
+  const onChange = e => {
+    if (e.matches){ gen++; renderFinal(); }
+    else loop();
+  };
+  if (motionQuery.addEventListener) motionQuery.addEventListener('change', onChange);
+  else if (motionQuery.addListener) motionQuery.addListener(onChange);
 
-  if (reduce){
-    textEl.textContent  = SEGS.map(s => s.fixed).join('');
-    romanEl.textContent = SEGS.map(s => s.roman).join('');
-    countEl.textContent = TOTAL + ' 打鍵 · Space 0';
+  if (motionQuery.matches){
+    renderFinal();
   } else {
     loop();
   }
