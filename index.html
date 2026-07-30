@@ -98,7 +98,8 @@
   }
   .wordmark{font-family:var(--mono);font-size:15px;letter-spacing:.02em}
   .nav .sp{flex:1}
-  .nav a{color:var(--sumi);font-size:14px;text-decoration:none;border-bottom:1px solid var(--kei)}
+  /* 下線が唯一のリンク手掛かりなので --kei(1.25:1)ではなく --usuzumi で引く。 */
+  .nav a{color:var(--sumi);font-size:14px;text-decoration:none;border-bottom:1px solid var(--usuzumi)}
 
   footer{margin-top:120px;border-top:1px solid var(--kei);padding:32px 0 64px}
   footer p{font-size:13px;line-height:1.85;color:var(--usuzumi);max-width:38em}
@@ -120,14 +121,19 @@
   }
   .demo .text{
     font-family:var(--mincho);font-weight:600;
-    /* 下限 20px + 狭幅だけ 2 行分の min-height(下の media query)。アニメーション中の
-       最長行は確定文(13 字)ではなく done+pre の 16 字(「変換キーの誤発火を」+「しゅうせいした」)
-       なので、374px 未満では 20px でも折り返す。折り返し自体は許し、高さを 2 行で
-       固定して「min-height が破れて毎サイクル上下する」ことだけを防ぐ。 */
-    font-size:clamp(20px,4.4vw,42px);line-height:1.6;letter-spacing:.02em;
+    /* アニメーション中の最長行は確定文(13 字)ではなく done+pre の 16 字
+       (「変換キーの誤発火を」+「しゅうせいした」)。行の必要幅は
+       16×(font+letter-spacing .02em) + キャレット 5px。
+       上限 40px: .wrap の内容幅 672px に 16 字が収まる上限(42px だと 690px 必要で、
+       929px 以上のデスクトップ全幅で毎サイクル折り返し、.lede 以下が 1 行分上下する)。
+       下限 20px は 379px 幅で折り返す(下の media query が高さを固定して吸収)。 */
+    font-size:clamp(20px,4.4vw,40px);line-height:1.6;letter-spacing:.02em;
     font-feature-settings:"palt" 1;min-height:1.6em;
   }
-  @media (max-width:380px){
+  /* 392px: 折り返し閾値の実測値 379.4px(16×20.4px + キャレット 5px + .wrap 48px)に、
+     キャレット幅や letter-spacing を触っても破れない余裕を足した値。この帯では折り返しを
+     許し、高さを 2 行で固定して「min-height が破れて毎サイクル上下する」ことだけを防ぐ。 */
+  @media (max-width:392px){
     .demo .text{min-height:3.2em}
   }
   .demo .pre{border-bottom:2px dotted var(--ai);padding-bottom:2px}
@@ -140,6 +146,14 @@
     font-family:var(--mono);font-size:12px;color:var(--usuzumi);
     letter-spacing:.06em;margin-top:10px;
   }
+  /* WCAG 2.2.2: 自動開始・5 秒超のデモには利用者が止める手段が要る
+     (prefers-reduced-motion 対応だけでは達成方法と認められない)。
+     ボタンは JS が生成する — JS 無効時は動くものが無く、死んだボタンだけ残るため。 */
+  .demo-stop{
+    font-family:var(--mono);font-size:12px;color:var(--usuzumi);
+    background:none;border:0;border-bottom:1px solid var(--usuzumi);
+    padding:0;margin-top:10px;cursor:pointer;letter-spacing:.06em;
+  }
 
   .lede{margin-bottom:36px;font-size:16px}
   .cta{display:flex;flex-wrap:wrap;gap:16px;align-items:center}
@@ -147,7 +161,7 @@
     font-family:var(--gothic);font-weight:500;font-size:15px;
     padding:13px 26px;border-radius:4px;text-decoration:none;
   }
-  .btn-p{background:var(--ai);color:var(--kami)}
+  .btn-p{background:var(--ai);color:var(--kami);border:1px solid var(--ai)}
   /* 境界色に --kei を使わないこと: 罫線用の 1.25:1 では WCAG 1.4.11(非テキスト 3:1)を
      割り、コントロールの唯一の視覚境界が消える環境が出る。--usuzumi は両テーマで 3:1 超。 */
   .btn-s{border:1px solid var(--usuzumi);color:var(--sumi)}
@@ -158,6 +172,11 @@
 
   @media (prefers-reduced-motion: reduce){
     .demo .caret{animation:none}
+  }
+  /* 強制カラーモードは background を消す。線・キャレットはシステム色で描き直し、
+     塗りだけの .btn-p には(通常時は塗りと同色で見えない)境界線を持たせる。 */
+  @media (forced-colors:active){
+    .demo .caret{background:CanvasText}
   }
 
   .why{display:flex;flex-direction:column;gap:44px}
@@ -258,13 +277,15 @@
     <div class="why">
       <div>
         <p class="sr-only">コマンドが全角で入力されてしまった例。</p>
-        <pre class="sym">$ ｇｉｔ　ｓｔａｔｕｓ
-<span lang="en">command not found</span></pre>
+        <!-- aria-hidden: 内容は直前の sr-only が説明済み。全角混じりの生文字列を
+             スクリーンリーダーに読ませても意味を成さない(lang も混在する)。 -->
+        <pre class="sym" aria-hidden="true">$ ｇｉｔ　ｓｔａｔｕｓ
+command not found</pre>
         <p>普段は半角英数のまま。<kbd>F8</kbd> で入った日本語は、確定した瞬間に英数へ戻る。切り忘れという状態が存在しない。</p>
       </div>
       <div>
         <p class="sr-only">セミコロンが全角になってしまった例。</p>
-        <pre class="sym">error: expected `;`, found `；`</pre>
+        <pre class="sym" aria-hidden="true">error: expected `;`, found `；`</pre>
         <p>日本語モードの最中でも、<code>;</code> のような記号は半角のまま入る。記号・句読点・数字の幅は、それぞれ設定で選べる。</p>
       </div>
       <div>
@@ -353,7 +374,8 @@
   // ローマ字は文節間でも連結する。区切りを入れないこと自体が「Space を押していない」証拠になる。
   // g の検査を呼び出し側に任せないこと: typeSeg の確定フェーズ(await の合間)だけで
   // 640ms あり、そこで reduce に切り替わると renderFinal() の直後に古い paint が
-  // DOM を上書きして未確定表示のまま止まる。描画の門でまとめて塞ぐ。
+  // DOM を上書きして未確定表示のまま止まる。描画はこの門で塞ぐ。ただしこの門が守るのは
+  // DOM だけで、共有状態(done 等)への書き込みは書き込み側で別途 gen を検査する。
   function paint(pre, g){
     if (g !== gen) return;
     textEl.innerHTML  = esc(done) + (pre ? '<span class="pre">' + esc(pre) + '</span>' : '') + CARET;
@@ -388,6 +410,10 @@
     await sleep(240);
     paint(seg.fixed, g);
     await sleep(260);
+    // paint の gen 門は DOM しか守らない。共有状態 done への書き込みは await の後なので
+    // ここで自分の世代を確かめる — 背景タブのタイマ遅延で新世代のリセット後に
+    // 前世代の文節が混入するのを防ぐ。
+    if (g !== gen) return;
     done += seg.fixed;
     paint('', g);
     await sleep(140);
@@ -409,21 +435,41 @@
     }
   }
 
+  // WCAG 2.2.2: 自動開始・5 秒超のデモは利用者が止められなければならない。
+  // 「一時停止」でなく「完成状態への停止」なのは、途中で凍らせると未確定のかなが
+  // 残り、確定しない IME という誤った印象を与えるため(renderFinal と同じ理由)。
+  let running = false;
+  const stopBtn = document.createElement('button');
+  stopBtn.type = 'button';
+  stopBtn.className = 'demo-stop';
+  function stopDemo(){
+    running = false; gen++;
+    renderFinal();
+    stopBtn.textContent = 'デモを再生する';
+  }
+  function startDemo(){
+    running = true;
+    stopBtn.textContent = 'デモを止める';
+    loop();
+  }
+  stopBtn.addEventListener('click', () => { running ? stopDemo() : startDemo(); });
+  document.querySelector('.demo').appendChild(stopBtn);
+
   // OS 設定は起動後にも変わりうる。reduce になった瞬間、走行中ループを世代で無効化して
   // 完成状態へ描き直す(CSS のキャレット点滅はメディアクエリ自体が効く)。解除されたら
   // ループを再開する。addListener 分岐は addEventListener 未実装の旧 Safari 向け —
   // ここで TypeError を投げると IIFE ごと死んで初回の loop() にすら到達しない。
   const onChange = e => {
-    if (e.matches){ gen++; renderFinal(); }
-    else loop();
+    if (e.matches) stopDemo();
+    else startDemo();
   };
   if (motionQuery.addEventListener) motionQuery.addEventListener('change', onChange);
   else if (motionQuery.addListener) motionQuery.addListener(onChange);
 
   if (motionQuery.matches){
-    renderFinal();
+    stopDemo();
   } else {
-    loop();
+    startDemo();
   }
 })();
 </script>
