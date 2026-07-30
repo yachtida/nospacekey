@@ -208,16 +208,18 @@
   .why p{font-size:15.5px}
 
   .spec{
-    /* 12em: 最長 dt「一時日本語モード」(8 字 = 120px) + padding 24px に、フォント代替
-       (Noto Sans JP 未ロード時)の字送り差を吸収する余白を足した値。 */
+    /* 12em: 内容幅 156px(180 − padding 24)に最長 dt 120px(8 字:「一時日本語モード」
+       「モードレス再変換」)で余裕 36px。11em(余裕 21px)でも成立するが、機能名は
+       増減するため余裕側に倒す。 */
     display:grid;grid-template-columns:12em 1fr;font-size:15px;
   }
   .spec dt{padding:16px 24px 16px 0;border-bottom:1px solid var(--kei);font-weight:500}
   .spec dd{padding:16px 0;border-bottom:1px solid var(--kei)}
-  .spec b{font-weight:500}
+  /* 1 列化しても dt の色は落とさない: dt はキー名だった頃の副次ラベルではなく
+     機能名(走査の主役)なので、薄墨にすると階層が反転する。 */
   @media (max-width:620px){
     .spec{grid-template-columns:1fr}
-    .spec dt{padding:14px 0 0;border-bottom:0;color:var(--usuzumi)}
+    .spec dt{padding:14px 0 0;border-bottom:0}
     .spec dd{padding:2px 0 14px}
   }
   .note{font-size:13px;color:var(--usuzumi);margin-top:20px;max-width:34em}
@@ -299,10 +301,10 @@ command not found</pre>
     <dl class="spec">
       <dt>ライブ変換</dt><dd>そのまま打ち続けるだけで変換が進み、確定まで自動。従来の Space 変換もそのまま使える</dd>
       <dt>一時日本語モード</dt><dd><kbd>F8</kbd> で日本語に入り、確定した瞬間に半角英数へ復帰する</dd>
-      <dt>モードレス再変換</dt><dd>半角英数で打ったローマ字を選択して <kbd>変換</kbd> — あとから日本語にできる</dd>
+      <dt>モードレス再変換</dt><dd>半角英数で打ったローマ字を選択して <kbd>変換</kbd> を押すと、あとから日本語になる</dd>
       <dt>修正変換</dt><dd>「こんんいちは」を <kbd>Tab</kbd> で修復。誤読みごと学習し、次からは通常の変換で直る</dd>
       <dt>英単語の混在</dt><dd><kbd>Shift</kbd> + 英字で、文中に英単語をそのまま混ぜる</dd>
-      <dt>Zenzai(選択式)</dt><dd>文脈を読むニューラル変換がローカル CPU(要 AVX2)で動く。モデル(GGUF、約 70 MB)はインストーラが既定で取得する — チェックを外せば古典 LOUDS 変換のみ</dd>
+      <dt>Zenzai(選択式)</dt><dd>文脈を読むニューラル変換がローカル CPU(要 AVX2)で動く。モデル(GGUF、約 70 MB)はインストーラが既定で取得する(チェックを外せば古典 LOUDS 変換のみ)</dd>
     </dl>
     <p class="note">機能キーの割り当ては設定 GUI で変えられ(割り当て先は列挙されたキーから選ぶ)、衝突は保存時に検出される。IME に切り替えた直後を半角英数で始める設定もある。</p>
   </section>
@@ -318,7 +320,6 @@ command not found</pre>
     </ul>
     <p class="note"><a href="https://github.com/yachtida/nospacekey/blob/master/PRIVACY.md">PRIVACY.md</a> / <a href="https://github.com/yachtida/nospacekey/blob/master/SECURITY.md">SECURITY.md</a></p>
   </section>
-
 </main>
 
 <footer>
