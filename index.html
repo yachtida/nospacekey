@@ -3,8 +3,9 @@
 <head>
 <!-- リリースのたびに直す箇所: (1) p.meta のバージョン行 (2) 入れる ステップ 1 の
      ファイル名 (3) pre.sh の Get-FileHash のファイル名 (4) og.png の再生成。
-     デモ文(script 内 SEGS)を変えたら: sr-only の説明文と、JS 無効時にそのまま
-     表示される初期 HTML の #roman/#text/#count もあわせて直す(3 箇所が同じ 32 を持っている)。
+     デモ文(script 内 SEGS)を変えたら: JS 無効時にそのまま表示される初期 HTML
+     (#roman/#text/#count)もあわせて直す。リテラル 32(打鍵数)は sr-only の説明文と
+     #count の 2 箇所にあり、#roman の文字列長もこれと一致させること。
      機能の個数など、ソースを見ないと確かめられない数はページに書かないこと。 -->
 <meta charset="utf-8">
 <meta name="referrer" content="no-referrer">
@@ -72,7 +73,10 @@
 
   h1{
     font-family:var(--mincho);font-weight:600;
-    font-size:clamp(40px,7.5vw,80px);line-height:1.45;letter-spacing:.02em;
+    /* 上限 72px: 2 行目「モードと戦わない。」(9 字)が .wrap の内容幅 672px に収まる上限
+       (9×1.02em ≤ 672 → 73.2px)。80px だと 1032px 以上の全デスクトップで折り返し、
+       禁則処理で「い。」だけの 3 行目ができる。<br> の 2 行構成が前提。 */
+    font-size:clamp(40px,7.5vw,72px);line-height:1.45;letter-spacing:.02em;
     font-feature-settings:"palt" 1;
   }
   h2{
@@ -111,6 +115,8 @@
 
   .demo{margin-bottom:40px}
   .demo .roman{
+    /* 32 字のローマ字が 320px 幅(内容 272px)に収まる条件は字送り 0.648em 以下。
+       Consolas 0.55 / Menlo・SFMono 0.60 なので破れない(.text と違い検算済みの余裕あり)。 */
     font-family:var(--mono);font-size:12px;line-height:1.7;
     color:var(--usuzumi);letter-spacing:.06em;
     word-break:break-all;min-height:1.7em;margin-bottom:10px;
@@ -150,9 +156,13 @@
      (prefers-reduced-motion 対応だけでは達成方法と認められない)。
      ボタンは JS が生成する — JS 無効時は動くものが無く、死んだボタンだけ残るため。 */
   .demo-stop{
-    font-family:var(--mono);font-size:12px;color:var(--usuzumi);
+    /* --mono にしない: ラベルは純日本語で、mono だと全字が CJK フォールバックに落ちる。
+       display:block + min-height 24px はタップ目標(WCAG 2.5.8)と、インラインのままだと
+       .demo の行送り(16px×1.95)の strut が下に余白を作るのを防ぐため。 */
+    display:block;min-height:24px;
+    font-family:var(--gothic);font-size:13px;color:var(--usuzumi);
     background:none;border:0;border-bottom:1px solid var(--usuzumi);
-    padding:0;margin-top:10px;cursor:pointer;letter-spacing:.06em;
+    padding:0;margin-top:8px;cursor:pointer;
   }
 
   .lede{margin-bottom:36px;font-size:16px}
@@ -161,6 +171,8 @@
     font-family:var(--gothic);font-weight:500;font-size:15px;
     padding:13px 26px;border-radius:4px;text-decoration:none;
   }
+  /* border は通常時は塗りと同色で不可視。forced-colors が background を消したとき
+     ボタンの境界として現れるためだけに持つ(副次的に .btn-s と高さも揃う)。 */
   .btn-p{background:var(--ai);color:var(--kami);border:1px solid var(--ai)}
   /* 境界色に --kei を使わないこと: 罫線用の 1.25:1 では WCAG 1.4.11(非テキスト 3:1)を
      割り、コントロールの唯一の視覚境界が消える環境が出る。--usuzumi は両テーマで 3:1 超。 */
@@ -173,8 +185,7 @@
   @media (prefers-reduced-motion: reduce){
     .demo .caret{animation:none}
   }
-  /* 強制カラーモードは background を消す。線・キャレットはシステム色で描き直し、
-     塗りだけの .btn-p には(通常時は塗りと同色で見えない)境界線を持たせる。 */
+  /* 強制カラーモードは background を消すので、キャレットをシステム色で描き直す。 */
   @media (forced-colors:active){
     .demo .caret{background:CanvasText}
   }
@@ -438,7 +449,10 @@ command not found</pre>
   // WCAG 2.2.2: 自動開始・5 秒超のデモは利用者が止められなければならない。
   // 「一時停止」でなく「完成状態への停止」なのは、途中で凍らせると未確定のかなが
   // 残り、確定しない IME という誤った印象を与えるため(renderFinal と同じ理由)。
-  let running = false;
+  // userStopped はボタン操作だけが立てる。これが無いと、ユーザが止めたあとに
+  // OS のアニメーション設定が OFF→ON と往復しただけで onChange の startDemo が
+  // 明示的な停止の意思を無言で上書きしてしまう。
+  let running = false, userStopped = false;
   const stopBtn = document.createElement('button');
   stopBtn.type = 'button';
   stopBtn.className = 'demo-stop';
@@ -452,7 +466,10 @@ command not found</pre>
     stopBtn.textContent = 'デモを止める';
     loop();
   }
-  stopBtn.addEventListener('click', () => { running ? stopDemo() : startDemo(); });
+  stopBtn.addEventListener('click', () => {
+    if (running){ userStopped = true; stopDemo(); }
+    else { userStopped = false; startDemo(); }
+  });
   document.querySelector('.demo').appendChild(stopBtn);
 
   // OS 設定は起動後にも変わりうる。reduce になった瞬間、走行中ループを世代で無効化して
@@ -461,7 +478,7 @@ command not found</pre>
   // ここで TypeError を投げると IIFE ごと死んで初回の loop() にすら到達しない。
   const onChange = e => {
     if (e.matches) stopDemo();
-    else startDemo();
+    else if (!userStopped) startDemo();
   };
   if (motionQuery.addEventListener) motionQuery.addEventListener('change', onChange);
   else if (motionQuery.addListener) motionQuery.addListener(onChange);
