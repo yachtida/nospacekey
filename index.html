@@ -78,9 +78,11 @@
        机上計算は 3px 甘い)。全域で 9.225×font ≤ 内容幅(viewport−48、上限 672px)を満たす
        必要がある:
        - 上限 72px = 664.2px ≤ 672(真の上限は 72.85px。73px で既に溢れる)
-       - 下限を固定 px にしない: 40px は 417px 未満の全スマホで溢れ、禁則処理で
-         「い。」だけの行が 2 つできる。6vw+8px は viewport≥273px で常に収まる。 */
-    font-size:clamp(28px,6vw + 8px,72px);line-height:1.45;letter-spacing:.02em;
+       - 下限を大きな固定 px にしない: 40px は 417px 未満の全スマホで溢れ、禁則処理で
+         「い。」だけの行が 2 つできる。6vw+8px が効く中間帯(w≥283px)は常に収まり、
+         下限 25px が効く帯でも 9.225×25=230.6 ≤ w−48 → 279px 以上で収まる
+         (280px = Galaxy Fold カバー画面級まで対象)。 */
+    font-size:clamp(25px,6vw + 8px,72px);line-height:1.45;letter-spacing:.02em;
     font-feature-settings:"palt" 1;
   }
   h2{
