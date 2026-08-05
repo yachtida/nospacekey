@@ -28,9 +28,11 @@
 ;    Killing the config also prevents an in-use NospacekeyConfig.exe from Abort/Retry
 ;    stranding the old config. The upgrade cost is only the RAM learning of a
 ;    composition in progress at that instant (committed learning is already on disk).
-;    In-use PEs (TIP DLL, and the engine exe if respawned mid-copy) fall back to
-;    reboot-time replacement via restartreplace; any engine lingering until reboot
-;    is reclaimed by the TIP's proto version handshake.
+;    In-use PEs fall back to reboot-time replacement via restartreplace: the TIP
+;    DLL and engine exe (dedicated lines), AND every shared runtime DLL covered by
+;    the recursive dist\* line (vcruntime140[_1]/msvcp140/Swift runtime DLLs held by
+;    whatever app loaded the TIP -- PrepareToInstall cannot kill those hosts). Any
+;    engine lingering until reboot is reclaimed by the TIP's proto version handshake.
 ;
 ;  WHY admin / per-machine
 ;    A TSF TIP must be registered per-machine (HKLM; CLASSES_ROOT == HKLM),
@@ -131,8 +133,22 @@ Source: "..\dist\NospacekeyEngineHost.exe"; DestDir: "{app}"; Flags: 64bit ignor
 ;     three *.resources bundles (dictionary / tokenizer / hub), ~32 Swift runtime
 ;     DLLs, the bundled llama/ggml DLLs, models\README.txt, LICENSE and
 ;     THIRD-PARTY-NOTICES.md. Recurse all subdirs, but do NOT re-place the TIP DLL /
-;     engine exe (handled by the dedicated lines above). ---
-Source: "..\dist\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion; Excludes: "nospacekey_tip.dll,NospacekeyEngineHost.exe"
+;     engine exe (handled by the dedicated lines above).
+;     restartreplace: PrepareToInstall kills the engine + config, but it CANNOT kill
+;     every app that loaded the TIP DLL -- any app using nospacekey as its IME holds
+;     the shared runtime DLLs (vcruntime140[_1]/msvcp140/concrt140 and the Swift/ggml
+;     runtime DLLs). On update, DeleteFile on such an in-use DLL fails with code 5
+;     (access denied) and aborts the installer. restartreplace turns that into a
+;     reboot-time swap, matching the dedicated TIP/engine lines above. Not in-use ->
+;     placed immediately, so new installs and text files are unaffected.
+;     Trade-off: if any file is deferred, Setup prompts "Reboot now?" at the end
+;     (silent: message box; very silent: auto-reboot; both skippable with /NORESTART).
+;     Until reboot the OLD engine/config remain on disk -- a preexisting window the
+;     TIP proto handshake already reconciles. Note this flag is NOT paired with
+;     uninsrestartdelete here, so UNINSTALL of an in-use shared DLL can still leave
+;     it on disk (preexisting, non-regression; the TIP line above carries
+;     uninsrestartdelete for the DLL that matters most for clean removal). ---
+Source: "..\dist\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion restartreplace; Excludes: "nospacekey_tip.dll,NospacekeyEngineHost.exe"
 
 [Icons]
 ; Shortcut to the settings GUI (SP6b) and to the third-party notices.
