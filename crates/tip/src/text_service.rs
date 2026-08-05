@@ -42,7 +42,7 @@ use crate::edit_session::{
     CancelComposition, CommitText, CommitUndoStart, QueryCaretRect, QueryInputScopes,
     QueryMonitorAnchorRect, ReconvertCapture, ReconvertStart, RestoreText, StartOrUpdatePreedit,
 };
-use crate::globals::{ComObjectGuard, GUID_DISPLAY_ATTRIBUTE};
+use crate::globals::{ComObjectGuard, GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_TARGET};
 use crate::input_state::InputState;
 use crate::input_state::InsertStyle;
 use crate::input_state::is_fresh_live;
@@ -324,7 +324,14 @@ pub struct TextService {
     /// — edit session 拒否で取得コード自体が走らないときの前文書残留を塞ぐ（spec §2.1）。
     pub(crate) left_context: Rc<RefCell<Option<String>>>,
     pub(crate) da_atom: Cell<u32>,
+    /// 文節ナビゲーションの選択文節（太下線）用の表示属性 atom（0=未登録）。
+    pub(crate) da_target_atom: Cell<u32>,
     pub(crate) showing: Cell<bool>,
+    /// 文節ナビゲーション（変換中の←/→）のビュー。Some=文節モード中（不変条件:
+    /// Some ⇒ showing。候補窓を閉じる/確定する全経路が clear_clause_nav で None に落とす）。
+    /// segments の連結が preedit 全体、selected が太下線を引く文節。候補列そのものは
+    /// 従来どおり cand_state が唯一の真実源（文節モード中は「選択文節の候補」が入る）。
+    pub(crate) clause_nav: RefCell<Option<ClauseNav>>,
     pub(crate) candidate_ui: RefCell<CandidatePresenter>,
     /// SP6a: presenter / UIElement と共有する候補状態（GetCount/GetString 等の読み元）。
     /// TextService も co-owner として保持し、drain_behavior の Finalize で
@@ -389,6 +396,12 @@ pub struct TextService {
     pub(crate) partial_committing: Cell<bool>,
     /// 再変換取消時に復元する元ラテン列。
     pub(crate) reconvert_original: Rc<RefCell<String>>,
+    /// 再変換で掴んだ対象の「かな読み」(RecordCorrection のキー)。経路別に採取する:
+    /// Surface=掴んだかな表層 / Latin=engine_insert 応答の Reading(ローマ字のかな化は
+    /// エンジン側 roman2kana にしか無いため TIP では作れない) / 確定取消=リプレイ用 reading。
+    /// 空 = 採取できなかった(送出しない — 深層防御)。クリアは reconvert_original の
+    /// clear サイトに併記(上書きサイトは経路別採取が無条件上書きするため対象外)。
+    pub(crate) reconvert_reading: Rc<RefCell<String>>,
     /// SP6b: ライブ変換 on/off（設定）。false なら打鍵でデバウンス変換を武装せず、
     /// 読み preedit のまま Space/Enter で SP1 候補フローに任せる。Activate で1度読む(D7)。
     pub(crate) live_enabled: Cell<bool>,
@@ -454,7 +467,7 @@ pub struct TextService {
     pub(crate) pending_since: Cell<Option<std::time::Instant>>,
     /// 品質ループ③: 直前確定 1 件のバッファ。commit_and_reset / apply_commit_plan /
     /// apply_live_auto_commit が**クリア前に**保存し、Ctrl+変換（OnPreservedKey Feedback）が
-    /// 消費して feedback.jsonl へ書く。idle_symbol の直接確定（読み無し記号）は対象外。
+    /// 消費して feedback.jsonl へ書く。shift_latin の直接確定（読み無し）は対象外。
     /// F-5 改定（確定取消）: 保存条件は `feedback_enabled || arms_undo(source)` へ拡大済み
     /// （常時保存ではない — remember_last_commit 参照）。
     pub(crate) last_commit: RefCell<Option<LastCommit>>,
@@ -470,9 +483,16 @@ pub struct TextService {
     /// 句読点全角設定（settings.punctuation.full_width）のキャッシュ。Activate で1度読む（D7）。
     /// idle 記号確定 / composition 記号畳み込みの ,. 幅に使う。既定 true（全角）。
     pub(crate) punctuation_full_width: Cell<bool>,
-    /// 記号全角設定（settings.symbol.full_width）のキャッシュ。Activate で1度読む（D7）。
-    /// idle 記号確定 / composition 記号畳み込み / Shift+数字行の記号化に使う。既定 false（半角）。
-    pub(crate) symbol_full_width: Cell<bool>,
+    /// 記号全角の overlay 実効値（= `settings.symbol.full_width` かつ実効集合が非空）の
+    /// キャッシュ。Activate で1度読む（D7）。idle 記号確定 / composition 記号畳み込み /
+    /// Shift+数字行の記号化に使う。既定 false（半角）。素のトグルでなく overlay を保持値に
+    /// するのは、全解除（実効空集合）を gate レベルまでトグル OFF と完全同一にするため
+    /// （読み出し7箇所すべてが同じ値を見る — 2026-08-02 spec §4 CR-1）。
+    pub(crate) symbol_overlay: Cell<bool>,
+    /// 全角化対象の記号集合（`settings.symbol.effective_chars()`）のキャッシュ。Activate で
+    /// 1度読む（D7）。文字が確定している `zenkaku_symbol` 呼び出しだけが参照する — gate は
+    /// VK しか知らず文字を引けないため（spec §4）。Activate 前の初期値は `EMPTY`。
+    pub(crate) symbol_chars: Cell<settings::symbol::SymbolCharSet>,
     /// 読みモニタの設定トグル（`reading_monitor.enabled`）。Activate で1度読む(D7)。既定 ON。
     pub(crate) reading_monitor_enabled: Cell<bool>,
     /// 読みモニタの累積設定（reading_monitor.accumulate）。Activate で1度読む(D7)。既定 ON。
@@ -535,7 +555,9 @@ impl TextService {
             composition: Rc::new(RefCell::new(None)),
             left_context: Rc::new(RefCell::new(None)),
             da_atom: Cell::new(0),
+            da_target_atom: Cell::new(0),
             showing: Cell::new(false),
+            clause_nav: RefCell::new(None),
             candidate_ui,
             cand_state,
             behavior_outbox,
@@ -559,6 +581,7 @@ impl TextService {
             reconverting: Cell::new(false),
             partial_committing: Cell::new(false),
             reconvert_original: Rc::new(RefCell::new(String::new())),
+            reconvert_reading: Rc::new(RefCell::new(String::new())),
             live_enabled: Cell::new(true),
             llm_enabled: Cell::new(false),
             typo_enabled: Cell::new(false),
@@ -583,7 +606,8 @@ impl TextService {
             preserved_regs: RefCell::new(Vec::new()),
             number_full_width: Cell::new(true),
             punctuation_full_width: Cell::new(true),
-            symbol_full_width: Cell::new(false),
+            symbol_overlay: Cell::new(false),
+            symbol_chars: Cell::new(settings::symbol::SymbolCharSet::EMPTY),
             reading_monitor_enabled: Cell::new(true),
             reading_monitor_accumulate: Cell::new(true),
             reading_monitor_max_chars: Cell::new(34),
@@ -671,7 +695,8 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         self.feedback_enabled.set(s.feedback.enabled);
         self.number_full_width.set(s.number.full_width);
         self.punctuation_full_width.set(s.punctuation.full_width);
-        self.symbol_full_width.set(s.symbol.full_width);
+        self.symbol_overlay.set(s.symbol.symbol_overlay());
+        self.symbol_chars.set(s.symbol.effective_chars());
         self.reading_monitor_enabled.set(s.reading_monitor.enabled);
         self.reading_monitor_accumulate.set(s.reading_monitor.accumulate);
         self.reading_monitor_max_chars.set(s.reading_monitor.effective_max_chars());
@@ -706,6 +731,9 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             {
                 if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE) {
                     self.da_atom.set(atom);
+                }
+                if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_TARGET) {
+                    self.da_target_atom.set(atom);
                 }
             }
         }
@@ -918,6 +946,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // 再入ガードに居残り、以降の再変換が不能になる＝awaiting_llm と同じ理由）。
         self.reconverting.set(false);
         self.reconvert_original.borrow_mut().clear();
+        self.reconvert_reading.borrow_mut().clear();
         // 品質ループ③: 直前確定バッファも持ち越さない（再活性化後の Ctrl+変換が
         // 非活性前の古い確定を記録しないように）。
         *self.last_commit.borrow_mut() = None;
@@ -934,6 +963,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // 候補ウィンドウを隠す（presenter なら UIElement も EndUIElement で畳む）。
         self.candidate_ui.borrow_mut().hide();
         self.showing.set(false);
+        self.clear_clause_nav();
         // SP6a: 非活性化後に Behavior が来ても dangling self を触らせない（UAF 防止）。
         // ui_mgr も手放して保持していた COM 参照を解放する。
         BEHAVIOR_TS.with(|c| c.set(std::ptr::null()));
@@ -1038,6 +1068,7 @@ impl TextService_Impl {
         }
 
         self.showing.set(false);
+        self.clear_clause_nav();
         self.candidate_ui.borrow_mut().hide();
         self.reading_monitor.borrow_mut().hide();
         // composition が消えた以上、保持していた context/読みも捨てる。残すと遅延変換が死んだ
@@ -1050,6 +1081,7 @@ impl TextService_Impl {
         // （候補キーは showing=false で食わず解除経路に到達しない）。
         self.reconverting.set(false);
         self.reconvert_original.borrow_mut().clear();
+        self.reconvert_reading.borrow_mut().clear();
         // ephemeral かな: 合成が畳まれた以上 direct へ復帰する（OnCompositionTerminated など
         // フォーカス変化を伴わない放棄経路でも残留させない。非 ephemeral 時は no-op）。
         self.exit_ephemeral_to_direct(None);
@@ -1761,6 +1793,121 @@ impl TextService_Impl {
         }
     }
 
+    /// 文節ナビゲーション: 選択文節を `offset` だけ動かす（未開始ならエンジンが `base_index` を
+    /// 種に開始する）。Error 応答は decline（旧エンジンの unknown method / キャッシュ無し /
+    /// stale / 被覆候補無し）= 接続不良ではないので drop しない — 呼び出し側が従来の
+    /// 「確定して畳む」へ劣化する（engine_commit の decline と同じ規律）。
+    pub(crate) fn engine_move_clause(&self, offset: i32, base_index: usize) -> Option<ClauseViewData> {
+        let session = self.engine_session.get();
+        let left_context = self.left_context.borrow().clone();
+        let result = {
+            let mut guard = self.client.borrow_mut();
+            let client = guard.as_mut()?;
+            timed_request(
+                client,
+                &Request::MoveClause {
+                    session,
+                    offset,
+                    base_index: base_index as u32,
+                    left_context,
+                },
+                IPC_TIMEOUT_CONVERT, // 選択文節の候補生成 = 変換 1 回ぶん
+                "move_clause",
+            )
+        };
+        match result {
+            Ok(Response::ClauseView { segments, selected, candidates, candidate_index }) => {
+                Some(ClauseViewData {
+                    segments,
+                    selected: selected as usize,
+                    candidates,
+                    candidate_index: candidate_index as usize,
+                })
+            }
+            Ok(Response::Error { message }) => {
+                tip_log(&format!("move_clause declined: {message}"));
+                None
+            }
+            other => {
+                tip_log(&format!("move_clause failed: {other:?}"));
+                tip_log("ev=degraded reason=move_clause_failed");
+                self.drop_engine();
+                None
+            }
+        }
+    }
+
+    /// 文節ナビゲーション: 選択文節の候補を `index` へ差し替える。decline 規約は
+    /// engine_move_clause と同じ（Error は drop しない）。
+    pub(crate) fn engine_select_clause_candidate(&self, index: usize) -> Option<ClauseViewData> {
+        let session = self.engine_session.get();
+        let result = {
+            let mut guard = self.client.borrow_mut();
+            let client = guard.as_mut()?;
+            timed_request(
+                client,
+                &Request::SelectClauseCandidate { session, index: index as u32 },
+                IPC_TIMEOUT_FAST, // 変換なし（状態差し替えのみ）
+                "select_clause_candidate",
+            )
+        };
+        match result {
+            Ok(Response::ClauseView { segments, selected, candidates, candidate_index }) => {
+                Some(ClauseViewData {
+                    segments,
+                    selected: selected as usize,
+                    candidates,
+                    candidate_index: candidate_index as usize,
+                })
+            }
+            Ok(Response::Error { message }) => {
+                tip_log(&format!("select_clause_candidate declined: {message}"));
+                None
+            }
+            other => {
+                tip_log(&format!("select_clause_candidate failed: {other:?}"));
+                tip_log("ev=degraded reason=select_clause_failed");
+                self.drop_engine();
+                None
+            }
+        }
+    }
+
+    /// 文節ナビゲーション: 全文節を確定する（文節ごとの学習はエンジン側）。decline 規約は
+    /// engine_commit と同じ — None なら呼び出し側が表示中ビューの連結を直確定する（学習に
+    /// 乗らないだけで確定は必ず成功する）。
+    pub(crate) fn engine_commit_clauses(&self) -> Option<(String, String)> {
+        let session = self.engine_session.get();
+        let result = {
+            let mut guard = self.client.borrow_mut();
+            let client = guard.as_mut()?;
+            timed_request(
+                client,
+                &Request::CommitClauses { session },
+                // FAST にしないのは、エンジン側 commitClauses が bindConverter(セッション切替時は
+                // zenz reset_context のスパイク)+文節数ぶんの setCompletedData/updateLearningData
+                // +flush を converterLock 下で行い、作業量が Commit(1候補分)の N 倍だから。
+                // タイムアウトはエンジンが確定+学習を完了した後に接続だけ破棄する「見かけ劣化」
+                // (次打鍵が再接続フルコース)になるため、太い側に倒す。
+                IPC_TIMEOUT_CONVERT,
+                "commit_clauses",
+            )
+        };
+        match result {
+            Ok(Response::Committed { text, reading }) => Some((text, reading)),
+            Ok(Response::Error { message }) => {
+                tip_log(&format!("commit_clauses declined: {message}"));
+                None
+            }
+            other => {
+                tip_log(&format!("commit_clauses failed: {other:?}"));
+                tip_log("ev=degraded reason=commit_clauses_failed");
+                self.drop_engine();
+                None
+            }
+        }
+    }
+
     /// `engine_live_convert` を呼んでよいか（設定 + 表記固定）。ライブ変換を参照する 3 経路
     /// （VK_RETURN / `settle_active_input` / `restore_live_preedit`）が共有する唯一の入口。
     pub(crate) fn should_consult_live_engine(&self) -> bool {
@@ -1912,6 +2059,8 @@ impl TextService_Impl {
             }
         }
         let (reading, text) = buf.expect("has_buffer=true guarantees Some");
+        // 深層防御: start_reconvert と同じく開始時にクリア(早期 return 経路で前回値を残さない)。
+        self.reconvert_reading.borrow_mut().clear();
 
         // 2) キャレット手前を既知長ぴったり読み戻し、text にバイト一致したときだけ composition 化する。
         //    不一致・非空選択・読み取り失敗は何も書かない（do-no-harm、ReconvertStart :318-329 と同型）。
@@ -1944,6 +2093,7 @@ impl TextService_Impl {
         // 3) 一致。Esc 復元用に確定文字列を原文としてセットし、バッファを消費する。
         //    以降 composition は開いている＝連打は composition ガードで no-op（armed は維持でよい）。
         *self.reconvert_original.borrow_mut() = text.clone();
+        *self.reconvert_reading.borrow_mut() = reading.clone();
         *self.last_commit.borrow_mut() = None;
 
         // 4) 新セッションを張り直して読みをリプレイする（セッション不変条件 — start_reconvert 同型）。
@@ -1990,6 +2140,7 @@ impl TextService_Impl {
         if self.showing.get() {
             self.candidate_ui.borrow_mut().hide();
             self.showing.set(false);
+            self.clear_clause_nav();
         }
         let seq = self.state.borrow_mut().bump_llm_seq();
         self.state.borrow_mut().set_awaiting_llm(true);
@@ -2233,6 +2384,36 @@ impl TextService_Impl {
         }
     }
 
+    /// 再変換訂正の通知。確定は呼び出し前に完了しているため、失敗しても確定動作に影響しない。
+    /// タイムアウトを pending owe にしないのは、この op に「後で読む」価値が無く
+    /// (応答は Ok のみ)、request-id 無しプロトコルで owe を増やすと desync 面積が広がるだけのため。
+    pub(crate) fn engine_record_correction(&self, reading: &str, surface: &str) {
+        match self.prepare_send("record_correction", IPC_TIMEOUT_FAST) {
+            DrainOutcome::Proceed => {}
+            DrainOutcome::StillPending | DrainOutcome::Dropped => return,
+        }
+        let result = {
+            let mut guard = self.client.borrow_mut();
+            let client = match guard.as_mut() { Some(c) => c, None => return };
+            timed_request(
+                client,
+                &Request::RecordCorrection {
+                    reading: reading.to_string(),
+                    surface: surface.to_string(),
+                },
+                IPC_TIMEOUT_FAST,
+                "record_correction",
+            )
+        };
+        match result {
+            Ok(_) => {}   // Ok。旧エンジンは Error を返すがどちらも無視(記録は best-effort)
+            Err(_) => {
+                tip_log("ev=degraded reason=record_correction_failed");
+                self.drop_engine();
+            }
+        }
+    }
+
     /// client 復帰後（on_llm_outcome）に、保留していた EndSession を送って取り残しを掃除する。
     /// Bug 1: engine_end_session と同じ ack 判定（`end_session_ack_accepted`）を使い、受理外なら
     /// 接続を破棄して応答フレームの滞留を防ぐ。
@@ -2265,14 +2446,36 @@ impl TextService_Impl {
         VARIANT::from(self.da_atom.get() as i32)
     }
 
+    /// 選択文節（太下線）属性 atom を内包した VARIANT を作る（atom 未登録なら i32(0)）。
+    fn da_target_variant(&self) -> VARIANT {
+        VARIANT::from(self.da_target_atom.get() as i32)
+    }
+
     /// preedit を `text` にする編集セッションを同期実行する。失敗は no-op。
     pub(crate) fn run_preedit(&self, ctx: &ITfContext, text: &str) {
+        self.run_preedit_with_target(ctx, text, None);
+    }
+
+    /// `target` = 選択文節の (UTF-16 開始, 長さ)。Some なら該当区間だけ太下線属性で上書きする
+    /// （文節ナビゲーション）。None は従来の run_preedit と同一。
+    pub(crate) fn run_preedit_with_target(
+        &self,
+        ctx: &ITfContext,
+        text: &str,
+        target: Option<(usize, usize)>,
+    ) {
+        // atom 未登録（RegisterGUID 失敗）で target を渡すと、sub-range へ atom 0
+        // （TF_INVALID_GUIDATOM）を SetValue して既定下線ごと消す — 太下線を諦め区間を
+        // 渡さない方が「選択文節だけ下線が無い」より良い劣化。
+        let target = target.filter(|_| self.da_target_atom.get() != 0);
         let sink: ITfCompositionSink = self.to_interface();
         let session_obj: ITfEditSession = StartOrUpdatePreedit {
             context: ctx.clone(),
             text: HSTRING::from(text),
             sink,
             da_variant: self.da_variant(),
+            target,
+            da_target_variant: self.da_target_variant(),
             composition: Rc::clone(&self.composition),
             left_context_out: Rc::clone(&self.left_context),
             _guard: ComObjectGuard::new(),
@@ -2338,6 +2541,13 @@ impl TextService_Impl {
         if !self.showing.get() {
             return;
         }
+        // 文節ナビゲーション中: 候補選択の変更は「選択文節の差し替え」。preedit は候補単体でなく
+        // 全文節の連結で描くため専用経路へ（キー/ホスト Behavior/マウスの全選択経路がここを通る
+        // ＝一点分岐で乖離しない）。
+        if self.clause_nav.borrow().is_some() {
+            self.sync_clause_to_selection(ctx);
+            return;
+        }
         // borrow は run_preedit（COM へ同期コールアウトする）より前で必ず落とす —
         // ホスト再入で drain が cand_state を borrow し直す（drain_behavior_inner 参照）。
         let pick = {
@@ -2349,6 +2559,88 @@ impl TextService_Impl {
         // widen_display_text を通さない生の候補を出す。通すと「全角表示の preedit を半角で確定」
         // が候補経路で再発する（trigger_convert の候補窓オープン時と同じ理由）。
         self.run_preedit(ctx, &text);
+    }
+
+    // ---- 文節ナビゲーション（変換中の←/→。MS-IME の文節移動）----
+
+    /// 文節ナビゲーション状態を破棄する。候補窓を閉じる/確定する全経路で呼ぶ
+    /// （不変条件: clause_nav が Some ⇒ showing。残すと次に候補窓を開いたとき
+    /// 選択同期/確定が文節ビューと取り違える）。
+    pub(crate) fn clear_clause_nav(&self) {
+        self.clause_nav.borrow_mut().take();
+    }
+
+    /// 候補表示中の←/→: 文節ナビゲーションへ入り（未開始ならエンジンが現在選択候補を種に
+    /// 分解して開始）、選択文節を `offset` だけ動かす。成功なら候補窓と preedit を文節ビューへ
+    /// 差し替えて true。false（旧エンジン/劣化/被覆候補無し）は呼び出し側が従来の
+    /// 「確定して畳む」へ落とす。
+    pub(crate) fn move_clause(&self, ctx: &ITfContext, offset: i32) -> bool {
+        let base_index = self.cand_state.borrow().selected();
+        let Some(view) = self.engine_move_clause(offset, base_index) else {
+            return false;
+        };
+        self.apply_clause_view(ctx, view);
+        true
+    }
+
+    /// エンジンの文節ビューを UI へ反映する: 候補窓を「選択文節の候補」へ差し替え
+    /// （show が cand_state を更新＝選択の唯一の真実源を維持）、preedit を全文節の連結
+    /// ＋選択文節の太下線で描き直す。
+    fn apply_clause_view(&self, ctx: &ITfContext, view: ClauseViewData) {
+        tip_log(&format!(
+            "ev=clause_move sel={} n={} cands={}",
+            view.selected,
+            view.segments.len(),
+            view.candidates.len()
+        ));
+        *self.clause_nav.borrow_mut() =
+            Some(ClauseNav { segments: view.segments, selected: view.selected });
+        let anchor = self.caret_point(ctx);
+        let theme = self.appearance.borrow_mut().current_theme();
+        self.candidate_ui.borrow_mut().show(&view.candidates, view.candidate_index, anchor, theme);
+        self.run_clause_preedit(ctx);
+    }
+
+    /// clause_nav の内容で preedit を描く（全文節の連結＋選択文節に太下線）。
+    /// 候補は選んだ幅が正なので widen は通さない（sync_preedit_to_selection と同じ理由）。
+    fn run_clause_preedit(&self, ctx: &ITfContext) {
+        // borrow は run_preedit（COM へ同期コールアウト）より前で必ず落とす。
+        let material = {
+            let nav = self.clause_nav.borrow();
+            nav.as_ref().map(|n| {
+                (
+                    n.segments.concat(),
+                    crate::input_state::clause_target_utf16(&n.segments, n.selected),
+                )
+            })
+        };
+        let Some((text, target)) = material else { return; };
+        self.run_preedit_with_target(ctx, &text, Some(target));
+    }
+
+    /// 文節ナビゲーション中の候補選択変更: エンジンへ SelectClauseCandidate を送って正
+    /// （確定/学習に使う Candidate）へ反映し、応答ビューで segments を更新する。劣化時は
+    /// ローカル反映（表示は保つ。確定は commit_clauses の劣化枝が表示中ビューを直確定する
+    /// ので表示＝確定は崩れない）。
+    fn sync_clause_to_selection(&self, ctx: &ITfContext) {
+        let sel = self.cand_state.borrow().selected();
+        if let Some(view) = self.engine_select_clause_candidate(sel) {
+            *self.clause_nav.borrow_mut() =
+                Some(ClauseNav { segments: view.segments, selected: view.selected });
+        } else {
+            let text = {
+                let st = self.cand_state.borrow();
+                st.string_at(sel)
+            };
+            if let Some(text) = text {
+                if let Some(nav) = self.clause_nav.borrow_mut().as_mut() {
+                    if nav.selected < nav.segments.len() {
+                        nav.segments[nav.selected] = text;
+                    }
+                }
+            }
+        }
+        self.run_clause_preedit(ctx);
     }
 
     /// 候補窓だけを閉じて composition を残す経路（Esc / Behavior::Abort）で、preedit を候補
@@ -2714,6 +3006,8 @@ impl TextService_Impl {
     /// 再変換: 直前ラテン列(or 選択)を掴んで composition 化し、g1 リプレイで候補を出す。
     pub(crate) fn start_reconvert(&self, ctx: &ITfContext) {
         if self.reconverting.get() { return; }
+        // 深層防御: 開始時に必ずクリア(採取できない経路で前回の読みと誤ペアにしない)。
+        self.reconvert_reading.borrow_mut().clear();
         // 既に composition が開いている（native の打ちかけ等）なら再変換しない。
         // ReconvertStart は無条件で StartComposition しスロットを上書きするため、
         // ここで弾かないと既存 composition を EndComposition せず孤児化させてしまう。
@@ -2755,10 +3049,17 @@ impl TextService_Impl {
                 // 生テキストのまま保持済み — Esc 復元は元の見た目（`wa-rudo`）へ戻す。
                 // engine_insert が文字列単位になったので 1 往復でリプレイする（挙動は逐次と等価）。
                 let reading = crate::input_state::latin_reconvert_reading(&text);
-                let _ = self.engine_insert(&reading, InsertStyle::Kana);
+                // かな読みは insert 応答の Reading から採取する(RecordCorrection のキー)。
+                // latin_reconvert_reading の戻り値は ASCII ローマ字で、かな化はエンジン側
+                // roman2kana にしか無いため TIP では作れない。
+                let kana = self.engine_insert(&reading, InsertStyle::Kana);
+                *self.reconvert_reading.borrow_mut() = kana.unwrap_or_default();
                 self.engine_convert().unwrap_or_default()
             }
-            ReconvertKind::Surface => self.engine_reconvert_surface(&text).unwrap_or_default(),
+            ReconvertKind::Surface => {
+                *self.reconvert_reading.borrow_mut() = text.clone();
+                self.engine_reconvert_surface(&text).unwrap_or_default()
+            }
             ReconvertKind::None | ReconvertKind::NonKana => unreachable!(),
         };
         if cands.is_empty() {
@@ -2807,9 +3108,11 @@ impl TextService_Impl {
         self.engine_end_session();
         self.reconverting.set(false);
         self.reconvert_original.borrow_mut().clear();
+        self.reconvert_reading.borrow_mut().clear();
         self.candidate_ui.borrow_mut().hide();
         self.reading_monitor.borrow_mut().hide();
         self.showing.set(false);
+        self.clear_clause_nav();
         *self.current_context.borrow_mut() = None;
         // U9: 第4の合成終了経路（RestoreText）。ReconvertStart が書いた文書本文の左文脈を
         // ここで残すと、次 composition の edit session 拒否時に別文書の要求（特に外部 LLM）へ
@@ -2891,6 +3194,13 @@ impl TextService_Impl {
                 if !self.showing.get() {
                     return;
                 }
+                // 文節ナビゲーション中のホスト確定は全文節の確定（Enter と同じ分岐 —
+                // cand_state の index は「選択文節の候補」の添字であり、エンジンの
+                // 全文候補キャッシュへ Commit{index} すると別候補を確定してしまう）。
+                if self.clause_nav.borrow().is_some() {
+                    self.commit_clauses(&ctx);
+                    return;
+                }
                 // Enter（候補表示中）と同一: 選択中の候補を commit_candidate で確定する
                 // （前方一致候補なら部分確定して残り読みを継続）。選択 index は cand_state
                 // （＝選択の唯一の真実源。キーボードも Behavior::SetSelection もここを更新）から読む。
@@ -2909,6 +3219,7 @@ impl TextService_Impl {
                 } else if self.showing.get() {
                     self.candidate_ui.borrow_mut().hide();
                     self.showing.set(false);
+                    self.clear_clause_nav();
                     tip_log("ev=candidates_hidden");
                     self.restore_live_preedit(&ctx);
                 } else if self.state.borrow().composing {
@@ -3297,6 +3608,24 @@ pub(crate) fn undo_precheck(
     Ok(())
 }
 
+// ---- 文節ナビゲーション（変換中の←/→）の純データ ----
+
+/// TIP が保持する文節ビュー。`segments` の連結が preedit 全体、`selected` が太下線を引く
+/// 選択文節。候補列は持たない — 候補窓の唯一の真実源は従来どおり cand_state。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ClauseNav {
+    pub segments: Vec<String>,
+    pub selected: usize,
+}
+
+/// エンジン ClauseView 応答の TIP 内表現（engine_move_clause / engine_select_clause_candidate）。
+pub(crate) struct ClauseViewData {
+    pub segments: Vec<String>,
+    pub selected: usize,
+    pub candidates: Vec<String>,
+    pub candidate_index: usize,
+}
+
 // ---- 品質ループ③: 誤変換ワンキー記録（直前確定バッファ → feedback.jsonl）----
 
 /// 直前確定 1 件のバッファ（誤変換ワンキー記録の対象）。sel=-1 はライブ/直接確定
@@ -3568,10 +3897,26 @@ mod uu5_reload_config_tests {
     }
 }
 
+/// 再変換確定の RecordCorrection 送出条件(commit_candidate の reconverting 分岐から呼ぶ)。
+/// index 0 は 1 位受諾=訂正ではない。空読みは採取できなかった劣化経路(送らない)。
+pub(crate) fn should_record_correction(index: usize, reading: &str) -> bool {
+    index != 0 && !reading.is_empty()
+}
+
 #[cfg(test)]
 mod a8_tests {
-    use super::{is_toggle_repeat, plan_start_session, should_log_slow, Response, MODE_TOGGLE_REPEAT_GUARD, IPC_TIMEOUT_CONVERT, IPC_TIMEOUT_FAST, IPC_TIMEOUT_LIVE};
+    use super::{is_toggle_repeat, plan_start_session, should_log_slow, should_record_correction, Response, MODE_TOGGLE_REPEAT_GUARD, IPC_TIMEOUT_CONVERT, IPC_TIMEOUT_FAST, IPC_TIMEOUT_LIVE};
     use std::time::Duration;
+
+    #[test]
+    fn record_correction_only_for_non_top_with_reading() {
+        // 送出条件: 再変換中の候補確定で「1位以外を選んだ」かつ読みを保持できている時だけ。
+        // index 0 は 1 位受諾(訂正ではない)、空読みは経路劣化(深層防御 — spec §2(b))。
+        assert!(should_record_correction(1, "みこみっと"));
+        assert!(should_record_correction(5, "わーるど"));
+        assert!(!should_record_correction(0, "みこみっと"));
+        assert!(!should_record_correction(1, ""));
+    }
 
     #[test]
     fn start_session_plan_adopts_session_and_drops_otherwise() {

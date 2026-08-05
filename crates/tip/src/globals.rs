@@ -8,7 +8,10 @@ use windows::core::GUID;
 use windows::Win32::Foundation::HMODULE;
 
 // 永続IDの唯一の真実源は `ids`。tip と testbench が同一値を参照する。
-pub use ids::{CLSID_NOSPACEKEY, GUID_DISPLAY_ATTRIBUTE, LANGID_JA, PROFILE_NOSPACEKEY};
+pub use ids::{
+    CLSID_NOSPACEKEY, GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_TARGET, LANGID_JA,
+    PROFILE_NOSPACEKEY,
+};
 
 /// SP5: モードトグル（ひらがな⇄半角英数）の preserved key 識別 GUID。
 pub const GUID_PRESERVEDKEY_MODE_TOGGLE: GUID = GUID::from_u128(0xc6963839_c572_45cb_a66d_25a4a4d704ba);

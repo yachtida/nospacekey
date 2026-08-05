@@ -1,6 +1,9 @@
 //! tauri コマンド層。logic（純関数）と settings crate を繋ぐだけの薄い層に保つ。
 
-use crate::logic::{self, FieldError, SettingsDto};
+use crate::logic::{
+    self, DictCmdError, DictLock, EngineStatus, ExportReportDto, FieldError, ImportReportDto, ListReport,
+    MutationReport, SettingsDto,
+};
 
 #[derive(serde::Serialize)]
 pub struct LoadResult {
@@ -43,6 +46,22 @@ pub fn apply_settings(dto: SettingsDto) -> Result<(), Vec<FieldError>> {
 #[tauri::command]
 pub fn get_default_settings() -> SettingsDto {
     logic::to_dto(&settings::Settings::default())
+}
+
+/// 記号個別選択グリッドの1項目(半角/全角プレビュー)。JS に写像表を持たせないための供給源
+/// （2026-08-02 spec §3）。
+#[derive(serde::Serialize)]
+pub struct SymbolCatalogEntry {
+    pub half: char,
+    pub full: char,
+}
+
+/// 記号個別選択の対象29件カタログ（read-only、`get_default_settings` と同列）。
+#[tauri::command]
+pub fn get_symbol_catalog() -> Vec<SymbolCatalogEntry> {
+    settings::symbol::symbol_targets()
+        .map(|(half, full)| SymbolCatalogEntry { half, full })
+        .collect()
 }
 
 #[derive(serde::Serialize)]
@@ -197,9 +216,152 @@ fn is_allowed_external_url(url: &str) -> bool {
     ALLOW.contains(&url)
 }
 
+// ============================================================================
+// カスタム辞書 CRUD(Issue #3 spec §5.3)。logic::dict_*_logic を State から借りて
+// 呼ぶだけの薄層に保つ(mutation 本体・直列化は logic.rs 側で単体テスト済み)。
+// ============================================================================
+
+/// 辞書系 IPC の接続 timeout(spec §4.2)。`clear_learning_history` の 250ms より短縮する —
+/// mutation ごとにエンジン不在で待たされると連続登録の体感に響くため、ローカル pipe の
+/// 生存確認としては 100ms で十分。
+const DICT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+const DICT_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// ReloadDictionary を実際にパイプへ送る唯一の実装。enabled は呼び出し側
+/// (`reload_payload` でゲート済み)から渡す — ここで settings を読み直さない
+/// (logic 層が enabled をでっち上げない不変条件と対の規律)。
+fn send_reload_over_pipe(enabled: bool) -> EngineStatus {
+    use std::time::Instant;
+    let pipe = ipc::client::stable_pipe_name();
+    let Ok(mut c) = ipc::client::EngineClient::connect_to(&pipe, DICT_CONNECT_TIMEOUT) else {
+        return EngineStatus::Absent;
+    };
+    let deadline = Instant::now() + DICT_REQUEST_DEADLINE;
+    match c.request_within(&ipc::protocol::Request::ReloadDictionary { enabled }, deadline) {
+        Ok(ipc::protocol::Response::Ok) => EngineStatus::Applied,
+        Ok(ipc::protocol::Response::Error { .. }) => EngineStatus::Declined,
+        Ok(_) => EngineStatus::Declined, // 未知応答は旧エンジンの拒否と同型に畳む
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => EngineStatus::Timeout,
+        Err(_) => EngineStatus::Absent, // 送信後の切断等も「反映されなかった」で無害に畳む
+    }
+}
+
+/// ReloadDictionary を送る全コマンド共通のゲート(spec §4.2)。送る enabled は常にディスクの
+/// settings.json から読む(UI の未適用トグル値は送らない)。読み取りが `Loaded`/`Missing`
+/// 以外なら `reload_payload` が送信を止める。
+fn reload_sender() -> impl Fn() -> EngineStatus {
+    let (s, outcome) = settings::load_reporting();
+    move || match logic::reload_payload(outcome, s.user_dictionary.enabled) {
+        Some(enabled) => send_reload_over_pipe(enabled),
+        None => EngineStatus::Absent,
+    }
+}
+
+fn dict_path_or_err() -> Result<std::path::PathBuf, DictCmdError> {
+    settings::user_dictionary::dict_path()
+        .ok_or_else(|| DictCmdError::Io { message: "LOCALAPPDATA が解決できません".into() })
+}
+
+#[tauri::command(async)]
+pub fn dict_list(lock: tauri::State<DictLock>) -> Result<ListReport, DictCmdError> {
+    logic::dict_list_logic(&lock, &dict_path_or_err()?)
+}
+
+#[tauri::command(async)]
+pub fn dict_add(
+    lock: tauri::State<DictLock>,
+    ruby: String,
+    word: String,
+    pos: String,
+) -> Result<MutationReport, DictCmdError> {
+    let path = dict_path_or_err()?;
+    logic::dict_add_logic(&lock, &path, &reload_sender(), &ruby, &word, &pos)
+}
+
+#[tauri::command(async)]
+pub fn dict_update(
+    lock: tauri::State<DictLock>,
+    old_ruby: String,
+    old_word: String,
+    ruby: String,
+    word: String,
+    pos: String,
+) -> Result<MutationReport, DictCmdError> {
+    let path = dict_path_or_err()?;
+    logic::dict_update_logic(&lock, &path, &reload_sender(), &old_ruby, &old_word, &ruby, &word, &pos)
+}
+
+#[tauri::command(async)]
+pub fn dict_delete(lock: tauri::State<DictLock>, ruby: String, word: String) -> Result<MutationReport, DictCmdError> {
+    let path = dict_path_or_err()?;
+    logic::dict_delete_logic(&lock, &path, &reload_sender(), &ruby, &word)
+}
+
+/// TSV ファイルを選んでインポートする。ダイアログ表示・ファイル読み込みは mutex の外
+/// (spec §5.3)。キャンセルは `Ok(None)`。
+#[tauri::command(async)]
+pub fn dict_import(
+    app: tauri::AppHandle,
+    lock: tauri::State<DictLock>,
+) -> Result<Option<ImportReportDto>, DictCmdError> {
+    use tauri_plugin_dialog::DialogExt;
+    let Some(picked) = app.dialog().file().add_filter("TSV", &["tsv", "txt"]).blocking_pick_file() else {
+        return Ok(None);
+    };
+    let file_path = picked.into_path().map_err(|e| DictCmdError::Io { message: e.to_string() })?;
+    let bytes = std::fs::read(&file_path).map_err(|e| DictCmdError::Io { message: e.to_string() })?;
+    let path = dict_path_or_err()?;
+    logic::dict_import_logic(&lock, &path, &reload_sender(), &bytes).map(Some)
+}
+
+/// TSV ファイルへエクスポートする。保存先ダイアログは mutex の外(spec §5.3)。
+/// キャンセルは `Ok(None)`。
+#[tauri::command(async)]
+pub fn dict_export(
+    app: tauri::AppHandle,
+    lock: tauri::State<DictLock>,
+) -> Result<Option<ExportReportDto>, DictCmdError> {
+    use tauri_plugin_dialog::DialogExt;
+    let Some(picked) =
+        app.dialog().file().add_filter("TSV", &["tsv"]).set_file_name("user_dictionary.tsv").blocking_save_file()
+    else {
+        return Ok(None);
+    };
+    let file_path = picked.into_path().map_err(|e| DictCmdError::Io { message: e.to_string() })?;
+    let path = dict_path_or_err()?;
+    let (tsv, report) = logic::dict_export_logic(&lock, &path)?;
+    std::fs::write(&file_path, tsv.as_bytes()).map_err(|e| DictCmdError::Io { message: e.to_string() })?;
+    Ok(Some(report))
+}
+
+/// settings 適用成功後にフロントが fire-and-forget で呼ぶトグル反映(spec §4.2)。
+/// エントリ mutation(§4.1 の起動時 enqueue で救済される)と異なり、トグル適用は engine
+/// init〜pipe 作成の短い窓に落ちると次回まで無言で効かないため、接続失敗時のみ
+/// 300ms×3 リトライして窓を実質閉塞する。
+#[tauri::command(async)]
+pub fn dict_sync_engine() -> EngineStatus {
+    let send = reload_sender();
+    for attempt in 0..3u32 {
+        match send() {
+            EngineStatus::Absent if attempt + 1 < 3 => {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            status => return status,
+        }
+    }
+    EngineStatus::Absent
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_external_url, releases_url, stop_engine_exit_code};
+    use super::{get_symbol_catalog, is_allowed_external_url, releases_url, stop_engine_exit_code};
+
+    #[test]
+    fn symbol_catalog_returns_29_entries_excluding_dash_comma_period() {
+        let catalog = get_symbol_catalog();
+        assert_eq!(catalog.len(), 29);
+        assert!(catalog.iter().all(|e| !matches!(e.half, '-' | ',' | '.')));
+    }
 
     #[test]
     fn external_url_allowlist_admits_only_attribution_links() {

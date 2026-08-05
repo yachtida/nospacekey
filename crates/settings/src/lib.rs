@@ -1,9 +1,12 @@
 //! SP6b: nospacekey の永続設定。TIP と NospacekeyConfig.exe が共有する。COM/GUI 非依存。
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 pub mod dpapi;
 pub mod keymap;
+pub mod symbol;
+pub mod user_dictionary;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmSettings {
@@ -97,10 +100,38 @@ pub struct PunctuationSettings { pub full_width: bool }
 impl Default for PunctuationSettings { fn default() -> Self { Self { full_width: true } } }
 
 /// かな入力モードの記号既定幅（true=全角 ・「」！？～：；等／false=半角 ASCII）。既定 false。
-/// Number/Punctuation と違い既定が false なので Default は derive で足りる。
 /// `,` `.`（punctuation の領分）と `-`→ー（長音符=かな）はこのトグルの対象外。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SymbolSettings { pub full_width: bool }
+/// `full_width_chars`: マスタートグル ON 時に実際に全角化する記号の部分集合（Issue #1 —
+/// 2026-08-02 spec）。既定は `symbol::symbol_targets()` の全29記号。
+/// **Default は手書き**（derive を外した）: derive のままだと `full_width_chars` が
+/// 空集合になり、`symbol` オブジェクトごと欠落した JSON・新規インストール・破損
+/// フォールバック・「既定に戻す」の全てで機能が黙って死ぬ（spec §3）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolSettings {
+    pub full_width: bool,
+    #[serde(default = "symbol::default_full_width_chars", deserialize_with = "symbol::de_symbol_chars")]
+    pub full_width_chars: BTreeSet<char>,
+}
+impl Default for SymbolSettings {
+    fn default() -> Self {
+        Self { full_width: false, full_width_chars: symbol::default_full_width_chars() }
+    }
+}
+impl SymbolSettings {
+    /// `full_width_chars` と `symbol_targets()` の積（対象外文字はここで落ちる）。
+    /// `Cell<SymbolCharSet>` としてキャッシュへ載せるための実効集合（spec §2）。
+    pub fn effective_chars(&self) -> symbol::SymbolCharSet {
+        symbol::SymbolCharSet::from(&self.full_width_chars)
+            & symbol::SymbolCharSet::from(&symbol::default_full_width_chars())
+    }
+    /// overlay 実効値（= `full_width` かつ実効集合が非空）。素の `full_width_chars.is_empty()`
+    /// を使わないのは、`["-"]` のような「非空だが実効ゼロ」の集合で gate だけ食い続ける
+    /// 不整合を防ぐため（spec §2）。TIP の gate/OnKeyDown 系はこの値をキャッシュへ格納するだけにし、
+    /// 判定ロジックを Activate に書かない。
+    pub fn symbol_overlay(&self) -> bool {
+        self.full_width && !self.effective_chars().is_empty()
+    }
+}
 
 /// 一時的なかなモード（トリガキーで一時的にかな入力へ入り、確定で自動的に半角英数へ戻る）。
 /// ターミナル/vim 向けに「日本語モードの抜け忘れ」を防ぐ。既定 ON・トリガは F8。
@@ -154,6 +185,17 @@ impl ReadingMonitorSettings {
     }
 }
 
+/// カスタム辞書(ユーザー辞書)の有効/無効。既定 ON。LearningSettings と同じく既定が true
+/// なので Default は手書き(derive だと false — 既存ユーザの辞書が黙って無効化される)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserDictionarySettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+impl Default for UserDictionarySettings {
+    fn default() -> Self { Self { enabled: true } }
+}
+
 fn default_true() -> bool { true }
 fn default_max_chars() -> u32 { 34 }
 
@@ -195,9 +237,11 @@ pub struct Settings {
     /// configurable keymap: コマンド系 12 機能のキー割り当て(spec 2026-07-16)。
     /// 欠落の旧 settings.json は全機能「既定」でロード。反映は Activate 時 1 回(D7)。
     #[serde(default)] pub keymap: keymap::KeymapSettings,
+    /// カスタム辞書(ユーザー辞書)。既定 ON。欠落の旧 settings.json は ON でロード(後方互換)。
+    #[serde(default)] pub user_dictionary: UserDictionarySettings,
 }
 impl Default for Settings {
-    fn default() -> Self { Self { version: 2, llm: Default::default(), zenzai: Default::default(), live_conversion: Default::default(), learning: Default::default(), default_direct: false, appearance: Default::default(), feedback: Default::default(), number: Default::default(), punctuation: Default::default(), symbol: Default::default(), ephemeral: EphemeralSettings::default(), typo_correct: Default::default(), shift_latin: Default::default(), reading_monitor: Default::default(), keymap: Default::default() } }
+    fn default() -> Self { Self { version: 2, llm: Default::default(), zenzai: Default::default(), live_conversion: Default::default(), learning: Default::default(), default_direct: false, appearance: Default::default(), feedback: Default::default(), number: Default::default(), punctuation: Default::default(), symbol: Default::default(), ephemeral: EphemeralSettings::default(), typo_correct: Default::default(), shift_latin: Default::default(), reading_monitor: Default::default(), keymap: Default::default(), user_dictionary: Default::default() } }
 }
 
 /// A 段の外観設定。全フィールド `#[serde(default)]` で後方互換（欠落フィールドは既定へ）。
@@ -444,16 +488,28 @@ pub fn load_reporting() -> (Settings, LoadOutcome) {
 /// 片方が NotFound や破損を起こす）。失敗時は残骸 tmp をベストエフォートで掃除する。
 pub fn save(s: &Settings) -> std::io::Result<()> {
     let path = settings_path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
-    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
     // シリアライズ失敗時に settings.json を空ファイルで上書きして破壊しないよう、ここで ?
     // で中断する（to_json は unwrap_or_default で "" に落ちるため save では使わない）。
     let json = serde_json::to_string_pretty(s).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, &json) {
+    save_atomic(&path, &json)
+}
+
+/// `save()` から抽出した汎用の原子保存ヘルパ（辞書ファイル保存でも使う想定）。
+/// 親 dir 作成→一時ファイルへ書き→rename（短リトライ付き）→AppContainer read ACE 付与、まで行う。
+pub(crate) fn save_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+    // 元の save() は settings.json 専用に with_extension(".json" 前提) で組んでいたが、
+    // save_atomic は拡張子を問わず呼ばれる汎用ヘルパなので、拡張子の有無に依存しない
+    // 文字列連結（`{path}.tmp.{pid}`）にする。
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = PathBuf::from(tmp_name);
+    if let Err(e) = std::fs::write(&tmp, content) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
+    // std::fs::rename は AsRef<Path> 総称のため直接渡すと HRTB 推論に失敗する。クロージャで包む。
+    if let Err(e) = rename_with_retry(&tmp, path, |f, t| std::fs::rename(f, t)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
@@ -461,8 +517,34 @@ pub fn save(s: &Settings) -> std::io::Result<()> {
     // 親ディレクトリと当該ファイルに AppContainer read ACE を付与する（best-effort・プロセス1回）。
     // %LOCALAPPDATA% は AppContainer ACE を継承しないため、付与しないと検索窓でだけ設定が既定へ
     // 劣化する（load() の PermissionDenied を握り潰していた症状）。DLL/pipe の ACE と同じ 2 SID・RX。
-    ensure_appcontainer_readable(&path);
+    ensure_appcontainer_readable(path);
     Ok(())
+}
+
+/// rename を短リトライする（spec §3.1: 5ms間隔×4回）。エンジンが settings.json/辞書ファイルを
+/// 読んでいる最中の rename は Windows では sharing violation（PermissionDenied）で瞬間的に
+/// 失敗し得るため、リトライなしだと保存が失敗扱いになる。rename 実装を注入可能にしてあるのは、
+/// 実 OS のファイルロックを再現せずにリトライ回数だけを単体テストするため。
+fn rename_with_retry(
+    from: &Path,
+    to: &Path,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    const RETRIES: u32 = 4;
+    const DELAY_MS: u64 = 5;
+    let mut last_err = None;
+    for attempt in 0..RETRIES {
+        match rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < RETRIES {
+                    std::thread::sleep(std::time::Duration::from_millis(DELAY_MS));
+                }
+            }
+        }
+    }
+    Err(last_err.expect("RETRIES > 0"))
 }
 
 /// UU-7: AppContainer(`ALL APPLICATION PACKAGES`=S-1-15-2-1)/LPAC(`ALL RESTRICTED APPLICATION
@@ -534,12 +616,49 @@ pub fn resolve_env_map(
     put("NOSPACEKEY_ZENZAI_INFERENCE_LIMIT", s.zenzai.effective_inference_limit().to_string());
     put("NOSPACEKEY_LEARNING", if s.learning.enabled { "1".into() } else { "0".into() });
     put("NOSPACEKEY_TYPO_LEARN", if s.typo_correct.learn { "1".into() } else { "0".into() });
+    put("NOSPACEKEY_USER_DICT_ENABLED", if s.user_dictionary.enabled { "1".into() } else { "0".into() });
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- save_atomic: rename 短リトライ ----
+    #[test]
+    fn rename_with_retry_retries_transient_failure() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let r = rename_with_retry(Path::new("a"), Path::new("b"), |_f, _t| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sharing violation"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(r.is_ok());
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn rename_with_retry_gives_up_after_retries() {
+        let r = rename_with_retry(Path::new("a"), Path::new("b"), |_f, _t| {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sv"))
+        });
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn save_atomic_roundtrip_via_tempdir() {
+        let dir = std::env::temp_dir().join(format!("nsk-sa-{}", std::process::id()));
+        let path = dir.join("x.json");
+        save_atomic(&path, "[1,2]").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[1,2]");
+        save_atomic(&path, "[3]").unwrap(); // 上書き(rename REPLACE_EXISTING)
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[3]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // ---- UU-7: 読み取り失敗の分類 ----
     #[test]
@@ -845,6 +964,106 @@ mod tests {
         assert!(back.symbol.full_width);
     }
 
+    // ---- Issue #1: symbol_full_width 対象記号の個別選択（2026-08-02 spec）----
+
+    #[test]
+    fn symbol_object_entirely_missing_loads_default_29_via_handwritten_default() {
+        // symbol オブジェクトごと欠落した旧 JSON は SymbolSettings::default()（手書き）を通る。
+        let s = Settings::from_json_str(r#"{"version":2}"#);
+        assert!(!s.symbol.full_width);
+        assert_eq!(s.symbol.full_width_chars, symbol::default_full_width_chars());
+        assert_eq!(s.symbol.full_width_chars.len(), 29);
+    }
+
+    #[test]
+    fn full_width_chars_field_missing_loads_default_29_via_field_default() {
+        // symbol はあるが full_width_chars フィールドだけ無い旧 JSON は serde のフィールド
+        // default（`default = "symbol::default_full_width_chars"`）を通る。
+        let s = Settings::from_json_str(r#"{"version":2,"symbol":{"full_width":true}}"#);
+        assert!(s.symbol.full_width);
+        assert_eq!(s.symbol.full_width_chars, symbol::default_full_width_chars());
+    }
+
+    #[test]
+    fn partial_symbol_subset_saves_and_restores() {
+        let mut s = Settings::default();
+        s.symbol.full_width = true;
+        s.symbol.full_width_chars = BTreeSet::from(['!', '?']);
+        let back = Settings::from_json_str(&s.to_json());
+        assert_eq!(back.symbol.full_width_chars, BTreeSet::from(['!', '?']));
+    }
+
+    #[test]
+    fn empty_symbol_set_saves_and_restores_distinct_from_missing_field() {
+        // 空集合（全解除）は serde 上「欠落」と区別される — 欠落は既定29へ、明示空は空のまま。
+        let mut s = Settings::default();
+        s.symbol.full_width_chars = BTreeSet::new();
+        let back = Settings::from_json_str(&s.to_json());
+        assert!(back.symbol.full_width_chars.is_empty());
+    }
+
+    #[test]
+    fn invalid_array_elements_are_skipped_and_valid_ones_kept() {
+        let js = r#"{"version":2,"symbol":{"full_width":true,"full_width_chars":["!","ab",42,"?"]},"number":{"full_width":false}}"#;
+        let s = Settings::from_json_str(js);
+        assert_eq!(s.symbol.full_width_chars, BTreeSet::from(['!', '?']));
+        assert!(s.symbol.full_width);
+        assert!(!s.number.full_width, "不正要素があっても兄弟設定は壊れない（spec §6）");
+    }
+
+    #[test]
+    fn invalid_container_falls_back_to_default_29_without_breaking_sibling_settings() {
+        // 不正コンテナ（配列でない値）は既定29へフォールバックし、blast radius はこのフィールド
+        // に限定される — 兄弟設定（number 等）や symbol.full_width 自体は壊れない。
+        for bad in [r#""!?""#, "null", "{}"] {
+            let js = format!(
+                r#"{{"version":2,"symbol":{{"full_width":true,"full_width_chars":{bad}}},"number":{{"full_width":false}}}}"#
+            );
+            let s = Settings::from_json_str(&js);
+            assert_eq!(s.symbol.full_width_chars, symbol::default_full_width_chars(), "container {bad:?}");
+            assert!(s.symbol.full_width);
+            assert!(!s.number.full_width);
+        }
+    }
+
+    #[test]
+    fn out_of_scope_char_is_preserved_in_set_but_ineffective() {
+        // `-`（対象外）だけの1文字要素は捨てずに保持してよい（将来対象が広がった場合に活きる）。
+        let s = Settings::from_json_str(r#"{"version":2,"symbol":{"full_width":true,"full_width_chars":["-"]}}"#);
+        assert!(s.symbol.full_width_chars.contains(&'-'));
+        assert!(s.symbol.effective_chars().is_empty());
+        assert!(!s.symbol.symbol_overlay());
+    }
+
+    #[test]
+    fn effective_chars_and_symbol_overlay_four_cases() {
+        // 全29 → overlay=true
+        let mut all = Settings::default();
+        all.symbol.full_width = true;
+        assert!(!all.symbol.effective_chars().is_empty());
+        assert!(all.symbol.symbol_overlay());
+
+        // 空集合 → overlay=false
+        let mut empty = Settings::default();
+        empty.symbol.full_width = true;
+        empty.symbol.full_width_chars = BTreeSet::new();
+        assert!(empty.symbol.effective_chars().is_empty());
+        assert!(!empty.symbol.symbol_overlay());
+
+        // 非空だが実効ゼロ（対象外文字のみ）→ overlay=false
+        let mut ineffective = Settings::default();
+        ineffective.symbol.full_width = true;
+        ineffective.symbol.full_width_chars = BTreeSet::from(['-']);
+        assert!(!ineffective.symbol.full_width_chars.is_empty());
+        assert!(ineffective.symbol.effective_chars().is_empty());
+        assert!(!ineffective.symbol.symbol_overlay());
+
+        // full_width=false → 実効集合が非空でも常に false
+        let off = Settings::default();
+        assert!(!off.symbol.effective_chars().is_empty());
+        assert!(!off.symbol.symbol_overlay());
+    }
+
     #[test]
     fn shift_latin_defaults_to_compose_and_roundtrips() {
         // 既定は compose（英語未確定モード=MS-IME系。変更要望の起点がこの挙動への期待だった）。
@@ -1013,6 +1232,21 @@ mod tests {
         assert_eq!(m.reading_monitor.effective_max_chars(), 34);
         m.reading_monitor.max_chars = 101;
         assert_eq!(m.reading_monitor.effective_max_chars(), 100);
+    }
+
+    #[test]
+    fn user_dictionary_defaults_enabled_on_missing_field() {
+        let s: Settings = serde_json::from_str(r#"{"version":2}"#).unwrap();
+        assert!(s.user_dictionary.enabled); // 旧 settings.json で辞書が死なない
+        assert!(UserDictionarySettings::default().enabled); // derive(Default)化の退行検出
+    }
+
+    #[test]
+    fn env_map_injects_user_dict_enabled() {
+        let mut s = Settings::default();
+        s.user_dictionary.enabled = false;
+        let m = resolve_env_map(&s, None, |_| None);
+        assert!(m.iter().any(|(k, v)| k == "NOSPACEKEY_USER_DICT_ENABLED" && v == "0"));
     }
 
     #[test]

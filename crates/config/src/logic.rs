@@ -6,6 +6,7 @@
 //!   その他=新規入力→encrypt 成功時のみ上書き（失敗時は既存 blob 維持）。
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// 鍵フィールドの「設定済み」プレースホルダ。これが入力欄の値のまま適用されたら
 /// 「変更なし」とみなし、既存の DPAPI blob を保持する（鍵を消さない）。
@@ -46,6 +47,8 @@ pub struct SettingsDto {
     pub punctuation_full_width: bool,
     /// かな入力モードで記号を既定で全角確定するか（既定 false）。
     pub symbol_full_width: bool,
+    /// マスタートグル ON 時に実際に全角化する記号の部分集合（1文字ずつの文字列、既定 全29）。
+    pub symbol_full_width_chars: Vec<String>,
     /// 読みモニタ（ライブ変換中の生読み常時表示、既定 true）。
     pub reading_monitor_enabled: bool,
     /// 読みモニタ: 自動確定をまたいで読みを累積表示する（既定 true）。
@@ -61,6 +64,8 @@ pub struct SettingsDto {
     pub ephemeral_trigger: String,
     /// Shift+英字の挙動（"compose"=英語未確定モード / "commit"=大文字直接確定、既定 "compose"）。
     pub shift_latin_mode: String,
+    /// カスタム辞書(ユーザー辞書)を有効にするか(既定 true)。
+    pub user_dictionary_enabled: bool,
     pub keymap: settings::keymap::KeymapSettings,
     pub appearance: settings::Appearance,
 }
@@ -88,12 +93,14 @@ pub fn to_dto(s: &settings::Settings) -> SettingsDto {
         number_full_width: s.number.full_width,
         punctuation_full_width: s.punctuation.full_width,
         symbol_full_width: s.symbol.full_width,
+        symbol_full_width_chars: s.symbol.full_width_chars.iter().map(|c| c.to_string()).collect(),
         reading_monitor_enabled: s.reading_monitor.enabled,
         reading_monitor_accumulate: s.reading_monitor.accumulate,
         reading_monitor_max_chars: s.reading_monitor.max_chars,
         ephemeral_enabled: s.ephemeral.enabled,
         ephemeral_trigger: s.ephemeral.trigger.clone(),
         shift_latin_mode: s.shift_latin.mode.clone(),
+        user_dictionary_enabled: s.user_dictionary.enabled,
         keymap: s.keymap.clone(),
         appearance: s.appearance.clone(),
     }
@@ -102,6 +109,27 @@ pub fn to_dto(s: &settings::Settings) -> SettingsDto {
 /// `#RRGGBB`（# + 6 桁16進、3桁短縮不可）のみ許可。settings::parse_hex_color と同じ制約。
 fn is_valid_hex(s: &str) -> bool {
     s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// DTO の `Vec<String>` を `BTreeSet<char>` へ正規化する。1文字の要素のみ採用し、
+/// 複数文字/空文字は黙って捨てる（settings::symbol::de_symbol_chars の要素検証と同じ規則）。
+///
+/// Why not FieldError: 上の `validate` が列挙値に FieldError を返すのは、ラジオ/テキスト
+/// 入力のようにユーザーが訂正可能な入力を想定しているため。このフィールドはチェックボックス
+/// UI からしか来ず、UI が複数文字/空文字を生成することは構造的に無いので、
+/// defense-in-depth の黙殺で足りる（手編集 JSON からの不正入力は settings 側
+/// `de_symbol_chars` が別途フィールド内で防御する）。
+fn normalize_symbol_chars(items: Vec<String>) -> std::collections::BTreeSet<char> {
+    items
+        .into_iter()
+        .filter_map(|s| {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// DTO 全体を検証してフィールド単位のエラーを返す。空 Vec = 妥当。
@@ -267,6 +295,7 @@ pub fn apply_dto(
     s.number.full_width = dto.number_full_width;
     s.punctuation.full_width = dto.punctuation_full_width;
     s.symbol.full_width = dto.symbol_full_width;
+    s.symbol.full_width_chars = normalize_symbol_chars(dto.symbol_full_width_chars);
     s.reading_monitor.enabled = dto.reading_monitor_enabled;
     s.reading_monitor.accumulate = dto.reading_monitor_accumulate;
     // 範囲外はエラーでなくクランプ(spec 決定)。正規化点は settings::effective_max_chars。
@@ -275,14 +304,285 @@ pub fn apply_dto(
     s.ephemeral.enabled = dto.ephemeral_enabled;
     s.ephemeral.trigger = dto.ephemeral_trigger; // validate 済み（未知値は上で Err 済み）
     s.shift_latin.mode = dto.shift_latin_mode; // validate 済み（同上）
+    s.user_dictionary.enabled = dto.user_dictionary_enabled;
     s.keymap = dto.keymap;
     s.appearance = dto.appearance;
     Ok(s)
 }
 
+// ============================================================================
+// カスタム辞書 CRUD(Issue #3 spec §5.3)。settings の dirty/適用フローとは独立で、
+// 確定した瞬間に load→mutate→save→ReloadDictionary 送信まで進める。
+// ============================================================================
+
+/// 辞書ファイル操作の直列化 mutex。`State` へ直接埋めず引数注入にする — mutex 込みの
+/// 不変条件(ロストアップデート無し)を単体テストから直接固定する場所を確保するため
+/// (commands.rs は `State` から借りて渡すだけの薄層)。
+pub struct DictLock(pub std::sync::Mutex<()>);
+
+/// ReloadDictionary の伝播結果(spec §4.2)。保存成功とは独立の付帯情報として返す
+/// (mutation はファイル保存が成功した時点で成功であり、エンジン都合で Err にしない)。
+#[derive(Serialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineStatus {
+    Applied,
+    Declined,
+    Absent,
+    Timeout,
+}
+
+/// UI 一覧行。ruby/pos は生値を必ず含める(`dict_update`/`dict_delete` の対象特定は
+/// 正準化前の生 ruby で行うため — 表示用の正準値だけでは非かな読みの移行産エントリを
+/// 削除できなくなる)。
+#[derive(Serialize)]
+pub struct DictEntryDto {
+    pub ruby: String,
+    pub word: String,
+    pub pos: Option<String>,
+    pub pos_display: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct ListReport {
+    pub entries: Vec<DictEntryDto>,
+    pub deduped: usize,
+    pub corrupt: String,
+}
+
+// Debug は本体機能に不要だが、テストの `.unwrap_err()`(Ok 側の型に境界が掛かる)が要求する。
+#[derive(Serialize, Debug)]
+pub struct MutationReport {
+    pub engine: EngineStatus,
+}
+
+#[derive(Serialize)]
+pub struct ImportReportDto {
+    pub added: usize,
+    pub skipped_dup: usize,
+    pub skipped_invalid: usize,
+    pub encoding_hint: bool,
+    pub engine: EngineStatus,
+}
+
+#[derive(Serialize)]
+pub struct ExportReportDto {
+    pub written: usize,
+    pub skipped_control: usize,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(tag = "kind")]
+pub enum DictCmdError {
+    NotFound,
+    Duplicate,
+    Invalid { field: String },
+    Unreadable,
+    QuarantineFailed,
+    Io { message: String },
+}
+
+/// `validate_entry` はどちらのフィールドが失敗したかを返さない。常に妥当なダミー word
+/// (ruby 側の判定は word に依存しない)で ruby 単体を再検証し、切り分ける。
+fn invalid_field(ruby: &str) -> &'static str {
+    if settings::user_dictionary::validate_entry(ruby, "x").is_err() {
+        "ruby"
+    } else {
+        "word"
+    }
+}
+
+/// mutation 側の load。読取 I/O エラー・隔離失敗のどちらも拒否する(空続行させると
+/// 後続 save が原本を上書きして恒久消失する — settings::user_dictionary::DictLoadError の doc 参照)。
+fn load_locked(path: &Path) -> Result<settings::user_dictionary::LoadedDict, DictCmdError> {
+    settings::user_dictionary::load_from(path).map_err(|e| match e {
+        settings::user_dictionary::DictLoadError::Unreadable => DictCmdError::Unreadable,
+        settings::user_dictionary::DictLoadError::QuarantineFailed => DictCmdError::QuarantineFailed,
+    })
+}
+
+fn save_and_send(
+    path: &Path,
+    entries: &[settings::user_dictionary::UserDictEntry],
+    send: &dyn Fn() -> EngineStatus,
+) -> Result<MutationReport, DictCmdError> {
+    settings::user_dictionary::save_to(path, entries).map_err(|e| DictCmdError::Io { message: e.to_string() })?;
+    Ok(MutationReport { engine: send() })
+}
+
+/// §5.1/§6.2 共通のソートキー `(normalize_key(ruby), word)` の辞書式昇順で DTO 化する。
+fn to_sorted_dtos(mut entries: Vec<settings::user_dictionary::UserDictEntry>) -> Vec<DictEntryDto> {
+    entries.sort_by_cached_key(|e| (settings::user_dictionary::normalize_key(&e.ruby), e.word.clone()));
+    entries
+        .into_iter()
+        .map(|e| {
+            let pos_display = settings::user_dictionary::canonical_pos(e.pos.as_deref());
+            DictEntryDto { ruby: e.ruby, word: e.word, pos: e.pos, pos_display }
+        })
+        .collect()
+}
+
+/// 読むだけ(書き戻さない)。**それでもロックを取る** — `load_from` は破損検知時に隔離
+/// rename を行うため、ロック無しだと mutation が保存した直後の健全ファイルを、破損バイト列
+/// を読んで止まっていた並行 dict_list が `.corrupt` へ持ち去る競合が成立する。
+pub fn dict_list_logic(lock: &DictLock, path: &Path) -> Result<ListReport, DictCmdError> {
+    let _guard = lock.0.lock().unwrap();
+    match settings::user_dictionary::load_from(path) {
+        Ok(loaded) => Ok(ListReport {
+            deduped: loaded.deduped,
+            corrupt: match loaded.corrupt {
+                settings::user_dictionary::DictCorrupt::None => "none",
+                settings::user_dictionary::DictCorrupt::Quarantined => "quarantined",
+            }
+            .to_string(),
+            entries: to_sorted_dtos(loaded.entries),
+        }),
+        Err(settings::user_dictionary::DictLoadError::Unreadable) => Err(DictCmdError::Unreadable),
+        // 隔離不能=mutation 拒否状態だが、閲覧自体は落とさず「壊れている」ことだけ伝える。
+        Err(settings::user_dictionary::DictLoadError::QuarantineFailed) => {
+            Ok(ListReport { entries: Vec::new(), deduped: 0, corrupt: "quarantine_failed".to_string() })
+        }
+    }
+}
+
+pub fn dict_add_logic(
+    lock: &DictLock,
+    path: &Path,
+    send: &dyn Fn() -> EngineStatus,
+    ruby: &str,
+    word: &str,
+    pos: &str,
+) -> Result<MutationReport, DictCmdError> {
+    settings::user_dictionary::validate_entry(ruby, word)
+        .map_err(|_| DictCmdError::Invalid { field: invalid_field(ruby).to_string() })?;
+    let _guard = lock.0.lock().unwrap();
+    let mut loaded = load_locked(path)?;
+    let entry = settings::user_dictionary::UserDictEntry {
+        ruby: ruby.to_string(),
+        word: word.to_string(),
+        pos: Some(pos.to_string()),
+    };
+    let key = settings::user_dictionary::entry_key(&entry);
+    if loaded.entries.iter().any(|e| settings::user_dictionary::entry_key(e) == key) {
+        return Err(DictCmdError::Duplicate);
+    }
+    loaded.entries.push(entry);
+    save_and_send(path, &loaded.entries, send)
+}
+
+#[allow(clippy::too_many_arguments)] // spec§5.3 の固定インターフェース(old_*/新値を並べる形)
+pub fn dict_update_logic(
+    lock: &DictLock,
+    path: &Path,
+    send: &dyn Fn() -> EngineStatus,
+    old_ruby: &str,
+    old_word: &str,
+    ruby: &str,
+    word: &str,
+    pos: &str,
+) -> Result<MutationReport, DictCmdError> {
+    settings::user_dictionary::validate_entry(ruby, word)
+        .map_err(|_| DictCmdError::Invalid { field: invalid_field(ruby).to_string() })?;
+    let _guard = lock.0.lock().unwrap();
+    let mut loaded = load_locked(path)?;
+    // 対象特定はキー組一致のみ(validate を通さない — 移行産の非かな読みエントリも編集可能にする)。
+    let old_key = settings::user_dictionary::entry_key(&settings::user_dictionary::UserDictEntry {
+        ruby: old_ruby.to_string(),
+        word: old_word.to_string(),
+        pos: None,
+    });
+    let idx = loaded
+        .entries
+        .iter()
+        .position(|e| settings::user_dictionary::entry_key(e) == old_key)
+        .ok_or(DictCmdError::NotFound)?;
+    let new_entry = settings::user_dictionary::UserDictEntry {
+        ruby: ruby.to_string(),
+        word: word.to_string(),
+        pos: Some(pos.to_string()),
+    };
+    let new_key = settings::user_dictionary::entry_key(&new_entry);
+    // 自己除外(§3.2): 編集対象自身とのキー一致は重複としない。
+    if loaded.entries.iter().enumerate().any(|(i, e)| i != idx && settings::user_dictionary::entry_key(e) == new_key)
+    {
+        return Err(DictCmdError::Duplicate);
+    }
+    loaded.entries[idx] = new_entry;
+    save_and_send(path, &loaded.entries, send)
+}
+
+pub fn dict_delete_logic(
+    lock: &DictLock,
+    path: &Path,
+    send: &dyn Fn() -> EngineStatus,
+    ruby: &str,
+    word: &str,
+) -> Result<MutationReport, DictCmdError> {
+    let _guard = lock.0.lock().unwrap();
+    let mut loaded = load_locked(path)?;
+    // delete も対象特定は validate を通さない(delete_works_on_invalid_legacy_entry)。
+    let key = settings::user_dictionary::entry_key(&settings::user_dictionary::UserDictEntry {
+        ruby: ruby.to_string(),
+        word: word.to_string(),
+        pos: None,
+    });
+    let idx = loaded
+        .entries
+        .iter()
+        .position(|e| settings::user_dictionary::entry_key(e) == key)
+        .ok_or(DictCmdError::NotFound)?;
+    loaded.entries.remove(idx);
+    save_and_send(path, &loaded.entries, send)
+}
+
+pub fn dict_import_logic(
+    lock: &DictLock,
+    path: &Path,
+    send: &dyn Fn() -> EngineStatus,
+    bytes: &[u8],
+) -> Result<ImportReportDto, DictCmdError> {
+    // エンコーディング判別+パースは mutex の外(spec §5.3 — ダイアログ同様、重い処理で
+    // 辞書タブ全体を無期限に無反応にしない)。
+    let parsed = settings::user_dictionary::parse_tsv(bytes);
+    let _guard = lock.0.lock().unwrap();
+    let mut loaded = load_locked(path)?;
+    let report =
+        settings::user_dictionary::merge_imported(&mut loaded.entries, parsed.rows, parsed.had_replacement);
+    settings::user_dictionary::save_to(path, &loaded.entries)
+        .map_err(|e| DictCmdError::Io { message: e.to_string() })?;
+    Ok(ImportReportDto {
+        added: report.added,
+        skipped_dup: report.skipped_dup,
+        skipped_invalid: report.skipped_invalid,
+        encoding_hint: report.encoding_hint,
+        engine: send(),
+    })
+}
+
+/// tsv は UTF-8 BOM 無しで書く(呼び出し元がファイルへ書き出す)。lock は `dict_list_logic`
+/// と同じ理由(`load_from` の隔離 rename)。
+pub fn dict_export_logic(lock: &DictLock, path: &Path) -> Result<(String, ExportReportDto), DictCmdError> {
+    let _guard = lock.0.lock().unwrap();
+    let loaded = load_locked(path)?;
+    let out = settings::user_dictionary::to_google_tsv(&loaded.entries);
+    Ok((out.tsv, ExportReportDto { written: out.written, skipped_control: out.skipped_control }))
+}
+
+/// spec §4.2: settings 読み取りが `Loaded`/`Missing` 以外(共有違反等の I/O エラー)なら
+/// ReloadDictionary を送らない。素の `settings::load()` は読み失敗を既定値(enabled=true)へ
+/// 劣化させるため、これを使うと settings.json の原子 rename と読みが競合した瞬間に
+/// OFF にした辞書がエンジン側だけ再有効化されてしまう。
+pub fn reload_payload(outcome: settings::LoadOutcome, enabled: bool) -> Option<bool> {
+    use settings::LoadOutcome::*;
+    match outcome {
+        Loaded | Missing => Some(enabled),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn base_dto() -> SettingsDto {
         to_dto(&settings::Settings::default())
@@ -504,6 +804,61 @@ mod tests {
     }
 
     #[test]
+    fn symbol_full_width_chars_roundtrips_default_29_and_partial_subset() {
+        // Settings → DTO（既定 全29 が BTreeSet 順の文字列配列で写る）
+        let s = settings::Settings::default();
+        let dto = to_dto(&s);
+        assert_eq!(dto.symbol_full_width_chars.len(), 29);
+        assert!(dto.symbol_full_width_chars.iter().all(|c| c.chars().count() == 1));
+        // DTO → Settings: 部分集合(Issue #1 の例 — `/` `@` を外す)
+        let mut dto = to_dto(&settings::Settings::default());
+        dto.symbol_full_width_chars.retain(|c| c != "/" && c != "@");
+        let applied = apply_dto(dto, &settings::Settings::default(), |v| Some(v.to_string()))
+            .expect("妥当な DTO は適用できる");
+        assert!(!applied.symbol.full_width_chars.contains(&'/'));
+        assert!(!applied.symbol.full_width_chars.contains(&'@'));
+        assert!(applied.symbol.full_width_chars.contains(&'!'));
+        assert_eq!(applied.symbol.full_width_chars.len(), 27);
+    }
+
+    #[test]
+    fn symbol_full_width_chars_to_dto_reflects_saved_non_default_subset() {
+        // Settings → DTO を「非既定の保存値」で固定する。既定入力のテストだけだと、
+        // to_dto が保存値を無視して常に既定29を返す変異が全緑で通る（起動のたび全チェックに
+        // 戻り、次の適用で部分選択が黙って消える = Issue #1 の機能価値の消失）。
+        // 他の bool 往復テストが「Settings 側を非既定に変えて to_dto を assert」で
+        // 揃えている規約（spec §6「既存の bool 往復テストを集合込みへ拡張」）の集合版。
+        let mut s = settings::Settings::default();
+        s.symbol.full_width_chars.remove(&'/');
+        s.symbol.full_width_chars.remove(&'@');
+        let dto = to_dto(&s);
+        assert_eq!(dto.symbol_full_width_chars.len(), 27);
+        assert!(!dto.symbol_full_width_chars.contains(&"/".to_string()));
+        assert!(!dto.symbol_full_width_chars.contains(&"@".to_string()));
+        assert!(dto.symbol_full_width_chars.contains(&"!".to_string()));
+    }
+
+    #[test]
+    fn symbol_full_width_chars_empty_roundtrips_as_all_deselected() {
+        let mut dto = to_dto(&settings::Settings::default());
+        dto.symbol_full_width_chars.clear();
+        let applied = apply_dto(dto, &settings::Settings::default(), |v| Some(v.to_string()))
+            .expect("空集合も妥当な DTO");
+        assert!(applied.symbol.full_width_chars.is_empty());
+    }
+
+    #[test]
+    fn symbol_full_width_chars_silently_drops_multi_char_and_empty_elements_without_field_error() {
+        // チェックボックス UI は不正値を生成し得ないため、apply は FieldError でなく黙殺で正規化する。
+        let mut dto = to_dto(&settings::Settings::default());
+        dto.symbol_full_width_chars = vec!["!".into(), "ab".into(), "".into(), "?".into()];
+        assert!(validate(&dto).is_empty(), "不正要素があっても FieldError は出さない");
+        let applied = apply_dto(dto, &settings::Settings::default(), |v| Some(v.to_string()))
+            .expect("妥当な DTO は適用できる");
+        assert_eq!(applied.symbol.full_width_chars, BTreeSet::from(['!', '?']));
+    }
+
+    #[test]
     fn reading_monitor_roundtrips_between_dto_and_settings() {
         // Settings → DTO（既定 ON が写る）
         let mut s = settings::Settings::default();
@@ -607,6 +962,16 @@ mod tests {
     }
 
     #[test]
+    fn dto_roundtrips_user_dictionary_enabled() {
+        let mut s = settings::Settings::default();
+        s.user_dictionary.enabled = false;
+        let dto = to_dto(&s);
+        assert!(!dto.user_dictionary_enabled);
+        let s2 = apply_dto(dto, &s, |_| None).unwrap();
+        assert!(!s2.user_dictionary.enabled);
+    }
+
+    #[test]
     fn apply_rejects_invalid_without_touching_key() {
         let mut dto = base_dto();
         dto.timeout_ms = 0;
@@ -675,5 +1040,188 @@ mod tests {
         dto.llm_enabled = true;
         dto.keymap.typo_correct = Some("Shift+Tab".into());
         assert!(validate(&dto).is_empty());
+    }
+
+    // ---- カスタム辞書 CRUD(spec §8 config 層) ----
+
+    fn no_send() -> EngineStatus {
+        EngineStatus::Absent
+    }
+
+    /// テストごとに専用 dir(共有すると並列実行で他テストの残骸を拾って偽 RED/GREEN になる)。
+    fn temp_dict_path(case: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nsk-cfg-dict-{}-{case}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("d.json")
+    }
+
+    #[test]
+    fn concurrent_adds_all_survive() {
+        // 2件×1回だとスレッド起動オーバーヘッド>臨界区間でロック無しでも偶然通る。
+        // 各スレッド50件で衝突確率を実質1へ上げ、直列化の不変条件を決定的に固定する。
+        let lock = std::sync::Arc::new(DictLock(std::sync::Mutex::new(())));
+        let path = std::sync::Arc::new(temp_dict_path("conc"));
+        let hs: Vec<_> = ["あ", "い"]
+            .map(|prefix| {
+                let (lock, path, prefix) = (lock.clone(), path.clone(), prefix.to_string());
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        let ruby = format!("{}{}", prefix, "かきくけこ".chars().cycle().take(i + 1).collect::<String>());
+                        dict_add_logic(&lock, &path, &no_send, &ruby, &format!("W{i}"), "名詞").unwrap();
+                    }
+                })
+            })
+            .into_iter()
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(dict_list_logic(&lock, &path).unwrap().entries.len(), 100); // ロストアップデートなし
+    }
+
+    #[test]
+    fn reload_payload_suppresses_send_on_read_failure() {
+        use settings::LoadOutcome::*;
+        assert_eq!(reload_payload(Loaded, false), Some(false));
+        assert_eq!(reload_payload(Missing, true), Some(true));
+        assert_eq!(reload_payload(PermissionDenied, true), None); // 既定trueへの劣化でOFFを潰さない
+        assert_eq!(reload_payload(IoError, false), None);
+    }
+
+    #[test]
+    fn list_and_export_share_sorted_order() {
+        let lock = DictLock(std::sync::Mutex::new(()));
+        let path = temp_dict_path("sort");
+        for (r, w) in [("アップル", "Apple2"), ("あっぷる", "Apple1"), ("いぬ", "犬")] {
+            dict_add_logic(&lock, &path, &no_send, r, w, "名詞").unwrap();
+        }
+        let names: Vec<_> = dict_list_logic(&lock, &path).unwrap().entries.iter().map(|e| e.word.clone()).collect();
+        assert_eq!(names, ["Apple1", "Apple2", "犬"]); // (normalize_key, word) 辞書式(かな種混在OK)
+        // export も同一順(テスト名どおり両方を固定 — list だけだと to_google_tsv 未ソートで緑)
+        let (tsv, _) = dict_export_logic(&lock, &path).unwrap();
+        let words: Vec<_> = tsv.lines().map(|l| l.split('\t').nth(1).unwrap().to_string()).collect();
+        assert_eq!(words, ["Apple1", "Apple2", "犬"]);
+    }
+
+    #[test]
+    fn update_pos_only_succeeds_and_notfound_rejects() {
+        let lock = DictLock(std::sync::Mutex::new(()));
+        let path = temp_dict_path("upd");
+        dict_add_logic(&lock, &path, &no_send, "やちだ", "谷内田", "名詞").unwrap();
+        dict_update_logic(&lock, &path, &no_send, "やちだ", "谷内田", "やちだ", "谷内田", "姓").unwrap(); // 自己除外
+        assert_eq!(
+            dict_update_logic(&lock, &path, &no_send, "ない", "無い", "あ", "a", "名詞").unwrap_err(),
+            DictCmdError::NotFound
+        ); // is_err() だけだと別エラーでも緑=UI分岐が偽緑
+        assert_eq!(dict_delete_logic(&lock, &path, &no_send, "ない", "無い").unwrap_err(), DictCmdError::NotFound); // phantom insert 禁止
+    }
+
+    #[test]
+    fn delete_after_dup_file_leaves_no_remnant() {
+        // 重複入りファイルへ delete → 保存後に同一キー残骸 0 件(dedup済みリスト経由の固定 — spec§8)
+        let path = temp_dict_path("dupdel");
+        std::fs::write(&path, r#"[{"ruby":"あっぷる","word":"Apple"},{"ruby":"アップル","word":"Apple"}]"#).unwrap();
+        let lock = DictLock(std::sync::Mutex::new(()));
+        dict_delete_logic(&lock, &path, &no_send, "あっぷる", "Apple").unwrap();
+        assert_eq!(dict_list_logic(&lock, &path).unwrap().entries.len(), 0);
+    }
+
+    #[test]
+    fn nfd_add_is_rejected_as_dup_via_key_pair() {
+        let lock = DictLock(std::sync::Mutex::new(()));
+        let path = temp_dict_path("nfd");
+        dict_add_logic(&lock, &path, &no_send, "か\u{3099}っこう", "学校", "名詞").unwrap();
+        assert_eq!(
+            dict_add_logic(&lock, &path, &no_send, "がっこう", "学校", "名詞").unwrap_err(),
+            DictCmdError::Duplicate
+        ); // キー組経由(is_err だと別エラーでも緑)
+        // word 側: ワ行濁点
+        dict_add_logic(&lock, &path, &no_send, "いすず", "いすヷ", "名詞").unwrap();
+        assert_eq!(
+            dict_add_logic(&lock, &path, &no_send, "いすず", "いすワ\u{3099}", "名詞").unwrap_err(),
+            DictCmdError::Duplicate
+        );
+    }
+
+    #[test]
+    fn delete_works_on_invalid_legacy_entry() {
+        // spec§3.2: 移行産の検証不合格エントリは削除可能(対象特定に validate を通さない)
+        let path = temp_dict_path("legacy");
+        std::fs::write(&path, r#"[{"ruby":"kanji漢字","word":"x"}]"#).unwrap();
+        let lock = DictLock(std::sync::Mutex::new(()));
+        dict_delete_logic(&lock, &path, &no_send, "kanji漢字", "x").unwrap();
+        assert_eq!(dict_list_logic(&lock, &path).unwrap().entries.len(), 0);
+    }
+
+    #[test]
+    fn corrupt_file_add_does_not_destroy_original() {
+        // 破損JSONを置く→dict_add→.corrupt.* が存在し原本は上書きされていない(隔離後の空+1件保存)
+        let path = temp_dict_path("addcorrupt");
+        std::fs::write(&path, br#"[{"ruby":"x""#).unwrap();
+        let lock = DictLock(std::sync::Mutex::new(()));
+        dict_add_logic(&lock, &path, &no_send, "あ", "亜", "名詞").unwrap();
+        assert!(path
+            .parent()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().contains(".corrupt.")));
+        let entries = dict_list_logic(&lock, &path).unwrap().entries;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].word, "亜");
+    }
+
+    #[test]
+    fn dict_list_does_not_write_file() {
+        // 重複入りファイル→dict_list→ファイル内容が不変(閲覧はファイルを書かない — spec§3.2)
+        let path = temp_dict_path("listnowrite");
+        let json = r#"[{"ruby":"あっぷる","word":"Apple"},{"ruby":"アップル","word":"Apple"}]"#;
+        std::fs::write(&path, json).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let lock = DictLock(std::sync::Mutex::new(()));
+        let report = dict_list_logic(&lock, &path).unwrap();
+        assert_eq!(report.entries.len(), 1); // 返り値は dedup 済みだが
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before); // ファイルは書いていない
+    }
+
+    #[test]
+    fn dict_list_blocks_while_lock_held() {
+        // 第3巡 N1(list/export もロックを取る)の決定的な固定。確率的な並行破損シナリオは
+        // 窓が µs 規模でロック無しでも緑になり得るため、「保持中は返らない」を直接見る。
+        let lock = std::sync::Arc::new(DictLock(std::sync::Mutex::new(())));
+        let path = std::sync::Arc::new(temp_dict_path("listlock"));
+        let guard = lock.0.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (l2, p2) = (lock.clone(), path.clone());
+        std::thread::spawn(move || {
+            let _ = dict_list_logic(&l2, &p2);
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err()); // 保持中は返らない
+        drop(guard);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok()); // 解放後に返る
+    }
+
+    #[test]
+    fn unreadable_mutation_refuses_and_preserves_file() {
+        // dir を辞書パスに指定(=読取 I/O エラー)→ dict_add_logic が Err(Unreadable) を返し、
+        // 隔離も保存も起きない(一過性 I/O 失敗で「空+1件」上書きしない — F-1 の mutation 側)
+        let dir = std::env::temp_dir().join(format!("nsk-cfg-dict-{}-unreadable", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = DictLock(std::sync::Mutex::new(()));
+        assert_eq!(dict_add_logic(&lock, &dir, &no_send, "あ", "亜", "名詞").unwrap_err(), DictCmdError::Unreadable);
+        assert!(dir.exists()); // ディレクトリのまま(何も書かれていない)
+    }
+
+    #[test]
+    fn invalid_input_is_rejected_with_field() {
+        // dict_add_logic("kanji漢字", "x", "名詞") → Err(Invalid{field:"ruby"})
+        // (validate 経路の観測 — バリアントが一度も使われない実装の検出)
+        let lock = DictLock(std::sync::Mutex::new(()));
+        let path = temp_dict_path("invalid");
+        assert_eq!(
+            dict_add_logic(&lock, &path, &no_send, "kanji漢字", "x", "名詞").unwrap_err(),
+            DictCmdError::Invalid { field: "ruby".to_string() }
+        );
     }
 }

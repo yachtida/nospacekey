@@ -3,13 +3,6 @@ import XCTest
 import KanaKanjiConverterModuleWithDefaultDictionary
 
 final class UserDictionaryTests: XCTestCase {
-    private func writeTempJson(_ s: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ud-test-\(UUID().uuidString).json")
-        try Data(s.utf8).write(to: url)
-        return url
-    }
-
     func testLoadParsesJsonAndMapsPos() throws {
         let json = #"[{"ruby":"やちだ","word":"谷内田","pos":"人名(姓)"},{"ruby":"ほげ","word":"ホゲ株式会社","pos":"組織"},{"ruby":"ふが","word":"fuga","pos":"謎の品詞"}]"#
         let url = try writeTempJson(json)

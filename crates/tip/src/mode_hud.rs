@@ -19,8 +19,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, SetTimer,
-    SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
-    WM_NCDESTROY, WM_PAINT, WM_TIMER,
+    ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
 };
 
 use crate::langbar::mode_label_ephemeral;
@@ -401,7 +400,7 @@ impl ModeHud {
         let (w, h) = hud_window_size(dpi);
         let (fx, fy) = popup::place_on_monitor(x, y, w, h);
         unsafe {
-            let _ = SetWindowPos(self.hwnd, None, fx, fy, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+            popup::set_popup_pos(self.hwnd, Some((fx, fy)), w, h);
             // SetWindowPos で決めた client size へ D2D の swapchain を毎回作り直す。
             // ResizeBuffers は同寸なら安価・冪等なので無条件で呼んで問題ない。以前はここに
             // size_changed ガードを置いていたが、その比較対象が SetWindowPos "後" の

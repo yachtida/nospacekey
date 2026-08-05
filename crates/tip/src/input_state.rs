@@ -306,32 +306,8 @@ pub fn sanitize_left_context(raw: &str) -> Option<String> {
 }
 
 // ---- 打鍵作法バンドル: 表記変換の純関数（Task 1）----
-
-/// かな入力打鍵の記号の既定幅（分類順に畳む）: 長音符=無条件 → 句読点=punct トグル →
-/// 記号=symbol トグル(既定 OFF) → 置換3件(/[]→・「」 = Mozc symbol_method 相当) →
-/// 残りは is_ascii_punctuation 全域を式で全角形へ。英数字は構造的に対象外
-///（roman2kana に委ねる）。VK でなく ToUnicode 結果の文字で引く — 記号 VK は
-/// レイアウト依存（JIS/US）のため VK 固定マップは禁止（設計ロック 2026-07-07）。
-/// 個別表を全記号に持たないのは、表の穴（旧 !/@ の US 到達不能・~→U+301C 混入）を
-/// 再生産しないため（2026-07-16 spec §2）。
-/// idle 直接確定と composition 畳み込みの両方が呼ぶ単一マップ（`-` と全記号を同仕様に）。
-pub fn zenkaku_symbol(c: char, punct_full_width: bool, symbol_full_width: bool) -> Option<char> {
-    Some(match c {
-        '-' => 'ー',
-        ',' => if punct_full_width { '、' } else { return None },
-        '.' => if punct_full_width { '。' } else { return None },
-        _ if !symbol_full_width => return None,
-        '/' => '・', '[' => '「', ']' => '」',
-        c if c.is_ascii_punctuation() => zenkaku_of(c),
-        _ => return None,
-    })
-}
-
-/// ASCII 印字可能域の機械写像（0x21..=0x7E → U+FF01..=U+FF5E）。`~`→～(U+FF5E) はここから
-/// 出る＝Windows 正準。Mozc/iOS 版の U+301C（波ダッシュ）は CP932 で ? に化けるため採らない。
-fn zenkaku_of(c: char) -> char {
-    char::from_u32(c as u32 - 0x21 + 0xFF01).unwrap_or(c)
-}
+// 記号の写像（zenkaku_symbol / zenkaku_of）は settings::symbol へ移設した（2026-08-02 spec §2）:
+// 設定 UI が29記号の変換先プレビューを出すのに写像が要り、config → tip 依存は方向が誤りのため。
 
 /// かな入力中の物理キー文字を「読みに積む文字」へ写す（物理キーボードの打鍵作法）。
 /// nospacekey の roman2kana は iOS 前提で `-`→`ー` を持たないため、ここで長音符を補う。
@@ -390,12 +366,38 @@ pub fn to_hankaku_kana(s: &str) -> String {
 }
 
 /// ASCII 印字可能文字（0x21-0x7E）→全角（U+FF01-FF5E）。空白は U+3000。非 ASCII は素通し。
+/// `zenkaku_of` は範囲ガードを持たない機械式なので、範囲アームの**中でだけ**呼ぶ
+/// （全域に適用すると全角英数表記で日本語が壊れる — spec §2 MI-c）。
 pub fn to_zenkaku_ascii(s: &str) -> String {
     s.chars().map(|c| match c as u32 {
         0x20 => '\u{3000}',
-        0x21..=0x7E => char::from_u32(c as u32 - 0x21 + 0xFF01).unwrap_or(c),
+        0x21..=0x7E => settings::symbol::zenkaku_of(c),
         _ => c,
     }).collect()
+}
+
+/// 全角文字を打鍵の半角 ASCII へ戻す。F10（半角英数）専用: 句読点/記号は合成へ入る時点で
+/// `zenkaku_symbol` により全角へ畳み込まれて raw に積まれるため、素の raw では「、。」等が
+/// 全角のまま残る（F8 の to_hankaku_kana だけが句読点表を持つ非対称の実装漏れ — 実機報告
+/// 2026-08-03）。U+FF01-FF5E は機械逆写像、U+3000 は空白、それ以外は zenkaku_symbol を
+/// 全トグル ON・全集合で走査して逆引きする（ー→- 、→, 。→. ・→/ 「→[ 」→]）。
+/// Why not（個別の逆引き表）: 表を二重に持つと表の穴を再生産する（2026-07-16 spec §2 と同じ
+/// 理由）。全トグル ON で引くのは「畳み込まれ得た文字を全て戻す」ため — トグル OFF なら
+/// raw は元々半角でこの走査に当たらない。部分確定 reseed 後の raw はかな（M-2 の既知の限界）
+/// でかなは素通しだが、ー だけ '-' へ落ちる — raw が打鍵でない時点で表示は既に劣化して
+/// おり許容。
+pub fn to_hankaku_ascii(s: &str) -> String {
+    use settings::symbol::{zenkaku_symbol, SymbolCharSet};
+    s.chars()
+        .map(|c| match c as u32 {
+            0x3000 => ' ',
+            0xFF01..=0xFF5E => char::from_u32(c as u32 - 0xFF01 + 0x21).unwrap_or(c),
+            _ => (0x21u32..=0x7E)
+                .filter_map(char::from_u32)
+                .find(|&h| zenkaku_symbol(h, true, true, SymbolCharSet::ALL) == Some(c))
+                .unwrap_or(c),
+        })
+        .collect()
 }
 
 /// 数字だけを全角へ写す（`0-9`→`０-９`）。他文字は素通し。数字全角設定の既定確定用。
@@ -429,7 +431,24 @@ pub fn should_widen_digits(
         && !direct
         && !latin
         && !halfwidth_notation
-        && !matches!(source, "candidate" | "candidate_prefix")
+        && !matches!(source, "candidate" | "candidate_prefix" | "clause")
+}
+
+/// 文節ナビゲーション: 文節ビューの選択文節を preedit（UTF-16）上の区間へ写す純関数。
+/// 戻り値は (開始, 長さ)。TSF の ITfRange::ShiftStart/ShiftEnd は UTF-16 コード単位で数える
+/// ため、Rust の文字数（char）でなく encode_utf16 の長さで合算する（サロゲートペアの絵文字/
+/// 拡張漢字で下線位置がずれないように）。selected が範囲外なら長さ 0（ハイライト無し）。
+pub fn clause_target_utf16(segments: &[String], selected: usize) -> (usize, usize) {
+    let start: usize = segments
+        .iter()
+        .take(selected)
+        .map(|s| s.encode_utf16().count())
+        .sum();
+    let len = segments
+        .get(selected)
+        .map(|s| s.encode_utf16().count())
+        .unwrap_or(0);
+    (start, len)
 }
 
 /// エンジン Insert の挿入解釈(IPC style フィールドの TIP 内表現)。
@@ -960,49 +979,6 @@ mod tests {
     // ---- 打鍵作法バンドル: 表記変換の純関数 ----
 
     #[test]
-    fn zenkaku_symbol_maps_ime_punctuation() {
-        // 長音符: 両トグル無関係（かな。切ると「コーヒー」が打てない）
-        assert_eq!(zenkaku_symbol('-', false, false), Some('ー'));
-        assert_eq!(zenkaku_symbol('-', true, true), Some('ー'));
-        // 句読点: punct トグルのみに従う（symbol トグルと独立）
-        assert_eq!(zenkaku_symbol('.', true, false), Some('。'));
-        assert_eq!(zenkaku_symbol(',', true, false), Some('、'));
-        assert_eq!(zenkaku_symbol('.', false, true), None);
-        assert_eq!(zenkaku_symbol(',', false, true), None);
-        // 記号トグル OFF: 置換も幅畳み込みも全部 None（ASCII のまま。旧仕様の無条件全角を廃止）
-        for c in ['/', '[', ']', '?', '~', ':', ';', '!', '@', '#', '(', ')', '=', '_'] {
-            assert_eq!(zenkaku_symbol(c, true, false), None, "{c:?} は OFF で半角");
-        }
-        // 英数字は常に対象外（roman2kana に委ねる。is_ascii_punctuation が構造的に排除）
-        assert_eq!(zenkaku_symbol('a', true, true), None);
-        assert_eq!(zenkaku_symbol('1', true, true), None);
-    }
-
-    #[test]
-    fn zenkaku_symbol_on_replaces_and_folds_all_ascii_punct() {
-        // 置換3件（Mozc symbol_method 相当 — 幅でなく別文字への置換）
-        assert_eq!(zenkaku_symbol('/', false, true), Some('・'));
-        assert_eq!(zenkaku_symbol('[', false, true), Some('「'));
-        assert_eq!(zenkaku_symbol(']', false, true), Some('」'));
-        // 幅畳み込みは式（0x21..=0x7E → U+FF01..U+FF5E）。~ は U+FF5E＝Windows 正準
-        //（U+301C 波ダッシュは CP932 非往復で ? に化けるため意図的に採らない — spec §1）。
-        assert_eq!(zenkaku_symbol('~', false, true), Some('\u{FF5E}'));
-        assert_eq!(zenkaku_symbol('?', false, true), Some('？'));
-        assert_eq!(zenkaku_symbol(':', false, true), Some('：'));
-        assert_eq!(zenkaku_symbol(';', false, true), Some('；'));
-        assert_eq!(zenkaku_symbol('!', false, true), Some('！'));
-        assert_eq!(zenkaku_symbol('@', false, true), Some('＠'));
-        assert_eq!(zenkaku_symbol('#', false, true), Some('＃'));
-        assert_eq!(zenkaku_symbol('(', false, true), Some('（'));
-        assert_eq!(zenkaku_symbol(')', false, true), Some('）'));
-        assert_eq!(zenkaku_symbol('=', false, true), Some('＝'));
-        assert_eq!(zenkaku_symbol('_', false, true), Some('＿'));
-        assert_eq!(zenkaku_symbol('\\', false, true), Some('＼'));
-        assert_eq!(zenkaku_symbol('\'', false, true), Some('＇'));
-        assert_eq!(zenkaku_symbol('`', false, true), Some('｀'));
-    }
-
-    #[test]
     fn to_kana_reading_char_maps_prolonged_sound() {
         assert_eq!(to_kana_reading_char('-'), 'ー'); // 長音符（nospacekey roman2kana が欠く）
         assert_eq!(to_kana_reading_char('a'), 'a');  // 英字は不変
@@ -1031,6 +1007,41 @@ mod tests {
     }
 
     #[test]
+    fn to_hankaku_ascii_reverses_folded_punctuation_to_keystrokes() {
+        // F10 の核: 合成時に畳み込まれた全角句読点が打鍵の半角へ戻る（実機報告 2026-08-03）。
+        assert_eq!(to_hankaku_ascii("、。"), ",.");
+        assert_eq!(to_hankaku_ascii("a、。"), "a,.");
+    }
+
+    #[test]
+    fn to_hankaku_ascii_reverses_symbol_folds_and_prolonged_sound() {
+        assert_eq!(to_hankaku_ascii("・「」"), "/[]"); // 置換3件（Mozc symbol_method 相当）の逆
+        assert_eq!(to_hankaku_ascii("waーdo"), "wa-do"); // `-` 打鍵の長音符化の逆
+        assert_eq!(to_hankaku_ascii("！？～"), "!?~"); // 機械写像域（U+FF01-FF5E）の逆
+        assert_eq!(to_hankaku_ascii("ＡＢ１２\u{3000}"), "AB12 ");
+    }
+
+    #[test]
+    fn to_hankaku_ascii_passes_kana_through() {
+        // 部分確定 reseed 後の raw はかな（M-2）— 変換対象外の文字は壊さない。
+        assert_eq!(to_hankaku_ascii("にほんご"), "にほんご");
+    }
+
+    #[test]
+    fn to_hankaku_ascii_roundtrips_to_zenkaku_ascii() {
+        let src = "abc123!?[]/,.-";
+        assert_eq!(to_hankaku_ascii(&to_zenkaku_ascii(src)), src);
+    }
+
+    #[test]
+    fn f9_pipeline_widens_folded_punctuation_to_zenkaku_ascii() {
+        // F9(全角英数)の素材整形: 畳み込み済み raw を半角へ戻してから機械全角化すると
+        // 「、。」が「，．」になる(F10 と同じ非対称の鏡像 — 敵対レビュー M-1)。
+        assert_eq!(to_zenkaku_ascii(&to_hankaku_ascii("a、。")), "ａ，．");
+        assert_eq!(to_zenkaku_ascii(&to_hankaku_ascii("waーdo")), "ｗａ－ｄｏ");
+    }
+
+    #[test]
     fn to_zenkaku_digits_maps_only_digits() {
         assert_eq!(to_zenkaku_digits("123"), "１２３");
         assert_eq!(to_zenkaku_digits("2024年"), "２０２４年"); // 漢字は不変
@@ -1045,9 +1056,10 @@ mod tests {
         assert!(should_widen_digits(true, false, false, None, "live"));
         assert!(should_widen_digits(true, false, false, None, "live_prefix"));
         assert!(should_widen_digits(true, false, false, None, "live_auto"));
-        // 候補の明示選択は幅を変えない
+        // 候補の明示選択は幅を変えない（文節ナビゲーション確定も候補選択の一種）
         assert!(!should_widen_digits(true, false, false, None, "candidate"));
         assert!(!should_widen_digits(true, false, false, None, "candidate_prefix"));
+        assert!(!should_widen_digits(true, false, false, None, "clause"));
         // settle 系（mode_toggle/navigate）は読みを確定するので既定確定＝全角化（候補選択のみ不変）。
         assert!(should_widen_digits(true, false, false, None, "mode_toggle"));
         assert!(should_widen_digits(true, false, false, None, "navigate"));
@@ -1055,6 +1067,30 @@ mod tests {
         assert!(!should_widen_digits(false, false, false, None, "live"));
         // direct モードは変えない
         assert!(!should_widen_digits(true, true, false, None, "live"));
+    }
+
+    // ---- 文節ナビゲーション: 選択文節 → UTF-16 区間 ----
+
+    #[test]
+    fn clause_target_maps_selected_segment_to_utf16_span() {
+        let segs = vec!["今日は".to_string(), "いい天気です".to_string()];
+        assert_eq!(clause_target_utf16(&segs, 0), (0, 3));
+        assert_eq!(clause_target_utf16(&segs, 1), (3, 6));
+    }
+
+    #[test]
+    fn clause_target_counts_utf16_units_not_chars() {
+        // サロゲートペア（𩸽 = U+29E3D は UTF-16 で 2 単位）を含む文節でも下線区間がずれない。
+        let segs = vec!["𩸽".to_string(), "定食".to_string()];
+        assert_eq!(clause_target_utf16(&segs, 0), (0, 2));
+        assert_eq!(clause_target_utf16(&segs, 1), (2, 2));
+    }
+
+    #[test]
+    fn clause_target_out_of_range_is_zero_length() {
+        let segs = vec!["今日は".to_string()];
+        assert_eq!(clause_target_utf16(&segs, 5), (3, 0)); // 範囲外はハイライト無し
+        assert_eq!(clause_target_utf16(&[], 0), (0, 0));
     }
 
     #[test]

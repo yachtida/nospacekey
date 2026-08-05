@@ -22,8 +22,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, SetTimer,
-    SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
+    ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
 };
 
 use crate::candidate_window::CaretAnchor;
@@ -531,26 +530,16 @@ impl ReadingMonitor {
                         None => (a.x, a.y),
                     };
                     let (fx, fy) = popup::place_on_monitor(dx, dy, w, h);
-                    let _ =
-                        SetWindowPos(self.hwnd, None, fx, fy, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+                    popup::set_popup_pos(self.hwnd, Some((fx, fy)), w, h);
                 }
                 AnchorPlan::Hold => {
                     // 位置は前回のまま、サイズだけ追従（読みは伸縮する）。
-                    let _ = SetWindowPos(
-                        self.hwnd,
-                        None,
-                        0,
-                        0,
-                        w,
-                        h,
-                        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOMOVE,
-                    );
+                    popup::set_popup_pos(self.hwnd, None, w, h);
                 }
                 AnchorPlan::Fallback => {
                     let a = crate::text_service::DEFAULT_CARET_POS;
                     let (fx, fy) = popup::place_on_monitor(a.x, a.y, w, h);
-                    let _ =
-                        SetWindowPos(self.hwnd, None, fx, fy, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+                    popup::set_popup_pos(self.hwnd, Some((fx, fy)), w, h);
                 }
             }
             // 同一サイズの打鍵更新は swapchain 再構築（ResizeBuffers — 同一サイズでも

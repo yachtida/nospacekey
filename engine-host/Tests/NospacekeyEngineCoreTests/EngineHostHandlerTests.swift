@@ -2,6 +2,17 @@ import XCTest
 import Foundation
 @testable import NospacekeyEngineCore
 
+/// 背景スレッドが書いた応答をテスト本体へ渡す箱（Swift 6 の Sendable 検査のため —
+/// 生の var キャプチャも XCTestCase 自身のキャプチャも @Sendable クロージャでは弾かれる）。
+private final class ReplyBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Data?
+    var data: Data? {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
+    }
+}
+
 final class EngineHostHandlerTests: XCTestCase {
     /// 応答 JSON の "result" タグを取り出す（Response は Encodable のみなので生 JSON で検証する）。
     /// handler は (reply, exitAfterReply) を返すので outcome を直接受けて reply を検証する。
@@ -30,7 +41,7 @@ final class EngineHostHandlerTests: XCTestCase {
         let obj = try JSONSerialization.jsonObject(
             with: handler(1, Data(#"{"method":"StartSession"}"#.utf8)).reply) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
-        XCTAssertEqual(obj["proto"] as? Int, 1)
+        XCTAssertEqual(obj["proto"] as? Int, 2)
     }
 
     // graceful 停止: Shutdown は Ok を返し、かつ「応答後に exit」を要求する（実際の exit(0) は
@@ -73,6 +84,35 @@ final class EngineHostHandlerTests: XCTestCase {
                                     learning: LearningSettings(enabled: true, memoryDir: dir))
         let handler = makeEngineHandler(service: svc, serviceLock: NSLock())
         XCTAssertEqual(resultTag(handler(1, Data(#"{"method":"ClearLearning"}"#.utf8))), "Ok")
+    }
+
+    // 訂正昇格: RecordCorrection の decode→dispatch→反映。reading/surface は switch の
+    // 位置バインドなので、入れ替えバグはこの end-to-end 観測でしか検出できない
+    // （reading をかな・surface を漢字にして、入れ替わると かなフィルタで棄却され lookup が nil になる）。
+    func testRecordCorrectionRoutesReadingAndSurfaceCorrectly() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nospacekey-reccorr-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: true, memoryDir: dir))
+        // 記録可否マップを張る(fail-closed のため、convert/reconvert を経ない記録は棄却される)。
+        let s = svc.startSession()
+        // ひらがな literal 候補("にほんご"自身)は除外する: reading==surface だと
+        // 入れ替えバグでも同じアサートが通り、テストの検出力がハッシュ順次第で消える。
+        guard let surface = { () -> String? in
+            _ = svc.reconvert(session: s, surface: "にほんご")
+            return svc.recordableSurfacesForTesting(reading: "にほんご")
+                .first(where: { $0 != "にほんご" })
+        }() else {
+            svc.endSession(session: s)
+            return XCTFail("no recordable surface")
+        }
+        svc.endSession(session: s)
+        let handler = makeEngineHandler(service: svc, serviceLock: NSLock())
+        let body = Data(#"{"method":"RecordCorrection","params":{"reading":"にほんご","surface":"\#(surface)"}}"#.utf8)
+        XCTAssertEqual(resultTag(handler(1, body)), "Ok")
+        XCTAssertEqual(svc.correctionLookupForTesting(reading: "にほんご"), surface)
     }
 
     // Spec2: learning_enabled 付き ReloadConfig が decode でき Ok（新 TIP → 新エンジン）。
@@ -120,6 +160,26 @@ final class EngineHostHandlerTests: XCTestCase {
         let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
         let body = Data(#"{"method":"TypoConvert","params":{"session":99999}}"#.utf8)
         XCTAssertEqual(resultTag(handler(1, body)), "Error")
+    }
+
+    // カスタム辞書: ReloadDictionary ハンドラは converterLock を待たない（spec §4.1 の眼目）。
+    // 別スレッドがロックを保持している間でも desired 更新+enqueue だけで即 Ok を返す。
+    // 壊れた実装（ハンドラ内 blocking lock）は Ok が返らず timeout で赤になる（ハングはしない）。
+    func testReloadDictionaryReturnsOkImmediatelyWhileConverterLockHeld() {
+        let svc = makeService()
+        let handler = makeEngineHandler(service: svc, serviceLock: NSLock())
+        let release = svc.beginConverterLockHoldForTesting()
+        defer { release() }
+        let reply = ReplyBox()
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            let out = handler(1, Data(#"{"method":"ReloadDictionary","params":{"enabled":true}}"#.utf8))
+            reply.data = out.reply
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 2), .success,
+                       "ReloadDictionary ハンドラが converterLock を待っている")
+        XCTAssertEqual(resultTag((reply.data ?? Data(), false)), "Ok")
     }
 
     func testCrossConnectionSessionAccessIsDeniedAsNoSession() {

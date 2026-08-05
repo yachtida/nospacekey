@@ -40,10 +40,12 @@ fn main() {
 
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(logic::DictLock(std::sync::Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
             commands::apply_settings,
             commands::get_default_settings,
+            commands::get_symbol_catalog,
             commands::get_app_info,
             commands::open_settings_dir,
             commands::open_releases_page,
@@ -52,6 +54,13 @@ fn main() {
             download::zenzai_model_status,
             download::download_zenzai_model,
             download::cancel_zenzai_download,
+            commands::dict_list,
+            commands::dict_add,
+            commands::dict_update,
+            commands::dict_delete,
+            commands::dict_import,
+            commands::dict_export,
+            commands::dict_sync_engine,
         ])
         .run(tauri::generate_context!());
     if let Err(e) = result {

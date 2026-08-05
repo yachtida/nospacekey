@@ -59,6 +59,11 @@ pub struct StartOrUpdatePreedit {
     pub text: HSTRING,
     pub sink: ITfCompositionSink,
     pub da_variant: VARIANT,
+    /// 文節ナビゲーション: 選択文節の (UTF-16 開始, UTF-16 長)。Some なら該当区間だけ
+    /// `da_target_variant`（太下線）で上書きし、選択文節を視覚化する（MS-IME の変換対象文節）。
+    pub target: Option<(usize, usize)>,
+    /// 選択文節用の表示属性 atom を内包した VARIANT（`target` が Some のときだけ使う）。
+    pub da_target_variant: VARIANT,
     pub composition: Rc<RefCell<Option<ITfComposition>>>,
     /// U9: composition 新規作成時に読んだ左文脈の出力先（TextService.left_context と共有）。
     /// 取得の成否にかかわらず**必ず上書き**する（失敗=None。前文書の文脈残留を許さない — spec §2.1）。
@@ -99,6 +104,24 @@ impl ITfEditSession_Impl for StartOrUpdatePreedit_Impl {
             // 末尾へ畳む前に適用すること（畳むと range が空になり下線が乗らない）。
             let prop: ITfProperty = self.context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
             prop.SetValue(ec, &crange, &self.da_variant)?;
+
+            // 文節ナビゲーション: 選択文節の区間だけ太下線属性で上書きする。sub-range は
+            // 全体 range の clone を先頭へ畳み、ShiftEnd→ShiftStart の順で切り出す
+            // （逆順だと start>end の一瞬が生じ実装依存の失敗を踏む）。属性の上書きは
+            // best-effort — 失敗しても preedit 本文は既に立っているので合成は壊さない。
+            if let Some((start, len)) = self.target {
+                if len > 0 {
+                    let apply_target = || -> Result<()> {
+                        let sub = crange.Clone()?;
+                        sub.Collapse(ec, TF_ANCHOR_START)?;
+                        let mut moved = 0i32;
+                        sub.ShiftEnd(ec, (start + len) as i32, &mut moved, core::ptr::null())?;
+                        sub.ShiftStart(ec, start as i32, &mut moved, core::ptr::null())?;
+                        prop.SetValue(ec, &sub, &self.da_target_variant)
+                    };
+                    let _ = apply_target();
+                }
+            }
 
             // preedit 更新後、キャレットを合成文字列の末尾へ移す。これをしないと多くの TSF アプリは
             // 合成開始位置（＝打ち始めた先頭）に選択を残し、ライブ変換中ずっとカーソルが文頭に
@@ -154,8 +177,8 @@ impl ITfEditSession_Impl for CommitText_Impl {
                     comp.EndComposition(ec)?;
                 }
                 None => {
-                    // composition が無い経路: 選択位置へ直接テキストを挿入する（従来の劣化 commit と、
-                    // idle 記号の全角直接確定 — 打鍵作法 Task3 — が使う）。
+                    // composition が無い経路: 選択位置へ直接テキストを挿入する（従来の劣化 commit と
+                    // shift_latin の直接確定が使う）。
                     // レビュー M-3: dwFlags は NOQUERY でなく 0（挿入して range も返す —
                     // Microsoft SampleIME の _InsertAtSelection と同型）を使う。NOQUERY だと
                     // 挿入後のキャレット位置がホストの ITextStoreACP 実装依存になり、

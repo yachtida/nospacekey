@@ -13,6 +13,7 @@
       <button class="nav-item" data-page="engine">変換エンジン</button>
       <button class="nav-item" data-page="appearance">外観</button>
       <button class="nav-item" data-page="keymap">キー設定</button>
+      <button class="nav-item" data-page="dictionary">辞書</button>
       <button class="nav-item" data-page="about">情報</button>
     </nav>
     <main class="content">
@@ -74,6 +75,14 @@
               <label><input type="checkbox" id="e-symbol-fullwidth" data-bind="symbol_full_width"> かな入力で記号を全角にする</label>
               <p class="hint">オンのとき、かな入力モードの記号（/ ? ~ : ; ! @ # ( ) 等）を全角（・？～：；！＠＃（）等）で入力します。
                 オフで半角のまま（既定オフ。「、。」は句読点の幅、長音の「ー」はこの設定と無関係。反映には新しい TIP 起動が必要な場合があります）</p>
+              <div class="symbol-detail" id="symbol-fullwidth-detail" hidden>
+                <p class="hint">全角にする記号を個別に選べます（例: 「!」だけ全角にして「/」は半角のまま、等）。</p>
+                <div class="hstack">
+                  <button type="button" id="symbol-select-all">すべて選択</button>
+                  <button type="button" id="symbol-deselect-all">すべて解除</button>
+                </div>
+                <div class="symbol-grid" id="symbol-grid"></div>
+              </div>
             </div>
           </div>
           <div class="row">
@@ -247,6 +256,82 @@
               <p class="hint">半角/全角キーはブラウザに届かないため、Enter またはクリックで割り当てます:</p>
               <button id="keymap-chip-hz" type="button">半角/全角 を割り当て (Enter)</button>
               <p class="hint" id="keymap-recorder-hint"></p>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section class="page" id="page-dictionary">
+        <h1>辞書</h1>
+        <div class="card">
+          <div class="row">
+            <label for="d-enabled">カスタム辞書</label>
+            <div class="grow">
+              <label><input type="checkbox" id="d-enabled" data-bind="user_dictionary_enabled">
+                有効にする</label>
+              <p class="hint">オンのとき、登録した読み・単語の変換候補が優先的に出るようになります
+                （反映には新しい TIP 起動が必要な場合があります）</p>
+            </div>
+          </div>
+        </div>
+        <div class="card dict-card">
+          <p class="field-error" id="dict-quarantine-error" hidden>
+            辞書ファイルが壊れています。手動での復旧が必要なため、編集操作を無効にしています。
+          </p>
+          <div class="dict-toolbar">
+            <button id="dict-add-btn" type="button">追加…</button>
+            <button id="dict-import-btn" type="button">インポート…</button>
+            <button id="dict-export-btn" type="button">エクスポート…</button>
+            <input type="text" id="dict-filter" placeholder="読み・単語で絞り込み">
+            <span class="dict-count-group">
+              <span id="dict-count"></span>
+              <span id="dict-dedup-note" class="dict-dedup-note" hidden></span>
+            </span>
+          </div>
+          <div class="dict-table-wrap">
+            <table class="dict-table">
+              <thead>
+                <tr><th>読み</th><th>単語</th><th>品詞</th><th>操作</th></tr>
+              </thead>
+              <tbody id="dict-rows"></tbody>
+            </table>
+          </div>
+        </div>
+        <div id="dict-modal" role="dialog" aria-modal="true" aria-label="辞書エントリ" tabindex="-1" hidden>
+          <div class="sheet dict-sheet">
+            <h2 id="dict-modal-title">エントリを追加</h2>
+            <div class="row">
+              <label for="dict-form-ruby">読み</label>
+              <div class="grow">
+                <input type="text" id="dict-form-ruby" spellcheck="false">
+                <span class="field-error" id="dict-form-error-ruby"></span>
+              </div>
+            </div>
+            <div class="row">
+              <label for="dict-form-word">単語</label>
+              <div class="grow">
+                <input type="text" id="dict-form-word" spellcheck="false">
+                <span class="field-error" id="dict-form-error-word"></span>
+              </div>
+            </div>
+            <div class="row">
+              <label for="dict-form-pos">品詞</label>
+              <div class="grow">
+                <select id="dict-form-pos">
+                  <option value="名詞">名詞</option>
+                  <option value="人名">人名</option>
+                  <option value="姓">姓</option>
+                  <option value="名">名</option>
+                  <option value="固有名詞">固有名詞</option>
+                  <option value="組織">組織</option>
+                  <option value="地名">地名</option>
+                  <option value="数">数</option>
+                </select>
+              </div>
+            </div>
+            <span class="field-error" id="dict-form-error-general"></span>
+            <div class="hstack dict-sheet-actions">
+              <button id="dict-form-cancel" type="button">キャンセル</button>
+              <button id="dict-form-save" type="button" class="primary">保存</button>
             </div>
           </div>
         </div>

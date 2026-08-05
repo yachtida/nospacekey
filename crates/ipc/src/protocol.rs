@@ -2,9 +2,12 @@ use serde::{Deserialize, Serialize};
 
 /// IPC プロトコルの互換世代。TIP は StartSession 応答の `proto` と本定数を突合し、
 /// 不一致（None=handshake 以前の旧エンジンを含む）を検出したら graceful に世代交代する。
-/// **互換が壊れる変更をした時だけ bump する** — optional フィールドの追加（skip_serializing_if で
-/// 旧形とバイト一致）では bump しない。Swift 側 `Protocol.protoVersion` とミラー（一字一句一致規約）。
-pub const PROTO_VERSION: u32 = 1;
+/// **wire 互換でも、その版が依存する op を追加したら bump する** — handshake は更新後に
+/// 居残る旧 persist エンジンを回収する唯一の手段で、「互換が壊れた時だけ bump」だと
+/// 新 op が再起動まで無言で decline / no-op になる（v1.2.0 の辞書即時反映・文節ナビ・
+/// 訂正昇格で顕在化）。optional フィールドの追加（skip_serializing_if で旧形とバイト一致）
+/// では bump しない。Swift 側 `ProtocolVersion.current` とミラー（一字一句一致規約）。
+pub const PROTO_VERSION: u32 = 2;
 
 /// `#[serde(skip_serializing_if)]` 用: false のときフィールド自体を省略する
 /// （旧エンジン/旧TIP と wire 形をバイト一致させるため）。
@@ -110,11 +113,37 @@ pub enum Request {
     /// Spec2: 学習履歴の消去（RAM+ディスク）。session を伴わないプロセス全体操作。
     /// Swift 側 Protocol.swift / EngineHost.swift と対で実装（一字一句一致規約）。
     ClearLearning,
+    /// カスタム辞書の再読込。session を伴わないプロセス全体 op。エンジンはファイルを読み直す
+    /// （エントリは載せない — spec §4.1）。Swift 側 Protocol.swift と対（一字一句一致規約）。
+    /// 応答は既存 Ok。
+    ReloadDictionary { enabled: bool },
     /// persist エンジンの graceful 停止（学習 flush → 応答後 exit）。session を伴わない
     /// プロセス全体操作。アンインストーラ/更新（NospacekeyConfig.exe --stop-engine）と
     /// version handshake（proto 不一致時の世代交代）から送る。TIP はエンジンを kill しない
     /// 不変条件を保ったまま、エンジン自身に flush して終了させるための唯一の停止手段。
     Shutdown,
+    /// 再変換で選び直された訂正の通知(記録のみ・確定は既に TIP 側で完了している)。
+    /// 確定契約(再変換は Commit IPC を迂回して直接挿入)を変えずに訂正シグナルだけを運ぶ。
+    /// Swift 側 Protocol.swift / EngineHost.swift と対(一字一句一致規約)。応答は既存 Ok。
+    RecordCorrection { reading: String, surface: String },
+    /// 文節ナビゲーション(変換中の←/→)。候補表示中に TIP が送る。エンジンは文節状態が
+    /// 無ければ `base_index`(直前 Convert 応答 candidates の添字＝現在選択中の候補)を種に
+    /// 候補を文節列へ分解して開始し、選択文節を `offset` だけ動かす(端はクランプ)。
+    /// 開始済みなら `base_index` は無視される。応答は ClauseView。候補キャッシュ無し・
+    /// stale・全被覆候補無しは Error(TIP は従来の「確定して畳む」へ劣化する)。
+    MoveClause {
+        session: i64,
+        offset: i32,
+        base_index: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        left_context: Option<String>,
+    },
+    /// 文節ナビゲーション中: 選択文節の表層を候補 `index`(直前 ClauseView.candidates の添字)へ
+    /// 差し替える。読みは変わらない(候補は全被覆のみ)ので文節境界は安定。応答は ClauseView。
+    SelectClauseCandidate { session: i64, index: u32 },
+    /// 文節ナビゲーション中の確定。全文節の表層を連結した文字列を確定し、文節ごとに
+    /// setCompletedData/学習へ乗せる。応答は既存 Committed(全消費なので reading="")。
+    CommitClauses { session: i64 },
 }
 
 /// エンジン -> TIP への応答。
@@ -153,6 +182,15 @@ pub enum Response {
     },
     /// 外部LLM変換結果。seq は要求エコー、text は補正済み文（preedit 全置換）。
     LlmResult { seq: u64, text: String },
+    /// 文節ナビゲーションのビュー。`segments` は各文節の現在表層（連結＝preedit 全体）、
+    /// `selected` は選択文節の添字、`candidates` は選択文節の変換候補（全被覆のみ）、
+    /// `candidate_index` は candidates 中の現在選択（＝segments[selected] と同一文字列）。
+    ClauseView {
+        segments: Vec<String>,
+        selected: u32,
+        candidates: Vec<String>,
+        candidate_index: u32,
+    },
 }
 
 #[cfg(test)]
@@ -381,6 +419,30 @@ mod tests {
     }
 
     #[test]
+    fn reload_dictionary_request_roundtrips() {
+        // カスタム辞書の再読込 op。Swift 側 Protocol.swift の "ReloadDictionary" と一字一句一致。
+        let r = Request::ReloadDictionary { enabled: true };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(js, r#"{"method":"ReloadDictionary","params":{"enabled":true}}"#);
+        assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
+    }
+
+    #[test]
+    fn record_correction_request_roundtrips() {
+        // 訂正通知 op。Swift 側 Protocol.swift の "RecordCorrection" と一字一句一致。
+        let r = Request::RecordCorrection {
+            reading: "みこみっと".to_string(),
+            surface: "未コミット".to_string(),
+        };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            js,
+            r#"{"method":"RecordCorrection","params":{"reading":"みこみっと","surface":"未コミット"}}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
+    }
+
+    #[test]
     fn shutdown_request_roundtrips() {
         // 引数なし op（Ping/ClearLearning と同型）。Swift 側 "Shutdown" と一字一句一致。
         let r = Request::Shutdown;
@@ -404,16 +466,16 @@ mod tests {
         let r = Response::Session { session: 7, proto: Some(PROTO_VERSION) };
         assert_eq!(
             serde_json::to_string(&r).unwrap(),
-            r#"{"result":"Session","session":7,"proto":1}"#
+            r#"{"result":"Session","session":7,"proto":2}"#
         );
-        assert_eq!(serde_json::from_str::<Response>(&r#"{"result":"Session","session":7,"proto":1}"#.to_string()).unwrap(), r);
+        assert_eq!(serde_json::from_str::<Response>(&r#"{"result":"Session","session":7,"proto":2}"#.to_string()).unwrap(), r);
     }
 
     #[test]
     fn old_tip_shape_decodes_new_engine_session() {
         // 旧TIP ↔ 新エンジン象限（更新後〜再起動前に本番で必ず走る）: 旧 TIP の Response 形を
         // テスト内ミラー enum（Session { session } のみ・proto フィールド無し）で再現し、新エンジンの
-        // 応答 {"result":"Session","session":7,"proto":1} が余剰フィールドを無視して decode できることを固定。
+        // 応答 {"result":"Session","session":7,"proto":2} が余剰フィールドを無視して decode できることを固定。
         // committed 先例は auto_commit:true 要求時のみ載るため実績にならない（設計ロック(d)）。
         #[derive(serde::Deserialize, Debug, PartialEq)]
         #[serde(tag = "result")]
@@ -421,7 +483,7 @@ mod tests {
             Session { session: i64 },
         }
         let r: OldTipResponse =
-            serde_json::from_str(r#"{"result":"Session","session":7,"proto":1}"#).unwrap();
+            serde_json::from_str(r#"{"result":"Session","session":7,"proto":2}"#).unwrap();
         assert_eq!(r, OldTipResponse::Session { session: 7 });
     }
 
@@ -454,6 +516,89 @@ mod tests {
         assert!(!js.contains("zenzai_inference_limit"), "None はフィールド省略: {js}");
         // フィールド無し wire が None に decode される（旧 TIP 形の互換固定）。
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
+    }
+
+    // ---- 文節ナビゲーション(変換中の←/→) ----
+
+    #[test]
+    fn move_clause_request_roundtrips() {
+        // left_context=None のときフィールド省略（Convert と同じ互換規約）。
+        let r = Request::MoveClause { session: 7, offset: 1, base_index: 2, left_context: None };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            js,
+            r#"{"method":"MoveClause","params":{"session":7,"offset":1,"base_index":2}}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
+    }
+
+    #[test]
+    fn move_clause_with_context_roundtrips() {
+        let r = Request::MoveClause {
+            session: 7,
+            offset: -1,
+            base_index: 0,
+            left_context: Some("私の".into()),
+        };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            js,
+            r#"{"method":"MoveClause","params":{"session":7,"offset":-1,"base_index":0,"left_context":"私の"}}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
+    }
+
+    #[test]
+    fn select_clause_candidate_request_roundtrips() {
+        let r = Request::SelectClauseCandidate { session: 7, index: 3 };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            js,
+            r#"{"method":"SelectClauseCandidate","params":{"session":7,"index":3}}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
+    }
+
+    #[test]
+    fn commit_clauses_request_roundtrips() {
+        let r = Request::CommitClauses { session: 7 };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(js, r#"{"method":"CommitClauses","params":{"session":7}}"#);
+        assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
+    }
+
+    #[test]
+    fn clause_view_response_roundtrips() {
+        let r = Response::ClauseView {
+            segments: vec!["今日は".into(), "いい天気です".into()],
+            selected: 1,
+            candidates: vec!["いい天気です".into(), "良い天気です".into()],
+            candidate_index: 0,
+        };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            js,
+            r#"{"result":"ClauseView","segments":["今日は","いい天気です"],"selected":1,"candidates":["いい天気です","良い天気です"],"candidate_index":0}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), r);
+    }
+
+    #[test]
+    fn clause_view_decodes_swift_key_order_independent() {
+        // Swift JSONEncoder はキー順を保証しない — 並びが違っても decode できることを固定する。
+        let r: Response = serde_json::from_str(
+            r#"{"candidate_index":1,"candidates":["天気","転機"],"result":"ClauseView","selected":0,"segments":["天気"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            Response::ClauseView {
+                segments: vec!["天気".into()],
+                selected: 0,
+                candidates: vec!["天気".into(), "転機".into()],
+                candidate_index: 1,
+            }
+        );
     }
 
     #[test]

@@ -14,10 +14,11 @@ use windows::Win32::UI::TextServices::{ITfContext, ITfKeyEventSink_Impl};
 
 use crate::candidate_window::{visible_range, CandidateUI, MAX_VISIBLE_ROWS};
 use crate::input_state::{
-    needs_session_reseed, plan_commit, plan_live_enter, should_widen_digits, to_hankaku_kana,
-    to_kana_reading_char, to_katakana, to_zenkaku_ascii, to_zenkaku_digits, zenkaku_symbol, CommitPlan,
-    InsertStyle, LiveEnterPlan,
+    needs_session_reseed, plan_commit, plan_live_enter, should_widen_digits, to_hankaku_ascii,
+    to_hankaku_kana, to_kana_reading_char, to_katakana, to_zenkaku_ascii, to_zenkaku_digits,
+    CommitPlan, InsertStyle, LiveEnterPlan,
 };
+use settings::symbol::zenkaku_symbol;
 use crate::text_service::TextService_Impl;
 use crate::text_service::tip_log;
 
@@ -78,7 +79,8 @@ fn is_text_vk(vk: u32) -> bool {
     )
 }
 
-/// OEM 記号 VK（打鍵作法 Task3）。native モードでは idle でも食い、全角記号へ写して直接確定する。
+/// OEM 記号 VK。native モードでは idle でも食い、全角へ写して composition を開始する
+/// （2026-08-03 — 旧・打鍵作法 Task3 の直接確定を廃止。eaten 契約は不変）。
 /// 数字/テンキー（0x30/0x60-0x6F）は**含めない** — テンキーの `.` や数字は idle 通常入力のまま
 /// （zenkaku_symbol も英数字を対象外にするのと対）。`is_text_vk` の OEM 部分集合。
 fn is_oem_symbol_vk(vk: u32) -> bool {
@@ -96,10 +98,12 @@ fn is_main_row_digit_vk(vk: u32) -> bool {
 
 /// 「記号打鍵」の単一の真実源。gated と OnKeyDown の両方がこれを見る(eaten 一致 = item19)。
 /// OEM キーはトグル非依存(表外も食い切って ASCII 確定する従来契約)。数字行は
-/// 「Shift かつ 記号トグル ON」のときだけ — OFF を含めないのは既定 OFF で現行経路と
+/// 「Shift かつ 記号 overlay ON」のときだけ — OFF を含めないのは既定 OFF で現行経路と
 /// 完全同一(新規に食う打鍵ゼロ)を保証するため(2026-07-16 spec §3)。
-fn is_symbol_keystroke(vk: u32, shift: bool, symbol_full_width: bool) -> bool {
-    is_oem_symbol_vk(vk) || (symbol_full_width && shift && is_main_row_digit_vk(vk))
+/// `symbol_overlay` は素のトグルでなく overlay 実効値。集合の個別内容は引かない —
+/// ここは VK しか受けず ToUnicode を呼べないため文字を知り得ない(2026-08-02 spec §4)。
+fn is_symbol_keystroke(vk: u32, shift: bool, symbol_overlay: bool) -> bool {
+    is_oem_symbol_vk(vk) || (symbol_overlay && shift && is_main_row_digit_vk(vk))
 }
 
 /// 数字 VK（メイン行 0-9 とテンキー 0-9）。かなモードでは idle でも食って composition を開始する
@@ -179,14 +183,15 @@ fn mods_now() -> (bool, bool, bool) {
 
 /// 確定取消（Ctrl+Backspace）: この `source`（remember_last_commit/commit_and_reset に渡る
 /// ev=commit の source ラベル）の確定が undo_armed を武装してよいかを判定する純粋関数。
-/// 対象は「読みを使い切って composition を畳んだ全確定」の candidate/live のみ
+/// 対象は「読みを使い切って composition を畳んだ全確定」の candidate/live/clause のみ
 /// （設計ロック⑤）。candidate_prefix/live_prefix は composition が残るためガードで自然に除外され、
 /// live_auto は全消費時のみ commit_and_reset を通るが「iOS 由来の自動確定」を undo 対象にしない
 /// 方針（M-2）で source ゲート側から明示的に除外する。mode_toggle/navigate（settle 系）は
-/// 対象外（C-1: settle は候補確定を経由すると source="candidate" になるため、armed を残さないよう
-/// settle_active_input/on_preserved_key_impl 側で disarm_undo を必ず呼ぶ）。
+/// 対象外（C-1: settle は候補確定を経由すると source="candidate"/"clause" になるため、armed を
+/// 残さないよう settle_active_input/on_preserved_key_impl 側で disarm_undo を必ず呼ぶ）。
+/// clause（文節ナビゲーションの Enter 確定）は candidate と同じ「明示選択の全確定」なので武装する。
 pub fn arms_undo(source: &str) -> bool {
-    matches!(source, "candidate" | "live")
+    matches!(source, "candidate" | "live" | "clause")
 }
 
 /// 確定取消の armed 状態機械: このキーが「純粋な修飾キー単体」（Shift/Ctrl/Alt/Win の
@@ -205,6 +210,14 @@ pub fn is_pure_modifier_vk(vk: u32) -> bool {
 
 /// 押された物理キー＋現在のキーボード状態(Shift等)＋レイアウトから入力文字を求める。
 /// 印字可能な1文字なら Some、制御文字/デッドキー/合字なら None。
+/// 打鍵が自動リピート(押しっぱなし)か — lparam bit30。文節モード中の候補/文節操作
+/// (←/→/↑/↓/Space/Tab/数字)は OnKeyDown 内の同期 IPC を伴うため、リピート連打はキー間隔より
+/// 遅い応答待ちの積み上げ＝IME ブロックとタイムアウト→接続断に直結する。リピートは IPC を
+/// 発行せず食い切り、離して押し直せば bit30=0 で通る(敵対レビュー③の一般化)。
+fn is_autorepeat(lparam: LPARAM) -> bool {
+    (lparam.0 & (1 << 30)) != 0
+}
+
 fn key_to_char(vk: u32, lparam: LPARAM) -> Option<char> {
     let scancode = ((lparam.0 >> 16) & 0xFF) as u32;
     let mut state = [0u8; 256];
@@ -264,14 +277,16 @@ pub fn will_handle(vk: u32, composing: bool, showing: bool, cmd_modifier: bool, 
         // 未処理だと合成中にキャレットだけ移動し preedit が別位置へ取り残される（合成崩れ）。
         // 一般的な日本語IMEに倣い、食って開いている入力を確定（settle）してから畳む。
         // idle では素通し（本文のキャレット移動/前方削除はアプリに任せる）。
-        // ←→ も同じ扱い（打鍵作法 Task2 — 意図的な仕様変更）: InputState にカーソル概念が
-        // 無く読み内移動は実装できないため、素通しでキャレットだけ逃がすより「確定して畳む」。
+        // ←→ も食う条件は同じ（composing||showing）だが処理が違う: 候補表示中は文節移動
+        // （MS-IME の文節ナビゲーション。劣化時は settle）、composition のみは「確定して畳む」
+        // （打鍵作法 Task2 — InputState にカーソル概念が無く読み内移動は実装できないため）。
         VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_DELETE | VK_LEFT | VK_RIGHT => composing || showing,
-        // OEM 記号: idle でも食う（全角化して直接確定する — 打鍵作法 Task3）。composition 中は
-        // 従来どおり食ってエンジンへ送る（このアームは常に true なので包含）。VK 単位で宣言する
-        // 理由: will_handle は COM 非依存純関数で ToUnicode を呼べないため、文字（zenkaku_symbol の
-        // 表の有無）では判定できない。表に無い文字も OnKeyDown 側が食い切って文字を直接確定し、
-        // Test/実の eaten を一致させる（is_text_vk アームより前に置くこと）。
+        // OEM 記号: idle でも食う（全角化して composition を開始する — 2026-08-03、旧 Task3 の
+        // 直接確定を廃止）。composition 中は従来どおり食ってエンジンへ送る（このアームは常に
+        // true なので包含）。VK 単位で宣言する理由: will_handle は COM 非依存純関数で ToUnicode を
+        // 呼べないため、文字（zenkaku_symbol の表の有無）では判定できない。表に無い文字も
+        // OnKeyDown 側が食い切って読みへ積み、Test/実の eaten を一致させる
+        // （is_text_vk アームより前に置くこと）。
         vk if is_oem_symbol_vk(vk) => true,
         // 0/記号/テンキー: composition 中だけ食ってエンジンへ送る（idle は素通し）。
         vk if is_text_vk(vk) => composing,
@@ -291,14 +306,14 @@ pub fn will_handle(vk: u32, composing: bool, showing: bool, cmd_modifier: bool, 
 /// 誤分類され dispatch 前に abort される穴も、gated 経由なら carve-out がそのまま効く。
 #[allow(clippy::too_many_arguments)]
 pub fn ephemeral_idle_abort(
-    vk: u32, cmd_modifier: bool, shift: bool, symbol_full_width: bool,
+    vk: u32, cmd_modifier: bool, shift: bool, symbol_overlay: bool,
     ephemeral: bool, composing: bool, showing: bool,
     action: crate::keymap::KeyAction,
 ) -> bool {
     ephemeral
         && !composing
         && !showing
-        && !will_handle_gated(vk, composing, showing, cmd_modifier, false, shift, symbol_full_width, action)
+        && !will_handle_gated(vk, composing, showing, cmd_modifier, false, shift, symbol_overlay, action)
 }
 
 /// 設定 settings.shift_latin.mode → compose か。"commit" 以外は compose 扱い —
@@ -307,8 +322,8 @@ pub fn shift_latin_is_compose(mode: &str) -> bool {
     mode != "commit"
 }
 
-/// `will_handle`（固定キーの真実）に keymap 由来の action（コマンド機能）と、記号トグル由来の
-/// Shift+数字行 overlay（symbol_full_width）を重ねた最終述語。action はどれも「その機能の文脈
+/// `will_handle`（固定キーの真実）に keymap 由来の action（コマンド機能）と、記号設定由来の
+/// Shift+数字行 overlay（symbol_overlay）を重ねた最終述語。action はどれも「その機能の文脈
 /// ゲート＋feature flag＋チョード一致」を resolve_action が織り込み済みなので、ここでは正の
 /// carve-out として食うだけでよい。
 /// OnTestKeyDown / OnKeyDown の両入口はこの単一関数を共有する（＝「食うか」の唯一の真実）。
@@ -320,7 +335,7 @@ pub fn will_handle_gated(
     cmd_modifier: bool,
     direct: bool,
     shift: bool,
-    symbol_full_width: bool,
+    symbol_overlay: bool,
     action: crate::keymap::KeyAction,
 ) -> bool {
     // keymap の action は cmd_modifier 早期 return より前の carve-out（Ctrl 併用チョードが
@@ -328,11 +343,13 @@ pub fn will_handle_gated(
     if action != crate::keymap::KeyAction::None {
         return true;
     }
-    // 記号トグル ON のときだけ Shift+数字行を記号として食う(idle=直接確定/composition=畳み込み)。
+    // 記号 overlay ON のときだけ Shift+数字行を記号として食う(読みへ畳み込み。idle=合成開始)。
     // 下の showing 取消より前に置く理由: 目的が候補選択でなく記号入力で、OEM 記号は今日
     // すでに showing 中も食って確定している(そのパターンへ合流)。OFF なら不発=現行同一経路
     //（2026-07-16 spec §3a。旧 !/@ が US 配列で表に到達できなかった穴を塞ぐゲート側の半分）。
-    if !direct && !cmd_modifier && symbol_full_width && shift && is_main_row_digit_vk(vk) {
+    // 集合の個別内容は見ない — 全解除は overlay=false へ縮退してトグル OFF と完全同一になる
+    //（部分集合時に集合外記号を「食って半角のまま確定」する差は既知の限界。2026-08-02 spec §4）。
+    if !direct && !cmd_modifier && symbol_overlay && shift && is_main_row_digit_vk(vk) {
         return true;
     }
     // Minor 2: 数字キーの候補選択は Shift 無しのときだけ（実処理 OnKeyDown の
@@ -354,8 +371,8 @@ pub fn will_handle_gated(
 /// 実処理 `on_key_down_impl` と一致させる（Bug A の鏡像＝Test/実の eaten 判定を揃える）。
 /// 実処理の優先順位を保つ: cmd 修飾は最優先でパススルー（待機より先）、待機中は cmd 修飾
 /// 以外の全キーを食って無視（preedit ロック）、それ以外は通常の gate。
-// 引数は「vk＋4 文脈＋shift＋awaiting＋symbol_full_width＋action」で意味のある最小集合（action へ
-// 集約済み。symbol_full_width は記号トグルの Shift+数字行 overlay 用でキーマップ非依存）。
+// 引数は「vk＋4 文脈＋shift＋awaiting＋symbol_overlay＋action」で意味のある最小集合（action へ
+// 集約済み。symbol_overlay は記号設定の Shift+数字行 overlay 用でキーマップ非依存）。
 #[allow(clippy::too_many_arguments)]
 pub fn will_handle_awaiting(
     vk: u32,
@@ -365,7 +382,7 @@ pub fn will_handle_awaiting(
     direct: bool,
     shift: bool,
     awaiting_llm: bool,
-    symbol_full_width: bool,
+    symbol_overlay: bool,
     action: crate::keymap::KeyAction,
 ) -> bool {
     // keymap action の carve-out は cmd_modifier 早期 return より**前**（I-1 と同じ理由の一般化:
@@ -379,7 +396,7 @@ pub fn will_handle_awaiting(
     if awaiting_llm {
         return true;
     }
-    will_handle_gated(vk, composing, showing, cmd_modifier, direct, shift, symbol_full_width, action)
+    will_handle_gated(vk, composing, showing, cmd_modifier, direct, shift, symbol_overlay, action)
 }
 
 /// Bug 4: 候補窓の可視ページ内で数字キー(0 始まりの `digit`)が指す **絶対** index を返す。
@@ -542,7 +559,7 @@ impl TextService_Impl {
         // 前に direct へ復帰しておく（投機的 exit。OnKeyDown を呼ばない行儀よいホストでもここで
         // 検知しないと、TestKeyDown=FALSE のまま押し忘れの言語モード居残りになる。exit は冪等）。
         if ephemeral_idle_abort(
-            vk, cmd_modifier_down(), shift_down(), self.symbol_full_width.get(),
+            vk, cmd_modifier_down(), shift_down(), self.symbol_overlay.get(),
             self.ephemeral_kana.get(), composing, showing, action,
         ) {
             let ctx: Option<ITfContext> = pic.ok().ok().cloned();
@@ -555,7 +572,7 @@ impl TextService_Impl {
         // 先に呼ぶ行儀よいホストでも、待機中は実処理が全キーを食うのと eaten 判定を一致させる。
         let handled = will_handle_awaiting(
             vk, composing, showing, cmd_modifier_down(), direct,
-            shift_down(), self.state.borrow().awaiting_llm(), self.symbol_full_width.get(), action,
+            shift_down(), self.state.borrow().awaiting_llm(), self.symbol_overlay.get(), action,
         );
         // 診断: A–Z 打鍵時に is_direct が実際に何を読むかを残す（toggle で direct にしたのに
         // 入力がひらがなになる件の切り分け。direct=false なら compartment が direct を保持していない）。
@@ -662,7 +679,7 @@ impl TextService_Impl {
         // ephemeral かな: idle で「かなが食わない（素通しする）キー」が来たら、この打鍵を
         // 消費する前に direct へ復帰しておく（キーは素通しのまま — 押し忘れの言語モード居残り防止）。
         if ephemeral_idle_abort(
-            vk, cmd_modifier_down(), shift_down(), self.symbol_full_width.get(),
+            vk, cmd_modifier_down(), shift_down(), self.symbol_overlay.get(),
             self.ephemeral_kana.get(), composing, showing, action,
         ) {
             self.exit_ephemeral_to_direct(Some(&ctx));
@@ -676,7 +693,7 @@ impl TextService_Impl {
                 "ev=keydown vk={vk:#04x} direct={direct} composing={composing} showing={showing}"
             ));
         }
-        if direct && !will_handle_gated(vk, composing, showing, cmd_modifier_down(), true, shift_down(), self.symbol_full_width.get(), action) {
+        if direct && !will_handle_gated(vk, composing, showing, cmd_modifier_down(), true, shift_down(), self.symbol_overlay.get(), action) {
             return Ok(FALSE);
         }
 
@@ -685,6 +702,11 @@ impl TextService_Impl {
         // CommitUndo/Ephemeral は上流（:594/:619）で return 済みなのでここには来ない。
         match action {
             crate::keymap::KeyAction::Typo => {
+                // 文節モード中の Tab は候補送り(trigger_typo_convert が showing で move_candidate)
+                // ＝SelectClauseCandidate の同期 IPC。自動リピートは Convert と同じ理由で食い切る。
+                if showing && self.clause_nav.borrow().is_some() && is_autorepeat(lparam) {
+                    return Ok(TRUE);
+                }
                 self.trigger_typo_convert(&ctx);
                 return Ok(TRUE);
             }
@@ -695,6 +717,11 @@ impl TextService_Impl {
             crate::keymap::KeyAction::Notation(kind) => return self.apply_notation(&ctx, vk, kind),
             crate::keymap::KeyAction::NotationRotate => return self.dispatch_notation_rotate(&ctx, vk),
             crate::keymap::KeyAction::Convert => {
+                // 文節モード中の変換キー(Space)は候補送り＝SelectClauseCandidate の同期 IPC。
+                // 自動リピートは ←/→ と同じ理由で IPC を発行せず食い切る(is_autorepeat 注記)。
+                if showing && self.clause_nav.borrow().is_some() && is_autorepeat(lparam) {
+                    return Ok(TRUE);
+                }
                 self.trigger_convert(&ctx);
                 return Ok(TRUE);
             }
@@ -734,6 +761,12 @@ impl TextService_Impl {
             // ---- ↑/↓: 候補表示中は選択を移動（↓=次 / ↑=前、端で循環）----
             VK_UP | VK_DOWN => {
                 if self.showing.get() {
+                    // 文節モード中の↑/↓は選択同期の SelectClauseCandidate IPC を伴う —
+                    // 自動リピートは IPC を発行せず食い切る(is_autorepeat 注記。通常候補窓の
+                    // ↑/↓はローカル反映のみなので従来どおりリピートを通す)。
+                    if self.clause_nav.borrow().is_some() && is_autorepeat(lparam) {
+                        return Ok(TRUE);
+                    }
                     self.move_candidate(&ctx, if vk == VK_DOWN { 1 } else { -1 });
                     Ok(TRUE)
                 } else {
@@ -749,6 +782,13 @@ impl TextService_Impl {
                     return Ok(FALSE);
                 }
                 let showing = self.showing.get();
+                // 文節ナビゲーション中の Enter は全文節の確定。cand_state の index は
+                // 「選択文節の候補」の添字なので、通常の Commit{index}（全文候補キャッシュ）へ
+                // 流すと別候補を確定してしまう — 専用の CommitClauses 経路へ。
+                if showing && self.clause_nav.borrow().is_some() {
+                    self.commit_clauses(&ctx);
+                    return Ok(TRUE);
+                }
                 // 確定文字列の唯一の真実源は cand_state（drain_behavior と同じ読み元）。
                 // 選択 index も cand_state から読み、空なら先頭へフォールバック（index と文字列は一致）。
                 let cand_pick = if showing {
@@ -802,6 +842,26 @@ impl TextService_Impl {
                     // を超えて 2ページ目以降を表示している場合は、絶対 index ではなくページ先頭を
                     // 加えた絶対 index を確定する（従来は絶対 index 固定で常に1ページ目を誤確定していた）。
                     // 確定文字列の唯一の真実源は cand_state（M-3）。borrow はこのブロック内で完結させる。
+                    // 文節ナビゲーション中は確定でなく「選択文節の候補選択」（MS-IME と同じ —
+                    // 確定は Enter の CommitClauses）。move_candidate 経由で選択＝preedit＝エンジン
+                    // 状態が一点で同期する。
+                    if self.clause_nav.borrow().is_some() {
+                        // 自動リピートは IPC を発行せず食い切る(is_autorepeat 注記)。
+                        if is_autorepeat(lparam) {
+                            return Ok(TRUE);
+                        }
+                        let delta = {
+                            let st = self.cand_state.borrow();
+                            let digit = (vk - VK_1) as usize;
+                            page_candidate_index(st.selected(), st.count(), digit)
+                                .map(|abs| abs as i32 - st.selected() as i32)
+                        };
+                        if let Some(delta) = delta {
+                            self.move_candidate(&ctx, delta);
+                        }
+                        // 可視ページ外の数字は no-op（通常経路と同じく食い切る）。
+                        return Ok(TRUE);
+                    }
                     let picked = {
                         let st = self.cand_state.borrow();
                         let digit = (vk - VK_1) as usize; // 0 始まりのページ内行
@@ -827,11 +887,11 @@ impl TextService_Impl {
                             Some(ch) => self.input_char(&ctx, ch, InsertStyle::Direct),
                             None => Ok(TRUE),
                         }
-                    } else if self.symbol_full_width.get() {
-                        // 記号トグル ON: Shift+1..9 は記号(！＠＃…)。idle=直接確定/composition=畳み込み。
+                    } else if self.symbol_overlay.get() {
+                        // 記号 overlay ON: Shift+1..9 は記号(！＠＃…)。読みへ畳み込む(idle は合成開始)。
                         // gated 側の同条件オーバーレイと対(eaten 一致)。旧仕様では !/@ が
                         // zenkaku_symbol の表にあるのに VK がここへ届かず死にエントリだった。
-                        self.symbol_keydown(&ctx, vk, lparam, direct)
+                        self.symbol_keydown(&ctx, vk, lparam)
                     } else if self.state.borrow().composing {
                         // OFF+composition: 従来どおり raw 記号('!' 等)を読みへ(gated が食うと宣言済み)。
                         match key_to_char(vk, lparam) {
@@ -872,6 +932,9 @@ impl TextService_Impl {
                 } else if self.showing.get() {
                     self.candidate_ui.borrow_mut().hide();
                     self.showing.set(false);
+                    // 文節ナビゲーションも解除（エンジン側の文節状態は次の Convert/Insert が
+                    // cacheCandidates/invalidate で必ず捨てるので IPC は送らない）。
+                    self.clear_clause_nav();
                     tip_log("ev=candidates_hidden");
                     self.restore_live_preedit(&ctx);
                     // 候補窓を閉じて composition は継続 → 読みモニタを再表示する
@@ -904,6 +967,7 @@ impl TextService_Impl {
                 if self.showing.get() {
                     self.candidate_ui.borrow_mut().hide();
                     self.showing.set(false);
+                    self.clear_clause_nav();
                 }
                 self.state.borrow_mut().on_backspace();
                 // mark_good は Some アーム内限定 — match 後の共通行に置くと劣化出力まで
@@ -940,12 +1004,12 @@ impl TextService_Impl {
             // として上流の dispatch match が処理する（reconvert_fallback 特例は撤去）。
 
             // ---- 0 / 記号 / テンキー: composition 中はエンジンへ送る（記号/数字を変換に含める）----
-            // idle の OEM 記号は全角記号へ写して直接確定する（打鍵作法 Task3。native のみ —
-            // direct は冒頭の will_handle_gated ゲートで到達しない）。
+            // idle の OEM 記号も全角へ写して composition を開始する（2026-08-03 — 旧 Task3 の
+            // 直接確定を廃止。native のみ — direct は冒頭の will_handle_gated ゲートで到達しない）。
             vk if is_text_vk(vk) => {
-                // 記号打鍵（OEM は常時・数字行 0x30 は Shift かつ 記号トグル ON）は composition/idle
+                // 記号打鍵（OEM は常時・数字行 0x30 は Shift かつ 記号 overlay ON）は composition/idle
                 // とも symbol_keydown へ。判定は gated と同じ述語（eaten 一致 = item19）。
-                let sym = is_symbol_keystroke(vk, shift_down(), self.symbol_full_width.get());
+                let sym = is_symbol_keystroke(vk, shift_down(), self.symbol_overlay.get());
                 if self.state.borrow().composing {
                     if self.state.borrow().latin_mode() {
                         // 英語モード: 記号/数字/テンキーも生 ASCII のまま direct へ（symbol_keydown の
@@ -956,7 +1020,7 @@ impl TextService_Impl {
                             None => Ok(TRUE),
                         }
                     } else if sym {
-                        self.symbol_keydown(&ctx, vk, lparam, direct)
+                        self.symbol_keydown(&ctx, vk, lparam)
                     } else {
                         match key_to_char(vk, lparam) {
                             // 英字＝ローマ字合成、テンキー `-`→ー（to_kana_reading_char 維持）、テンキー `.` は literal。
@@ -966,7 +1030,7 @@ impl TextService_Impl {
                         }
                     }
                 } else if sym {
-                    self.symbol_keydown(&ctx, vk, lparam, direct)
+                    self.symbol_keydown(&ctx, vk, lparam)
                 } else if is_digit_vk(vk) {
                     // 0x30/テンキー数字の idle: Shift はここに来ない契約(gated=false)。TestKeyDown を
                     // 経ず KeyDown を直叩きするホスト(US配列バグAで実在)の保険 — 素通しし、')' 等で
@@ -985,14 +1049,44 @@ impl TextService_Impl {
                 }
             }
 
+            // ---- ←/→: 候補表示中は文節移動（MS-IME の文節ナビゲーション）----
+            // 変換候補の表示中に選択文節を左右へ動かし、候補窓を「選択文節の候補」へ差し替える。
+            // 劣化は 2 段: 文節モードに**入れない**（旧エンジン非対応/被覆候補無し/再変換中）は
+            // 従来どおり「確定して畳む」、**確立後**の失敗（一時的な IPC タイムアウト等）は
+            // no-op で食い切る — settle へ落とすと移動のつもりの矢印 1 打が合成の全確定になる
+            // （マージ後敵対レビュー④。両者は move_clause=false からは区別できない）。
+            // composition のみ（候補窓なし）も従来どおり settle — 読み内カーソル移動は据え置き。
+            // eaten 契約（composing||showing で食い切る）は不変（will_handle_gated と一致）。
+            VK_LEFT | VK_RIGHT => {
+                if self.showing.get() && !self.reconverting.get() {
+                    let in_nav = self.clause_nav.borrow().is_some();
+                    // 自動リピート中の文節モードは IPC を発行せず食い切る(is_autorepeat 注記。
+                    // 敵対レビュー③ — ↑/↓/Space/数字のガードと同じ規律)。
+                    if in_nav && is_autorepeat(lparam) {
+                        return Ok(TRUE);
+                    }
+                    if self.move_clause(&ctx, if vk == VK_RIGHT { 1 } else { -1 }) {
+                        return Ok(TRUE);
+                    }
+                    if in_nav {
+                        return Ok(TRUE);
+                    }
+                }
+                if self.state.borrow().composing || self.showing.get() {
+                    self.settle_active_input(Some(&ctx), "navigate");
+                    Ok(TRUE)
+                } else {
+                    Ok(FALSE)
+                }
+            }
+
             // ---- Home/End/PageUp/PageDown/Delete: 合成/候補表示中は確定して畳む（UU-6）----
             // 未処理だと合成中にキャレットだけ動いて preedit が別位置へ取り残される（合成崩れ）。
             // 開いている入力を settle（候補表示中は選択候補、composition のみはライブ変換結果）で
             // 確定してから畳む＝MS-IME/Google 日本語入力に倣った「確定してから移動」。キー自体は
             // 食い切る（Test/実の eaten 判定を一致させる）。idle では上の gate に到達せず
             // will_handle=false で OnKeyDown 自体が呼ばれない（呼ばれてもここで FALSE を返す）。
-            // ←→ も同アーム（打鍵作法 Task2）: 読み内カーソル移動ではなく「確定して畳む」。
-            VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_DELETE | VK_LEFT | VK_RIGHT => {
+            VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_DELETE => {
                 if self.state.borrow().composing || self.showing.get() {
                     self.settle_active_input(Some(&ctx), "navigate");
                     Ok(TRUE)
@@ -1018,6 +1112,7 @@ impl TextService_Impl {
         if self.showing.get() {
             self.candidate_ui.borrow_mut().hide();
             self.showing.set(false);
+            self.clear_clause_nav();
         }
         self.disarm_debounce();
         let reading = self.last_reading.borrow().clone();
@@ -1026,8 +1121,12 @@ impl TextService_Impl {
             Notation::Hiragana => reading,
             Notation::Katakana => to_katakana(&reading),
             Notation::HankakuKana => to_hankaku_kana(&reading),
-            Notation::ZenkakuEisu => to_zenkaku_ascii(&raw),
-            Notation::HankakuEisu => raw,
+            // どちらも raw をそのまま素材にしない: 句読点/記号は合成時に全角へ畳み込まれて
+            // raw に積まれる(symbol_keydown)ため、まず逆写像で打鍵の半角へ戻す。全角英数は
+            // その上で機械全角化(「、。」→",."→"，．")。戻さないと 、。 が「英数記号」表記に
+            // ならず素通りする(F10 側と同型の非対称 — 敵対レビュー M-1)。
+            Notation::ZenkakuEisu => to_zenkaku_ascii(&to_hankaku_ascii(&raw)),
+            Notation::HankakuEisu => to_hankaku_ascii(&raw),
         };
         {
             let mut st = self.state.borrow_mut();
@@ -1169,6 +1268,7 @@ impl TextService_Impl {
                 None => {
                     self.reconverting.set(false);
                     self.reconvert_original.borrow_mut().clear();
+                    self.reconvert_reading.borrow_mut().clear();
                 }
             }
         }
@@ -1202,6 +1302,13 @@ impl TextService_Impl {
             return;
         };
         tip_log(&format!("ev=settle source={source}"));
+        // 文節ナビゲーション中の settle は全文節の確定（VK_RETURN の文節枝と同じ理由 —
+        // cand_state の index は選択文節の候補添字で、Commit{index} へは流せない）。
+        if self.showing.get() && self.clause_nav.borrow().is_some() {
+            self.commit_clauses(ctx);
+            self.disarm_undo();
+            return;
+        }
         // 候補表示中: 選択中の候補を確定（VK_RETURN の候補枝と同じ読み元・同じ経路）。
         let cand_pick = if self.showing.get() {
             let st = self.cand_state.borrow();
@@ -1308,8 +1415,8 @@ impl TextService_Impl {
     /// Shift 押下時の一時直接入力（打鍵作法 Task5 改）。素の（大文字）ASCII 文字 `ch` を
     /// composition を張らず直接確定する（Google/ATOK の「Shift で一時的に直接入力」）。
     /// 開いている合成/候補があれば先に settle して畳む（MS-IME/Google の「Shift で暗黙確定して
-    /// から直接入力」）。読みの無い直接確定なので undo 武装はしない（idle_symbol と同じ規律 —
-    /// remember_last_commit を通さない）。commit は composition の無い do_commit 枝
+    /// から直接入力」）。読みの無い直接確定なので undo 武装はしない
+    ///（remember_last_commit を通さない）。commit は composition の無い do_commit 枝
     /// （InsertTextAtSelection＋末尾 SetSelection）で 1 発挿入し、連続 Shift 打鍵の順序も
     /// キャレット末尾追従で保たれる。
     pub(crate) fn commit_char_direct(&self, ctx: &ITfContext, ch: char) -> Result<BOOL> {
@@ -1323,49 +1430,35 @@ impl TextService_Impl {
         Ok(TRUE)
     }
 
-    /// 記号打鍵の実処理。composition=全角へ写して読みへ畳み込み / idle=直接確定。
+    /// 記号打鍵の実処理。全角へ写して読みへ畳み込む — idle なら composition を開始する。
     /// text_vk アーム(OEM 記号)と VK_1..=VK_9 アーム(Shift+数字行、記号トグル ON 時)が共有する
     /// — 呼び出し条件は is_symbol_keystroke(eaten 一致 = item19 のため gated と同一述語)。
     ///
-    /// idle 側は必ず食い切る: 表に無い文字(トグル OFF の '=' や '\' 等)を FALSE で素通すと
+    /// Why not(idle=全角直接確定 — 旧・打鍵作法 Task3): 句読点から打ち始めると composition が
+    /// 張られず、続く打鍵と同一 composition で変換できない・表記変換(F10 等)も一切効かない
+    /// (実機報告 2026-08-03)。idle 数字が合成を開始するのとも非対称だった。MS-IME/Google と
+    /// 同じく idle でも合成開始へ揃える。表に無い文字(トグル OFF の '/' 等)も同様に半角のまま
+    /// 読みへ積んで合成開始する — 句読点だけ特別扱いすると「どの記号が合成に入るか」が
+    /// 設定依存で割れ、続く打鍵との同一 composition 変換(この修正の動機)も記号種で欠ける
+    /// (ユーザー判断 2026-08-03: 記号全般を合成開始に)。
+    ///
+    /// 必ず食い切る: 表に無い文字(トグル OFF の '=' や '\' 等)を FALSE で素通すと
     /// Test/実の eaten が食い違い、OnTestKeyDown=TRUE を信じたホストで打鍵が失われる
-    /// (item19 の教訓)。よって写せない文字はその文字のまま直接確定する(文書上の結果は
-    /// 従来のパススルー挿入とバイト等価)。composition は張らず do_commit の「composition 無し」
-    /// 枝(InsertTextAtSelection＋末尾 SetSelection — M-3)で1発挿入する(連打「。。」の順序は
-    /// キャレット末尾追従で保証)。
-    fn symbol_keydown(&self, ctx: &ITfContext, vk: u32, lparam: LPARAM, direct: bool) -> Result<BOOL> {
+    /// (item19 の教訓)。よって写せない文字はその文字のまま読みへ積む。
+    fn symbol_keydown(&self, ctx: &ITfContext, vk: u32, lparam: LPARAM) -> Result<BOOL> {
         let punct = self.punctuation_full_width.get();
-        let symbol = self.symbol_full_width.get();
-        if self.state.borrow().composing {
-            match key_to_char(vk, lparam) {
-                // 全角へ写して読みへ畳み込む（idle と同一マップ・`-` と全記号を同仕様に — 設計 §C）。
-                // テンキー記号は is_symbol_keystroke=false でここに来ない（`.` は literal、`-` はー化）。
-                Some(ch) => {
-                    let folded = zenkaku_symbol(ch, punct, symbol).unwrap_or(ch);
-                    // 呼び出し側が英語モードを先に分岐させるので、ここは常にかな読みへの畳み込み。
-                    self.input_char(ctx, folded, InsertStyle::Kana)
-                }
-                // L-3: 合成中の印字不能キー（デッドキー/合字）は食って無視（stray char 漏れ防止）。
-                None => Ok(TRUE),
+        let symbol = self.symbol_overlay.get();
+        let chars = self.symbol_chars.get();
+        match key_to_char(vk, lparam) {
+            // 全角へ写して読みへ畳み込む（`-` と全記号を同仕様に — 設計 §C）。
+            // テンキー記号は is_symbol_keystroke=false でここに来ない（`.` は literal、`-` はー化）。
+            Some(ch) => {
+                let folded = zenkaku_symbol(ch, punct, symbol, chars).unwrap_or(ch);
+                // 呼び出し側が英語モードを先に分岐させるので、ここは常にかな読みへの畳み込み。
+                self.input_char(ctx, folded, InsertStyle::Kana)
             }
-        } else {
-            match key_to_char(vk, lparam) {
-                Some(ch) => {
-                    let text = zenkaku_symbol(ch, punct, symbol)
-                        .map(String::from)
-                        .unwrap_or_else(|| ch.to_string());
-                    // 品質ループ②: 読み無しの直接確定（rlen=0 sel=-1 cand_n=0）。
-                    // この経路は native 限定（direct は冒頭 gate で到達しない）だが、
-                    // mode は実測値（採取済みの direct）を出す。
-                    let fields = commit_fields(None, 0, "", &text, direct);
-                    tip_log(&format!("ev=commit text={text} source=idle_symbol {fields}"));
-                    self.do_commit(ctx, &text);
-                    Ok(TRUE)
-                }
-                // 印字不能（デッドキー/合字）: 食って無視（L-3 と同じ規律。eaten 一致優先。
-                // native 日本語入力ではデッドキーは実質使われないため失うものは無い）。
-                None => Ok(TRUE),
-            }
+            // L-3: 印字不能キー（デッドキー/合字）は食って無視（stray char 漏れ防止）。
+            None => Ok(TRUE),
         }
     }
 
@@ -1375,6 +1468,7 @@ impl TextService_Impl {
         if self.showing.get() {
             self.candidate_ui.borrow_mut().hide();
             self.showing.set(false);
+            self.clear_clause_nav();
         }
         // 喪失判定は ensure_engine より**前**に行う: drop_engine 後の再接続は
         // ensure_engine 内の start_and_store が StartSession まで済ませて engine_session を
@@ -1439,8 +1533,10 @@ impl TextService_Impl {
     /// 品質ループ③: 直前確定バッファ（誤変換ワンキー記録の対象）を保存する。commit サイトが
     /// **状態クリア前に** ev=commit と同じ採取材料で呼ぶ。かな変換系の確定
     /// （commit_and_reset / apply_commit_plan / apply_live_auto_commit）のみが対象で、
-    /// idle_symbol の直接確定は**意図的に対象外**（読みが無く「誤変換」の概念が成立しない —
-    /// 「。」への Ctrl+変換 は直前のかな確定を指すほうが有用）。
+    /// shift_latin の直接確定は**意図的に対象外**（読みが無く「誤変換」の概念が成立しない）。
+    /// idle 記号は 2026-08-03 の仕様変更（直接確定→合成開始）で通常の commit 経路に乗り、
+    /// 対象**内**になった — 「。」だけの確定も undo/feedback の対象になるのは、記号 composition
+    /// を通常の合成と区別しない一様性の帰結（旧・対象外の理由づけは直接確定経路ごと消滅）。
     fn remember_last_commit(&self, reading: &str, text: &str, source: &str, sel: Option<usize>, cand_n: usize) {
         // F-5 改定（確定取消）: opt-in（settings.feedback.enabled）に加えて、この確定が undo
         // 武装対象（arms_undo(source)）なら保存する。常時保存にはしない — mode_toggle/navigate/
@@ -1520,6 +1616,7 @@ impl TextService_Impl {
         self.candidate_ui.borrow_mut().hide();
         self.reading_monitor.borrow_mut().hide();
         self.showing.set(false);
+        self.clear_clause_nav();
         // U9: 合成終了 — 次 composition の再捕捉まで前文書の左文脈を残さない（stale 残留防止）。
         *self.left_context.borrow_mut() = None;
         // 読みキャッシュ: 合成終了の全経路+PartialReseed でクリア（U9 左文脈と同じ規律。
@@ -1539,11 +1636,48 @@ impl TextService_Impl {
         self.disarm_debounce();
         // 再変換中の確定は対象外（g1 リプレイ由来の別セッション）。従来確定へフォールバック。
         if self.reconverting.get() {
+            let reading = self.reconvert_reading.borrow().clone();
             self.commit_and_reset(ctx, resolved_text, "candidate", Some(index));
+            // 訂正通知は確定完了後(ユーザ可視の確定を待たせない)。確定契約(Commit IPC 迂回・
+            // 直接挿入)は不変で、これは記録専用の別 op。resolved_text を widen 前の値で
+            // 記録できるのは should_widen_digits が source=="candidate" を除外している前提
+            // (除外を外すなら widen 後の文字列を送ること — 確定本文と記録表層の一致が契約)。
+            if crate::text_service::should_record_correction(index, &reading) {
+                self.engine_record_correction(&reading, resolved_text);
+            }
             return;
         }
         let plan = plan_commit(self.engine_commit(index), resolved_text);
         self.apply_commit_plan(ctx, plan, "candidate", "candidate_prefix", Some(index));
+    }
+
+    /// 文節ナビゲーション中の確定（Enter / settle / ホスト Finalize）。エンジンの CommitClauses が
+    /// 文節ごとに学習して全文節の連結を返す。劣化時（旧エンジン/接続断）は表示中ビューの連結を
+    /// 直確定する — 学習に乗らないだけで、表示＝確定の一致は保たれる。常に全確定
+    /// （文節候補は全被覆のみ＝残り読みは構造的に無い）なので commit_and_reset へ。
+    /// source は settle 発でも "clause" 固定 — settle の候補確定が source="candidate" になるのと
+    /// 同じ規律（幅の契約 should_widen_digits と undo 武装 arms_undo が source 列挙で判定するため、
+    /// 呼び出し契機で名前が揺れると両方が静かに壊れる）。
+    pub(crate) fn commit_clauses(&self, ctx: &ITfContext) {
+        let source = "clause";
+        let fallback = self
+            .clause_nav
+            .borrow()
+            .as_ref()
+            .map(|n| n.segments.concat())
+            .unwrap_or_default();
+        let text = self
+            .engine_commit_clauses()
+            .map(|(t, _)| t)
+            .unwrap_or(fallback);
+        if text.is_empty() {
+            // 防御: ビュー無しで呼ばれた（呼び出し側の clause_nav ガードが破れた）場合のみ。
+            // 空文字の確定は composition を只の空置換で畳むだけなので何もしない方が安全。
+            tip_log("ev=clause_commit skip=empty");
+            return;
+        }
+        tip_log(&format!("ev=clause_commit text={text}"));
+        self.commit_and_reset(ctx, &text, source, None);
     }
 
     /// plan_commit の結果を composition へ適用する（候補確定とライブ確定で共有 — Spec2）。
@@ -1578,6 +1712,7 @@ impl TextService_Impl {
                 self.cand_state.borrow_mut().set(Vec::new(), 0); // 古い(全読み)候補を破棄
                 self.candidate_ui.borrow_mut().hide();
                 self.showing.set(false);
+                self.clear_clause_nav();
                 // 残り読みで新しい composition を張る（表示だけ全角化 — remaining 自体は半角のまま
                 // reseed_after_partial_commit / last_reading / live_text へ渡してある）。
                 self.run_preedit(ctx, &self.widen_display_text(&remaining));
@@ -1672,6 +1807,19 @@ mod tests {
     fn az_always_handled() {
         assert!(will_handle(0x41, false, false, false, false)); // 'A'
         assert!(will_handle(0x5A, false, false, false, false)); // 'Z'
+    }
+
+    #[test]
+    fn autorepeat_is_bit30_of_lparam() {
+        // 文節モード中の同期 IPC を伴うキー(←/→/↑/↓/Space/数字)は自動リピートで積み上がると
+        // タイムアウト→接続断になるため、bit30 での判定を全アームで共有する。
+        use super::is_autorepeat;
+        use windows::Win32::Foundation::LPARAM;
+        assert!(!is_autorepeat(LPARAM(0)));
+        assert!(!is_autorepeat(LPARAM(1)));
+        assert!(is_autorepeat(LPARAM(1 << 30)));
+        assert!(is_autorepeat(LPARAM((1 << 30) | 1)));
+        assert!(!is_autorepeat(LPARAM(1 << 29)));
     }
 
     #[test]
@@ -1981,18 +2129,18 @@ mod tests {
         assert!(!will_handle_gated(0x76, true, false, false, false, false, false, KeyAction::None));
     }
 
-    // ---- 打鍵作法 Task3: OEM 記号は idle でも食う（全角直接確定・意図的な仕様変更）----
+    // ---- OEM 記号は idle でも食う（2026-08-03: 全角化して合成開始。旧 Task3 は直接確定）----
     // 旧仕様「OEM 記号は idle 素通し」の assert は text_keys_handled_only_when_composing から
-    // 本テストへ反転分離した。
+    // 本テストへ反転分離した。eaten 契約は直接確定→合成開始の変更を跨いで不変。
     #[test]
     fn symbol_vks_handled_even_when_idle_in_native() {
-        // OEM 記号 VK は idle でも食う（全角化して直接確定するため）。native のみ。
+        // OEM 記号 VK は idle でも食う（全角化して composition を開始するため）。native のみ。
         assert!(will_handle(0xBE, false, false, false, false)); // VK_OEM_PERIOD idle
         assert!(will_handle(0xBC, false, false, false, false)); // VK_OEM_COMMA idle
         // composition 中も従来どおり食う（エンジンへ送る経路は OnKeyDown 側で分岐）。
         for vk in [0xBAu32, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xDB, 0xDE] {
             assert!(will_handle(vk, true, false, false, false), "vk {vk:#x} composing -> handled");
-            assert!(will_handle(vk, false, false, false, false), "vk {vk:#x} idle -> handled (Task3)");
+            assert!(will_handle(vk, false, false, false, false), "vk {vk:#x} idle -> handled (合成開始)");
         }
         // Ctrl/Alt 併用はアプリのアクセラレータとして常に素通し。
         assert!(!will_handle(0xBE, false, false, true, false));
@@ -2108,7 +2256,7 @@ mod tests {
         // OEM 記号キーはトグル/Shift 非依存(従来契約=常に記号打鍵。表外も食い切って ASCII 確定)。
         assert!(is_symbol_keystroke(0xBF, false, false)); // '/'
         assert!(is_symbol_keystroke(0xC0, true, false));  // Shift+` = '~'
-        // 数字行は「Shift かつ 記号トグル ON」のときだけ記号打鍵。OFF を含めないのは
+        // 数字行は「Shift かつ 記号 overlay ON」のときだけ記号打鍵。OFF を含めないのは
         // 既定 OFF で現行経路と完全同一(新規に食う打鍵ゼロ)を保証するため。
         assert!(is_symbol_keystroke(0x31, true, true));   // Shift+1 = '!' (ON)
         assert!(!is_symbol_keystroke(0x31, true, false)); // OFF なら記号扱いしない
@@ -2117,11 +2265,11 @@ mod tests {
     }
 
     #[test]
-    fn gated_eats_shifted_digit_row_only_when_symbol_full_width() {
-        // (vk, composing, showing, cmd, direct, shift, symbol_fw, action) — action は記号 overlay に無関係。
+    fn gated_eats_shifted_digit_row_only_when_symbol_overlay() {
+        // (vk, composing, showing, cmd, direct, shift, symbol_overlay, action) — action は記号 overlay に無関係。
         let none = KeyAction::None;
         assert!(will_handle_gated(0x31, false, false, false, false, true, true, none),
-            "ON: idle の Shift+1 を食って！を直接確定する");
+            "ON: idle の Shift+1 を食って！で合成を開始する");
         assert!(will_handle_gated(0x30, false, false, false, false, true, true, none),
             "ON: Shift+0=) も対象(0x30 を含む)");
         assert!(!will_handle_gated(0x31, false, false, false, false, true, false, none),
@@ -2258,7 +2406,7 @@ mod tests {
     fn ephemeral_idle_abort_only_for_passthrough_actionless_keys_when_ephemeral() {
         // abort は「かな(native)が食わない」＝ !will_handle_gated(direct=false) と同義。
         // 素通しキー（矢印・nav idle）は abort=true（direct へ戻して素通し）。
-        // 引数: (vk, cmd, shift, symbol_full_width, ephemeral, composing, showing, action)
+        // 引数: (vk, cmd, shift, symbol_overlay, ephemeral, composing, showing, action)
         assert!(ephemeral_idle_abort(0x26, false, false, false, true, false, false, act(0x26, false, false, false)));  // ↑ → 素通し
         assert!(ephemeral_idle_abort(0x0D, false, false, false, true, false, false, act(0x0D, false, false, false)));  // Enter idle → 素通し
         assert!(ephemeral_idle_abort(0x1B, false, false, false, true, false, false, act(0x1B, false, false, false)));  // Esc idle → 素通し
@@ -2287,7 +2435,7 @@ mod tests {
             assert!(!ephemeral_idle_abort(vk, false, false, false, true, false, false, act(vk, false, false, false)),
                 "vk {vk:#x}: かなが食う数字キーで ephemeral を抜けてはならない");
         }
-        // 記号トグル ON の Shift+数字行も「かなが食う」側（全角記号として直接確定する）。
+        // 記号トグル ON の Shift+数字行も「かなが食う」側（全角記号で合成を開始する）。
         // 既定キーマップで数字は未束縛なので action は None（act ヘルパは shift を取らないため直接渡す）。
         assert!(!ephemeral_idle_abort(0x31, false, true, true, true, false, false, KeyAction::None));
         // トグル OFF の Shift+数字はかなが食わない＝素通しなので従来どおり abort する。
@@ -2320,7 +2468,7 @@ mod tests {
         // ---- 旧実装の忠実な複製(削除したアームを含む)＋意図的な新規 eaten の baseline 更新 ----
         // ベースラインはマージ後のマスタ側最終述語(d9e8a32): 旧 will_handle は
         // Tab(0x09)/F6-F10(0x75..=0x79)/direct VK_CONVERT(0x1C) を食い、旧 gated は
-        // 記号トグル(symbol_full_width)の Shift+数字行 overlay を持っていた。
+        // 記号設定(symbol_overlay)の Shift+数字行 overlay を持っていた。
         // これに本設計の意図的差分 f/g(無変換 0x1D 救済・direct+composing Space)を足して更新する。
         fn legacy_will_handle(vk: u32, composing: bool, showing: bool, cmd_modifier: bool, direct: bool) -> bool {
             if cmd_modifier { return false; }
@@ -2364,7 +2512,7 @@ mod tests {
         fn legacy_awaiting(
             vk: u32, composing: bool, showing: bool, cmd_modifier: bool, direct: bool,
             llm_enabled: bool, typo_enabled: bool, shift: bool, awaiting: bool,
-            undo_hot: bool, ephemeral_hot: bool, symbol_full_width: bool,
+            undo_hot: bool, ephemeral_hot: bool, symbol_overlay: bool,
         ) -> bool {
             if ephemeral_hot { return true; }
             if undo_hot { return true; }
@@ -2372,8 +2520,8 @@ mod tests {
             if awaiting { return true; }
             // 旧 will_handle_gated (master d9e8a32)
             if vk == 0x09 && !(if shift { llm_enabled } else { typo_enabled }) { return false; }
-            // 記号トグル overlay: Shift+数字行を食う(showing veto より前)。
-            if !direct && !cmd_modifier && symbol_full_width && shift && is_main_row_digit_vk(vk) { return true; }
+            // 記号 overlay: Shift+数字行を食う(showing veto より前)。
+            if !direct && !cmd_modifier && symbol_overlay && shift && is_main_row_digit_vk(vk) { return true; }
             if (0x31..=0x39).contains(&vk) && shift && showing && !composing { return false; }
             if !direct && !cmd_modifier && !shift && is_digit_vk(vk) { return true; }
             legacy_will_handle(vk, composing, showing, cmd_modifier, direct)

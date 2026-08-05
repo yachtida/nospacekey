@@ -57,8 +57,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, SetTimer,
-    SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
-    WM_LBUTTONDOWN, WM_NCDESTROY, WM_PAINT, WM_TIMER,
+    ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE, WM_LBUTTONDOWN, WM_NCDESTROY, WM_PAINT, WM_TIMER,
 };
 
 // ポップアップ共有基盤（popup.rs）の純ヘルパ。旧来この module にあったものを移設した。
@@ -891,15 +890,7 @@ impl CandidateWindow {
         let (fx, fy) =
             popup::place_on_monitor_flipped(anchor.x, anchor.y, anchor.caret_top, width, height);
         unsafe {
-            let _ = SetWindowPos(
-                self.hwnd,
-                None,
-                fx,
-                fy,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            );
+            popup::set_popup_pos(self.hwnd, Some((fx, fy)), width, height);
             // D2D パスの swapchain 作り直し＋InvalidateRect（SetWindowPos の後、描画の前）。
             popup::resize_and_invalidate::<WindowState>(self.hwnd, width, height);
         }

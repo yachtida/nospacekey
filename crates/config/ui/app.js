@@ -258,6 +258,72 @@ window.addEventListener("keydown", (e) => {
   stop();
 }, true);
 
+// ---- 記号の幅: 個別選択グリッド ----
+// [{half, full}] のカタログ。get_symbol_catalog から取得し、JS に写像表は持たない
+// （2026-08-02 spec §3/§5）。カタログ順は「すべて選択」等での再構築順にも使う。
+let symbolCatalog = [];
+
+// グリッドは createElement + textContent/dataset のみで組む: 29記号には
+// `" & ' < >` が含まれ、innerHTML への文字列補間だと属性が破綻する（keymap の
+// テンプレート補間は固定 ASCII 識別子しか差し込まないため無事なだけ）。
+async function initSymbolGrid() {
+  symbolCatalog = await invoke("get_symbol_catalog");
+  const grid = document.getElementById("symbol-grid");
+  for (const { half, full } of symbolCatalog) {
+    const item = document.createElement("label");
+    item.className = "symbol-item";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.dataset.symbolHalf = half;
+    cb.addEventListener("change", syncSymbolCharsFromGrid);
+    const text = document.createElement("span");
+    text.textContent = `${half} → ${full}`;
+    item.append(cb, text);
+    grid.appendChild(item);
+  }
+  document.getElementById("symbol-select-all").addEventListener("click", () => {
+    state.symbol_full_width_chars = symbolCatalog.map((e) => e.half);
+    markDirty();
+    renderSymbolGrid();
+  });
+  document.getElementById("symbol-deselect-all").addEventListener("click", () => {
+    state.symbol_full_width_chars = [];
+    markDirty();
+    renderSymbolGrid();
+  });
+  // bindInputs() の汎用ハンドラは appearance. パスのときしか副作用フックを呼ばない
+  // ため、マスタートグルの表示切替はここで個別に配線する（無ければリロードまで
+  // グリッドの表示/非表示が反映されない）。
+  document.getElementById("e-symbol-fullwidth").addEventListener("change", updateSymbolDetailVisibility);
+  renderSymbolGrid(); // 初期ロード分の反映（keymap の buildKeymapRows→renderKeymapValues と同型）
+}
+
+// state.symbol_full_width_chars をカタログ順で毎回再構築する。push で崩すと
+// recomputeDirty の JSON 文字列比較が値同一でも dirty 誤判定するため。
+function syncSymbolCharsFromGrid() {
+  const checked = new Set();
+  document.querySelectorAll("#symbol-grid input[type=checkbox]").forEach((cb) => {
+    if (cb.checked) checked.add(cb.dataset.symbolHalf);
+  });
+  state.symbol_full_width_chars = symbolCatalog.filter((e) => checked.has(e.half)).map((e) => e.half);
+  markDirty();
+  renderSymbolGrid();
+}
+
+// 初期ロード / applyNow の再ロード / 「既定に戻す」の3箇所から呼ぶ
+// （keymap の renderKeymapValues と同じ配線点）。
+function renderSymbolGrid() {
+  const selected = new Set(state.symbol_full_width_chars);
+  document.querySelectorAll("#symbol-grid input[type=checkbox]").forEach((cb) => {
+    cb.checked = selected.has(cb.dataset.symbolHalf);
+  });
+  updateSymbolDetailVisibility();
+}
+
+function updateSymbolDetailVisibility() {
+  document.getElementById("symbol-fullwidth-detail").hidden = !state.symbol_full_width;
+}
+
 function bindPaletteTabs() {
   document.querySelectorAll(".pal-tab").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -440,7 +506,13 @@ async function applyNow() {
     clearDirty();
     renderAll();
     renderKeymapValues();
+    renderSymbolGrid();
     toast("適用しました（候補ウィンドウは次回表示から反映）");
+    // カスタム辞書の enabled トグルは fire-and-forget で常駐エンジンへ伝える(spec §4.2)。
+    // 失敗は無害（次回エンジン起動時の enqueue 読み直しで追いつく）ので待たない。
+    invoke("dict_sync_engine").then((st) => {
+      if (st === "declined") toast("反映には IME の再起動が必要な場合があります");
+    }).catch(() => {});
   } catch (errors) {
     if (Array.isArray(errors)) showFieldErrors(errors);
     else toast(String(errors), true);
@@ -547,16 +619,255 @@ function bindZenzaiDownload() {
   });
 }
 
+// ---- 辞書 ----
+// dict_list のキャッシュ。絞り込みはこの配列を filter して行 DOM を再構築する
+// （サーバへ問い合わせ直さない）。行は必ず createElement + textContent で組む
+// （エントリ由来文字列 — ruby/word/pos — を innerHTML/テンプレートリテラルへ絶対に入れない。spec §5.4）。
+let dictEntries = [];
+let dictLoaded = false;    // ページ初回表示時にだけ dict_list する
+let dictEditable = true;   // quarantine_failed で false（編集操作を無効化）
+let dictQuarantineToastShown = false; // 「壊れていたため退避」は1回だけ
+let dictEditTarget = null; // 編集中エントリの {ruby, word}（null = 追加モード）
+let dictModalReturnFocus = null;
+
+const DICT_RUBY_RE = /^[ぁ-ゖァ-ヶー]+$/;
+
+function dictHasControlChar(s) {
+  return /[\u0000-\u001f]/.test(s);
+}
+// ruby=かな+ー のみ・word=任意。共通で非空/300文字(スカラ単位)以下/制御文字なし。
+function dictFieldValid(value, isRuby) {
+  const len = [...value].length;
+  if (len === 0 || len > 300) return false;
+  if (dictHasControlChar(value)) return false;
+  if (isRuby && !DICT_RUBY_RE.test(value)) return false;
+  return true;
+}
+
+function dictErrorKind(err) {
+  return err && typeof err === "object" ? err.kind : null;
+}
+function dictUnreadableToast(err) {
+  const kind = dictErrorKind(err);
+  if (kind === "Unreadable" || kind === "QuarantineFailed") {
+    toast("辞書ファイルを読めません", true);
+  } else {
+    toast(err && err.message ? err.message : String(err), true);
+  }
+}
+
+function updateDictActionsEnabled() {
+  document.getElementById("dict-add-btn").disabled = !dictEditable;
+  document.getElementById("dict-import-btn").disabled = !dictEditable;
+  document.getElementById("dict-export-btn").disabled = !dictEditable;
+}
+
+function buildDictRow(entry) {
+  const tr = document.createElement("tr");
+  for (const value of [entry.ruby, entry.word, entry.pos_display]) {
+    const td = document.createElement("td");
+    td.textContent = value; // XSS不変条件: エントリ由来文字列は textContent のみ
+    tr.appendChild(td);
+  }
+  const actionsTd = document.createElement("td");
+  actionsTd.className = "dict-row-actions";
+  const editBtn = document.createElement("button");
+  editBtn.type = "button";
+  editBtn.textContent = "編集";
+  editBtn.disabled = !dictEditable;
+  editBtn.addEventListener("click", () => openDictModal(entry));
+  const delBtn = document.createElement("button");
+  delBtn.type = "button";
+  delBtn.textContent = "削除";
+  delBtn.disabled = !dictEditable;
+  delBtn.addEventListener("click", () => deleteDictEntry(entry));
+  actionsTd.appendChild(editBtn);
+  actionsTd.appendChild(delBtn);
+  tr.appendChild(actionsTd);
+  return tr;
+}
+
+function renderDictTable() {
+  const filter = document.getElementById("dict-filter").value.trim();
+  const filtered = filter
+    ? dictEntries.filter((e) => e.ruby.includes(filter) || e.word.includes(filter))
+    : dictEntries;
+  const tbody = document.getElementById("dict-rows");
+  tbody.textContent = "";
+  for (const entry of filtered) tbody.appendChild(buildDictRow(entry));
+  document.getElementById("dict-count").textContent = `${dictEntries.length} 語`;
+}
+
+async function loadDictList() {
+  try {
+    const report = await invoke("dict_list");
+    dictEntries = report.entries;
+    dictEditable = report.corrupt !== "quarantine_failed";
+    document.getElementById("dict-quarantine-error").hidden = report.corrupt !== "quarantine_failed";
+    if (report.corrupt === "quarantined" && !dictQuarantineToastShown) {
+      dictQuarantineToastShown = true;
+      toast("辞書ファイルが壊れていたため退避しました");
+    }
+    const dedupNote = document.getElementById("dict-dedup-note");
+    dedupNote.hidden = report.deduped === 0;
+    if (report.deduped > 0) {
+      dedupNote.textContent = `重複 ${report.deduped} 件は表示から畳んでいます（次の編集時にファイルも整理されます）`;
+    }
+    updateDictActionsEnabled();
+    renderDictTable();
+  } catch (err) {
+    dictUnreadableToast(err);
+  }
+}
+
+function clearDictFormErrors() {
+  document.getElementById("dict-form-error-ruby").textContent = "";
+  document.getElementById("dict-form-error-word").textContent = "";
+  document.getElementById("dict-form-error-general").textContent = "";
+}
+function updateDictSaveEnabled() {
+  const ruby = document.getElementById("dict-form-ruby").value;
+  const word = document.getElementById("dict-form-word").value;
+  document.getElementById("dict-form-save").disabled =
+    !dictFieldValid(ruby, true) || !dictFieldValid(word, false);
+}
+
+function openDictModal(entry) {
+  dictEditTarget = entry ? { ruby: entry.ruby, word: entry.word } : null;
+  document.getElementById("dict-modal-title").textContent = entry ? "エントリを編集" : "エントリを追加";
+  document.getElementById("dict-form-ruby").value = entry ? entry.ruby : "";
+  document.getElementById("dict-form-word").value = entry ? entry.word : "";
+  // 編集時の品詞初期選択は pos_display（正準化済み表示値）を使う（spec §5.2）。
+  document.getElementById("dict-form-pos").value = entry ? entry.pos_display : "名詞";
+  clearDictFormErrors();
+  updateDictSaveEnabled();
+  dictModalReturnFocus = document.activeElement;
+  document.getElementById("dict-modal").hidden = false;
+  document.getElementById("dict-form-ruby").focus();
+}
+function closeDictModal() {
+  document.getElementById("dict-modal").hidden = true;
+  dictEditTarget = null;
+  if (dictModalReturnFocus && dictModalReturnFocus.isConnected) dictModalReturnFocus.focus();
+  dictModalReturnFocus = null;
+}
+
+async function saveDictEntry() {
+  const ruby = document.getElementById("dict-form-ruby").value;
+  const word = document.getElementById("dict-form-word").value;
+  const pos = document.getElementById("dict-form-pos").value;
+  clearDictFormErrors();
+  try {
+    const report = dictEditTarget
+      ? await invoke("dict_update", {
+          oldRuby: dictEditTarget.ruby,
+          oldWord: dictEditTarget.word,
+          ruby, word, pos,
+        })
+      : await invoke("dict_add", { ruby, word, pos });
+    closeDictModal();
+    await loadDictList();
+    // MutationReport.engine の declined を無言にしない(spec §4.2 — 全 mutation コマンド共通)。
+    if (report.engine === "declined") toast("反映には IME の再起動が必要な場合があります");
+  } catch (err) {
+    const kind = dictErrorKind(err);
+    if (kind === "NotFound") {
+      toast("辞書が他で変更されました");
+      closeDictModal();
+      await loadDictList();
+    } else if (kind === "Duplicate") {
+      document.getElementById("dict-form-error-general").textContent =
+        "同じ読み・単語の組み合わせが既に登録されています";
+    } else if (kind === "Invalid") {
+      const slot = document.getElementById(`dict-form-error-${err.field}`);
+      if (slot) slot.textContent = "入力を確認してください";
+    } else {
+      dictUnreadableToast(err);
+    }
+  }
+}
+
+async function deleteDictEntry(entry) {
+  try {
+    const report = await invoke("dict_delete", { ruby: entry.ruby, word: entry.word });
+    await loadDictList();
+    if (report.engine === "declined") toast("反映には IME の再起動が必要な場合があります");
+  } catch (err) {
+    const kind = dictErrorKind(err);
+    if (kind === "NotFound") {
+      toast("辞書が他で変更されました");
+      await loadDictList();
+    } else {
+      dictUnreadableToast(err);
+    }
+  }
+}
+
+async function importDict() {
+  try {
+    const report = await invoke("dict_import");
+    if (!report) return; // キャンセル
+    let msg = `${report.added} 件追加、${report.skipped_dup} 件スキップ(重複)、${report.skipped_invalid} 件スキップ(不正)`;
+    if (report.encoding_hint) {
+      msg += "。文字コードが UTF-8 / UTF-16 でない可能性があります(Shift_JIS 等は非対応)";
+    }
+    // toast() は表示スロットが1つのため、declined の注記は同じトーストへ連結する
+    // （直後に別トーストを呼ぶと import 結果の文言が上書きされて消える）。
+    if (report.engine === "declined") {
+      msg += "。反映には IME の再起動が必要な場合があります";
+    }
+    toast(msg);
+    await loadDictList();
+  } catch (err) {
+    dictUnreadableToast(err);
+  }
+}
+
+async function exportDict() {
+  try {
+    const report = await invoke("dict_export");
+    if (!report) return; // キャンセル
+    let msg = `${report.written} 件書き出しました`;
+    if (report.skipped_control > 0) msg += `(制御文字を含む ${report.skipped_control} 件はスキップ)`;
+    toast(msg);
+  } catch (err) {
+    dictUnreadableToast(err);
+  }
+}
+
+function bindDictionary() {
+  document.getElementById("dict-add-btn").addEventListener("click", () => openDictModal(null));
+  document.getElementById("dict-import-btn").addEventListener("click", importDict);
+  document.getElementById("dict-export-btn").addEventListener("click", exportDict);
+  document.getElementById("dict-filter").addEventListener("input", renderDictTable);
+  document.getElementById("dict-form-cancel").addEventListener("click", closeDictModal);
+  document.getElementById("dict-form-save").addEventListener("click", saveDictEntry);
+  ["dict-form-ruby", "dict-form-word"].forEach((id) =>
+    document.getElementById(id).addEventListener("input", updateDictSaveEnabled));
+  document.getElementById("dict-modal").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeDictModal();
+  });
+  document.querySelector('.nav-item[data-page="dictionary"]').addEventListener("click", () => {
+    if (dictLoaded) return;
+    dictLoaded = true;
+    loadDictList();
+  });
+}
+
 // ---- 起動 ----
 async function init() {
   const r = await invoke("get_settings");
   state = r.dto;
   baseline = structuredClone(state);
+  // グリッド DOM はカタログ到着後にしか作れないため、renderAll() より前で待つ
+  // （順序を誤ると初回だけチェック状態が反映されない静かな失敗になる）。
+  await initSymbolGrid();
   bindNav();
   buildPaletteEditors();
   buildKeymapRows();
   bindPaletteTabs();
   bindInputs();
+  bindDictionary();
   renderAll();
   clearDirty();
   if (r.corrupt_recovered) {
@@ -586,6 +897,7 @@ async function init() {
     markDirty();
     renderAll();
     renderKeymapValues();
+    renderSymbolGrid();
     toast("既定値に戻しました（適用を押すまで保存されません）");
   });
   document.getElementById("apply-btn").addEventListener("click", applyNow);

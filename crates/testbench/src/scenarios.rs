@@ -16,7 +16,8 @@ pub const NONCONVERT: Vk = Vk(0x1D, "Muhenkan"); // 待機中=モードトグル
 pub const HANKAKU_ZENKAKU: Vk = Vk(0xF3, "HankakuZenkaku"); // 半角/全角(正準 VK)。全文脈モードトグル
 pub const CONVERT: Vk = Vk(0x1C, "Convert"); // 再変換/henkan（Task5: 対象なし→eaten no-op、ephemeral には落ちない）
 pub const HOME: Vk = Vk(0x24, "Home");
-pub const OEM_PERIOD: Vk = Vk(0xBE, "OemPeriod"); // '.'（打鍵作法 Task3: idle 全角直接確定）
+pub const OEM_PERIOD: Vk = Vk(0xBE, "OemPeriod"); // '.'（idle でも食って全角句点で合成開始 — 2026-08-03）
+pub const OEM_COMMA: Vk = Vk(0xBC, "OemComma"); // ','（同上、全角読点）
 pub const OEM_MINUS: Vk = Vk(0xBD, "OemMinus"); // '-'（かな合成中 → 長音符 ー）
 pub const OEM_SLASH: Vk = Vk(0xBF, "Oem2Slash"); // '/'（かな合成中 → 全角中点 ・）
 pub const F7: Vk = Vk(0x76, "F7"); // 表記変換: カタカナ（打鍵作法 Task4）
@@ -254,30 +255,26 @@ pub fn all() -> Vec<Scenario> {
                 }
                 Ok(())
             } },
-        // item25: 打鍵作法 Task3 — idle（composition なし）で OEM_PERIOD を打つと全角句点「。」が
-        // 直接確定される（native モード）。composition を張らない do_commit の composition 無し枝
-        // （InsertTextAtSelection＋末尾 SetSelection — レビュー M-3）で 1 発挿入する経路の回帰。
-        // **2 連打**で committed=="。。" を要求する: 挿入後にキャレットが末尾へ追従しないと
-        // 2 打目が 1 打目の**前**へ入り "。。" にならない（連打順序＝キャレット後置の検証）。
-        // 自己証明: (a) 最後の OEM_PERIOD をちゃんと食う（旧実装は idle 素通しで eaten=false）、
-        // (b) ev=commit source=idle_symbol が 2 回出る（新経路が 2 打とも走った）、
-        // (c) committed=="。。"（順序保証込み）。
-        Scenario { item: 25, name: "idle oem-period commits fullwidth kuten directly (twice, ordered)",
-            keys: vec![OEM_PERIOD, OEM_PERIOD],
+        // item25: idle（composition なし）の句読点は composition を開始する（2026-08-03 —
+        // 旧・打鍵作法 Task3 の「全角直接確定」を廃止。句読点から打ち始めると変換を一切
+        // 開始できない実機報告への修正。idle 数字の合成開始とも整合）。
+        // 自己証明: (a) 最後の Enter を食う（composition が張られている＝合成開始した）、
+        // (b) source=idle_symbol の直接確定が 1 回も出ない（旧経路が死んでいる）、
+        // (c) committed=="。。"（2 打が同一 composition に順序どおり積まれ、Enter で確定）。
+        Scenario { item: 25, name: "idle oem-period starts a composition (kuten convertible)",
+            keys: vec![OEM_PERIOD, OEM_PERIOD, ENTER],
             expect: |c, _f, p, evs, eaten_last| {
                 if !eaten_last {
-                    return Err("OEM_PERIOD が食われていない（eaten_last=false＝idle 素通しの旧挙動）".into());
+                    return Err("Enter が食われていない（composition 無し＝idle 句読点が合成を開始していない）".into());
                 }
-                let n = evs.iter().filter(|e| matches!(e, Ev::Commit { text, source }
-                    if text == "。" && source == "idle_symbol")).count();
-                if n != 2 {
-                    return Err(format!("ev=commit text=。 source=idle_symbol が 2 回出ていない（n={n}）"));
+                if evs.iter().any(|e| matches!(e, Ev::Commit { source, .. } if source == "idle_symbol")) {
+                    return Err("ev=commit source=idle_symbol が出た（旧・全角直接確定の経路が残っている）".into());
                 }
                 if !p.is_empty() {
-                    return Err(format!("preedit={p:?} != 空（idle 直接確定で composition を張らないはず）"));
+                    return Err(format!("preedit={p:?} != 空（Enter 後に composition が畳まれていない）"));
                 }
                 if c != "。。" {
-                    return Err(format!("committed={c:?} != 。。（2 打目がキャレット末尾に入っていない）"));
+                    return Err(format!("committed={c:?} != 。。（句点2打が合成→確定で残っていない/順序が崩れた）"));
                 }
                 Ok(())
             } },
@@ -673,6 +670,62 @@ pub fn all() -> Vec<Scenario> {
                         "preedit={:?} != 日本語（Esc で候補プレビューが残り、確定される文字列と食い違う）",
                         p
                     ));
+                }
+                Ok(())
+            } },
+        // item49: 句読点から打ち始めても変換が始まる（実機報告 2026-08-03 バグ1 の核心再現）。
+        // idle の「、」が composition を開始し、続く "nihongo" と**同一 composition** で変換される。
+        // 自己証明: (a) Space で候補が出る（旧仕様は 、 が即確定され…はしたが、本質は句読点が
+        // 変換対象に入らないこと）、(b) 候補または preedit が 、 で始まる（別 composition に
+        // 分かれていれば 、 は既に本文へ確定済みで現れない）。
+        Scenario { item: 49, name: "leading kuten joins the composition and converts with following kana",
+            keys: { let mut k = vec![OEM_COMMA]; k.extend(typed("nihongo")); k.push(SPACE); k },
+            expect: |_c, _f, p, evs, _l| {
+                if !has_candidates_shown(evs) {
+                    return Err("候補が出ていない（句読点開始で変換が始まらない）".into());
+                }
+                let in_cands = evs.iter().any(|e| matches!(e, Ev::CandidatesShown { list, .. }
+                    if list.iter().any(|x| x.starts_with('、'))));
+                if !in_cands && !p.starts_with('、') {
+                    return Err(format!(
+                        "preedit={p:?} も候補も 、 で始まらない（句読点が composition に入っていない）"
+                    ));
+                }
+                Ok(())
+            } },
+        // item50: F10（半角英数）は raw に畳み込まれた全角句読点を打鍵の半角へ戻す（実機報告
+        // 2026-08-03 バグ2）。"a" + `,` + `.` → raw は「a、。」→ F10 で preedit=="a,."。
+        // 旧実装は raw 無変換で「a、。」のまま＝機能名（半角英数）に反していた。
+        // ⚠前提: punctuation.full_width=ON（既定）。OFF の実機設定だと raw は元々 "a,." で
+        // 逆写像なしでも PASS する（空振り）— testbench に設定注入機構が無いため（item40 の
+        // 注記と同じ制約）、ON 側の検証は既定設定のゲート実行が担う。
+        Scenario { item: 50, name: "f10 hankaku-eisu maps folded fullwidth punctuation back to ascii",
+            keys: { let mut k = typed("a"); k.push(OEM_COMMA); k.push(OEM_PERIOD); k.push(F10); k },
+            expect: |_c, _f, p, _e, eaten_last| {
+                if !eaten_last {
+                    return Err("F10 が食われていない（表記変換が起動していない）".into());
+                }
+                if p != "a,." {
+                    return Err(format!("preedit={p:?} != \"a,.\"（F10 の全角→半角逆写像が効いていない）"));
+                }
+                Ok(())
+            } },
+        // item51: 表（zenkaku_symbol）に無い記号も idle で合成を開始する（2026-08-03 仕様変更の
+        // 表外クラス。既定=記号トグル OFF なので `/` は畳み込まれず半角のまま読みへ入る）。
+        // 旧仕様はこのクラスを「その文字のまま直接確定」していた — 半角のまま出る点は同じでも
+        // composition を経由するかが変わるので、直接確定経路の死亡（source=idle_symbol 皆無）と
+        // 合成経由で `/` が失われないこと（preedit ∪ committed）を固定する。
+        Scenario { item: 51, name: "idle unfoldable symbol starts a composition and keeps the char",
+            keys: vec![OEM_SLASH],
+            expect: |c, _f, p, evs, eaten_last| {
+                if !eaten_last {
+                    return Err("OEM_SLASH が食われていない（idle 素通し）".into());
+                }
+                if evs.iter().any(|e| matches!(e, Ev::Commit { source, .. } if source == "idle_symbol")) {
+                    return Err("ev=commit source=idle_symbol が出た（旧・直接確定の経路が残っている）".into());
+                }
+                if !(p.contains('/') || c.contains('/')) {
+                    return Err(format!("preedit={p:?} committed={c:?} に / が無い（打鍵が消えた）"));
                 }
                 Ok(())
             } },

@@ -30,7 +30,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GetWindowLongPtrW, RegisterClassW, SetWindowLongPtrW,
-    CS_DROPSHADOW, GWLP_USERDATA, HMENU, WINDOW_EX_STYLE, WNDCLASSW, WNDPROC, WS_EX_NOACTIVATE,
+    SetWindowPos, CS_DROPSHADOW, GWLP_USERDATA, HMENU, HWND_TOPMOST, SET_WINDOW_POS_FLAGS,
+    SWP_NOACTIVATE, SWP_NOMOVE, WINDOW_EX_STYLE, WNDCLASSW, WNDPROC, WS_EX_NOACTIVATE,
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -284,6 +285,29 @@ pub(crate) unsafe fn create_backed_popup(
     Some((hwnd, None))
 }
 
+/// ポップアップの移動・リサイズ。挿入位置は毎回 `HWND_TOPMOST` を再主張する。
+/// `SWP_NOZORDER` で生成時の `WS_EX_TOPMOST` に頼り続けない理由: OS は全画面化・
+/// DirectX 排他モード・explorer 再起動などで TOPMOST 属性を剥奪することがあり、
+/// 以後 z 順を触らない窓は前面アプリの背後に沈んだまま自力回復しない
+/// （IME を切り替えると直るのは Deactivate→Activate で窓が作り直されるため）。
+/// 既に TOPMOST なら位置維持の no-op 相当で、WS_EX_NOACTIVATE 窓なので
+/// フォーカスも奪わない。`pos=None` は `SWP_NOMOVE`（現在位置のままサイズ追従）。
+pub(crate) unsafe fn set_popup_pos(hwnd: HWND, pos: Option<(i32, i32)>, width: i32, height: i32) {
+    let (x, y, extra) = match pos {
+        Some((x, y)) => (x, y, SET_WINDOW_POS_FLAGS(0)),
+        None => (0, 0, SWP_NOMOVE),
+    };
+    let _ = SetWindowPos(
+        hwnd,
+        Some(HWND_TOPMOST),
+        x,
+        y,
+        width,
+        height,
+        SWP_NOACTIVATE | extra,
+    );
+}
+
 // ============================================================================
 // HWND ごとの状態（GWLP_USERDATA）と共有バックエンド。
 // ============================================================================
@@ -517,12 +541,21 @@ pub(crate) fn recover_if_device_lost<T: PopupState>(hwnd: &mut HWND, log_event: 
 }
 
 /// D2D パスの swapchain を新サイズへ作り直してから InvalidateRect する。
-/// resize 失敗はそのフレームの描画をスキップ（panic せず劣化。次回表示で再試行される）。
+/// resize 失敗はそのフレームの描画をスキップし `renderer_dead` を立てる
+/// （panic せず劣化。次回表示の recover_if_device_lost が窓ごと作り直す）。
 pub(crate) unsafe fn resize_and_invalidate<T: PopupState>(hwnd: HWND, width: i32, height: i32) {
     let mut skip_paint = false;
     if let Some(state) = state_mut::<T>(hwnd) {
-        if let Some(r) = state.backend_mut().renderer.as_mut() {
+        let backend = state.backend_mut();
+        if let Some(r) = backend.renderer.as_mut() {
             if r.resize(width as u32, height as u32).is_err() {
+                // is_device_lost で選別せず失敗理由を問わず dead にする。resize は
+                // SetTarget(None) の後に失敗するとターゲット未バインドのまま戻るので、
+                // 以後の EndDraw は D2DERR_WRONG_STATE 系（is_device_lost 非該当）しか
+                // 返さない。デバイスロストが end_draw でなくここで最初に顕在化した場合、
+                // ここで立てないと再生成が永遠に発火せず、可視だが何も描かれない窓が
+                // IME 切替（Deactivate→Activate の窓再生成）まで残る。
+                backend.renderer_dead = true;
                 skip_paint = true;
             }
         }

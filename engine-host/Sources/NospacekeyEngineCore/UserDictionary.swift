@@ -36,6 +36,42 @@ public enum UserDictionary {
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
+    /// カスタム辞書が有効か。**未設定は有効**(`!= "0"`) — `NOSPACEKEY_TYPO_LEARN` と同じ規約で、
+    /// 旧 TIP・手動起動のように env を積まない起こし方で辞書が黙って死なないようにする。
+    public static func enabled(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        environment["NOSPACEKEY_USER_DICT_ENABLED"] != "0"
+    }
+
+    /// ロード結果の3値。`load(url:)` の「失敗も空配列」は起動時1回・読み手専用の劣化であり、
+    /// リロード(全置換)に流用すると一過性の読み失敗が「動いていた辞書の全消滅」になるため、
+    /// 呼び出し側が現状維持を選べるよう不在と失敗を分ける(spec §4.1)。
+    public enum LoadResult {
+        case absent
+        case loaded([DicdataElement])
+        case failed
+    }
+
+    /// 移行 JSON を3値でロードする。url が nil(=resolve 不成立)は不在、Data 読み/デコード失敗は
+    /// 失敗、それ以外は成功(空配列もあり得る＝「0件の辞書」で正しく全置換される)。
+    public static func loadResult(url: URL?) -> LoadResult {
+        guard let url else { return .absent }
+        guard var data = try? Data(contentsOf: url) else { return .failed }
+        // PS 5.1 の Set-Content -Encoding UTF8 等が付けうる UTF-8 BOM は剥がす(防御)。
+        if data.starts(with: [0xEF, 0xBB, 0xBF]) { data.removeFirst(3) }
+        guard let entries = try? JSONDecoder().decode([Entry].self, from: data) else { return .failed }
+        return .loaded(entries.compactMap(element(from:)))
+    }
+
+    /// Entry → DicdataElement。空 ruby/word は捨てる(DicdataStore に空読みを入れない)。
+    private static func element(from e: Entry) -> DicdataElement? {
+        let ruby = ConversionService.toKatakana(e.ruby.trimmingCharacters(in: .whitespaces))
+        let word = e.word.trimmingCharacters(in: .whitespaces)
+        guard !ruby.isEmpty, !word.isEmpty else { return nil }
+        // value=-5 は仮値(plan Open Risk): 辞書語が上位に出すぎ/出なさすぎなら実機で調整。
+        return DicdataElement(word: word, ruby: ruby, cid: cid(for: e.pos),
+                              mid: MIDData.一般.mid, value: -5)
+    }
+
     /// Google日本語入力/MS-IME の品詞名 → CID。CIDData の名前付き case の範囲でマップし、
     /// 未知の品詞は一般名詞(1285)へフォールバックする。
     /// 注: Google のエクスポートは「姓」「名」が単独の品詞名で現れる。「名詞」「固有名詞」も
@@ -59,23 +95,14 @@ public enum UserDictionary {
 
     /// 移行 JSON を [DicdataElement] へロードする。読めない/壊れた JSON は空配列へ劣化
     /// (黙って壊れない、はログを出す呼び出し側の責務 — loaded=0 が観測される)。
+    /// **起動時1回のロード専用**。リロード経路は失敗と不在を区別する `loadResult(url:)` を使う。
     ///
     /// ruby は**カタカナへ正規化必須**: DicdataStore は動的ユーザ辞書を索く前に読みを
     /// `toKatakana()` してから `$0.ruby == ruby` の完全一致で照合する
     /// (lib DicdataStore.swift:369,873)。ひらがな ruby のままでは永遠にヒットしない。
     public static func load(url: URL) -> [DicdataElement] {
-        guard var data = try? Data(contentsOf: url) else { return [] }
-        // PS 5.1 の Set-Content -Encoding UTF8 等が付けうる UTF-8 BOM は剥がす(防御)。
-        if data.starts(with: [0xEF, 0xBB, 0xBF]) { data.removeFirst(3) }
-        guard let entries = try? JSONDecoder().decode([Entry].self, from: data) else { return [] }
-        return entries.compactMap { e in
-            let ruby = ConversionService.toKatakana(e.ruby.trimmingCharacters(in: .whitespaces))
-            let word = e.word.trimmingCharacters(in: .whitespaces)
-            guard !ruby.isEmpty, !word.isEmpty else { return nil }
-            // value=-5 は仮値(plan Open Risk): 辞書語が上位に出すぎ/出なさすぎなら実機で調整。
-            return DicdataElement(word: word, ruby: ruby, cid: cid(for: e.pos),
-                                  mid: MIDData.一般.mid, value: -5)
-        }
+        if case .loaded(let dicdata) = loadResult(url: url) { return dicdata }
+        return []
     }
 
     /// 「きょう/あした/きのう」→ 実日付へ展開されるテンプレートエントリ(3読み×3形式=9件)。

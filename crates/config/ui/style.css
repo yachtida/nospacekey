@@ -192,6 +192,29 @@ a:hover { text-decoration-thickness: 2px; }
 .row .grow { flex: 1; }
 .hint { color: var(--text-sub); font-size: 12px; margin: 2px 0 8px; }
 
+/* ---- 記号の幅: 個別選択グリッド（マスタートグル ON 時だけ表示） ---- */
+.symbol-detail { display: flex; flex-direction: column; gap: 8px; padding-top: 2px; }
+/* display:flex を持つため、hidden 属性の既定 display:none だけでは効かない
+   （#keymap-recorder[hidden] と同じ罠・同じ形）。開閉に transition を付けないのは
+   意図的な逸脱: display は transition 不能で、height アニメは reflow を挟むわりに
+   29項目グリッドでは効果が薄い（チェックリスト「状態遷移は CSS transition」の例外） */
+.symbol-detail[hidden] { display: none; }
+.symbol-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 4px 10px;
+}
+.symbol-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  transition: background var(--dur-quick) var(--ease-snap);
+}
+.symbol-item:hover { background: color-mix(in srgb, var(--text) 6%, transparent); }
+
 /* ---- 入力: 白地 + ヘアライン。フォーカスはアクセントのグロー ---- */
 input[type="text"], input[type="password"], input[type="number"], textarea, select {
   font: inherit;
@@ -288,6 +311,9 @@ button.primary:hover { background: color-mix(in srgb, #000 12%, var(--accent)); 
 
 .field-error { color: var(--danger); font-size: 12px; margin-top: 2px; display: block; }
 .field-error:empty { display: none; }
+/* 静的文言を hidden 属性で開閉するバナー(#dict-quarantine-error)は :empty で隠れず、
+   author の display:block が UA の [hidden] に勝つ（#keymap-recorder と同じ罠）。 */
+.field-error[hidden] { display: none; }
 
 /* ---- レイアウトユーティリティ（インライン style 禁止の受け皿） ---- */
 .hstack { display: flex; gap: 8px; align-items: center; }
@@ -410,6 +436,62 @@ input.w-md { width: 140px; }
 
 .keymap-value { display: inline-block; min-width: 120px; font-weight: 500; }
 
+/* ---- 辞書ページ ---- */
+.dict-card { padding-bottom: 8px; }
+.dict-toolbar { display: flex; align-items: center; gap: 8px; padding: 10px 0; flex-wrap: wrap; }
+.dict-toolbar input[type="text"] { flex: 1; min-width: 160px; }
+.dict-count-group { flex: none; display: flex; align-items: baseline; gap: 8px; white-space: nowrap; }
+.dict-dedup-note { color: var(--text-sub); font-size: 11px; }
+.dict-table-wrap {
+  max-height: 360px;
+  overflow-y: auto;
+  border: 1px solid var(--separator);
+  border-radius: var(--radius-md);
+  margin-bottom: 8px;
+}
+.dict-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.dict-table th, .dict-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--separator); }
+.dict-table th {
+  color: var(--text-sub);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+.dict-table tbody tr:last-child td { border-bottom: none; }
+.dict-row-actions { white-space: nowrap; }
+.dict-row-actions button { padding: 3px 10px; font-size: 12px; margin-right: 4px; }
+.dict-row-actions button:last-child { margin-right: 0; }
+
+/* ---- 辞書エントリモーダル: キー割り当てレコーダと同型（中央シート + 調光スクリム） ---- */
+#dict-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--scrim);
+  animation: scrim-in var(--dur-quick) ease-out;
+}
+#dict-modal[hidden] { display: none; }
+#dict-modal:focus { outline: none; }
+.dict-sheet {
+  min-width: 320px;
+  max-width: 420px;
+  padding: 20px 24px;
+  text-align: left;
+  background: var(--material-strong);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--separator);
+  border-radius: 14px;
+  box-shadow: var(--shadow-float);
+  animation: sheet-in 300ms var(--ease-pop);
+}
+.dict-sheet h2 { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
+.dict-sheet-actions { justify-content: flex-end; margin-top: 8px; }
+
 /* ---- 候補ウィンドウプレビュー: 市松模様の上に実寸感のモックを重ねる ---- */
 .pv-backdrop {
   padding: 22px;
@@ -430,7 +512,7 @@ input.w-md { width: 140px; }
   .page.active { animation: reduced-fade 160ms ease; }
   #toast { animation: reduced-fade 160ms ease; }
   #toast.hide { animation: reduced-fade-out 120ms ease forwards; }
-  #keymap-recorder .sheet { animation: reduced-fade 160ms ease; }
+  #keymap-recorder .sheet, .dict-sheet { animation: reduced-fade 160ms ease; }
   .nav-item:active, button:active, .theme-card:active { transform: none; }
   input[type="checkbox"]::after { transition-duration: 1ms; }
   @keyframes reduced-fade { from { opacity: 0; } }
@@ -438,7 +520,7 @@ input.w-md { width: 140px; }
 }
 /* 透明を減らす = 材質を不透明に近づけ、ブラーを落とす */
 @media (prefers-reduced-transparency: reduce) {
-  .actions, #toast, #keymap-recorder .sheet {
+  .actions, #toast, #keymap-recorder .sheet, .dict-sheet {
     background: var(--panel);
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
@@ -447,7 +529,7 @@ input.w-md { width: 140px; }
 /* 高コントラスト = ほぼ不透明の背景 + はっきりした境界 */
 @media (prefers-contrast: more) {
   :root { --border: rgba(0, 0, 0, 0.5); --separator: rgba(0, 0, 0, 0.35); }
-  .actions, #toast, #keymap-recorder .sheet {
+  .actions, #toast, #keymap-recorder .sheet, .dict-sheet {
     background: var(--panel);
     -webkit-backdrop-filter: none;
     backdrop-filter: none;

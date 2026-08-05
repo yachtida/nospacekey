@@ -204,13 +204,24 @@ final class ProtocolTests: XCTestCase {
         XCTAssertNil(req.sessionId)
     }
 
+    func testDecodeRecordCorrection() throws {
+        // Rust 側 protocol.rs の serialize 出力と一字一句一致(record_correction_request_roundtrips と対)。
+        // session を伴わない(確定済み訂正はどのセッションにも属さない — ClearLearning と同じ共有資源扱い)。
+        let json = #"{"method":"RecordCorrection","params":{"reading":"みこみっと","surface":"未コミット"}}"#
+        let req = try JSONDecoder().decode(Request.self, from: Data(json.utf8))
+        guard case .recordCorrection(let r, let s) = req else { return XCTFail("not recordCorrection: \(req)") }
+        XCTAssertEqual(r, "みこみっと")
+        XCTAssertEqual(s, "未コミット")
+        XCTAssertNil(req.sessionId)
+    }
+
     func testEncodeSessionCarriesProto() throws {
         // 新エンジン: Session 応答に proto を載せる。dict 比較（キー順非保証のためバイト一致比較はしない）。
-        let res = Response.session(7, proto: 1)
+        let res = Response.session(7, proto: 2)
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
         XCTAssertEqual(obj["session"] as? Int, 7)
-        XCTAssertEqual(obj["proto"] as? Int, 1)
+        XCTAssertEqual(obj["proto"] as? Int, 2)
     }
 
     func testEncodeSessionWithoutProtoOmitsKey() throws {

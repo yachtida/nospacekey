@@ -11,6 +11,21 @@ private let bodyReadTimeoutMs = 5000
 /// body ストール検出のポーリング間隔（ms）。
 private let bodyPollIntervalMs: DWORD = 5
 
+/// クロージャを1回だけ実行するガード。`run` の onListening を accept ループから呼ぶための
+/// 部品で、単体テストできるよう型として切り出す（ループ内のローカル Bool だと「1回だけ」が
+/// daemon で複数接続を流す細工でしか観測できない）。
+final class OnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+    func fireOnce(_ body: () -> Void) {
+        lock.lock()
+        let already = fired
+        fired = true
+        lock.unlock()
+        if !already { body() }
+    }
+}
+
 /// 同期(ブロッキング)名前付きパイプサーバ。
 ///
 /// **常駐モード**（oneShot=false）: nMaxInstances=255 で複数パイプインスタンスを生成し、
@@ -33,10 +48,14 @@ final class NamedPipeServer: @unchecked Sendable {
     /// oneShot=true なら1接続を処理して切断したら **run を抜けて終了** する。
     /// TIP はプロセス毎に一意パイプ名でこのエンジンを起動する＝1クライアント専用なので、
     /// 接続が切れたら（＝ホストアプリ終了/IME 非活性化）プロセスを残さず終わらせる。
+    /// onListening: 初回の pipe 作成成功直後（ConnectNamedPipe より**前**）に1回だけ呼ばれる。
+    /// 呼ばれた時点でクライアントは接続できる＝「接続可能になった後」を要求する処理（カスタム辞書の
+    /// 再読 — spec §4.1 の spawn 窓閉塞）の起点。accept ループを塞ぐので短い処理だけを置くこと。
     func run(handler: @escaping @Sendable (Int, Data) -> (reply: Data, exitAfterReply: Bool),
              onDisconnect: @escaping @Sendable (Int) -> Void = { _ in },
              oneShot: Bool = false,
-             exitHook: @escaping @Sendable () -> Void = { exit(0) }) {
+             exitHook: @escaping @Sendable () -> Void = { exit(0) },
+             onListening: @escaping @Sendable () -> Void = {}) {
         // 同一ユーザーの他プロセス(設定アプリ等)が read+write で接続できるよう明示 DACL を付与する。
         // 既定 DACL は Everyone READ のみ＝起こしたプロセス以外の write 接続が ACCESS_DENIED になる。
         //
@@ -63,6 +82,7 @@ final class NamedPipeServer: @unchecked Sendable {
         engineLog("nospacekey-engine pipe acl: explicit=\(sdOk)\n")
         // 接続ごとの一意 id。accept ループ（本スレッド）でのみ増やすので競合しない。
         var nextConnId = 1
+        let listeningOnce = OnceFlag()
         while true {
             let hPipe: HANDLE = pipeName.withCString(encodedAs: UTF16.self) { name in
                 withUnsafeMutablePointer(to: &sa) { saPtr in
@@ -83,6 +103,9 @@ final class NamedPipeServer: @unchecked Sendable {
                 Sleep(50)
                 continue
             }
+            // pipe が存在した瞬間に1回だけ通知する。ConnectNamedPipe より前なのは、ここで待つと
+            // 「最初のクライアントが来るまで呼ばれない」＝spawn 窓の閉塞にならないため。
+            listeningOnce.fireOnce(onListening)
             let connected = ConnectNamedPipe(hPipe, nil)
             if !connected && GetLastError() != DWORD(ERROR_PIPE_CONNECTED) {
                 CloseHandle(hPipe)

@@ -95,6 +95,39 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                 response = service.clearLearning()
                     ? .ok
                     : .error("learning files still locked; retry after engine restart")
+            case .recordCorrection(let reading, let surface):
+                service.recordCorrection(reading: reading, surface: surface)
+                response = .ok
+            case .reloadDictionary(let enabled):
+                // カスタム辞書: 適用はここでやらない（fire-and-forget）。desired 更新+直列キューへの
+                // enqueue だけ行い即 Ok を返す — このハンドラは serviceLock を握っており、
+                // converterLock を待つと warm-up 中の編集で全クライアントの打鍵が凍る（spec §4.1）。
+                // Ok は「受理した」の意（実適用の成否は返さない。設定アプリ側も不達を成功扱いする）。
+                service.requestDictionaryReload(enabled: enabled)
+                response = .ok
+            // 文節ナビゲーション: nil（キャッシュ無し/stale/被覆候補無し/状態なし）は一律
+            // "no session" ではなく decline として区別せず Error に落とす — TIP は Error を
+            // 「対応不可」として従来の確定へ劣化する（旧エンジンの unknown method Error と同型）。
+            case .moveClause(let s, let offset, let baseIndex, let ctx):
+                if let v = service.moveClause(session: Int(s), offset: offset, baseIndex: baseIndex, leftContext: ctx) {
+                    response = .clauseView(segments: v.segments, selected: v.selected,
+                                           candidates: v.candidates, candidateIndex: v.candidateIndex)
+                } else {
+                    response = .error("no clause view")
+                }
+            case .selectClauseCandidate(let s, let idx):
+                if let v = service.selectClauseCandidate(session: Int(s), index: idx) {
+                    response = .clauseView(segments: v.segments, selected: v.selected,
+                                           candidates: v.candidates, candidateIndex: v.candidateIndex)
+                } else {
+                    response = .error("no clause view")
+                }
+            case .commitClauses(let s):
+                if let r = service.commitClauses(session: Int(s)) {
+                    response = .committed(text: r.text, reading: r.reading)
+                } else {
+                    response = .error("no clause view")
+                }
             case .shutdown:
                 // graceful 停止: 学習を flush してから応答を返し、その後 NamedPipeServer が exit する。
                 // ここで exit しないのは、応答を書き終える前にプロセスを殺すと TIP が broken pipe に
@@ -168,8 +201,11 @@ public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, one
     }
 
     engineLog("ev=log_open build=\(BuildInfo.version)\n")
-    engineLog("nospacekey-engine listening on \(pipeName) (oneShot=\(oneShot), zenzai=\(service.zenzaiEnabled))\n")
-    // cold start ①: spawn からここ（listening 直前＝接続受理可能になる点）までの総所要。
+    // ここはまだ pipe 作成前＝接続を受理できない。実際に接続可能になった時刻は onListening が出す
+    // （"listening" を名乗る位置を pipe 作成後へ揃える — spec §4.1）。
+    engineLog("nospacekey-engine starting pipe server on \(pipeName) (oneShot=\(oneShot), zenzai=\(service.zenzaiEnabled))\n")
+    // cold start ①: spawn からここ（pipe 作成直前＝準備が終わり accept ループへ入る点）までの総所要。
+    // 指標名は既存の観測との連続性のため stage=listening のまま据え置く。
     engineLog("ev=coldstart stage=listening total_ms=\(Int(Date().timeIntervalSince(t0) * 1000))\n")
     let llm = LLMConfig.resolve(environment: ProcessInfo.processInfo.environment)
     engineLog("nospacekey-engine llm: enabled=\(llm.enabled) endpoint=\(llm.endpoint ?? "-") model=\(llm.model) echo=\(llm.echo)\n")
@@ -182,5 +218,15 @@ public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, one
         engineLog("nospacekey-engine shutdown requested -> exit\n")
         exit(0)
     }
-    NamedPipeServer(pipeName: pipeName).run(handler: handle, onDisconnect: onDisconnect, oneShot: oneShot, exitHook: exitHook)
+    // カスタム辞書の spawn 窓の閉塞（spec §4.1）: エンジンは辞書を ConversionService init
+    // （= pipe 作成前）に読む。設定アプリの保存がその後〜pipe 作成前に落ちると接続失敗＝不達で、
+    // persist エンジンは自発終了しないため反映が恒久に漏れる。pipe 作成直後に再読を1件積めば、
+    // 接続に失敗したどの保存もこの再読か以後の op のどちらかに必ず拾われる（冪等）。
+    // desired は書かない（env 値での書き戻しは届いた ReloadDictionary を上書きする）。
+    let onListening: @Sendable () -> Void = {
+        engineLog("nospacekey-engine listening on \(pipeName)\n")
+        service.enqueueDictionaryReload()
+    }
+    NamedPipeServer(pipeName: pipeName).run(handler: handle, onDisconnect: onDisconnect, oneShot: oneShot,
+                                            exitHook: exitHook, onListening: onListening)
 }
