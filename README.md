@@ -109,6 +109,26 @@ nospacekey\
 小規模な個人プロジェクトのため、現在 Pull Request は受け付けていません。
 不具合報告や提案は [Issue](https://github.com/yachtida/nospacekey/issues) までお寄せください。
 
+## コントリビューター
+
+機能要望・不具合報告を通じて nospacekey の形作りに協力いただいた方々（Issue からのコントリビューション）:
+
+<!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section. -->
+<!-- prettier-ignore-start -->
+<!-- markdownlint-disable -->
+<table>
+  <tbody>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/waigoma"><img src="https://avatars.githubusercontent.com/u/48357625?v=4?s=100" width="100px;" alt="waichi"/><br /><sub><b>waichi</b></sub></a><br /><a href="#ideas-waigoma" title="Ideas, Planning, & Feedback">🤔</a></td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- markdownlint-restore -->
+<!-- prettier-ignore-end -->
+
+<!-- ALL-CONTRIBUTORS-LIST:END -->
+
 ## 謝辞
 
 nospacekey は次のオープンソースプロジェクトの成果の上に成り立っています。
