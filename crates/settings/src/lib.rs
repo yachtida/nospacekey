@@ -199,6 +199,14 @@ impl Default for UserDictionarySettings {
 fn default_true() -> bool { true }
 fn default_max_chars() -> u32 { 34 }
 
+/// 設定アプリのアップデート確認設定。TIP は読まない（設定アプリのみが使うローカル設定）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateSettings {
+    /// pre-release(beta) をアップデート通知に含めるか。既定 false=安定版のみ。
+    #[serde(default)]
+    pub include_beta: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub version: u32,
@@ -239,9 +247,11 @@ pub struct Settings {
     #[serde(default)] pub keymap: keymap::KeymapSettings,
     /// カスタム辞書(ユーザー辞書)。既定 ON。欠落の旧 settings.json は ON でロード(後方互換)。
     #[serde(default)] pub user_dictionary: UserDictionarySettings,
+    /// アップデート確認（beta を含めるか）。欠落の旧 settings.json は既定（安定版のみ）でロード。
+    #[serde(default)] pub update: UpdateSettings,
 }
 impl Default for Settings {
-    fn default() -> Self { Self { version: 2, llm: Default::default(), zenzai: Default::default(), live_conversion: Default::default(), learning: Default::default(), default_direct: false, appearance: Default::default(), feedback: Default::default(), number: Default::default(), punctuation: Default::default(), symbol: Default::default(), ephemeral: EphemeralSettings::default(), typo_correct: Default::default(), shift_latin: Default::default(), reading_monitor: Default::default(), keymap: Default::default(), user_dictionary: Default::default() } }
+    fn default() -> Self { Self { version: 2, llm: Default::default(), zenzai: Default::default(), live_conversion: Default::default(), learning: Default::default(), default_direct: false, appearance: Default::default(), feedback: Default::default(), number: Default::default(), punctuation: Default::default(), symbol: Default::default(), ephemeral: EphemeralSettings::default(), typo_correct: Default::default(), shift_latin: Default::default(), reading_monitor: Default::default(), keymap: Default::default(), user_dictionary: Default::default(), update: Default::default() } }
 }
 
 /// A 段の外観設定。全フィールド `#[serde(default)]` で後方互換（欠落フィールドは既定へ）。

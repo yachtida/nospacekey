@@ -619,6 +619,99 @@ function bindZenzaiDownload() {
   });
 }
 
+// ---- アップデート確認（情報ページ）----
+// check_for_update → UpToDate / Available。Available ならインストーラをDL→起動。
+// ダウンロード進捗は update-download-progress イベントで受ける（zenzai DL と同型）。
+function bindUpdateCheck() {
+  const checkBtn = document.getElementById("about-check-update");
+  const status = document.getElementById("update-status");
+  const installBtn = document.getElementById("update-install");
+  const cancelBtn = document.getElementById("update-cancel");
+  const dlStatus = document.getElementById("update-dl-status");
+  const progress = document.getElementById("update-progress");
+  // 最後に確認した Available 情報。ダウンロード時に URL/期待ハッシュを使い回す（再取得のレース回避）。
+  let pending = null;
+
+  function resetDl() {
+    installBtn.hidden = true;
+    cancelBtn.hidden = true;
+    progress.hidden = true;
+    progress.removeAttribute("value");
+    dlStatus.textContent = "";
+  }
+
+  checkBtn.addEventListener("click", async () => {
+    checkBtn.disabled = true;
+    resetDl();
+    status.textContent = "確認中…";
+    status.className = "hint";
+    try {
+      const r = await invoke("check_for_update", { includeBeta: state.update_include_beta });
+      if (r.kind === "UpToDate") {
+        status.textContent = `最新バージョンです（v${r.current}）`;
+        status.className = "hint update-status-ok";
+        pending = null;
+      } else {
+        pending = r;
+        status.textContent = `新しいバージョン v${r.latest} が利用できます（現在 v${r.current}）`;
+        status.className = "hint";
+        installBtn.hidden = false;
+      }
+    } catch (e) {
+      status.textContent = `確認できませんでした: ${e}`;
+      status.className = "hint update-status-err";
+      pending = null;
+    } finally {
+      checkBtn.disabled = false;
+    }
+  });
+
+  installBtn.addEventListener("click", async () => {
+    if (!pending) return;
+    installBtn.hidden = true;
+    checkBtn.disabled = true;
+    cancelBtn.hidden = false;
+    progress.hidden = false;
+    progress.removeAttribute("value");
+    dlStatus.textContent = "ダウンロード中…";
+    try {
+      await invoke("download_and_install_update", {
+        installerUrl: pending.installer_url,
+        expectedSha256: pending.expected_sha256,
+      });
+      // インストーラ起動成功 = 設定アプリは終了させる（インストーラの taskkill が追い打ち）。
+      dlStatus.textContent = "インストーラを起動しました。このウィンドウは閉じます…";
+      try { await getCurrentWindow().destroy(); } catch (_) { /* インストーラがプロセスを終了させる */ }
+    } catch (e) {
+      dlStatus.textContent = "";
+      status.textContent = `アップデートに失敗しました: ${e}`;
+      status.className = "hint update-status-err";
+    } finally {
+      checkBtn.disabled = false;
+      cancelBtn.hidden = true;
+      progress.hidden = true;
+    }
+  });
+
+  cancelBtn.addEventListener("click", () => invoke("cancel_update_download"));
+
+  listen("update-download-progress", (ev) => {
+    const p = ev.payload;
+    if (p.percent != null) {
+      progress.value = p.percent;
+      dlStatus.textContent = `ダウンロード中… ${p.percent}%`;
+    } else {
+      progress.removeAttribute("value");
+      dlStatus.textContent = `ダウンロード中… ${(p.received / 1048576).toFixed(1)} MB`;
+    }
+  });
+
+  document.getElementById("update-releases").addEventListener("click", (e) => {
+    e.preventDefault();
+    invoke("open_releases_page");
+  });
+}
+
 // ---- 辞書 ----
 // dict_list のキャッシュ。絞り込みはこの配列を filter して行 DOM を再構築する
 // （サーバへ問い合わせ直さない）。行は必ず createElement + textContent で組む
@@ -891,7 +984,7 @@ async function init() {
   document.getElementById("about-version").textContent = `${info.version} (${info.build_hash})`;
   document.getElementById("about-path").textContent = info.settings_path;
   document.getElementById("about-open-dir").addEventListener("click", () => invoke("open_settings_dir"));
-  document.getElementById("about-check-update").addEventListener("click", () => invoke("open_releases_page"));
+  bindUpdateCheck();
   document.getElementById("about-defaults").addEventListener("click", async () => {
     state = await invoke("get_default_settings");
     markDirty();

@@ -325,6 +325,12 @@ input.w-sm { width: 90px; }
 input.w-md { width: 140px; }
 
 #zenzai-download-progress { width: 100%; margin-top: 6px; }
+#update-progress { width: 100%; margin-top: 6px; }
+#update-status { min-height: 1em; }
+.update-status-ok { color: var(--accent); }
+.update-status-err { color: var(--danger); }
+.update-link { display: inline-block; margin-top: 6px; }
+.update-beta { display: inline-flex; gap: 6px; align-items: center; margin-top: 4px; font-size: 13px; color: var(--text-sub); }
 #about-path { word-break: break-all; }
 #pal-reset { margin-left: auto; }
 

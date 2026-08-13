@@ -8,6 +8,7 @@
 mod commands;
 mod download;
 mod logic;
+mod update;
 
 use windows::core::PCWSTR;
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
@@ -54,6 +55,9 @@ fn main() {
             download::zenzai_model_status,
             download::download_zenzai_model,
             download::cancel_zenzai_download,
+            update::check_for_update,
+            update::download_and_install_update,
+            update::cancel_update_download,
             commands::dict_list,
             commands::dict_add,
             commands::dict_update,

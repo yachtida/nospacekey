@@ -341,9 +341,20 @@
         <div class="card">
           <div class="row">
             <label>バージョン</label>
-            <div class="grow hstack">
-              <span id="about-version">–</span>
-              <button id="about-check-update" type="button">更新を確認</button>
+            <div class="grow">
+              <div class="hstack">
+                <span id="about-version">–</span>
+                <button id="about-check-update" type="button">更新を確認</button>
+              </div>
+              <label class="update-beta"><input type="checkbox" data-bind="update_include_beta"> ベータ版（プレリリース）を含める</label>
+              <div id="update-status" class="hint"></div>
+              <div class="hstack mt-6">
+                <button id="update-install" type="button" class="primary" hidden>アップデート</button>
+                <button id="update-cancel" type="button" hidden>キャンセル</button>
+                <span id="update-dl-status" class="hint"></span>
+              </div>
+              <progress id="update-progress" value="0" max="100" hidden></progress>
+              <a href="#" id="update-releases" class="hint update-link">リリースページを開く</a>
             </div>
           </div>
           <div class="row">

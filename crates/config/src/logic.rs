@@ -66,6 +66,8 @@ pub struct SettingsDto {
     pub shift_latin_mode: String,
     /// カスタム辞書(ユーザー辞書)を有効にするか(既定 true)。
     pub user_dictionary_enabled: bool,
+    /// アップデート通知に pre-release(beta) を含めるか（既定 false=安定版のみ）。
+    pub update_include_beta: bool,
     pub keymap: settings::keymap::KeymapSettings,
     pub appearance: settings::Appearance,
 }
@@ -101,6 +103,7 @@ pub fn to_dto(s: &settings::Settings) -> SettingsDto {
         ephemeral_trigger: s.ephemeral.trigger.clone(),
         shift_latin_mode: s.shift_latin.mode.clone(),
         user_dictionary_enabled: s.user_dictionary.enabled,
+        update_include_beta: s.update.include_beta,
         keymap: s.keymap.clone(),
         appearance: s.appearance.clone(),
     }
@@ -305,6 +308,7 @@ pub fn apply_dto(
     s.ephemeral.trigger = dto.ephemeral_trigger; // validate 済み（未知値は上で Err 済み）
     s.shift_latin.mode = dto.shift_latin_mode; // validate 済み（同上）
     s.user_dictionary.enabled = dto.user_dictionary_enabled;
+    s.update.include_beta = dto.update_include_beta;
     s.keymap = dto.keymap;
     s.appearance = dto.appearance;
     Ok(s)
