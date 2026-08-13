@@ -204,9 +204,41 @@ public final class ConversionService: @unchecked Sendable {
         get { zenzaiReadyLock.lock(); defer { zenzaiReadyLock.unlock() }; return _zenzaiReady }
         set { zenzaiReadyLock.lock(); defer { zenzaiReadyLock.unlock() }; _zenzaiReady = newValue }
     }
+    /// Zenzai 推論が重すぎて古典（辞書）変換へフォールバックしたか。true の間 makeOptions が
+    /// ZenzaiMode を .off に落とし、変換は古典で即応する。1回でも推論が zenzaiSlowThresholdMs を
+    /// 超えると true に張り付き、このエンジンプロセスの生存中は古典固定（ハングするPC環境での
+    /// 「ぶっ壊れない」体験を最優先 — Zenzai なしでも精度は十分ある）。
+    /// リセットは reload のみ（ユーザーが設定アプリで Zenzai を明示操作した時）。
+    /// zenzaiReadyLock と同じ規律（専用 NSLock・他ロック取らない・makeOptions の converterLock 下
+    /// 読みと convert の converterLock 下書きを直列化）。
+    private let zenzaiTooSlowLock = NSLock()
+    private var _zenzaiTooSlow = false
+    public private(set) var zenzaiTooSlow: Bool {
+        get { zenzaiTooSlowLock.lock(); defer { zenzaiTooSlowLock.unlock() }; return _zenzaiTooSlow }
+        set { zenzaiTooSlowLock.lock(); defer { zenzaiTooSlowLock.unlock() }; _zenzaiTooSlow = newValue }
+    }
+    /// Zenzai 推論の「重い」判定閾値（ms）。1回の推論がこれを超えたら zenzaiTooSlow=true。
+    /// **TIP 側 IPC タイムアウトより前に自発的に古典へ落ちる安全裕度**として設定する。
+    /// convert/reconvert/typoConvert/moveClause は TIP 側 IPC_TIMEOUT_CONVERT(1200ms) に晒される
+    /// ため 800ms（400ms の裕度）。liveConvert は IPC_TIMEOUT_LIVE(400ms) に晒されるため
+    /// 300ms（100ms の裕度）— 400ms に届く前にSwift側でフォールバックを決めないと、TIP 側が
+    /// タイムアウトして Swift の liveConvert が呼ばれなくなり checkZenzaiTooSlowLocked が発火しない。
+    /// Zenzai small(Q5_K_M) の通常推論は短文脈で数百ms未満。長文脈(leftContext最大40文字)では
+    /// 伸びうるが、重いPCの恒常ハング防止を優先し、一過性スパイクは初回スキップで吸収する。
+    private let zenzaiSlowThresholdMs: Double = 800
+    private let zenzaiSlowThresholdLiveMs: Double = 300
     /// cold start ①: プロセス起動後の「初回変換」(convert/liveConvert の先勝ち) を一度だけ計測する
     /// ワンショット。読み書きとも converterLock 下（両呼び出し元が t0〜ms 計測を lock 内で行う）。
     private var firstConvertLogged = false
+    /// zenzaiTooSlow 監視の初回スキップカウンタ。初回 cold spike（KVキャッシュがまだ温まっていない
+    /// 一時的な遅延）で本来速いPCが誤って古典へ落ちるのを防ぐため、warmUp 完了後の最初の数回の
+    /// Zenzai推論をスキップしてから監視を開始する。convert/liveConvert/typoConvert/reconvert の
+    /// いずれかが Zenzai を使う最初の推論から消費する（合計回数ベース — op別でなく呼出順非依存）。
+    /// reload で 0 にリセット（モデルは既にホットなので cold spike ガードは不要）。
+    /// 読み書きとも converterLock 下。
+    private var slowWatchSkipsRemaining = 1
+    private let slowWatchSkipInitial = 1
+    private let slowWatchSkipAfterReload = 0
     /// 外部LLM変換クライアント。echo 判定（`isEcho`）も含めここに一本化する。
     /// UU-5: `reload` で差し替え可能（LLMClient は config を保持するだけなのでモデル再ロード等は不要）。
     private var llmClient: LLMClient
@@ -422,12 +454,29 @@ public final class ConversionService: @unchecked Sendable {
                 corrections.flush()
                 corrections = CorrectionStore(directory: newLearning.memoryDir)
             }
+            // self.config の差し替え前に、旧 weightURL をキャプチャ（新規有効化判定で self.config が
+            // 既に newZenzai に置き換わった後だと old==new で常に false になる — 行451 と同じパターン）。
+            let oldWeightURL = self.config.weightURL
             self.learning = newLearning
             self.config = newZenzai
             self.llmClient = LLMClient(config: newLLM)
             self.autoCommit = AutoCommitStrength.resolve(environment: env)
             self.autoCommitMaxReading = AutoCommitLengthBackstop.resolve(environment: env)
             self.typoLearn = env["NOSPACEKEY_TYPO_LEARN"] != "0"
+            // slow-inference フォールバックをリセット: reload は常にユーザー明示操作（設定アプリの適用）
+            // 経由なので、「重い」と判定された後でもユーザーが再試行できる。Zenzai 有効のまま他設定変更
+            // した時もリセットする — 環境が改善した（別GPUプロセス終了等）可能性があるため。
+            if self.zenzaiTooSlow {
+                self.zenzaiTooSlow = false
+                engineLog("ev=zenzai_reset reason=reload\n")
+            }
+            // 初回スキップ: モデルが既にホット（Zenzai 継続/無効→無効）なら 0 で即監視。
+            // ただし Zenzai を新規有効化（weightURL が nil→有効値）した直後はモデルが未ロードで、
+            // 初回 convert がインラインモデルロード＋初回推論（KV冷え）で本質的に遅くなる（reload の注記参照）。
+            // この cold spike を吸収するため、新規有効化時だけ初回スキップを復活させる。
+            let newlyEnabledZenzai = ConversionService.shouldRestoreSkipOnReload(
+                old: oldWeightURL, new: newZenzai.weightURL)
+            self.slowWatchSkipsRemaining = newlyEnabledZenzai ? self.slowWatchSkipInitial : self.slowWatchSkipAfterReload
             engineLog("ev=reload_config zenzai=\(newZenzai.weightURL != nil) inference_limit=\(newZenzai.inferenceLimit) llm=\(newLLM.enabled) learning=\(newLearning.enabled) auto_commit=\(self.autoCommit.rawValue) auto_commit_max_reading=\(self.autoCommitMaxReading) typo_learn=\(self.typoLearn)\n")
         } else {
             // warm-up/変換中。config は最新のまま（skip 安全）。次回接続で反映。
@@ -550,6 +599,7 @@ public final class ConversionService: @unchecked Sendable {
         let results = mainResults.map { $0.text }
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
         logFirstConvertOnceLocked(ms: ms)
+        checkZenzaiTooSlowLocked(ms: ms, thresholdMs: zenzaiSlowThresholdMs)
         engineLog("ev=infer kind=convert ms=\(String(format: "%.1f", ms)) n=\(results.count) target=\(rec.composing.convertTarget) ctx=\(leftContext?.count ?? 0)\n")
         return results
     }
@@ -619,6 +669,7 @@ public final class ConversionService: @unchecked Sendable {
         sessions[session] = rec
         let results = merged.map { $0.text }
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
+        checkZenzaiTooSlowLocked(ms: ms, thresholdMs: zenzaiSlowThresholdMs)
         engineLog("ev=infer kind=typo_convert ms=\(String(format: "%.1f", ms)) n=\(results.count) hyps=\(hyps.count) target=\(rec.composing.convertTarget)\n")
         return results
     }
@@ -649,6 +700,7 @@ public final class ConversionService: @unchecked Sendable {
         }
         let results = (promotedList ?? mainCands).map { $0.text }
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
+        checkZenzaiTooSlowLocked(ms: ms, thresholdMs: zenzaiSlowThresholdMs)
         engineLog("ev=infer kind=reconvert ms=\(String(format: "%.1f", ms)) n=\(results.count) target=\(c.convertTarget) ctx=\(leftContext?.count ?? 0)\n")
         return results
     }
@@ -759,6 +811,7 @@ public final class ConversionService: @unchecked Sendable {
 
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
         logFirstConvertOnceLocked(ms: ms)
+        checkZenzaiTooSlowLocked(ms: ms, thresholdMs: zenzaiSlowThresholdLiveMs)
         engineLog("ev=infer kind=live ms=\(String(format: "%.1f", ms)) target=\(rec.composing.convertTarget) ctx=\(leftContext?.count ?? 0)\n")
         if let committedText = committed {
             // 確定文節は candidate.text の prefix（履歴の安定判定により両者の先頭文節テキストは一致）。
@@ -1158,9 +1211,12 @@ public final class ConversionService: @unchecked Sendable {
         // 左文脈 = 文書の左文脈 + 先行文節の表層（連文節スコアの代替。Zenzai の品質レバー）。
         let preceding = state.clauses[..<state.selected].map { $0.text }.joined()
         let ctx = (leftContext ?? "") + preceding
+        let ct0 = DispatchTime.now()
         let results = converter.requestCandidates(
             c, options: makeOptions(leftSideContext: ctx.isEmpty ? nil : ctx)
         ).mainResults
+        let cms = Double(DispatchTime.now().uptimeNanoseconds &- ct0.uptimeNanoseconds) / 1_000_000
+        checkZenzaiTooSlowLocked(ms: cms, thresholdMs: zenzaiSlowThresholdMs)
         // noteRecordability は呼ばない — 共有マップは reconvert→RecordCorrection の照合専用で、
         // 文節読みで書くと同一読みの reconvert エントリ(別接続)を丸ごと差し替え fail-closed
         // 棄却に落とす(第2R敵対レビュー③)。文節スコープの記録可否は select 時の
@@ -1490,6 +1546,48 @@ public final class ConversionService: @unchecked Sendable {
         engineLog("ev=coldstart stage=first_convert ms=\(String(format: "%.1f", ms))\n")
     }
 
+    /// Zenzai 推論の重さを監視し、閾値を超えたら zenzaiTooSlow=true で古典へ固定する。
+    /// **converterLock 保持中に呼ぶこと**（slowWatchSkipsRemaining の読み書きが lock 内のため）。
+    /// 初回（slowWatchSkipsRemaining で指定）は cold spike 誤判定防止のためスキップする。
+    /// zenzaiTooSlow の setter が zenzaiTooSlowLock を取るが、これは他ロックを取らない独立ロック
+    /// （zenzaiReadyLock と同型）なので converterLock 保持下からの呼出は安全。
+    /// thresholdMs: op別のTIP側IPCタイムアウトに合わせた閾値（convert系=800ms, liveConvert=300ms）。
+    private func checkZenzaiTooSlowLocked(ms: Double, thresholdMs: Double) {
+        guard !zenzaiTooSlow else { return }
+        if slowWatchSkipsRemaining > 0 {
+            slowWatchSkipsRemaining -= 1
+            return
+        }
+        if ms > thresholdMs {
+            zenzaiTooSlow = true
+            engineLog("ev=zenzai_disabled reason=slow_inference ms=\(String(format: "%.1f", ms)) threshold=\(String(format: "%.0f", thresholdMs))\n")
+        }
+    }
+
+    /// reload 時に初回スキップを復活させるべきか（Zenzai 新規有効化）を判定する純関数。
+    /// 新規有効化（weightURL が nil→非nil）ではモデルが未ロードで、初回 convert がインライン
+    /// モデルロード＋初回推論（KV冷え）で本質的に遅くなる。この cold spike を吸収するためスキップを復活。
+    /// テストから直接検証可能（fileExists 制約を受けない）。
+    static func shouldRestoreSkipOnReload(old: URL?, new: URL?) -> Bool {
+        old == nil && new != nil
+    }
+
+    /// テスト専用: converterLock を取った上で checkZenzaiTooSlowLocked を呼ぶ（本番の convert/liveConvert
+    /// が converterLock 内で呼ぶのと同じ規律を再現）。private(set) の zenzaiTooSlow をテストから操作するための口。
+    func forceTooSlowForTesting(ms: Double = 1000, thresholdMs: Double = 800) {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        checkZenzaiTooSlowLocked(ms: ms, thresholdMs: thresholdMs)
+    }
+
+    /// テスト専用: zenzaiReady（warmUp 完了ゲート）を強制設定する。private(set) の zenzaiReady を
+    /// テストから操作する口。ダミー weightURL で startWarmUp を呼んでもモデルロード失敗で
+    /// zenzaiReady が true にならないため、結合テストで makeOptions の zenzaiTooSlow 分岐を
+    /// 分離検証するには直接ゲートを開ける必要がある。
+    func setZenzaiReadyForTesting(_ value: Bool) {
+        zenzaiReady = value
+    }
+
     /// graceful 停止（Shutdown IPC → 応答後 exit）の前段: 保留中の学習をディスクへフラッシュする。
     /// flushLearningLocked は private かつ「converterLock 保持中に呼ぶこと」契約なので、ここで
     /// converterLock を取ってから呼ぶ公開ラッパ。呼び出し元 handler は serviceLock を保持しており、
@@ -1565,10 +1663,15 @@ public final class ConversionService: @unchecked Sendable {
     private func makeOptions(nBest: Int = 10, leftSideContext: String? = nil, forceZenzai: Bool = false, forceClassic: Bool = false, noLearning: Bool = false) -> ConvertRequestOptions {
         // cold start ③: ゲートが開く（zenzaiReady）まで Zenzai を options に載せない＝古典（辞書）変換で即応。
         // forceZenzai は warmUp 専用（ゲートを開ける前のモデル先読みロードに Zenzai ON が要る）。
+        // zenzaiTooSlow: 推論が恒常的に重い環境では古典固定（drop_engine 自己増幅ループ＝Space ハング防止）。
+        //   forceZenzai（warmUp）は zenzaiTooSlow で止めない — warmUp は起動時1回のモデル先読みで、
+        //   ユーザーが Zenzai を意図した以上はロードを尊重し、ロード完了後の convert で重さを判定する。
         let zenzai: ConvertRequestOptions.ZenzaiMode
         if forceClassic {
             zenzai = .off
-        } else if zenzaiReady || forceZenzai {
+        } else if forceZenzai {
+            zenzai = ConversionService.makeZenzaiMode(config: config, leftSideContext: leftSideContext)
+        } else if zenzaiReady && !zenzaiTooSlow {
             zenzai = ConversionService.makeZenzaiMode(config: config, leftSideContext: leftSideContext)
         } else {
             zenzai = .off

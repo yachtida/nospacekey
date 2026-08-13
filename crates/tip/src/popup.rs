@@ -23,16 +23,16 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, DeleteObject, GetDC, GetDeviceCaps, GetMonitorInfoW, InvalidateRect,
-    MonitorFromPoint, ReleaseDC, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HFONT, LOGPIXELSX, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, OUT_TT_PRECIS,
+    MonitorFromPoint, MonitorFromWindow, ReleaseDC, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HFONT, LOGPIXELSX, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, OUT_TT_PRECIS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetWindowLongPtrW, RegisterClassW, SetWindowLongPtrW,
-    SetWindowPos, CS_DROPSHADOW, GWLP_USERDATA, HMENU, HWND_TOPMOST, SET_WINDOW_POS_FLAGS,
-    SWP_NOACTIVATE, SWP_NOMOVE, WINDOW_EX_STYLE, WNDCLASSW, WNDPROC, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowLongPtrW, RegisterClassW,
+    SetWindowLongPtrW, SetWindowPos, CS_DROPSHADOW, GWLP_USERDATA, HMENU, HWND_TOPMOST,
+    SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOMOVE, WINDOW_EX_STYLE, WNDCLASSW, WNDPROC,
+    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::render::SurfaceRenderer;
@@ -160,6 +160,39 @@ pub(crate) fn place_on_monitor(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
             fit_to_work_area(x, y, w, h, mi.rcWork)
         } else {
             (x, y)
+        }
+    }
+}
+
+/// キャレットを持たない経路（Activate/Deactivate/focus 切替/langbar クリック等）が
+/// Mode HUD を出す際の「無害位置」。従来は固定 (200,200) の画面左上へ出て不自然だったため、
+/// Win11 Input Indicator と同じ作業領域右下帯域へ出す。
+///
+/// 戻り値は「右下角の点」そのものを返す（HUD の左上ではない）。`flash` 側が
+/// `place_on_monitor(x,y,w,h)` → `fit_to_work_area` で「右下はみ出し→内側へ寄せ」を行い、
+/// 最終的に `(rcWork.right-w, rcWork.bottom-h)` へ着地する。よってここは w,h を知らず、
+/// DPI 非依存な純粋な座標源になる（Win32 物理座標は per-monitor-v2 で一貫）。
+///
+/// モニタは「ユーザーが今開いたアプリ」＝フォアグラウンド窓が属すモニタ。副モニタで
+/// アプリを開いたときにメイン画面へ飛ぶのを防ぐ。窓が取れなければプライマリへ劣化。
+pub(crate) fn harmless_anchor() -> (i32, i32) {
+    unsafe {
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let fg = GetForegroundWindow();
+        let hmon = if !fg.is_invalid() {
+            MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST)
+        } else {
+            // フォアグラウンド窓不明（起動直後等）はプライマリモニタへ。
+            MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)
+        };
+        if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            (mi.rcWork.right, mi.rcWork.bottom)
+        } else {
+            // 最終劣化: (0,0) を出し、place_on_monitor に見える位置へクランプさせる。
+            (0, 0)
         }
     }
 }

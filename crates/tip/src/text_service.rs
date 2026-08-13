@@ -2926,8 +2926,8 @@ impl TextService_Impl {
 
     /// 言語バーのモード表示を更新する。共有フラグ langbar_is_direct/langbar_ephemeral を反映し、
     /// システムの sink へ OnUpdate を投げて GetText（あ/A/あ˙）を再取得させる。sink 未 advise /
-    /// 言語バー非表示なら no-op。`ctx` があれば HUD を実キャレット近傍へ、無ければ既定座標へ出す。
-    /// `ephemeral`: ephemeral かなモード中（F8 等の一時トリガ中）かどうか。
+    /// 言語バー非表示なら no-op。`ctx` があれば HUD を実キャレット近傍へ、無ければ作業領域右下
+    /// （無害位置）へ出す。`ephemeral`: ephemeral かなモード中（F8 等の一時トリガ中）かどうか。
     fn update_langbar_mode(&self, is_direct: bool, ephemeral: bool, ctx: Option<&ITfContext>) {
         self.langbar_is_direct.set(is_direct);
         self.langbar_ephemeral.set(ephemeral);
@@ -2937,17 +2937,22 @@ impl TextService_Impl {
             }
         }
         // SP5/US: モード切替を あ/A の HUD でキャレット近傍に一瞬表示する（Win11 では langbar が
-        // 出ないため）。生きた context があれば GetTextExt で実キャレット位置に出し、無ければ既定座標。
-        let anchor = match ctx {
-            Some(ctx) => self.caret_point(ctx),
-            None => DEFAULT_CARET_POS,
+        // 出ないため）。生きた context があれば GetTextExt で実キャレット位置に出す。
+        // ctx 無し（Activate/Deactivate/focus 切替/langbar クリック等）はキャレットを持たないため、
+        // 従来 (200,200) の画面左上固定は不自然だった。Win11 Input Indicator と同じ作業領域右下へ。
+        let (x, y) = match ctx {
+            Some(ctx) => {
+                let a = self.caret_point(ctx);
+                (a.x, a.y)
+            }
+            None => crate::popup::harmless_anchor(),
         };
         // Task 7: 表示のたびに settings の mtime とダークモードを再評価した Theme を渡す
         // （設定変更・OS のライト/ダーク切替が次の flash から再起動なしで反映される）。
         let theme = self.appearance.borrow_mut().current_theme();
         self.mode_hud
             .borrow_mut()
-            .flash(is_direct, ephemeral, anchor.x, anchor.y, theme);
+            .flash(is_direct, ephemeral, x, y, theme);
     }
 
     /// SP7: 活性化時に conversion-mode を半角英数(直接入力)へ初期化する（設定 default_direct=true）。
@@ -2964,7 +2969,7 @@ impl TextService_Impl {
         let ok = unsafe { c.SetValue(tid, &v).is_ok() };
         tip_log(&format!("ev=default_direct applied ok={ok}"));
         // 言語バーの あ/A 表示を初期化後のモードへ更新する。Activate 時点では合焦 context が
-        // 定まらず実キャレットが取れないため、HUD は既定座標へ出す（ctx=None）。
+        // 定まらず実キャレットが取れないため、HUD は作業領域右下（無害位置）へ出す（ctx=None）。
         self.update_langbar_mode(crate::conversion_mode::is_direct(next), false, None);
     }
 

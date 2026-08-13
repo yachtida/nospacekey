@@ -38,7 +38,8 @@
 ;    A TSF TIP must be registered per-machine (HKLM; CLASSES_ROOT == HKLM),
 ;    which requires elevation. PrivilegesRequired=admin enforces this.
 ;
-;  HOW TO BUILD (this dev box has NO ISCC -- do this on a VM/host with Inno Setup)
+;  HOW TO BUILD (ISCC is user-scope installed at %LOCALAPPDATA%\Programs\Inno Setup 6,
+;    which is outside release.ps1's Machine PATH probe -- prepend it to PATH first)
 ;    Normally run scripts\release.ps1 instead (one command; evidence-gated order).
 ;    The manual steps below are the fallback decomposition:
 ;    1. Stage the payload:        powershell -File scripts\stage-dist.ps1 -Rebuild
@@ -82,7 +83,9 @@ AppId=nospacekey
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 ; Stamp the produced setup.exe's own VERSIONINFO resource with the same version.
-VersionInfoVersion={#MyAppVersion}
+; MyAppVersionNum is the 4-part numeric (major.minor.patch.build) -- ISCC's
+; VersionInfoVersion rejects semver pre-release/build metadata in MyAppVersion.
+VersionInfoVersion={#MyAppVersionNum}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\nospacekey
 DefaultGroupName=nospacekey
