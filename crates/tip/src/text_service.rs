@@ -416,6 +416,11 @@ pub struct TextService {
     /// 真にしたら Deactivate でもリセットしない＝IME 切替往復後の再 Activate で
     /// ユーザの手動トグル（無変換）を巻き戻さない（spec §3.3「以後の手動トグルを尊重」）。
     pub(crate) default_direct_applied: Cell<bool>,
+    /// TIP が conversion-mode の真実を所有しているか。default_direct 適用・トグル・
+    /// ephemeral のあと true。true のとき `is_direct_mode` は compartment ではなく
+    /// `langbar_is_direct` を読む（Activate 後のホスト上書きで表示A・入力あ にしない）。
+    /// Deactivate ではリセットしない（`default_direct_applied` と同じワンショット契約）。
+    pub(crate) direct_mode_owned: Cell<bool>,
     /// SP5/US: 言語バーの あ/A モードインジケータと共有する「現在モード」フラグ（true=半角英数=A）。
     /// toggle_conversion_mode / apply_default_direct が更新し、ModeLangBarItem の GetText が読む。
     pub(crate) langbar_is_direct: Rc<Cell<bool>>,
@@ -586,6 +591,7 @@ impl TextService {
             llm_enabled: Cell::new(false),
             typo_enabled: Cell::new(false),
             default_direct_applied: Cell::new(false),
+            direct_mode_owned: Cell::new(false),
             langbar_is_direct: Rc::new(Cell::new(false)),
             langbar_ephemeral: Rc::new(Cell::new(false)),
             langbar_sink: Rc::new(RefCell::new(None)),
@@ -746,7 +752,13 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // 無変換/Alt+; で conversion-mode が切り替わってもユーザが現在モードを視認できるように。
         // 二重 Activate ガード: 既に item があれば再追加しない（item と Rc 共有状態を取りこぼさない）。
         if self.langbar_item.borrow().is_none() {
-            self.langbar_is_direct.set(self.is_direct_mode());
+            // default_direct 適用予定かつ compartment が取れるときだけ AddItem 前に A を出す。
+            // 取れなければ live 読みのまま（失敗時に表示A・入力あ を残さない）。
+            let will_be_direct = crate::conversion_mode::should_apply_default_direct(
+                s.default_direct, self.default_direct_applied.get());
+            let compartment_available = self.conversion_compartment().is_some();
+            self.langbar_is_direct.set(crate::conversion_mode::langbar_direct_for_additem(
+                will_be_direct, compartment_available, self.is_direct_mode()));
             let item: ITfLangBarItemButton = crate::langbar::ModeLangBarItem::new(
                 self.langbar_is_direct.clone(),
                 self.langbar_ephemeral.clone(),
@@ -956,7 +968,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // ephemeral かな: 非活性化（IME 切替/シャットダウン）でも direct へ復帰する。thread_mgr が
         // まだ有効な（下で None にする前の）この時点で呼ぶ必要がある。
         self.exit_ephemeral_to_direct(None);
-        // SP7: default_direct_applied は **意図的にリセットしない**。リセットすると
+        // SP7: default_direct_applied / direct_mode_owned は **意図的にリセットしない**。リセットすると
         // IME 切替の往復（Deactivate→Activate）のたびに半角英数へ再初期化してしまい、
         // ユーザが無変換でひらがなへ戻した選択を巻き戻す。1度だけ適用を貫く。
 
@@ -2887,8 +2899,16 @@ impl TextService_Impl {
     }
 
     /// SP5: 半角英数(直接入力)モードか。
+    /// TIP がモードを所有しているときは langbar Cell を真実にする。Obsidian 等は
+    /// `apply_default_direct` の SetValue 成功後にホストが NATIVE へ戻すため、
+    /// ライブ compartment だけを見ると設定 default_direct とタスクバー A に反して
+    /// ひらがな入力になる。
     pub(crate) fn is_direct_mode(&self) -> bool {
-        crate::conversion_mode::is_direct(self.conversion_mode_value())
+        crate::conversion_mode::effective_is_direct(
+            self.direct_mode_owned.get(),
+            self.langbar_is_direct.get(),
+            crate::conversion_mode::is_direct(self.conversion_mode_value()),
+        )
     }
 
     /// conversion-mode をひらがな⇄半角英数でトグルする（NATIVE ビット反転）。
@@ -2909,13 +2929,19 @@ impl TextService_Impl {
             tip_log("ev=mode_toggle skip=no_compartment");
             return;
         };
-        let before = self.conversion_mode_value();
+        let live = self.conversion_mode_value();
+        let before = crate::conversion_mode::toggle_before_mode(
+            self.direct_mode_owned.get(),
+            self.langbar_is_direct.get(),
+            live,
+        );
         let next = crate::conversion_mode::toggled(before);
         let v = VARIANT::from(next as i32);
         let tid = self.tid.get();
         // 診断: SetValue の成否と、書込直後に読み戻した実値を残す（write 失敗/上書きの切り分け）。
         let set_ok = unsafe { c.SetValue(tid, &v).is_ok() };
         let after = self.conversion_mode_value();
+        self.direct_mode_owned.set(true);
         tip_log(&format!(
             "ev=mode_toggle direct={} set_ok={set_ok} before={before:#06x} next={next:#06x} after={after:#06x} tid={tid}",
             crate::conversion_mode::is_direct(next)
@@ -2926,9 +2952,27 @@ impl TextService_Impl {
 
     /// 言語バーのモード表示を更新する。共有フラグ langbar_is_direct/langbar_ephemeral を反映し、
     /// システムの sink へ OnUpdate を投げて GetText（あ/A/あ˙）を再取得させる。sink 未 advise /
-    /// 言語バー非表示なら no-op。`ctx` があれば HUD を実キャレット近傍へ、無ければ作業領域右下
+    /// 言語バー非表示なら no-op。続けてモード HUD を flash する（toggle / ephemeral の通常経路）。
+    /// Activate の `apply_default_direct` だけは起動チラつき防止のため HUD を出さない
+    /// （`update_langbar_mode_no_hud`）。`ctx` があれば HUD を実キャレット近傍へ、無ければ作業領域右下
     /// （無害位置）へ出す。`ephemeral`: ephemeral かなモード中（F8 等の一時トリガ中）かどうか。
     fn update_langbar_mode(&self, is_direct: bool, ephemeral: bool, ctx: Option<&ITfContext>) {
+        self.update_langbar_mode_inner(is_direct, ephemeral, ctx, true);
+    }
+
+    /// `update_langbar_mode` と同じ Cell / OnUpdate だが HUD は出さない。
+    /// Activate の default_direct 専用（起動時の右下フラッシュ抑制）。
+    fn update_langbar_mode_no_hud(&self, is_direct: bool, ephemeral: bool, ctx: Option<&ITfContext>) {
+        self.update_langbar_mode_inner(is_direct, ephemeral, ctx, false);
+    }
+
+    fn update_langbar_mode_inner(
+        &self,
+        is_direct: bool,
+        ephemeral: bool,
+        ctx: Option<&ITfContext>,
+        flash_hud: bool,
+    ) {
         self.langbar_is_direct.set(is_direct);
         self.langbar_ephemeral.set(ephemeral);
         if let Some(sink) = self.langbar_sink.borrow().as_ref() {
@@ -2936,41 +2980,54 @@ impl TextService_Impl {
                 let _ = sink.OnUpdate(TF_LBI_TEXT | TF_LBI_STATUS | TF_LBI_ICON);
             }
         }
-        // SP5/US: モード切替を あ/A の HUD でキャレット近傍に一瞬表示する（Win11 では langbar が
-        // 出ないため）。生きた context があれば GetTextExt で実キャレット位置に出す。
-        // ctx 無し（Activate/Deactivate/focus 切替/langbar クリック等）はキャレットを持たないため、
-        // 従来 (200,200) の画面左上固定は不自然だった。Win11 Input Indicator と同じ作業領域右下へ。
-        let (x, y) = match ctx {
-            Some(ctx) => {
-                let a = self.caret_point(ctx);
-                (a.x, a.y)
-            }
-            None => crate::popup::harmless_anchor(),
-        };
-        // Task 7: 表示のたびに settings の mtime とダークモードを再評価した Theme を渡す
-        // （設定変更・OS のライト/ダーク切替が次の flash から再起動なしで反映される）。
-        let theme = self.appearance.borrow_mut().current_theme();
-        self.mode_hud
-            .borrow_mut()
-            .flash(is_direct, ephemeral, x, y, theme);
+        if flash_hud {
+            // SP5/US: モード切替を あ/A の HUD でキャレット近傍に一瞬表示する（Win11 では langbar が
+            // 出ないため）。生きた context があれば GetTextExt で実キャレット位置に出す。
+            // ctx 無し（Activate/Deactivate/focus 切替/langbar クリック等）はキャレットを持たないため、
+            // 従来 (200,200) の画面左上固定は不自然だった。Win11 Input Indicator と同じ作業領域右下へ。
+            let (x, y) = match ctx {
+                Some(ctx) => {
+                    let a = self.caret_point(ctx);
+                    (a.x, a.y)
+                }
+                None => crate::popup::harmless_anchor(),
+            };
+            // Task 7: 表示のたびに settings の mtime とダークモードを再評価した Theme を渡す
+            // （設定変更・OS のライト/ダーク切替が次の flash から再起動なしで反映される）。
+            let theme = self.appearance.borrow_mut().current_theme();
+            self.mode_hud
+                .borrow_mut()
+                .flash(is_direct, ephemeral, x, y, theme);
+        }
     }
 
     /// SP7: 活性化時に conversion-mode を半角英数(直接入力)へ初期化する（設定 default_direct=true）。
-    /// NATIVE と FULLSHAPE を落として半角を保証する（ROMAN 等は保存）。compartment 取得失敗時は劣化（何もしない）。
+    /// NATIVE と FULLSHAPE を落として半角を保証する（ROMAN 等は保存）。
+    /// compartment 取得失敗時は Cell を実値へ戻して OnUpdate する（HUD は出さない）。
+    /// SetValue は値が変わるときだけ。表示更新は Cell が目標と不一致のときだけ（再描画チラつき防止）。
     /// Activate 内の tid/thread_mgr セット後に1度だけ呼ぶ＝以後のユーザ手動トグルは上書きしない。
     pub(crate) fn apply_default_direct(&self) {
         let Some(c) = self.conversion_compartment() else {
             tip_log("ev=default_direct skip=no_compartment");
+            // Cell を実値へ戻し、OnUpdate で表示も合わせる。HUD だけ抑制。
+            self.update_langbar_mode_no_hud(self.is_direct_mode(), false, None);
             return;
         };
-        let next = crate::conversion_mode::to_direct(self.conversion_mode_value());
-        let v = VARIANT::from(next as i32);
-        let tid = self.tid.get();
-        let ok = unsafe { c.SetValue(tid, &v).is_ok() };
-        tip_log(&format!("ev=default_direct applied ok={ok}"));
-        // 言語バーの あ/A 表示を初期化後のモードへ更新する。Activate 時点では合焦 context が
-        // 定まらず実キャレットが取れないため、HUD は作業領域右下（無害位置）へ出す（ctx=None）。
-        self.update_langbar_mode(crate::conversion_mode::is_direct(next), false, None);
+        let current = self.conversion_mode_value();
+        let next = crate::conversion_mode::to_direct(current);
+        if next != current {
+            let v = VARIANT::from(next as i32);
+            let tid = self.tid.get();
+            let ok = unsafe { c.SetValue(tid, &v).is_ok() };
+            tip_log(&format!("ev=default_direct applied ok={ok}"));
+        } else {
+            tip_log("ev=default_direct skip=already_direct");
+        }
+        self.direct_mode_owned.set(true);
+        let target = crate::conversion_mode::is_direct(next);
+        if crate::conversion_mode::should_notify_langbar(self.langbar_is_direct.get(), target) {
+            self.update_langbar_mode_no_hud(target, false, None);
+        }
     }
 
     /// ephemeral かなモード開始: direct 中にトリガキー（既定 F8）が来たら compartment を
@@ -2987,6 +3044,7 @@ impl TextService_Impl {
         let v = VARIANT::from(next as i32);
         let ok = unsafe { c.SetValue(self.tid.get(), &v).is_ok() };
         self.ephemeral_kana.set(true);
+        self.direct_mode_owned.set(true);
         tip_log(&format!("ev=ephemeral_enter set_ok={ok} next={next:#06x}"));
         self.update_langbar_mode(false, true, ctx);
     }
@@ -3001,6 +3059,7 @@ impl TextService_Impl {
             let next = crate::conversion_mode::to_direct(self.conversion_mode_value());
             let v = VARIANT::from(next as i32);
             let ok = unsafe { c.SetValue(self.tid.get(), &v).is_ok() };
+            self.direct_mode_owned.set(true);
             tip_log(&format!("ev=ephemeral_exit set_ok={ok} next={next:#06x}"));
             self.update_langbar_mode(true, false, ctx);
         } else {

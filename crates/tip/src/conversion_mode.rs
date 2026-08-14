@@ -47,6 +47,51 @@ pub fn should_apply_default_direct(enabled: bool, already_applied: bool) -> bool
     enabled && !already_applied
 }
 
+/// AddItem 直前の langbar Cell に入れる値。
+/// 直後の `apply_default_direct` が走れて（`will_apply`）、かつ compartment が取れるときだけ
+/// 楽観的に直接入力（A）を出す。取れなければ live 読みのまま（失敗時に表示A・入力あ を残さない）。
+pub fn langbar_direct_for_additem(
+    will_apply: bool,
+    compartment_available: bool,
+    live_is_direct: bool,
+) -> bool {
+    if will_apply && compartment_available {
+        true
+    } else {
+        live_is_direct
+    }
+}
+
+/// langbar の OnUpdate が必要か。Cell が既に目標と一致していれば再描画しない。
+/// 不一致（ロールバックや未プリセット）のときだけ通知する。
+pub fn should_notify_langbar(cell_is_direct: bool, target_is_direct: bool) -> bool {
+    cell_is_direct != target_is_direct
+}
+
+/// 打鍵ゲートが使う「今 direct か」。TIP がモードを所有している（default_direct 適用・
+/// トグル・ephemeral）ときは langbar Cell を真実にする。ホストが Activate 後に
+/// compartment を NATIVE へ戻しても、表示 A のままひらがな入力にはしない。
+pub fn effective_is_direct(owned: bool, langbar_is_direct: bool, live_is_direct: bool) -> bool {
+    if owned {
+        langbar_is_direct
+    } else {
+        live_is_direct
+    }
+}
+
+/// トグルの XOR 対象。owned かつ Cell と live が食い違うとき、live を XOR すると
+/// 「A に見えているのに次も direct」になる。Cell を before の NATIVE ビットにする。
+pub fn toggle_before_mode(owned: bool, langbar_is_direct: bool, live: u32) -> u32 {
+    if !owned {
+        return live;
+    }
+    if langbar_is_direct {
+        to_direct(live)
+    } else {
+        live | CONVMODE_NATIVE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +123,41 @@ mod tests {
         assert!(!should_apply_default_direct(true, true)); // 有効 & 適用済み → しない（手動トグル尊重）
         assert!(!should_apply_default_direct(false, false)); // 無効 → しない
         assert!(!should_apply_default_direct(false, true));
+    }
+
+    #[test]
+    fn langbar_direct_for_additem_truth_table() {
+        assert!(langbar_direct_for_additem(true, true, false)); // 適用予定かつ compartment あり → A
+        assert!(!langbar_direct_for_additem(true, false, false)); // compartment なし → 楽観しない
+        assert!(langbar_direct_for_additem(true, true, true));
+        assert!(!langbar_direct_for_additem(false, true, false));
+        assert!(langbar_direct_for_additem(false, true, true));
+    }
+
+    #[test]
+    fn should_notify_langbar_truth_table() {
+        assert!(!should_notify_langbar(true, true)); // 成功経路で再 OnUpdate しない
+        assert!(should_notify_langbar(true, false)); // ロールバックで通知する
+        assert!(should_notify_langbar(false, true));
+    }
+
+    #[test]
+    fn effective_is_direct_trusts_cell_when_owned() {
+        assert!(effective_is_direct(true, true, false)); // 所有中: live が NATIVE でも A
+        assert!(!effective_is_direct(true, false, true));
+        assert!(!effective_is_direct(false, true, false)); // 未所有: live
+        assert!(effective_is_direct(false, false, true));
+    }
+
+    #[test]
+    fn toggle_before_mode_uses_cell_when_owned_and_live_diverges() {
+        // 表示 A・live ひらがなでトグル → before は direct、XOR で NATIVE（あへ）
+        let before = toggle_before_mode(true, true, CONVMODE_NATIVE);
+        assert_eq!(before, 0);
+        assert_eq!(toggled(before), CONVMODE_NATIVE);
+        // 未所有なら live をそのまま XOR
+        assert_eq!(toggle_before_mode(false, true, CONVMODE_NATIVE), CONVMODE_NATIVE);
+        assert_eq!(toggled(toggle_before_mode(false, true, CONVMODE_NATIVE)), 0);
     }
 
     #[test]

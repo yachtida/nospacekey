@@ -216,9 +216,10 @@ pub struct Settings {
     /// Spec2: かな漢字変換の学習（確定候補を以後の順位に反映）。既定 ON。
     /// engine env `NOSPACEKEY_LEARNING`（"1"/"0"）へ resolve_env_map が常に注入する。
     #[serde(default)] pub learning: LearningSettings,
-    /// SP7: 真なら IME 活性化時に conversion-mode を半角英数(直接入力)へ初期化する
-    /// （ターミナル/Vim 向け）。既定 false＝従来どおりひらがな既定。TIP 側の挙動で
-    /// engine env には注入しない。フィールド欠落の旧 settings.json は false でロード。
+    /// SP7: 真なら新しいアプリ（TIP インスタンス初回 Activate）で conversion-mode を
+    /// 半角英数へ初期化する。既定 false＝従来どおりひらがな既定。ワンショットなので
+    /// 無変換後のひらがなは維持する。TIP 側の挙動で engine env には注入しない。
+    /// フィールド欠落の旧 settings.json は false でロード。
     #[serde(default)] pub default_direct: bool,
     /// A 段: 外観（配色/フォント/角丸/バックドロップ）。欠落は既定 Appearance。
     #[serde(default)] pub appearance: Appearance,
