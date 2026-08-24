@@ -30,6 +30,10 @@ fn workspace_version() -> String {
         .expect("workspace.package.version がない")
 }
 
+fn windows_file_version(version: &str) -> String {
+    format!("{}.0", version.split('-').next().unwrap())
+}
+
 #[test]
 fn all_version_declarations_match_workspace_package() {
     let ws = workspace_version();
@@ -51,6 +55,13 @@ fn all_version_declarations_match_workspace_package() {
         read("../../installer/version.iss").contains(&format!("#define MyAppVersion \"{ws}\"")),
         "version.iss 不一致"
     );
+    assert!(
+        read("../../installer/version.iss").contains(&format!(
+            "#define MyAppFileVersion \"{}\"",
+            windows_file_version(&ws)
+        )),
+        "version.iss の Windows ファイルバージョン不一致"
+    );
     // engine-host BuildInfo.swift
     assert!(
         read("../../engine-host/Sources/NospacekeyEngineCore/BuildInfo.swift")
@@ -64,6 +75,7 @@ fn nospacekey_iss_has_no_hardcoded_version() {
     // .iss 本体に版リテラルが復活しないこと(#include "version.iss" 経由のみ)
     let iss = read("../../installer/nospacekey.iss");
     assert!(iss.contains("#include \"version.iss\""));
+    assert!(iss.contains("VersionInfoVersion={#MyAppFileVersion}"));
     assert!(
         !iss.contains("#define MyAppVersion \""),
         "nospacekey.iss に版の直書きが復活している"

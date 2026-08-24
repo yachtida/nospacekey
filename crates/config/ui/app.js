@@ -1,10 +1,12 @@
 import {
   clearLearningSuccessMessage,
+  dictionaryPage,
   bindDefaultSettingsHandler,
   mergePersistedAutomaticCheckFields,
   reconcileDefaultSettingsResponse,
   reconcileLateAutomaticCheckFields,
   reconcilePromptDismissal,
+  resetDictionaryScroll,
   rollbackAutomaticCheckFields,
 } from "./app-state.mjs";
 
@@ -1261,6 +1263,8 @@ let dictEditable = true;   // quarantine_failed で false（編集操作を無�
 let dictQuarantineToastShown = false; // 「壊れていたため退避」は1回だけ
 let dictEditTarget = null; // 編集中エントリの {ruby, word}（null = 追加モード）
 let dictModalReturnFocus = null;
+const DICT_PAGE_SIZE = 200;
+let dictPageIndex = 0;
 
 const DICT_RUBY_RE = /^[ぁ-ゖァ-ヶー]+$/;
 
@@ -1330,15 +1334,28 @@ function buildDictRow(entry) {
   return tr;
 }
 
-function renderDictTable() {
-  const filter = document.getElementById("dict-filter").value.trim();
-  const filtered = filter
-    ? dictEntries.filter((e) => e.ruby.includes(filter) || e.word.includes(filter))
-    : dictEntries;
+function renderDictTable(resetScroll = false) {
+  const filter = document.getElementById("dict-filter").value;
+  const page = dictionaryPage(dictEntries, filter, dictPageIndex, DICT_PAGE_SIZE);
+  dictPageIndex = page.pageIndex;
   const tbody = document.getElementById("dict-rows");
   tbody.textContent = "";
-  for (const entry of filtered) tbody.appendChild(buildDictRow(entry));
-  document.getElementById("dict-count").textContent = `${dictEntries.length} 語`;
+  const fragment = document.createDocumentFragment();
+  for (const entry of page.visible) fragment.appendChild(buildDictRow(entry));
+  tbody.appendChild(fragment);
+
+  const count = document.getElementById("dict-count");
+  count.textContent = filter.trim()
+    ? `${dictEntries.length} 語（${page.matchingCount} 件該当）`
+    : `${dictEntries.length} 語`;
+
+  document.getElementById("dict-page-status").textContent = page.pageCount === 0
+    ? "0 / 0 ページ"
+    : `${page.pageIndex + 1} / ${page.pageCount} ページ`;
+  document.getElementById("dict-page-prev").disabled = page.pageIndex === 0;
+  document.getElementById("dict-page-next").disabled =
+    page.pageCount === 0 || page.pageIndex >= page.pageCount - 1;
+  if (resetScroll) resetDictionaryScroll(document.querySelector(".dict-table-wrap"));
 }
 
 // 巡3 Q6: 一覧取得の世代カウンタ — 削除/保存/インポートの並走で後から届く古い応答が
@@ -1351,6 +1368,7 @@ async function loadDictList() {
     const report = await invoke("dict_list");
     if (gen !== dictListGen) return; // 自分より新しい要求が出ている — 結果を捨てる
     dictEntries = report.entries;
+    dictPageIndex = 0;
     dictEditable = report.corrupt !== "quarantine_failed";
     document.getElementById("dict-quarantine-error").hidden = report.corrupt !== "quarantine_failed";
     if (report.corrupt === "quarantined" && !dictQuarantineToastShown) {
@@ -1363,7 +1381,7 @@ async function loadDictList() {
       dedupNote.textContent = `重複 ${report.deduped} 件は表示から畳んでいます（次の編集時にファイルも整理されます）`;
     }
     updateDictActionsEnabled();
-    renderDictTable();
+    renderDictTable(true);
   } catch (err) {
     if (gen !== dictListGen) return;
     dictUnreadableToast(err);
@@ -1565,7 +1583,18 @@ function bindDictionary() {
   document.getElementById("dict-add-btn").addEventListener("click", () => openDictModal(null));
   document.getElementById("dict-import-btn").addEventListener("click", importDict);
   document.getElementById("dict-export-btn").addEventListener("click", exportDict);
-  document.getElementById("dict-filter").addEventListener("input", renderDictTable);
+  document.getElementById("dict-filter").addEventListener("input", () => {
+    dictPageIndex = 0;
+    renderDictTable(true);
+  });
+  document.getElementById("dict-page-prev").addEventListener("click", () => {
+    dictPageIndex -= 1;
+    renderDictTable(true);
+  });
+  document.getElementById("dict-page-next").addEventListener("click", () => {
+    dictPageIndex += 1;
+    renderDictTable(true);
+  });
   document.getElementById("dict-form-cancel").addEventListener("click", requestCloseDictModal);
   document.getElementById("dict-form-save").addEventListener("click", saveDictEntry);
   ["dict-form-ruby", "dict-form-word"].forEach((id) =>

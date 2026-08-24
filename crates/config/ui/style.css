@@ -487,6 +487,9 @@ input.w-md { width: 140px; }
 .dict-row-actions { white-space: nowrap; }
 .dict-row-actions button { padding: 3px 10px; font-size: 12px; margin-right: 4px; }
 .dict-row-actions button:last-child { margin-right: 0; }
+.dict-pager { display: flex; justify-content: center; align-items: center; gap: 10px; padding-bottom: 8px; }
+.dict-pager button { min-width: 72px; }
+.dict-pager span { min-width: 96px; text-align: center; color: var(--text-sub); }
 
 /* ---- 辞書エントリモーダル: ネイティブ <dialog>（キー割当レコーダと同型のシート） ----
    showModal() が top layer・フォーカストラップ・背面inert を担保するため、

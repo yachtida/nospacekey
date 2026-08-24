@@ -82,9 +82,8 @@
 AppId=nospacekey
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-; VERSIONINFO requires a four-part numeric value; the displayed version keeps
-; the full SemVer prerelease suffix from MyAppVersion.
-VersionInfoVersion={#MyAppVersionNum}
+; Windows VERSIONINFO accepts four numeric components, not SemVer prerelease text.
+VersionInfoVersion={#MyAppFileVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\nospacekey
 DefaultGroupName=nospacekey

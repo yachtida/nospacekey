@@ -4,12 +4,76 @@ import { readFileSync } from "node:fs";
 import {
   bindDefaultSettingsHandler,
   clearLearningSuccessMessage,
+  dictionaryPage,
   mergePersistedAutomaticCheckFields,
   reconcileDefaultSettingsResponse,
   reconcileLateAutomaticCheckFields,
   reconcilePromptDismissal,
+  resetDictionaryScroll,
   rollbackAutomaticCheckFields,
 } from "../ui/app-state.mjs";
+
+test("dictionary page caps DOM work and reaches later entries", () => {
+  const entries = Array.from({ length: 10_000 }, (_, index) => ({
+    ruby: `よみ${index}`,
+    word: `単語${index}`,
+  }));
+
+  const initial = dictionaryPage(entries, "", 0, 200);
+  const second = dictionaryPage(entries, "", 1, 200);
+
+  assert.equal(initial.matchingCount, 10_000);
+  assert.equal(initial.visible.length, 200);
+  assert.deepEqual(initial.visible, entries.slice(0, 200));
+  assert.equal(initial.pageCount, 50);
+  assert.equal(second.pageIndex, 1);
+  assert.deepEqual(second.visible, entries.slice(200, 400));
+});
+
+test("dictionary page filters all entries before applying the render cap", () => {
+  const entries = [
+    { ruby: "あい", word: "愛" },
+    { ruby: "あお", word: "青" },
+    { ruby: "あか", word: "赤" },
+  ];
+
+  const page = dictionaryPage(entries, "あ", 0, 2);
+
+  assert.equal(page.matchingCount, 3);
+  assert.deepEqual(page.visible, entries.slice(0, 2));
+  assert.equal(page.pageCount, 2);
+});
+
+test("dictionary page clamps a stale page after filtering", () => {
+  const entries = [
+    { ruby: "あい", word: "愛" },
+    { ruby: "あお", word: "青" },
+    { ruby: "いぬ", word: "犬" },
+  ];
+
+  const page = dictionaryPage(entries, "い", 10, 200);
+
+  assert.equal(page.pageIndex, 0);
+  assert.equal(page.pageCount, 1);
+  assert.deepEqual(page.visible, [entries[0], entries[2]]);
+});
+
+test("dictionary navigation resets the table viewport to its first row", () => {
+  const tableViewport = { scrollTop: 720 };
+
+  resetDictionaryScroll(tableViewport);
+
+  assert.equal(tableViewport.scrollTop, 0);
+  const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
+  assert.match(source, /renderDictTable\(true\)/);
+});
+
+test("settings executable uses the product profile icon", () => {
+  const settingsIcon = readFileSync(new URL("../icons/icon.ico", import.meta.url));
+  const productIcon = readFileSync(new URL("../../tip/icons/profile-n.ico", import.meta.url));
+
+  assert.deepEqual(settingsIcon, productIcon);
+});
 
 test("defaults is serialized with settings operations", () => {
   const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");

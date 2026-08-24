@@ -19,6 +19,29 @@ function copyAutomaticCheckFields(target, source) {
   }
 }
 
+export function dictionaryPage(entries, filter, pageIndex, pageSize) {
+  const query = filter.trim();
+  const matching = query
+    ? entries.filter((entry) => entry.ruby.includes(query) || entry.word.includes(query))
+    : entries;
+  const size = Math.max(1, pageSize);
+  const pageCount = Math.ceil(matching.length / size);
+  const safePageIndex = pageCount === 0
+    ? 0
+    : Math.min(Math.max(0, pageIndex), pageCount - 1);
+  const start = safePageIndex * size;
+  return {
+    matchingCount: matching.length,
+    pageCount,
+    pageIndex: safePageIndex,
+    visible: matching.slice(start, start + size),
+  };
+}
+
+export function resetDictionaryScroll(container) {
+  container.scrollTop = 0;
+}
+
 /**
  * Merge backend-owned automatic-check fields into an in-flight edit snapshot.
  * The input objects are never mutated; unrelated user edits remain intact.

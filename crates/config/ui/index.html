@@ -284,9 +284,14 @@
             <button id="dict-export-btn" type="button">エクスポート…</button>
             <input type="text" id="dict-filter" placeholder="読み・単語で絞り込み">
             <span class="dict-count-group">
-              <span id="dict-count"></span>
+              <span id="dict-count" aria-live="polite"></span>
               <span id="dict-dedup-note" class="dict-dedup-note" hidden></span>
             </span>
+          </div>
+          <div class="dict-pager">
+            <button id="dict-page-prev" type="button">前へ</button>
+            <span id="dict-page-status" aria-live="polite">0 / 0 ページ</span>
+            <button id="dict-page-next" type="button">次へ</button>
           </div>
           <div class="dict-table-wrap">
             <table class="dict-table">
