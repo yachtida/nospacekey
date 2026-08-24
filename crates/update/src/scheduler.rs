@@ -144,11 +144,19 @@ fn output_detail(output: &CommandOutput) -> String {
 }
 
 fn run_command(program: &str, args: &[String]) -> Result<CommandOutput, String> {
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let child = command
         .spawn()
         .map_err(|error| format!("command spawn failed: {error}"))?;
     poll_process(&mut ChildHandle(Some(child)))
