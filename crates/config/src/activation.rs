@@ -10,7 +10,9 @@ pub enum LaunchIntent {
 
 pub fn parse_argument(value: &str) -> LaunchIntent {
     match value {
-        "--open-update" | "nospacekey://update" => LaunchIntent::OpenUpdate,
+        "--open-update" | "nospacekey://update" | "nospacekey://update/" => {
+            LaunchIntent::OpenUpdate
+        }
         "--stop-engine" => LaunchIntent::StopEngine,
         _ => value
             .parse::<isize>()
@@ -68,6 +70,10 @@ mod tests {
         assert_eq!(parse_argument("--open-update"), LaunchIntent::OpenUpdate);
         assert_eq!(
             parse_argument("nospacekey://update"),
+            LaunchIntent::OpenUpdate
+        );
+        assert_eq!(
+            parse_argument("nospacekey://update/"),
             LaunchIntent::OpenUpdate
         );
         assert_eq!(

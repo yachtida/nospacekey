@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "1.2.2-beta.5"
+version = "1.2.2-beta.5.1"
 dependencies = [
  "futures-util",
  "hex",
@@ -1717,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "ids"
-version = "1.2.2-beta.5"
+version = "1.2.2-beta.5.1"
 dependencies = [
  "windows-core 0.62.2",
 ]
@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "ipc"
-version = "1.2.2-beta.5"
+version = "1.2.2-beta.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2094,7 +2094,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nospacekey-update"
-version = "1.2.2-beta.5"
+version = "1.2.2-beta.5.1"
 dependencies = [
  "chrono",
  "futures-util",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "nospacekey_tip"
-version = "1.2.2-beta.5"
+version = "1.2.2-beta.5.1"
 dependencies = [
  "ids",
  "ipc",
@@ -3188,7 +3188,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "1.2.2-beta.5"
+version = "1.2.2-beta.5.1"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -3787,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "testbench"
-version = "1.2.2-beta.5"
+version = "1.2.2-beta.5.1"
 dependencies = [
  "ids",
  "serde",
