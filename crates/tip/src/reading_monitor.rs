@@ -15,14 +15,14 @@ use std::sync::OnceLock;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect,
-    GetDC, GetDeviceCaps, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject,
-    SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
-    LOGPIXELSX, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC,
+    GetDeviceCaps, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, SetBkMode,
+    SetTextColor, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, LOGPIXELSX,
+    PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, SetTimer,
-    ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
+    DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, ShowWindow, SW_HIDE,
+    SW_SHOWNOACTIVATE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
 };
 
 use crate::candidate_window::CaretAnchor;
@@ -30,9 +30,6 @@ use crate::popup::{self, effective_dpi, font_size_px, scale, Backend, PopupState
 use crate::text_service::tip_log;
 
 const CLASS_NAME: PCWSTR = w!("NospacekeyReadingMonitor");
-
-/// 退場フェード完了後に SW_HIDE する遅延タイマの ID（自動消去タイマは持たない）。
-const FADE_TIMER_ID: usize = 1;
 
 /// ヘアライン枠の太さ（px、非スケール）。
 const BORDER: i32 = 1;
@@ -134,7 +131,12 @@ pub(crate) fn plan_anchor(anchor: Option<CaretAnchor>, visible: bool) -> AnchorP
 /// `max_w_px` は px 上限（max_text_w_px 由来）。テキスト幅は [MIN, max_w_px] へクランプ —
 /// はみ出しは描画側の末尾寄せクリップが受ける。max 側は `.max(min_w)` で下駄を履かせる —
 /// clamp は min>max で panic するため（max_chars=10×小フォントで実在するエッジ）。
-pub(crate) fn monitor_window_size(text_px_w: i32, font_px: i32, dpi: i32, max_w_px: i32) -> (i32, i32) {
+pub(crate) fn monitor_window_size(
+    text_px_w: i32,
+    font_px: i32,
+    dpi: i32,
+    max_w_px: i32,
+) -> (i32, i32) {
     let min_w = scale(MIN_TEXT_W, dpi);
     let clamped = text_px_w.clamp(min_w, max_w_px.max(min_w));
     let w = 2 * BORDER + 2 * scale(PAD_H, dpi) + clamped;
@@ -173,14 +175,26 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_TIMER => unsafe {
-            if wparam.0 == FADE_TIMER_ID {
-                // 退場フェード完了 → フラグを解いて実際に隠す（HUD の HUD_FADE_TIMER_ID と同じ）。
-                let _ = KillTimer(Some(hwnd), FADE_TIMER_ID);
-                if let Some(s) = monitor_state(hwnd) {
-                    s.backend.fading_out = false;
+            // 退場フェード完了タイマは世代ID判定（KillTimer はキュー済みの WM_TIMER
+            // を除去できないため、旧世代の発火を切り捨てる — 候補窓/HUD と同じ仕組み）。
+            // 巡3 G6: state 欠落（WM_NCDESTROY 後等）は判定不能だが可視のまま残す理由も
+            // 無い — 1438196 構造に倣い隠して抜ける（SW_HIDE は冪等）。
+            let Some(s) = monitor_state(hwnd) else {
+                if wparam.0 >= 1000 {
+                    let _ = KillTimer(Some(hwnd), wparam.0);
                 }
                 let _ = ShowWindow(hwnd, SW_HIDE);
+                return LRESULT(0);
+            };
+            if wparam.0 >= 1000 {
+                let _ = KillTimer(Some(hwnd), wparam.0);
             }
+            if !s.backend.is_current_fade_timer(wparam.0) {
+                return LRESULT(0);
+            }
+            s.backend.fade_timer_id = 0;
+            s.backend.fading_out = false;
+            let _ = ShowWindow(hwnd, SW_HIDE);
             LRESULT(0)
         },
         WM_NCDESTROY => unsafe {
@@ -238,7 +252,12 @@ fn paint_gdi(hwnd: HWND) {
         let mut text: Vec<u16> = state.text.encode_utf16().collect();
         // 左右パディング分を除いた領域へ 1 行描画（候補窓と同じ DT_SINGLELINE|DT_END_ELLIPSIS）。
         let pad = scale(PAD_H, dpi);
-        let mut tr = RECT { left: rc.left + pad, top: rc.top, right: rc.right - pad, bottom: rc.bottom };
+        let mut tr = RECT {
+            left: rc.left + pad,
+            top: rc.top,
+            right: rc.right - pad,
+            bottom: rc.bottom,
+        };
         // 上限超過は末尾寄せ: DT_RIGHT + rect クリップで頭側が切れる（DT_END_ELLIPSIS だと
         // 末尾=最新の読みが消える）。
         let flags = if state.overflow {
@@ -324,7 +343,15 @@ unsafe fn paint_d2d(hwnd: HWND) {
     };
     let brush = |c: crate::theme::Rgba| ctx.CreateSolidColorBrush(&c.d2d(), None).ok();
 
-    ctx.Clear(Some(&crate::theme::Rgba { r: 0, g: 0, b: 0, a: 0 }.d2d()));
+    ctx.Clear(Some(
+        &crate::theme::Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        }
+        .d2d(),
+    ));
     if let Some(b) = brush(t.colors.bg) {
         ctx.FillRectangle(&rectf, &b);
     }
@@ -377,7 +404,9 @@ unsafe fn measure_text_gdi(hwnd: HWND, state: &mut MonitorState, dpi: i32) -> Op
         return None;
     }
     let family = popup::family_utf16z(&state.theme.font_family);
-    let hfont = state.backend.font_for_dpi(&family, state.theme.font_point_tenths, dpi);
+    let hfont = state
+        .backend
+        .font_for_dpi(&family, state.theme.font_point_tenths, dpi);
     let mut size = SIZE::default();
     let ok = match hfont {
         Some(f) => {
@@ -401,7 +430,15 @@ pub struct ReadingMonitor {
 impl ReadingMonitor {
     /// HWND を持たない空のモニタを構築する（`TextService::new` 用）。
     pub fn empty() -> Self {
-        Self { hwnd: HWND(std::ptr::null_mut()) }
+        Self {
+            hwnd: HWND(std::ptr::null_mut()),
+        }
+    }
+
+    /// 窓が生成済みで可視か。UIバグ4 のレイアウト追従（OnLayoutChange）で
+    /// 「この窓のために再照会するか」の判定に使う。
+    pub fn is_visible(&self) -> bool {
+        !self.hwnd.is_invalid() && unsafe { IsWindowVisible(self.hwnd) }.as_bool()
     }
 
     /// Deactivate から呼ぶ（mode_hud::destroy と同じ理由 — プロセス終了時の msctf 後始末に
@@ -442,7 +479,11 @@ impl ReadingMonitor {
             };
             self.hwnd = hwnd;
             // 角丸は両パス、アクリルは D2D パスのみ（mode_hud と同じ。Win10=no-op）。
-            crate::render::apply_dwm_chrome(hwnd, theme.rounded, theme.acrylic && renderer.is_some());
+            crate::render::apply_dwm_chrome(
+                hwnd,
+                theme.rounded,
+                theme.acrylic && renderer.is_some(),
+            );
             popup::install_state(
                 hwnd,
                 Box::new(MonitorState {
@@ -487,14 +528,47 @@ impl ReadingMonitor {
                 if chrome_changed {
                     let d2d = state.backend.renderer.is_some();
                     crate::render::apply_dwm_chrome(
-                        self.hwnd, state.theme.rounded, state.theme.acrylic && d2d,
+                        self.hwnd,
+                        state.theme.rounded,
+                        state.theme.acrylic && d2d,
                     );
                 }
             }
         }
-        let dpi = popup::window_dpi(self.hwnd);
+        // アンカー計画を先に確定し、DPI は「これから置く／留まる位置」のモニタから読む
+        // （候補窓・HUD と同じ理由 — 窓の現位置 DPI では混合DPIのモニタ越えで外枠と
+        // グリフの縮尺が1フレーム食い違う、UIバグ2）。Hold は位置不変なので現位置の
+        // DPI が正しい。Fallback の座標は harmless_anchor（前景窓照会）で、位置決め時の
+        // 再照会を避けるためここで確定させておく。
+        enum Target {
+            Move(CaretAnchor),
+            Hold,
+            Harmless(i32, i32),
+        }
+        // SetWindowPos/resize は WS_VISIBLE を触らないので、ここでの IsWindowVisible は
+        // 従来使っていた ShowWindow の戻り値（呼び出し前の可視状態）と同値。
+        let was_visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
+        let (target, dpi) = match plan_anchor(anchor, was_visible) {
+            // 巡3 P10: DPI 照会点は「窓を置く側」の y（caret_top があればその行）— y=rc.bottom
+            // は上モニタ最下行のとき境界点で MonitorFromPoint が下モニタへ帰属し、上側に置く窓を
+            // 下モニタの DPI で計算して混合DPIで食い違う（harmless_anchor の -1 退避と同根）。
+            AnchorPlan::Move(a) => {
+                let ay = a.caret_top.unwrap_or(a.y);
+                (Target::Move(a), popup::dpi_for_anchor(a.x, ay))
+            }
+            AnchorPlan::Hold => (Target::Hold, popup::window_dpi(self.hwnd)),
+            // 初回表示でアンカー取得失敗: 主モニタ左上 (200,200) ではなく、HUD と同じ
+            // 「作業領域右下の無害位置」へ劣化させる（UIバグ5 — ctx=Some+照会失敗経路の
+            // 左上残存と同じ不自然さをこの窓でも潰す）。
+            AnchorPlan::Fallback => {
+                let (hx, hy) = popup::harmless_anchor();
+                (Target::Harmless(hx, hy), popup::dpi_for_anchor(hx, hy))
+            }
+        };
         unsafe {
-            let Some(state) = monitor_state(self.hwnd) else { return };
+            let Some(state) = monitor_state(self.hwnd) else {
+                return;
+            };
             let font_px_f = font_size_px(state.theme.font_point_tenths, dpi);
             let font_px = font_px_f.ceil() as i32;
             // テキスト幅は描画と同一エンジンで実測（D2D=DWrite / GDI=GetTextExtentPoint32W）。
@@ -514,31 +588,42 @@ impl ReadingMonitor {
             } else {
                 measure_text_gdi(self.hwnd, state, dpi).unwrap_or(0)
             };
+            // 巡3 P10: クランプの照会点も同じ「窓を置く側」の y で統一（上記 DPI と同じ点）。
             let (w, h) = monitor_window_size(text_w, font_px, dpi, max_w);
             state.overflow = text_overflows(text_w, max_w);
-            // SetWindowPos/resize は WS_VISIBLE を触らないので、ここでの IsWindowVisible は
-            // 従来使っていた ShowWindow の戻り値（呼び出し前の可視状態）と同値。
-            let was_visible = IsWindowVisible(self.hwnd).as_bool();
-            // アンカー上側（caret_top の上に GAP 空けて）。caret_top 不明（既定座標劣化）は
+            // アンカー上側（caret_top の上に GAP 空けて）。caret_top 不明（無害位置劣化）は
             // アンカー位置へそのまま（下側）— そのときは実キャレットも不明なので上下の
-            // 使い分けに意味がない。place_on_monitor が作業領域内へクランプする
-            // （上端はみ出しは上端貼り付き。下へのフリップはしない — spec 位置決め）。
-            match plan_anchor(anchor, was_visible) {
-                AnchorPlan::Move(a) => {
+            // 使い分けに意味がない。クランプは**アンカーモニタの作業領域**で行う
+            // （place_on_monitor だと配置点のモニタに跨いでしまい、縦積み混合DPIで
+            // 着地モニタとサイズDPIが不一致する — 巡1検証 G1。候補窓の
+            // place_on_monitor_flipped と同じ「アンカー点基準」に統一）。
+            match target {
+                Target::Move(a) => {
                     let (dx, dy) = match a.caret_top {
                         Some(top) => (a.x, top - h - scale(GAP, dpi)),
                         None => (a.x, a.y),
                     };
-                    let (fx, fy) = popup::place_on_monitor(dx, dy, w, h);
-                    popup::set_popup_pos(self.hwnd, Some((fx, fy)), w, h);
+                    // クランプはアンカーモニタ（=窓を置く側）の作業領域で行う。fit_to_work_area は
+                    // 「窓が作業領域より広い」場合も (right-w).max(left) の二段クランプで
+                    // panic しない（i32::clamp の min>max panic を構造的に回避 — 巡2 A1。
+                    // popup.rs に幅超過テストあり。max_chars=100 等の合法設定で窓幅が
+                    // 作業領域幅を超えうるため、素の clamp は使えない）。
+                    match popup::work_area_at(a.x, a.caret_top.unwrap_or(a.y)) {
+                        Some(work) => {
+                            let (cx, cy) = popup::fit_to_work_area(dx, dy, w, h, work);
+                            popup::set_popup_pos(self.hwnd, Some((cx, cy)), w, h);
+                        }
+                        // モニタ情報が取れないときは配置希望点を素通し（候補窓の
+                        // place_on_monitor_flipped 失敗時と同じ劣化）。
+                        None => popup::set_popup_pos(self.hwnd, Some((dx, dy)), w, h),
+                    }
                 }
-                AnchorPlan::Hold => {
+                Target::Hold => {
                     // 位置は前回のまま、サイズだけ追従（読みは伸縮する）。
                     popup::set_popup_pos(self.hwnd, None, w, h);
                 }
-                AnchorPlan::Fallback => {
-                    let a = crate::text_service::DEFAULT_CARET_POS;
-                    let (fx, fy) = popup::place_on_monitor(a.x, a.y, w, h);
+                Target::Harmless(hx, hy) => {
+                    let (fx, fy) = popup::place_on_monitor(hx, hy, w, h);
                     popup::set_popup_pos(self.hwnd, Some((fx, fy)), w, h);
                 }
             }
@@ -557,8 +642,11 @@ impl ReadingMonitor {
             if let Some(s) = monitor_state(self.hwnd) {
                 s.last_size = (w, h);
             }
-            // 退場フェード中の再表示なら遅延 hide タイマを解除して表示を続行する。
-            let _ = KillTimer(Some(self.hwnd), FADE_TIMER_ID);
+            // 退場フェード中の再表示なら現在の世代タイマを解除して表示を続行する
+            // （旧世代のキュー済み発火は WM_TIMER 側の世代ID判定が切り捨てる）。
+            if let Some(s) = monitor_state(self.hwnd) {
+                s.backend.cancel_fade_timer(self.hwnd);
+            }
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             // 出現モーション（新規出現のみ短いフェード。表示中の打鍵更新は 1.0 へスナップ
             // ＝ちらつかない）。候補窓/HUD と共有の popup::play_entrance。
@@ -593,9 +681,12 @@ impl ReadingMonitor {
             match action {
                 popup::FadeOut::AlreadyFading => return,
                 popup::FadeOut::Fade(ms) => {
-                    // SetTimer 失敗を無視すると fading_out が立ったまま透明な TOPMOST 窓が
-                    // 残留する（HUD/候補窓と同じ理由）。失敗時は即時 hide へ劣化する。
-                    if SetTimer(Some(self.hwnd), FADE_TIMER_ID, ms, None) == 0 {
+                    // 世代ID付きで武装。失敗を無視すると fading_out が立ったまま透明な
+                    // TOPMOST 窓が残留する（HUD/候補窓と同じ理由）。失敗時は即時 hide へ劣化。
+                    let armed = monitor_state(self.hwnd)
+                        .map(|s| s.backend.arm_fade_timer(self.hwnd, ms))
+                        .unwrap_or(false);
+                    if !armed {
                         if let Some(s) = monitor_state(self.hwnd) {
                             s.backend.fading_out = false;
                         }
@@ -635,11 +726,17 @@ mod tests {
     #[test]
     fn consumed_reading_strips_remaining_as_suffix() {
         // 自動確定はエンジンが先頭文節の読みを消費する — 残りは全読みの末尾サフィックス。
-        assert_eq!(consumed_reading("きょうはてんき", "てんき"), Some("きょうは"));
+        assert_eq!(
+            consumed_reading("きょうはてんき", "てんき"),
+            Some("きょうは")
+        );
         // 全消費(remaining が空)は全体が消費分。
         assert_eq!(consumed_reading("きょうは", ""), Some("きょうは"));
         // 濁点・促音・小書きを含む読みでも文字列サフィックスとして剥がせる。
-        assert_eq!(consumed_reading("がっこうへいった", "へいった"), Some("がっこう"));
+        assert_eq!(
+            consumed_reading("がっこうへいった", "へいった"),
+            Some("がっこう")
+        );
         // サフィックス不成立(raw フォールバック等の不整合)は None — 呼び出し側がスキップ。
         assert_eq!(consumed_reading("kyouha", "てんき"), None);
     }
@@ -657,7 +754,10 @@ mod tests {
     #[test]
     fn compose_monitor_text_joins_and_trims_tail_priority() {
         // 通常: 連結のみ。
-        assert_eq!(compose_monitor_text("きょうは", "てんき", 64), "きょうはてんき");
+        assert_eq!(
+            compose_monitor_text("きょうは", "てんき", 64),
+            "きょうはてんき"
+        );
         // 累積 OFF 相当(committed 空)は current と等価 — OFF 時の現状挙動保証。
         assert_eq!(compose_monitor_text("", "てんき", 64), "てんき");
         // 上限超過は末尾優先で頭を落とす。
@@ -704,7 +804,11 @@ mod tests {
 
     #[test]
     fn plan_anchor_holds_position_when_rect_unavailable_but_visible() {
-        let a = CaretAnchor { x: 10, y: 20, caret_top: Some(5) };
+        let a = CaretAnchor {
+            x: 10,
+            y: 20,
+            caret_top: Some(5),
+        };
         // 矩形が取れたら移動。
         assert!(matches!(plan_anchor(Some(a), true), AnchorPlan::Move(_)));
         assert!(matches!(plan_anchor(Some(a), false), AnchorPlan::Move(_)));
@@ -719,7 +823,10 @@ mod tests {
         // 96DPI・フォント14px・テキスト100px: w=2+20+100=122, h=2+12+14=28。
         assert_eq!(monitor_window_size(100, 14, 96, 480), (122, 28));
         // 192DPI で pad が倍にスケール（テキスト実測幅・px上限は呼び出し側が実DPIで計算）。
-        assert_eq!(monitor_window_size(100, 28, 192, 960), (2 + 40 + 100, 2 + 24 + 28));
+        assert_eq!(
+            monitor_window_size(100, 28, 192, 960),
+            (2 + 40 + 100, 2 + 24 + 28)
+        );
         // 幅下限: 空文字相当でも最小幅を保つ（96DPI: 24px）。
         assert_eq!(monitor_window_size(0, 14, 96, 480).0, 2 + 20 + 24);
         // 幅上限: 巨大テキストは max_w_px でクランプ。

@@ -2,7 +2,7 @@
 //!
 //! TIP 本体（`TextService`）は STA・`!Send`（Rc/Cell/RefCell・COM）だが、`EngineClient` は
 //! `std::fs::File` を包むだけで `Send`。Tab 押下中は入力ロックで UI スレッドが IPC を出さない
-//! ので、接続を1本このワーカへ move して秒オーダのブロッキング呼び出しをさせ、結果だけを
+//! ので、接続1本このワーカへ move して秒オーダのブロッキング呼び出しをさせ、結果だけを
 //! 共有スロット（`Arc<Mutex>`）へ書き戻す。UI スレッドは別途ポーリングタイマでスロットを見る。
 //! **スレッド境界を越えるのは owned 値（`EngineClient`/`String`）のみ。**
 
@@ -30,6 +30,9 @@ pub type LlmSlot = Arc<Mutex<Option<LlmOutcome>>>;
 /// 既知の限界: `request_within` の期限は read 待ちにのみ効き、write は非有界のまま
 /// （client.rs の phase1 制約）。LlmConvert は小フレームで実際には write ブロックしないが、
 /// 期限が write 詰まりまで覆う保証は無い（監査 B3 と同根・レビュー M-1）。
+/// 巡3 P6: `std::thread::spawn` は OS のスレッド生成失敗で panic する — awaiting_llm=true 済みの
+/// 呼び出し側から panic されると poll timer 未武装のまま入力ロックが残るため、panic しない
+/// `Builder::spawn` の `io::Result` を返し、呼び出し側が abort へ劣化できるようにする。
 pub fn spawn_llm_worker(
     mut client: EngineClient,
     session: i64,
@@ -37,28 +40,40 @@ pub fn spawn_llm_worker(
     left_context: Option<String>,
     slot: LlmSlot,
     timeout: std::time::Duration,
-) {
-    std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + timeout;
-        let result: Result<String, String> = match client
-            .request_within(&Request::LlmConvert { session, seq, left_context }, deadline)
-        {
-            // エコーされた seq が一致する応答だけ採用する。接続は Tab 毎に再利用されるため、
-            // 前要求の未読フレームを読んでしまった場合（ストリーム desync）はここで弾き、
-            // Err にして接続を破棄＝次操作で貼り直す（誤った結果を確定させない）。
-            Ok(Response::LlmResult { seq: echoed, text }) if echoed == seq => Ok(text),
-            Ok(Response::LlmResult { seq: echoed, .. }) =>
-                Err(format!("seq mismatch: got {echoed}, want {seq}")),
-            Ok(Response::Error { message }) => Err(message),
-            Ok(other) => Err(format!("unexpected response: {other:?}")),
-            Err(e) => Err(format!("ipc error: {e}")),
-        };
-        // IPC 成功なら接続を返す。エラー（接続破損の可能性）なら返さない＝UIで drop_engine。
-        let client_back = if result.is_ok() { Some(client) } else { None };
-        if let Ok(mut g) = slot.lock() {
-            *g = Some(LlmOutcome { seq, result, client: client_back });
-        }
-    });
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + timeout;
+            let result: Result<String, String> = match client.request_within(
+                &Request::LlmConvert {
+                    session,
+                    seq,
+                    left_context,
+                },
+                deadline,
+            ) {
+                // エコーされた seq が一致する応答だけ採用する。接続は Tab 毎に再利用されるため、
+                // 前要求の未読フレームを読んでしまった場合（ストリーム desync）はここで弾き、
+                // Err にして接続を破棄＝次操作で貼り直す（誤った結果を確定させない）。
+                Ok(Response::LlmResult { seq: echoed, text }) if echoed == seq => Ok(text),
+                Ok(Response::LlmResult { seq: echoed, .. }) => {
+                    Err(format!("seq mismatch: got {echoed}, want {seq}"))
+                }
+                Ok(Response::Error { message }) => Err(message),
+                Ok(other) => Err(format!("unexpected response: {other:?}")),
+                Err(e) => Err(format!("ipc error: {e}")),
+            };
+            // IPC 成功なら接続を返す。エラー（接続破損の可能性）なら返さない＝UIで drop_engine。
+            let client_back = if result.is_ok() { Some(client) } else { None };
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(LlmOutcome {
+                    seq,
+                    result,
+                    client: client_back,
+                });
+            }
+        })
+        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -67,7 +82,11 @@ mod tests {
     #[test]
     fn slot_holds_outcome() {
         let slot: LlmSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
-        *slot.lock().unwrap() = Some(LlmOutcome { seq: 1, result: Ok("x".into()), client: None });
+        *slot.lock().unwrap() = Some(LlmOutcome {
+            seq: 1,
+            result: Ok("x".into()),
+            client: None,
+        });
         let taken = slot.lock().unwrap().take();
         assert!(matches!(taken, Some(LlmOutcome { seq: 1, .. })));
     }
@@ -119,7 +138,8 @@ mod tests {
             let client = EngineClient::connect_to(&name, Duration::from_secs(1)).expect("connect");
 
             let slot: LlmSlot = Arc::new(Mutex::new(None));
-            spawn_llm_worker(client, 7, 3, None, slot.clone(), Duration::from_millis(200));
+            // 巡3 P6: io::Result 返却化に伴う戻り値の明示的破棄（生成失敗はテスト対象外）。
+            let _ = spawn_llm_worker(client, 7, 3, None, slot.clone(), Duration::from_millis(200));
 
             // 5秒以内に必ず outcome が書かれること（旧実装ならここで永久に来ない）。
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -127,15 +147,25 @@ mod tests {
                 if let Some(o) = slot.lock().unwrap().take() {
                     break o;
                 }
-                assert!(Instant::now() < deadline, "worker never posted outcome (unbounded block)");
+                assert!(
+                    Instant::now() < deadline,
+                    "worker never posted outcome (unbounded block)"
+                );
                 std::thread::sleep(Duration::from_millis(10));
             };
             unsafe {
                 let _ = CloseHandle(server);
             }
             assert_eq!(outcome.seq, 3);
-            assert!(outcome.result.is_err(), "expected error, got {:?}", outcome.result);
-            assert!(outcome.client.is_none(), "timed-out connection must not be returned");
+            assert!(
+                outcome.result.is_err(),
+                "expected error, got {:?}",
+                outcome.result
+            );
+            assert!(
+                outcome.client.is_none(),
+                "timed-out connection must not be returned"
+            );
         }
     }
 }

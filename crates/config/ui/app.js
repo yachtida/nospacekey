@@ -1,3 +1,13 @@
+import {
+  clearLearningSuccessMessage,
+  bindDefaultSettingsHandler,
+  mergePersistedAutomaticCheckFields,
+  reconcileDefaultSettingsResponse,
+  reconcileLateAutomaticCheckFields,
+  reconcilePromptDismissal,
+  rollbackAutomaticCheckFields,
+} from "./app-state.mjs";
+
 // nospacekey 設定 UI。state = SettingsDto（snake_case、Rust 側 logic.rs と同名キー）。
 "use strict";
 const { invoke } = window.__TAURI__.core;
@@ -8,6 +18,16 @@ const tauriConfirm = window.__TAURI__.dialog.confirm;
 let state = null;    // 編集中の SettingsDto
 let baseline = null; // 最終ロード/適用時点のスナップショット（dirty 判定・鍵クリア検出用）
 let dirty = false;
+// Startup reconciliation runs after setup returns.  The event listener is
+// installed before the first get_settings call; an early event is coalesced
+// until the initial state/baseline and DOM exist.
+let startupReconcileInitialReady = false;
+let startupReconcilePending = false;
+let reconcileRefreshInFlight = false;
+let reconcileRefreshQueued = false;
+let reconcileRefreshEpoch = 0;
+let corruptRecoveryNoticeShown = false;
+let drainQueuedReconcileRefresh = () => {};
 
 // ---- 小物 ----
 function getByPath(obj, path) {
@@ -52,6 +72,7 @@ function toast(message, isError = false) {
   }, isError ? 5000 : 2500);
 }
 function markDirty() {
+  settingsEditEpoch++;
   dirty = true;
   document.getElementById("dirty-indicator").hidden = false;
 }
@@ -283,12 +304,14 @@ async function initSymbolGrid() {
   }
   document.getElementById("symbol-select-all").addEventListener("click", () => {
     state.symbol_full_width_chars = symbolCatalog.map((e) => e.half);
-    markDirty();
+    settingsEditEpoch++;
+    recomputeDirty();
     renderSymbolGrid();
   });
   document.getElementById("symbol-deselect-all").addEventListener("click", () => {
     state.symbol_full_width_chars = [];
-    markDirty();
+    settingsEditEpoch++;
+    recomputeDirty();
     renderSymbolGrid();
   });
   // bindInputs() の汎用ハンドラは appearance. パスのときしか副作用フックを呼ばない
@@ -306,7 +329,8 @@ function syncSymbolCharsFromGrid() {
     if (cb.checked) checked.add(cb.dataset.symbolHalf);
   });
   state.symbol_full_width_chars = symbolCatalog.filter((e) => checked.has(e.half)).map((e) => e.half);
-  markDirty();
+  settingsEditEpoch++;
+  recomputeDirty();
   renderSymbolGrid();
 }
 
@@ -335,12 +359,39 @@ function bindPaletteTabs() {
   });
   // 表示中のパレットだけを既定に戻す（spec: パレットごとのリセット）。
   document.getElementById("pal-reset").addEventListener("click", async () => {
+    // disabled は表示上の保護にすぎないため、合成 click も同じ排他域で拒否する。
+    if (settingsOperationBusy() || reconcileRefreshInFlight) return;
     const which = document.querySelector(".pal-tab.active").dataset.pal; // "light" | "dark"
-    const defaults = await invoke("get_default_settings");
-    state.appearance[`palette_${which}`] = defaults.appearance[`palette_${which}`];
-    markDirty();
-    renderAll();
-    toast(`${which === "light" ? "ライト" : "ダーク"}パレットを既定に戻しました（適用で保存）`);
+    const epoch = settingsEpoch;
+    const editEpoch = settingsEditEpoch;
+    defaultsInFlight = true;
+    syncBusyButtons();
+    try {
+      const defaults = await invoke("get_default_settings");
+      // フリーズまたは別の設定操作を跨いだ応答は破棄する。さらに reducer が、await 中の
+      // 後発ユーザー編集を世代で検出してパレットだけを黙って巻き戻さないようにする。
+      if (epoch !== settingsEpoch) return;
+      const reduced = reconcileDefaultSettingsResponse(
+        state,
+        defaults,
+        which,
+        editEpoch,
+        settingsEditEpoch,
+        defaultSettingsResponseBusy(),
+      );
+      if (!reduced.applied) return;
+      state = reduced.state;
+      // 巡3 Q10: 既定と同一の状態なら dirty を立てない — 無条件 markDirty() だと内容が
+      // 変わっていないのに閉じる確認が出る偽陽性になる。
+      recomputeDirty();
+      renderAll();
+      toast(`${which === "light" ? "ライト" : "ダーク"}パレットを既定に戻しました（適用で保存）`);
+    } catch (error) {
+      toast(`パレットの既定値を取得できませんでした: ${error}`, true);
+    } finally {
+      defaultsInFlight = false;
+      syncBusyButtons();
+    }
   });
 }
 // custom 注記の表示制御(外観変更フックに合流。Task 7 でプレビュー描画も同フックに入る)。
@@ -444,6 +495,7 @@ function bindInputs() {
       else if (el.type === "number") value = Number.isNaN(el.valueAsNumber) ? 0 : el.valueAsNumber;
       else value = el.value;
       setByPath(state, path, value);
+      if (path === "update_include_beta") invalidateUpdateCandidate();
       markDirty();
       // 同じパスに束縛された他要素（カラーピッカー⇔HEX欄）を同期する。
       document.querySelectorAll(`[data-bind="${CSS.escape(path)}"]`).forEach((peer) => {
@@ -462,11 +514,39 @@ function writeToElement(el, value) {
   } else el.value = value ?? "";
 }
 // state の値を全 data-bind 要素へ流し込む（ロード直後・既定に戻す後に呼ぶ）。
+function setAutomaticPromptVisible(visible) {
+  const prompt = document.getElementById("update-automatic-prompt");
+  if (!prompt) return;
+  prompt.classList.toggle("is-hidden", !visible);
+  prompt.setAttribute("aria-hidden", String(!visible));
+  prompt.toggleAttribute("inert", !visible);
+}
+
+function showCorruptRecoveryNotice() {
+  if (corruptRecoveryNoticeShown) return;
+  corruptRecoveryNoticeShown = true;
+  // Set the toast DOM first.  The append-only ledger is acknowledged only
+  // after the user-visible handoff has been placed in the DOM.
+  toast("設定ファイルが壊れていたため既定値で開きました（元ファイルは退避済み）", true);
+  void invoke("acknowledge_corrupt_recovery_notices").catch(() => {});
+}
+
+async function registerStartupReconcileListener() {
+  await listen("startup-reconcile-complete", () => {
+    if (!startupReconcileInitialReady || !state || !baseline) {
+      startupReconcilePending = true;
+      return;
+    }
+    queueStartupReconcileRefresh();
+  });
+}
+
 function renderAll() {
   document.querySelectorAll("[data-bind]").forEach((el) => {
     writeToElement(el, getByPath(state, el.dataset.bind));
   });
   window.onAppearanceChanged();
+  if (state) setAutomaticPromptVisible(!state.update_automatic_check_prompt_dismissed);
 }
 
 // 注: ラジオも上の汎用ハンドラで動く（input はチェックされたラジオでのみ発火し、
@@ -475,10 +555,17 @@ function renderAll() {
 // ---- 検証エラー表示 ----
 function clearFieldErrors() {
   document.querySelectorAll("[data-error-for]").forEach((el) => (el.textContent = ""));
+  const taskStatus = document.getElementById("update-task-status");
+  if (taskStatus) taskStatus.textContent = "";
 }
 function showFieldErrors(errors) {
   for (const err of errors) {
     if (err.field === "_io") { toast(err.message, true); continue; }
+    if (err.field === "update_automatic_check") {
+      const taskStatus = document.getElementById("update-task-status");
+      if (taskStatus) taskStatus.textContent = err.message;
+      continue;
+    }
     const slot = document.querySelector(`[data-error-for="${CSS.escape(err.field)}"]`);
     if (slot) slot.textContent = err.message;
     else toast(err.message, true); // 表示先がないエラーはトーストに逃がす
@@ -486,24 +573,233 @@ function showFieldErrors(errors) {
 }
 
 // ---- 適用/閉じる ----
+// 適用と Zenzai DL は settings.json への書き込み側で互いに排他 — 片方の await 中に
+// もう片方を始められると last-writer-wins で相手の成果を黙って上書きしうる（巡2 C1）。
+// 両ハンドラで共有ビジーフラグを立て、ボタン状態は必ずこの同期関数経由で戻す
+// （各ハンドラが finally で disabled=false を書き合うと相手の保護を解除してしまう）。
+// アップデートもこの排他域に参加する: インストーラはプロセスを taskkill するため、
+// DL 中に書かれた設定の運命が不定になる（「適用しました」が taskkill で消えうる）。
+let applyInFlight = false;
+let dlInFlight = false;
+let updateInFlight = false;
+let clearInFlight = false;
+let promptDismissInFlight = false;
+// get_default_settings also replaces the complete in-memory DTO.  Keep it in
+// the same busy domain as apply/update/reconciliation so its await cannot
+// race a settings write or a late startup refresh.
+let defaultsInFlight = false;
+// 更新確認(check_for_update)の予約。確認の await 中に適用などが完了すると、その finally が
+// syncBusyButtons を呼ぶ — 各ボタンは必ずここを経由して戻すため、確認飛行中の再有効化
+// (確認の二重開始・適用/DL/インストールの並走)を防ぐにはこのフラグを busy 計算に
+// 含める必要がある。
+let checkInFlight = false;
+// bindInputs/about-defaults から、bindUpdateCheck が保持する候補を無効化するための seam。
+// 初期化前は no-op、bindUpdateCheck 後は現在の候補だけを破棄する。
+let invalidateUpdateCandidate = () => {};
+// Protocol intents are queued while an existing settings/update operation owns
+// the UI. The queue is drained by syncBusyButtons after that operation ends.
+let drainQueuedUpdateIntent = () => {};
+// インストーラ起動済みフラグ。bindUpdateCheck と performClose の両方から参照するため
+// モジュールスコープに置く(起動後は destroy 再試行以外の全操作を封じ続ける — 巡2 C3)。
+let installerLaunched = false;
+
+function settingsOperationBusy() {
+  return applyInFlight || dlInFlight || updateInFlight || clearInFlight ||
+    installerLaunched || checkInFlight || defaultsInFlight || promptDismissInFlight;
+}
+
+// A default response must ignore every other operation, but not its own
+// defaultsInFlight flag.  The start guard already prevents a second default
+// operation; this predicate protects the await boundary and synthetic events.
+function defaultSettingsResponseBusy() {
+  return applyInFlight || dlInFlight || updateInFlight || clearInFlight ||
+    installerLaunched || checkInFlight || reconcileRefreshInFlight || promptDismissInFlight;
+}
+
+function syncBusyButtons() {
+  const applyBtn = document.getElementById("apply-btn");
+  const dlBtn = document.getElementById("zenzai-download");
+  const updateBtn = document.getElementById("update-install");
+  const checkBtn = document.getElementById("about-check-update");
+  const clearBtn = document.getElementById("btn-clear-learning");
+  const promptDismissBtn = document.getElementById("update-prompt-dismiss");
+  const defaultsBtn = document.getElementById("about-defaults");
+  const paletteResetBtn = document.getElementById("pal-reset");
+  const automatic = document.querySelector('[data-bind="update_automatic_check"]');
+  // installerLaunched 後は updateInFlight が true のまま残る(封止維持)ため busy に数える。
+  // これで各ハンドラの finally syncBusyButtons が意図せず封止を解除しない。
+  // checkInFlight も busy に数える: 確認の await 中に完了する操作の finally がここを
+  // 呼んでも Apply/DL/インストールが有効に戻らない(確認中の並走書き込みを封じる)。
+  const anyBusy = settingsOperationBusy() || reconcileRefreshInFlight;
+  applyBtn.disabled = anyBusy;
+  if (dlBtn) dlBtn.disabled = anyBusy;
+  // 逆方向（適用/DL 飛行中にアップデートを始めさせない）もボタン状態で示す。
+  // ハンドラ側ガードと二重 — 片方だけだと表示タイミングの隙間が残る。
+  if (updateBtn) updateBtn.disabled = anyBusy;
+  // 更新確認ボタンも同じ排他域に参加: 適用/DL/アップデート予約中の確認開始を封じる
+  // (応答側の検査と二重 — 片方だけだと await の隙間が残る)。確認自身の飛行中
+  // (checkInFlight)は anyBusy に含まれるため、同じ計算で足りる。
+  if (checkBtn) checkBtn.disabled = anyBusy;
+  // 学習消去は engine の serviceLock/停止状態を操作するため、モデルDL・更新と同じ排他域。
+  if (clearBtn) clearBtn.disabled = anyBusy;
+  if (promptDismissBtn) promptDismissBtn.disabled = anyBusy;
+  if (defaultsBtn) defaultsBtn.disabled = anyBusy;
+  if (paletteResetBtn) paletteResetBtn.disabled = anyBusy;
+  // The automatic-check toggle participates in apply_settings' task
+  // registration/removal transaction. Keep it disabled for the whole async
+  // operation so a second click cannot race that transaction.
+  if (automatic) automatic.disabled = anyBusy;
+  drainQueuedUpdateIntent();
+  drainQueuedReconcileRefresh();
+}
+
+function queueStartupReconcileRefresh() {
+  if (!startupReconcileInitialReady || !state || !baseline) {
+    startupReconcilePending = true;
+    return;
+  }
+  if (reconcileRefreshInFlight || settingsOperationBusy()) {
+    reconcileRefreshQueued = true;
+    return;
+  }
+  reconcileRefreshQueued = false;
+  void refreshStartupReconcile();
+}
+
+async function refreshStartupReconcile() {
+  if (!startupReconcileInitialReady || !state || !baseline) {
+    startupReconcilePending = true;
+    return;
+  }
+  if (settingsOperationBusy()) {
+    reconcileRefreshQueued = true;
+    return;
+  }
+  reconcileRefreshInFlight = true;
+  reconcileRefreshQueued = false;
+  const epoch = ++reconcileRefreshEpoch;
+  syncBusyButtons();
+  try {
+    const r = await invoke("get_settings");
+    // A settings operation may have started while get_settings was in flight.
+    // Do not overwrite that edit; let its finally drain one coalesced refresh.
+    if (epoch !== reconcileRefreshEpoch || settingsOperationBusy()) {
+      reconcileRefreshQueued = true;
+      return;
+    }
+    // The response represents the only startup worker generation; duplicate
+    // completion notifications coalesced while it was in flight are now
+    // satisfied by this same disk snapshot.
+    reconcileRefreshQueued = false;
+    const reduced = reconcileLateAutomaticCheckFields(state, baseline, r.dto);
+    state = reduced.state;
+    baseline = reduced.baseline;
+    const taskStatus = document.getElementById("update-task-status");
+    if (taskStatus) taskStatus.textContent = r.update_task_error || "";
+    recomputeDirty();
+    renderAll();
+    renderKeymapValues();
+    renderSymbolGrid();
+    if (r.corrupt_recovered) showCorruptRecoveryNotice();
+  } catch (error) {
+    if (epoch === reconcileRefreshEpoch && !settingsOperationBusy()) {
+      toast(`起動時の設定更新確認を再読込できませんでした: ${error}`, true);
+    } else {
+      reconcileRefreshQueued = true;
+    }
+  } finally {
+    if (epoch === reconcileRefreshEpoch) reconcileRefreshInFlight = false;
+    syncBusyButtons();
+  }
+}
+
+drainQueuedReconcileRefresh = () => {
+  if (!reconcileRefreshQueued || reconcileRefreshInFlight ||
+      settingsOperationBusy() || !startupReconcileInitialReady) return;
+  reconcileRefreshQueued = false;
+  void refreshStartupReconcile();
+};
+
+// アップデートの開始(破棄確認の待機を含む)から DL/インストール中までは、設定を変える全
+// コントロールを凍結する。DL は長引きうる上、インストーラ起動でプロセスが taskkill される
+// ため、この間に新しく作られた未適用編集は確実に失われる — 凍結して作らせない。対象は
+// state/dirty を触る経路のみ（辞書は settings.json と dirty に無関係なので通常操作のまま）。
+// 適用/Zenzai DL ボタンは syncBusyButtons の管轄なのでここに入れない。解除は
+// 凍結前の disabled に戻す — 単純に false を書くと、凍結前に無効だった要素を
+// 勝手に有効化しうる。
+let updateFreeze = null;
+// 設定変更の世代(epoch)。フリーズ開始で増やす。パレット戻し/全設定戻しは await
+// (get_default_settings)を挟むため、フリーズ前に始まっても応答がフリーズ後や更新飛行中に
+// 届きうる — その場合 state・dirty・描画を触らせない(凍結の不変条件「この間に未適用編集を
+// 作らせない」を await の隙間越しに守る)。
+let settingsEpoch = 0;
+// Unlike settingsEpoch (which advances for update-control freezing), this
+// generation advances only for user edits.  Programmatic render/reconcile and
+// default application deliberately leave it unchanged.
+let settingsEditEpoch = 0;
+function freezeSettingsControls() {
+  settingsEpoch++; // フリーズ前に始まったリセット系 await の応答を無効化する
+  const targets = new Set(document.querySelectorAll(
+    "[data-bind], [data-keymap-record], [data-keymap-none], [data-keymap-default], " +
+    "[data-keymap-toggle], #symbol-grid input, #symbol-select-all, #symbol-deselect-all, " +
+    "#pal-reset, #e-weight-browse, #about-defaults, #update-prompt-dismiss"));
+  updateFreeze = [...targets].map((el) => ({ el, was: el.disabled }));
+  for (const { el } of updateFreeze) el.disabled = true;
+}
+function unfreezeSettingsControls() {
+  if (!updateFreeze) return;
+  for (const { el, was } of updateFreeze) el.disabled = was;
+  updateFreeze = null;
+}
+
 async function applyNow() {
+  if (settingsOperationBusy() || reconcileRefreshInFlight) return; // ボタン無効化と同じ排他のハンドラ側ガード
   clearFieldErrors();
   // 鍵クリアの確認: 元は設定済み（プレースホルダ表示）だったのに空にされたときだけ。
-  const hadKey = baseline.api_key_input !== "";
-  if (hadKey && state.api_key_input.trim() === "") {
-    const yes = await tauriConfirm(
-      "保存済みの API キーを削除します。よろしいですか？\n（キャンセルすると適用を中止します）",
-      { title: "APIキーの削除", kind: "warning" }
-    );
-    if (!yes) return;
-  }
+  const needKeyConfirm = baseline.api_key_input !== "" && state.api_key_input.trim() === "";
+  // 確認ダイアログは webview を止めないため、tauriConfirm の待機中に Zenzai DL・アップデート
+  // を始めさせないよう、確認に入る前に適用予約を立ててボタンを同期する。キャンセル・例外を
+  // 含めて try/finally で必ず解除する — 確認中から排他を主張するのがこの修正の本体。
+  applyInFlight = true;
+  syncBusyButtons();
   try {
-    await invoke("apply_settings", { dto: state });
+    if (needKeyConfirm) {
+      const yes = await tauriConfirm(
+        "保存済みの API キーを削除します。よろしいですか？\n（キャンセルすると適用を中止します）",
+        { title: "APIキーの削除", kind: "warning" }
+      );
+      if (!yes) return;
+      // 承認後の競合防御: 予約を握っている間に他操作が始まる構造はないが、送出直前にもう
+      // 一度排他を検査してから apply_settings を一度だけ送る。
+      if (dlInFlight || updateInFlight || clearInFlight || defaultsInFlight ||
+          installerLaunched || reconcileRefreshInFlight) return;
+    }
+    // コマンドの async 化で適用中も UI が生きるようになったため、適用中にユーザーが
+    // 編集した内容を完了後の再ロードで黙って捨てないよう、送出時点のスナップショットを
+    // 取る（同期コマンド時代は UI ブロックで構造的に起きなかった競合）。
+    const applying = structuredClone(state);
+    await invoke("apply_settings", { dto: applying });
     // 鍵表示を正規化するため再ロード（新規入力→プレースホルダ表示に変わる）。
     const r = await invoke("get_settings");
-    state = r.dto;
-    baseline = structuredClone(state);
-    clearDirty();
+    const taskStatus = document.getElementById("update-task-status");
+    if (taskStatus) taskStatus.textContent = r.update_task_error || "";
+    baseline = structuredClone(r.dto);
+    if (JSON.stringify(state) !== JSON.stringify(applying)) {
+      // 適用中にユーザー編集があった — state は保持して未適用の変更として残す。
+      // backend-owned fields can be normalized by a post-save task failure;
+      // merge those two fields while retaining every concurrent user edit.
+      state = mergePersistedAutomaticCheckFields(state, r.dto);
+      // api_key_input は「適用中に触られていない」場合だけ正規化（新規入力値のままだと
+      // 次回適用で再暗号化されるため）。触られていればユーザー値（削除意図の空欄や
+      // 「既定に戻す」によるクリア含む）を優先し、黙って戻さない（巡2 C2）。
+      if (state.api_key_input === applying.api_key_input) {
+        state.api_key_input = r.dto.api_key_input;
+      }
+      recomputeDirty();
+    } else {
+      state = r.dto;
+      clearDirty();
+    }
     renderAll();
     renderKeymapValues();
     renderSymbolGrid();
@@ -516,6 +812,22 @@ async function applyNow() {
   } catch (errors) {
     if (Array.isArray(errors)) showFieldErrors(errors);
     else toast(String(errors), true);
+    // A registration/save failure is reported before the post-save reload.
+    // Scheduler run failures are instead returned as Ok after the backend has
+    // persisted the safe OFF state, so that path is reconciled above.
+    const automaticTransactionFailed = Array.isArray(errors) && errors.some((error) =>
+      error.field === "update_automatic_check" || error.field === "_io");
+    if (automaticTransactionFailed) {
+      // Registration/save failures leave the disk baseline authoritative for
+      // both backend-owned fields. Keep every unrelated edit dirty so retrying
+      // Apply does not discard work made while the request was in flight.
+      state = rollbackAutomaticCheckFields(state, baseline);
+      renderAll();
+      recomputeDirty();
+    }
+  } finally {
+    applyInFlight = false;
+    syncBusyButtons();
   }
 }
 
@@ -529,6 +841,10 @@ async function confirmDiscardIfDirty() {
 
 // ---- ナビ ----
 function bindNav() {
+  window.openConfigPage = (page) => {
+    const btn = document.querySelector(`.nav-item[data-page="${CSS.escape(page)}"]`);
+    if (btn) btn.click();
+  };
   document.querySelectorAll(".nav-item").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".nav-item").forEach((b) => b.classList.remove("active"));
@@ -563,10 +879,10 @@ function bindZenzaiDownload() {
   const bar = document.getElementById("zenzai-download-progress");
   const status = document.getElementById("zenzai-download-status");
 
-  const applyBtn = document.getElementById("apply-btn");
   btn.addEventListener("click", async () => {
-    btn.disabled = true;
-    applyBtn.disabled = true; // DL 中の apply_settings による設定の相互上書きを防ぐ
+    if (settingsOperationBusy() || reconcileRefreshInFlight) return; // ボタン無効化と同じ排他のハンドラ側ガード
+    dlInFlight = true;
+    syncBusyButtons(); // DL 中の apply_settings による設定の相互上書きを防ぐ（共有フラグ）
     cancelBtn.hidden = false;
     bar.hidden = false;
     bar.removeAttribute("value"); // 最初の進捗が来るまで不定表示
@@ -574,11 +890,20 @@ function bindZenzaiDownload() {
     try {
       const msg = await invoke("download_zenzai_model");
       status.textContent = msg;
-      // Rust 側が settings.json を直接更新済み。未適用の他項目を潰さないよう、zenzai の
-      // 2 項目だけ state/baseline に反映し dirty を再計算する（この 2 項目は dirty 扱いにしない）。
+      // Rust 側が settings.json を直接更新済み。baseline は常にディスクの真へ反映
+      // （この 2 項目は dirty 扞いにしない）。state 側は**未適用編集が無い**ときだけ自動反映。
+      // 巡4 B1: 判定基準は baseline（DL 開始時の state ではない）— DL 前から未適用だった
+      // 編集（state≠baseline）は黙って置換せず dirty として残す。DL 中は apply が dlInFlight
+      // で封じられるため baseline は DL 中不変=開始時と同一。
+      // 既知の限界: 「編集して最終的に baseline 値へ戻した」ケースは未編集と原理的に区別
+      // できない（中間値履歴が無い）— その場合の置換は renderAll+toast で即座に可視化される。
       const st = await invoke("zenzai_model_status");
-      state.zenzai_enabled = true;
-      state.weight_path = st.path;
+      if (state.zenzai_enabled === baseline.zenzai_enabled) {
+        state.zenzai_enabled = true;
+      }
+      if (state.weight_path === baseline.weight_path) {
+        state.weight_path = st.path;
+      }
       baseline.zenzai_enabled = true;
       baseline.weight_path = st.path;
       renderAll();
@@ -586,11 +911,17 @@ function bindZenzaiDownload() {
       await refreshZenzaiStatus();
       toast("Zenzai モデルを導入しました");
     } catch (e) {
-      status.textContent = `失敗: ${e}`;
-      toast(String(e), true);
+      // 巡4 B2: キャンセルは失敗扱いにしない（アップデータと同じ規律）。
+      const msg = String(e);
+      if (msg.includes("キャンセルしました")) {
+        status.textContent = "ダウンロードをキャンセルしました。";
+      } else {
+        status.textContent = `失敗: ${msg}`;
+        toast(msg, true);
+      }
     } finally {
-      btn.disabled = false;
-      applyBtn.disabled = false;
+      dlInFlight = false;
+      syncBusyButtons();
       cancelBtn.hidden = true;
       bar.hidden = true;
     }
@@ -629,67 +960,275 @@ function bindUpdateCheck() {
   const cancelBtn = document.getElementById("update-cancel");
   const dlStatus = document.getElementById("update-dl-status");
   const progress = document.getElementById("update-progress");
+  const automatic = document.querySelector('[data-bind="update_automatic_check"]');
+  const promptDismiss = document.getElementById("update-prompt-dismiss");
+  if (promptDismiss) promptDismiss.addEventListener("click", async () => {
+    if (settingsOperationBusy() || reconcileRefreshInFlight) return;
+    promptDismissInFlight = true;
+    syncBusyButtons();
+    state.update_automatic_check_prompt_dismissed = true;
+    setAutomaticPromptVisible(false);
+    try {
+      await invoke("dismiss_automatic_check_prompt");
+      const reduced = reconcilePromptDismissal(state, baseline, true);
+      state = reduced.state;
+      baseline = reduced.baseline;
+      renderAll();
+      recomputeDirty();
+    } catch (error) {
+      const reduced = reconcilePromptDismissal(state, baseline, false);
+      state = reduced.state;
+      baseline = reduced.baseline;
+      renderAll();
+      recomputeDirty();
+      toast(String(error), true);
+    } finally {
+      promptDismissInFlight = false;
+      syncBusyButtons();
+    }
+  });
+  if (automatic) automatic.addEventListener("change", () => {
+    if (automatic.checked) {
+      state.update_automatic_check_prompt_dismissed = true;
+      setAutomaticPromptVisible(false);
+      markDirty();
+    }
+  });
+  let queuedUpdateIntent = false;
+  let consumingUpdateIntent = false;
+  let consumeUpdateIntentAgain = false;
+  const isUpdateBusy = () => applyInFlight || dlInFlight || updateInFlight || clearInFlight ||
+    installerLaunched || checkInFlight || defaultsInFlight || promptDismissInFlight ||
+    reconcileRefreshInFlight;
+  const openUpdatePage = () => {
+    if (window.openConfigPage) window.openConfigPage("about");
+    const card = document.getElementById("update-card");
+    if (card) {
+      const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      card.scrollIntoView({ block: "center", behavior: reducedMotion ? "auto" : "smooth" });
+      card.focus({ preventScroll: true });
+    }
+    // Protocol activation only opens the existing check flow. It never starts
+    // download/install automatically.
+    checkBtn.click();
+  };
+  const drainUpdateIntent = () => {
+    if (!queuedUpdateIntent || consumingUpdateIntent || isUpdateBusy()) return;
+    queuedUpdateIntent = false;
+    openUpdatePage();
+  };
+  drainQueuedUpdateIntent = drainUpdateIntent;
+  const consumeUpdateIntent = async () => {
+    if (consumingUpdateIntent) {
+      consumeUpdateIntentAgain = true;
+      return;
+    }
+    consumingUpdateIntent = true;
+    try {
+      if (await invoke("consume_update_intent")) queuedUpdateIntent = true;
+    } catch (_) {
+      // A transient activation-consume failure must not fabricate an update.
+    } finally {
+      consumingUpdateIntent = false;
+      drainUpdateIntent();
+      if (consumeUpdateIntentAgain) {
+        consumeUpdateIntentAgain = false;
+        void consumeUpdateIntent();
+      }
+    }
+  };
+  // Register first, then consume cold-start state. Warm events consume their
+  // backend flag too, so an event cannot be lost while the UI is busy.
+  listen("open-update", () => { void consumeUpdateIntent(); })
+    .then(() => consumeUpdateIntent())
+    .catch(() => {});
   // 最後に確認した Available 情報。ダウンロード時に URL/期待ハッシュを使い回す（再取得のレース回避）。
   let pending = null;
+  // pending を取得したときのチャンネル。現在設定と一致する候補だけを起動できる。
+  let pendingIncludeBeta = null;
+  // 確認の世代カウンタ — 予約(checkInFlight)で二重開始は封じるが、それでも並走が起きた
+  // 場合に、古い確認の応答・catch・finally が新しい確認の pending・表示・ボタンを上書き
+  // しないための所有権(dictListGen と同型)。
+  let checkGen = 0;
 
   function resetDl() {
+    pending = null;
+    pendingIncludeBeta = null;
     installBtn.hidden = true;
     cancelBtn.hidden = true;
     progress.hidden = true;
     progress.removeAttribute("value");
     dlStatus.textContent = "";
+    // 巡4 B4(b): 前回の結果表示も初期化 — インストール再試行経路で「アップデートに失敗
+    // しました: …」（キャンセル含む）が DL 中も残り続けるのを防ぐ。
+    status.textContent = "";
+    status.className = "hint";
   }
 
+  invalidateUpdateCandidate = () => {
+    if (!pending && !checkInFlight) return;
+    pending = null;
+    pendingIncludeBeta = null;
+    installBtn.hidden = true;
+    cancelBtn.hidden = true;
+    progress.hidden = true;
+    progress.removeAttribute("value");
+    dlStatus.textContent = "";
+    status.textContent = "更新チャンネルが変更されました。もう一度確認してください";
+    status.className = "hint";
+  };
+
   checkBtn.addEventListener("click", async () => {
-    checkBtn.disabled = true;
+    // 巡2 C3: インストーラ起動済みなら再確認で Available を引き直し、二重起動経路を
+    // 復活させない（destroy 失敗で窓が生き残った場合の迂回路封じ）。
+    if (installerLaunched) return;
+    // 適用/DL/アップデートの予約中は確認を始めない。開始時と応答時の両側で検査するのは、
+    // 確認の await 中にそれらが始まった場合、遅れて届いた応答が DL 中の pending・進捗・
+    // キャンセル UI を上書きするのを防ぐため。確認自身の再入もここで封じる(ボタン無効化と
+    // 同じ排他のハンドラ側ガードと二重)。
+    if (settingsOperationBusy() || reconcileRefreshInFlight) return;
+    const gen = ++checkGen;
+    // await の前に予約を立てる: 確認中に完了する適用などの finally syncBusyButtons でも
+    // 確認ボタンが有効に戻らない。解除は自分の世代の finally だけが行う。
+    checkInFlight = true;
+    syncBusyButtons();
     resetDl();
     status.textContent = "確認中…";
     status.className = "hint";
     try {
-      const r = await invoke("check_for_update", { includeBeta: state.update_include_beta });
+      const requestedIncludeBeta = Boolean(state.update_include_beta);
+      const r = await invoke("check_for_update", { includeBeta: requestedIncludeBeta });
+      if (gen !== checkGen || applyInFlight || dlInFlight || updateInFlight || clearInFlight ||
+          defaultsInFlight || promptDismissInFlight || installerLaunched || reconcileRefreshInFlight) {
+        // 遅延応答は破棄。自分の「確認中…」だけ後始末する(より新しい確認や他操作が表示を
+        // 管理中なら触らない)。
+        if (gen === checkGen && status.textContent === "確認中…") status.textContent = "";
+        return;
+      }
+      if (requestedIncludeBeta !== Boolean(state.update_include_beta)) {
+        pending = null;
+        pendingIncludeBeta = null;
+        installBtn.hidden = true;
+        status.textContent = "更新チャンネルが変更されました。もう一度確認してください";
+        status.className = "hint";
+        return;
+      }
       if (r.kind === "UpToDate") {
         status.textContent = `最新バージョンです（v${r.current}）`;
         status.className = "hint update-status-ok";
         pending = null;
+        pendingIncludeBeta = null;
       } else {
         pending = r;
+        pendingIncludeBeta = requestedIncludeBeta;
         status.textContent = `新しいバージョン v${r.latest} が利用できます（現在 v${r.current}）`;
         status.className = "hint";
         installBtn.hidden = false;
+        syncBusyButtons(); // 表示と同時に排他を disabled へ反映 — 適用/DL 飛行中なら無効のまま出す
       }
     } catch (e) {
+      if (gen !== checkGen || applyInFlight || dlInFlight || updateInFlight || clearInFlight ||
+          defaultsInFlight || promptDismissInFlight || installerLaunched || reconcileRefreshInFlight) {
+        // 破棄されるエラーでも、自分の世代が置いた「確認中…」だけは後始末する
+        // (放置すると busy 表示が永久に残る)。より新しい世代の表示は触らない。
+        if (gen === checkGen && status.textContent === "確認中…") status.textContent = "";
+        return;
+      }
       status.textContent = `確認できませんでした: ${e}`;
       status.className = "hint update-status-err";
       pending = null;
+      pendingIncludeBeta = null;
     } finally {
-      checkBtn.disabled = false;
+      // 予約の解除は最新世代の確認だけ — 古い確認の finally が新しい確認の封止を解かない。
+      // busy 中は syncBusyButtons が封止を維持する(installerLaunched 含む)。
+      // 待機中に他操作が始まっていなければ、ここで確認ボタンが有効に戻る。
+      if (gen === checkGen) checkInFlight = false;
+      syncBusyButtons();
     }
   });
 
   installBtn.addEventListener("click", async () => {
     if (!pending) return;
-    installBtn.hidden = true;
-    checkBtn.disabled = true;
-    cancelBtn.hidden = false;
-    progress.hidden = false;
-    progress.removeAttribute("value");
-    dlStatus.textContent = "ダウンロード中…";
+    if (pendingIncludeBeta !== Boolean(state.update_include_beta)) {
+      invalidateUpdateCandidate();
+      return;
+    }
+    // 再入と、適用/Zenzai DL 飛行中の開始を拒否（ボタン無効化と同じ排他のハンドラ側ガード）。
+    if (settingsOperationBusy() || reconcileRefreshInFlight) return;
+    // 確認ダイアログの待機中に候補が差し替わらないよう、クリック時点の Available 情報を
+    // 世代固定する。承認後に pending が同一世代であることを検証してから URL/ハッシュを使う。
+    const selected = pending;
+    const selectedIncludeBeta = pendingIncludeBeta;
+    // 破棄確認の待機中も排他域: 予約を先に立てて check・適用・DL・二重 install を封じ、
+    // 設定コントロールも凍結する(確認中の編集で「破棄」承認の意味が変わるのを防ぐ)。
+    updateInFlight = true;
+    syncBusyButtons();
+    freezeSettingsControls();
     try {
+      // インストーラはプロセスを taskkill する — 窓を閉じるのと同義なので、未適用編集の
+      // 破棄をここで確認する。
+      if (!(await confirmDiscardIfDirty())) return;
+      // 確認中に候補が差し替わっていたら今回の起動は行わない — 新しい候補で選び直させる。
+      if (pending !== selected || pendingIncludeBeta !== selectedIncludeBeta ||
+          selectedIncludeBeta !== Boolean(state.update_include_beta)) {
+        invalidateUpdateCandidate();
+        return;
+      }
+      // 承認後の競合防御(確認ダイアログは webview を止めない)。
+      if (applyInFlight || dlInFlight || clearInFlight || defaultsInFlight || promptDismissInFlight ||
+          installerLaunched || reconcileRefreshInFlight) return;
+      installBtn.hidden = true;
+      cancelBtn.hidden = false;
+      progress.hidden = false;
+      progress.removeAttribute("value");
+      dlStatus.textContent = "ダウンロード中…";
+      // 巡5(巡4 B4(b) の真の修正): 再試行の実経路 — 前回の失敗/キャンセル表示を消す。
+      // resetDl は checkBtn 経由でしか呼ばれないため、ここで明示的に初期化する。
+      status.textContent = "";
+      status.className = "hint";
       await invoke("download_and_install_update", {
-        installerUrl: pending.installer_url,
-        expectedSha256: pending.expected_sha256,
+        installerUrl: selected.installer_url,
+        expectedSha256: selected.expected_sha256,
+        installerSize: selected.installer_size,
       });
       // インストーラ起動成功 = 設定アプリは終了させる（インストーラの taskkill が追い打ち）。
       dlStatus.textContent = "インストーラを起動しました。このウィンドウは閉じます…";
+      // 起動済みのため再試行・再確認の両方を封じる（巡2 C3）: pending を null にして
+      // installBtn を隠し（finally の !pending が true＝非表示を保つ）、installerLaunched で
+      // checkBtn も押せなくする — destroy 失敗で窓が残ってもインストーラの二重起動を
+      // 許さない。
+      pending = null;
+      pendingIncludeBeta = null;
+      installerLaunched = true;
       try { await getCurrentWindow().destroy(); } catch (_) { /* インストーラがプロセスを終了させる */ }
     } catch (e) {
       dlStatus.textContent = "";
-      status.textContent = `アップデートに失敗しました: ${e}`;
-      status.className = "hint update-status-err";
+      // 巡4 B2: キャンセル（固定文字列）は失敗扱いにしない — ユーザ操作の中性表示。
+      const msg = String(e);
+      if (msg.includes("キャンセルしました")) {
+        status.textContent = "アップデートをキャンセルしました。";
+        status.className = "hint";
+      } else {
+        status.textContent = `アップデートに失敗しました: ${msg}`;
+        status.className = "hint update-status-err";
+      }
     } finally {
-      checkBtn.disabled = false;
+      // 確認キャンセル・候補差し替え・DL 失敗/キャンセルの全経路で予約・凍結・ボタンを復元。
+      // 成功時（installerLaunched）は taskkill まで凍結と排他を維持する — 再編集も
+      // アップデートの再開も封じたまま。
+      // installerLaunched 時の封止維持(下の syncBusyButtons は呼ばないため直接書く)。
+      // 確認飛行中のインストール完了でも確認ボタンを再有効化しない。
+      checkBtn.disabled = installerLaunched || checkInFlight;
       cancelBtn.hidden = true;
       progress.hidden = true;
+      // 失敗時は pending に Available 情報が残っており再試行可能 — ボタンを戻す。
+      // 成功時（installerLaunched）は installBtn は隠したまま。
+      installBtn.hidden = !pending || installerLaunched;
+      if (!installerLaunched) {
+        updateInFlight = false;
+        unfreezeSettingsControls();
+        syncBusyButtons();
+      }
     }
   });
 
@@ -750,9 +1289,20 @@ function dictUnreadableToast(err) {
 }
 
 function updateDictActionsEnabled() {
-  document.getElementById("dict-add-btn").disabled = !dictEditable;
-  document.getElementById("dict-import-btn").disabled = !dictEditable;
-  document.getElementById("dict-export-btn").disabled = !dictEditable;
+  // 巡5: 削除/インポート/書き出しの飛行中は追加/インポート/書き出しボタンも無効化 —
+  // 無反応ガード(dictMutationInFlight return)を視覚的に伝える。
+  document.getElementById("dict-add-btn").disabled = !dictEditable || dictMutationInFlight;
+  document.getElementById("dict-import-btn").disabled = !dictEditable || dictMutationInFlight;
+  document.getElementById("dict-export-btn").disabled = !dictEditable || dictMutationInFlight;
+}
+
+// 巡8: 行ボタン(編集/削除)の飛行中 disabled を、表の全再構築なしで切り替える —
+// renderDictTable の破棄再生成は wrap のスクロール位置と行フォーカスを落とすため。
+// 式は buildDictRow の disabled 計算と同一(再構築と走査で状態が一貫する)。
+function setDictRowsMutationBusy(busy) {
+  for (const btn of document.querySelectorAll("#dict-rows button")) {
+    btn.disabled = !dictEditable || busy;
+  }
 }
 
 function buildDictRow(entry) {
@@ -767,12 +1317,12 @@ function buildDictRow(entry) {
   const editBtn = document.createElement("button");
   editBtn.type = "button";
   editBtn.textContent = "編集";
-  editBtn.disabled = !dictEditable;
+  editBtn.disabled = !dictEditable || dictMutationInFlight; // 巡7 M-1: 行ボタンも飛行中は無効化
   editBtn.addEventListener("click", () => openDictModal(entry));
   const delBtn = document.createElement("button");
   delBtn.type = "button";
   delBtn.textContent = "削除";
-  delBtn.disabled = !dictEditable;
+  delBtn.disabled = !dictEditable || dictMutationInFlight; // 巡7 M-1: 行ボタンも飛行中は無効化
   delBtn.addEventListener("click", () => deleteDictEntry(entry));
   actionsTd.appendChild(editBtn);
   actionsTd.appendChild(delBtn);
@@ -791,9 +1341,15 @@ function renderDictTable() {
   document.getElementById("dict-count").textContent = `${dictEntries.length} 語`;
 }
 
+// 巡3 Q6: 一覧取得の世代カウンタ — 削除/保存/インポートの並走で後から届く古い応答が
+// 一覧表示を巻き戻すのを防ぐ（ファイルは DictLock が守るが UI 表示順は守らない）。
+let dictListGen = 0;
+
 async function loadDictList() {
+  const gen = ++dictListGen;
   try {
     const report = await invoke("dict_list");
+    if (gen !== dictListGen) return; // 自分より新しい要求が出ている — 結果を捨てる
     dictEntries = report.entries;
     dictEditable = report.corrupt !== "quarantine_failed";
     document.getElementById("dict-quarantine-error").hidden = report.corrupt !== "quarantine_failed";
@@ -809,7 +1365,11 @@ async function loadDictList() {
     updateDictActionsEnabled();
     renderDictTable();
   } catch (err) {
+    if (gen !== dictListGen) return;
     dictUnreadableToast(err);
+    // 巡4 B4(a): 初回読み込み失敗で辞書タブが永久に空のままになるのを防ぐ — フラグを戻して
+    // 次回のタブ訪問で再取得させる。
+    dictLoaded = false;
   }
 }
 
@@ -835,21 +1395,52 @@ function openDictModal(entry) {
   clearDictFormErrors();
   updateDictSaveEnabled();
   dictModalReturnFocus = document.activeElement;
-  document.getElementById("dict-modal").hidden = false;
+  // showModal(): フォーカストラップ・背面inert・top layer をブラウザが担保。
+  // 初期フォーカスは明示的に読み欄へ（autofocus 属性より JS 制御が一目で分かる）。
+  document.getElementById("dict-modal").showModal();
   document.getElementById("dict-form-ruby").focus();
 }
 function closeDictModal() {
-  document.getElementById("dict-modal").hidden = true;
+  document.getElementById("dict-modal").close();
   dictEditTarget = null;
   if (dictModalReturnFocus && dictModalReturnFocus.isConnected) dictModalReturnFocus.focus();
   dictModalReturnFocus = null;
 }
 
+// 保存 IPC の飛行中はモーダルを閉じさせない（巡2 C5）: 完了時の closeDictModal() が
+// その間に開いた別エントリのモーダルまで閉じてしまうのを防ぐ。
+function requestCloseDictModal() {
+  if (dictSaving) return;
+  closeDictModal();
+}
+
+let dictSaving = false;
+
+/// 巡3 Q4/Q5: 保存 IPC の飛行中は入力欄とボタンを無効化し（飛行中の編集が成功 close で
+/// 黙って捨てられるのを防ぐ）、dictSaving は「モーダル飛行中ロック」に限定する —
+/// closeDictModal の時点で解除し、その後の loadDictList 待ちで新モーダルが脱出不能に
+/// ならないようにする（解除後は save ボタンもモーダルも消えており再入経路がない）。
+function setDictFormBusy(busy) {
+  for (const id of ["dict-form-ruby", "dict-form-word", "dict-form-pos", "dict-form-save", "dict-form-cancel"]) {
+    document.getElementById(id).disabled = busy;
+  }
+  if (!busy) updateDictSaveEnabled();
+}
+
 async function saveDictEntry() {
+  if (dictSaving) return;
+  // 巡4 B4(d): 削除/インポート/書き出しの飛行中も保存を始めない — 削除/インポートは
+  // 辞書ファイルを書き変えるので DictLock が直列化しても Duplicate/NotFound が
+  // スケジューリング依存になるため。書き出しは読み取り専用でこの競合に無関係だが、
+  // mutation の一括ガードに含める。逆方向（保存中の削除）はモーダル close 後の
+  // 一覧再読込待ちで到達し得るが、削除 IPC は保存 IPC の完了後に走るため競合しない。
+  if (dictMutationInFlight) return; // 巡5/巡6: 削除・インポート・書き出しの飛行中は保存を始めない（押下は無反応。完了後に再押下で回復）
   const ruby = document.getElementById("dict-form-ruby").value;
   const word = document.getElementById("dict-form-word").value;
   const pos = document.getElementById("dict-form-pos").value;
   clearDictFormErrors();
+  dictSaving = true;
+  setDictFormBusy(true);
   try {
     const report = dictEditTarget
       ? await invoke("dict_update", {
@@ -858,11 +1449,16 @@ async function saveDictEntry() {
           ruby, word, pos,
         })
       : await invoke("dict_add", { ruby, word, pos });
-    closeDictModal();
+    dictSaving = false; // close の前に解除（closeDictModal 以降の待機で閉じ込めない）
+    setDictFormBusy(false);
+    // 飛行中は閉じられない設計だが、二重保険として開いているときだけ閉じる。
+    if (document.getElementById("dict-modal").open) closeDictModal();
     await loadDictList();
     // MutationReport.engine の declined を無言にしない(spec §4.2 — 全 mutation コマンド共通)。
     if (report.engine === "declined") toast("反映には IME の再起動が必要な場合があります");
   } catch (err) {
+    dictSaving = false;
+    setDictFormBusy(false);
     const kind = dictErrorKind(err);
     if (kind === "NotFound") {
       toast("辞書が他で変更されました");
@@ -880,7 +1476,18 @@ async function saveDictEntry() {
   }
 }
 
+// 巡3 Q6: 削除・インポート・書き出しの並走を封じる — dict_delete は engine 送信込みで
+// 最大約2秒かかるため二重クリックの窓が現実的（2 発目が NotFound で誤解を招くトースト）。
+let dictMutationInFlight = false;
+
 async function deleteDictEntry(entry) {
+  if (dictMutationInFlight) return;
+  dictMutationInFlight = true;
+  // 巡6 M-1 + 巡8: ヘッダ3ボタンと行ボタンを飛行中に即時無効化 — IPC await の飛行中
+  // （最も長い区間）にこそ無効化が見えているべき。行は走査で切り替え（スクロール・
+  // フォーカス保持）、再構築時は buildDictRow の disabled 計算が同じ状態を描く。
+  updateDictActionsEnabled();
+  setDictRowsMutationBusy(true);
   try {
     const report = await invoke("dict_delete", { ruby: entry.ruby, word: entry.word });
     await loadDictList();
@@ -893,10 +1500,22 @@ async function deleteDictEntry(entry) {
     } else {
       dictUnreadableToast(err);
     }
+  } finally {
+    dictMutationInFlight = false;
+    // 巡5 I-1: フラグを戻した後にボタン状態を再描画 — loadDictList 内の
+    // updateDictActionsEnabled は飛行中フラグ(true)を見て disabled にするため、
+    // ここで戻さないと削除1回で追加/インポート/書き出しが恒久無効化される。
+    updateDictActionsEnabled();
+    setDictRowsMutationBusy(false); // 巡8: 行ボタンの復帰も走査で(loadDictList 不発経路含む)
   }
 }
 
 async function importDict() {
+  if (dictMutationInFlight) return;
+  dictMutationInFlight = true;
+  // 巡6 M-1 + 巡8: ヘッダ3ボタンと行ボタンの飛行中即時無効化（走査で切替）。
+  updateDictActionsEnabled();
+  setDictRowsMutationBusy(true);
   try {
     const report = await invoke("dict_import");
     if (!report) return; // キャンセル
@@ -913,10 +1532,20 @@ async function importDict() {
     await loadDictList();
   } catch (err) {
     dictUnreadableToast(err);
+  } finally {
+    dictMutationInFlight = false;
+    updateDictActionsEnabled(); // 巡5 I-1: フラグ戻し後にボタン再描画（削除と同じ）
+    setDictRowsMutationBusy(false); // 巡8: 行ボタンの復帰も走査で
   }
 }
 
 async function exportDict() {
+  if (dictMutationInFlight) return;
+  dictMutationInFlight = true;
+  // 巡6 M-1 + 巡8: ヘッダ3ボタンと行ボタンの飛行中即時無効化（走査で切替）。
+  // export は loadDictList を呼ばないため、開始時描画が飛行中無効化の唯一の経路。
+  updateDictActionsEnabled();
+  setDictRowsMutationBusy(true);
   try {
     const report = await invoke("dict_export");
     if (!report) return; // キャンセル
@@ -925,6 +1554,10 @@ async function exportDict() {
     toast(msg);
   } catch (err) {
     dictUnreadableToast(err);
+  } finally {
+    dictMutationInFlight = false;
+    updateDictActionsEnabled(); // 巡5 I-1: フラグ戻し後にボタン再描画（削除と同じ）
+    setDictRowsMutationBusy(false); // 巡8: 行ボタンの復帰（export は一覧再読込が無いため必須）
   }
 }
 
@@ -933,12 +1566,16 @@ function bindDictionary() {
   document.getElementById("dict-import-btn").addEventListener("click", importDict);
   document.getElementById("dict-export-btn").addEventListener("click", exportDict);
   document.getElementById("dict-filter").addEventListener("input", renderDictTable);
-  document.getElementById("dict-form-cancel").addEventListener("click", closeDictModal);
+  document.getElementById("dict-form-cancel").addEventListener("click", requestCloseDictModal);
   document.getElementById("dict-form-save").addEventListener("click", saveDictEntry);
   ["dict-form-ruby", "dict-form-word"].forEach((id) =>
     document.getElementById(id).addEventListener("input", updateDictSaveEnabled));
-  document.getElementById("dict-modal").addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeDictModal();
+  // Esc はネイティブ <dialog> の cancel イベントで受ける（フォーカス位置に依存しない）。
+  // preventDefault で自動 close を止め、returnFocus 込りの closeDictModal に統一する。
+  // 保存 IPC 飛行中は requestCloseDictModal が閉じない（巡2 C5）。
+  document.getElementById("dict-modal").addEventListener("cancel", (e) => {
+    e.preventDefault();
+    requestCloseDictModal();
   });
   document.querySelector('.nav-item[data-page="dictionary"]').addEventListener("click", () => {
     if (dictLoaded) return;
@@ -949,9 +1586,14 @@ function bindDictionary() {
 
 // ---- 起動 ----
 async function init() {
+  // Register before the first get_settings: the startup worker may complete
+  // while this initial DTO is being assembled.
+  await registerStartupReconcileListener();
   const r = await invoke("get_settings");
   state = r.dto;
   baseline = structuredClone(state);
+  const taskStatus = document.getElementById("update-task-status");
+  if (taskStatus) taskStatus.textContent = r.update_task_error || "";
   // グリッド DOM はカタログ到着後にしか作れないため、renderAll() より前で待つ
   // （順序を誤ると初回だけチェック状態が反映されない静かな失敗になる）。
   await initSymbolGrid();
@@ -964,7 +1606,12 @@ async function init() {
   renderAll();
   clearDirty();
   if (r.corrupt_recovered) {
-    toast("設定ファイルが壊れていたため既定値で開きました（元ファイルは退避済み）", true);
+    showCorruptRecoveryNotice();
+  }
+  startupReconcileInitialReady = true;
+  if (startupReconcilePending) {
+    startupReconcilePending = false;
+    queueStartupReconcileRefresh();
   }
   document.getElementById("e-weight-browse").addEventListener("click", async () => {
     const picked = await window.__TAURI__.dialog.open({
@@ -985,29 +1632,72 @@ async function init() {
   document.getElementById("about-path").textContent = info.settings_path;
   document.getElementById("about-open-dir").addEventListener("click", () => invoke("open_settings_dir"));
   bindUpdateCheck();
-  document.getElementById("about-defaults").addEventListener("click", async () => {
-    state = await invoke("get_default_settings");
-    markDirty();
-    renderAll();
-    renderKeymapValues();
-    renderSymbolGrid();
-    toast("既定値に戻しました（適用を押すまで保存されません）");
+  bindDefaultSettingsHandler(document.getElementById("about-defaults"), {
+    isBusy: () => settingsOperationBusy() || reconcileRefreshInFlight,
+    setBusy: (busy) => {
+      defaultsInFlight = busy;
+      syncBusyButtons();
+    },
+    invoke,
+    capture: () => ({
+      epoch: settingsEpoch,
+      editEpoch: settingsEditEpoch,
+      previousIncludeBeta: Boolean(state.update_include_beta),
+    }),
+    applyDefaults: (defaults, operation) => {
+      // パレット戻しと同じ凍結越え検査 — フリーズ(または更新飛行中)後に届いた応答で
+      // state を置き替えない。凍結中に未適用編集を作らせない。自分自身の
+      // defaultsInFlight は除外し、他の操作・late refresh が割り込んだら破棄する。
+      if (operation.epoch !== settingsEpoch) return false;
+      const reduced = reconcileDefaultSettingsResponse(
+        state,
+        defaults,
+        "full",
+        operation.editEpoch,
+        settingsEditEpoch,
+        defaultSettingsResponseBusy(),
+      );
+      if (!reduced.applied) return false;
+      state = reduced.state;
+      if (operation.previousIncludeBeta !== Boolean(state.update_include_beta)) {
+        invalidateUpdateCandidate();
+      }
+      // 巡3 Q10: 既定と同一の状態（二度連続で戻す等）なら dirty を立てない。
+      recomputeDirty();
+      renderAll();
+      renderKeymapValues();
+      renderSymbolGrid();
+      return true;
+    },
+    onApplied: () => toast("既定値に戻しました（適用を押すまで保存されません）"),
+    errorMessage: (error) => `既定値を取得できませんでした: ${error}`,
+    toast,
   });
   document.getElementById("apply-btn").addEventListener("click", applyNow);
   // Spec2: 学習履歴の消去（確認ダイアログ→ Tauri command。結果は隣の span へ）。
   document.getElementById("btn-clear-learning").addEventListener("click", async () => {
-    const yes = await tauriConfirm(
-      "学習履歴をすべて消去します。元に戻せません。よろしいですか？",
-      { title: "nospacekey 設定", kind: "warning" }
-    );
-    if (!yes) return;
+    if (settingsOperationBusy() || reconcileRefreshInFlight) return;
+    // 確認ダイアログの待機中から予約する。背後でモデルDL/更新を開始されると、ClearLearning
+    // の serviceLock と Shutdown、または updater の taskkill が競合するため。
+    clearInFlight = true;
+    syncBusyButtons();
     const el = document.getElementById("clear-learning-result");
-    el.textContent = "消去中…";
     try {
-      const via = await invoke("clear_learning_history");
-      el.textContent = via === "engine" ? "消去しました" : "消去しました（エンジン停止中: ファイル削除）";
+      const yes = await tauriConfirm(
+        "学習履歴をすべて消去します。元に戻せません。よろしいですか？",
+        { title: "nospacekey 設定", kind: "warning" }
+      );
+      if (!yes) return;
+      el.textContent = "消去中…";
+      const outcome = await invoke("clear_learning_history");
+      const message = clearLearningSuccessMessage(outcome);
+      if (message === null) throw new Error("消去結果が不明です。再試行してください");
+      el.textContent = message;
     } catch (e) {
       el.textContent = `消去に失敗: ${e}`;
+    } finally {
+      clearInFlight = false;
+      syncBusyButtons();
     }
   });
   // 閉じる処理は destroy() で強制クローズする。close() は tauri://close-requested を
@@ -1017,7 +1707,19 @@ async function init() {
   let closing = false;
   async function performClose() {
     if (closing) return;
+    // アップデートの DL/インストーラ起動（UAC 待ちを含む）中は destroy しない — 窓だけ
+    // 消えてアップデートだけが半端に残るのを防ぐ。「キャンセル」で中止して完了を待ってもらう。
+    // installerLaunched 後は例外: auto destroy の失敗だけ手動再試行させる(凍結・排他は維持)。
+    if (updateInFlight && !installerLaunched) {
+      toast("アップデート進行中です。「キャンセル」で中止して完了を待ってから閉じてください");
+      return;
+    }
     if (await confirmDiscardIfDirty()) {
+      // 破棄確認の待機中にアップデートが始まっていた場合も、承認後に destroy を拒否する。
+      if (updateInFlight && !installerLaunched) {
+        toast("アップデート進行中です。「キャンセル」で中止して完了を待ってから閉じてください");
+        return;
+      }
       closing = true;
       try {
         await getCurrentWindow().destroy();

@@ -48,8 +48,7 @@ fn all_version_declarations_match_workspace_package() {
     );
     // installer/version.iss
     assert!(
-        read("../../installer/version.iss")
-            .contains(&format!("#define MyAppVersion \"{ws}\"")),
+        read("../../installer/version.iss").contains(&format!("#define MyAppVersion \"{ws}\"")),
         "version.iss 不一致"
     );
     // engine-host BuildInfo.swift
@@ -74,10 +73,18 @@ fn nospacekey_iss_has_no_hardcoded_version() {
 #[test]
 fn all_crates_inherit_workspace_version() {
     // env!(CARGO_PKG_VERSION) は config 1 crate の継承しか証明しない。
-    // 6 crate 全部の Cargo.toml を読み、[package] 節(次の [ 行まで)に
+    // workspace crate 全部の Cargo.toml を読み、[package] 節(次の [ 行まで)に
     // version.workspace = true があることを assert — cargo test 単独で全所在が閉じる。
     // (sync-version.ps1 -Check の同種検査は release.ps1 用の冗長系)
-    for c in ["tip", "ipc", "ids", "settings", "testbench", "config"] {
+    for c in [
+        "tip",
+        "ipc",
+        "ids",
+        "settings",
+        "testbench",
+        "config",
+        "update",
+    ] {
         let s = read(&format!("../{c}/Cargo.toml"));
         let pkg: Vec<&str> = s
             .split("[package]")
@@ -91,7 +98,8 @@ fn all_crates_inherit_workspace_version() {
             "{c}/Cargo.toml の [package] が version.workspace = true でない"
         );
         assert!(
-            !pkg.iter().any(|l| l.trim_start().starts_with("version = \"")),
+            !pkg.iter()
+                .any(|l| l.trim_start().starts_with("version = \"")),
             "{c}/Cargo.toml の [package] に version 直書きが残っている"
         );
     }

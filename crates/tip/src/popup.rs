@@ -29,10 +29,11 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowLongPtrW, RegisterClassW,
-    SetWindowLongPtrW, SetWindowPos, CS_DROPSHADOW, GWLP_USERDATA, HMENU, HWND_TOPMOST,
-    SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOMOVE, WINDOW_EX_STYLE, WNDCLASSW, WNDPROC,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowLongPtrW, KillTimer,
+    RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPos, CS_DROPSHADOW, GWLP_USERDATA, HMENU,
+    HWND_TOPMOST, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOMOVE, WINDOW_EX_STYLE, WNDCLASSW,
+    WNDPROC, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 use crate::render::SurfaceRenderer;
@@ -75,8 +76,18 @@ pub(crate) fn font_size_px(point_tenths: i32, dpi: i32) -> f32 {
 /// 画面（モニタ作業領域 `work`）に収まるよう、ウィンドウ左上 (x, y) を補正する純粋関数。
 /// 右/下にはみ出すなら端へ寄せ、その後あらためて左/上を作業領域内へクランプする。
 pub(crate) fn fit_to_work_area(x: i32, y: i32, w: i32, h: i32, work: RECT) -> (i32, i32) {
-    let nx = (if x + w > work.right { work.right - w } else { x }).max(work.left);
-    let ny = (if y + h > work.bottom { work.bottom - h } else { y }).max(work.top);
+    let nx = (if x + w > work.right {
+        work.right - w
+    } else {
+        x
+    })
+    .max(work.left);
+    let ny = (if y + h > work.bottom {
+        work.bottom - h
+    } else {
+        y
+    })
+    .max(work.top);
     (nx, ny)
 }
 
@@ -135,6 +146,9 @@ pub(crate) unsafe fn create_font(family_z: &[u16], point_tenths: i32, dpi: i32) 
 }
 
 /// hwnd の横 DPI を読む（描画・メトリクスと単一の DPI 軸で整合させる）。取れなければ 96。
+///
+/// 注意: これは窓の**現位置**（前回 SetWindowPos 位置・初回生成は (0,0)=主モニタ）の DPI を
+/// 返す。移動を伴う表示のサイズ計算には `dpi_for_anchor` を使うこと（UIバグ2）。
 pub(crate) fn window_dpi(hwnd: HWND) -> i32 {
     unsafe {
         let hdc = GetDC(Some(hwnd));
@@ -147,7 +161,45 @@ pub(crate) fn window_dpi(hwnd: HWND) -> i32 {
     }
 }
 
-/// (x, y) を希望位置に、その点が属すモニタの作業領域内へ収めた左上座標を返す。
+/// 点 (x, y) が属すモニタの実効 DPI。ポップアップのサイズ計算は「これから移動する先」
+/// の DPI で行う必要がある — `window_dpi` では混合DPIマルチモニタのモニタ越え表示で
+/// 外枠(旧モニタのDPI)とグリフ(WM_PAINT が再読みする新モニタのDPI)の縮尺が
+/// 1フレーム食い違う（UIバグ2。mode_hud.rs の backbuffer 実測記録が同症状の先例）。
+///
+/// `MonitorFromPoint + GetDpiForMonitor(MDT_EFFECTIVE_DPI)`。DPI 非対応プロセスでは
+/// GetDpiForMonitor は仮想化された値を返す（= window_dpi と同値になり無害）。
+pub(crate) fn dpi_for_anchor(x: i32, y: i32) -> i32 {
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    unsafe {
+        let hmon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut dpi_x = 0u32;
+        let mut dpi_y = 0u32;
+        if GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() && dpi_x > 0 {
+            effective_dpi(dpi_x as i32)
+        } else {
+            96
+        }
+    }
+}
+
+/// 点 (x, y) が属すモニタの作業領域(RECT)。モニタ情報が取れなければ None。
+/// reading_monitor の配置クランプ用（アンカー点基準でモニタを固定する — 巡1検証 G1）。
+pub(crate) fn work_area_at(x: i32, y: i32) -> Option<RECT> {
+    unsafe {
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let hmon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            Some(mi.rcWork)
+        } else {
+            None
+        }
+    }
+}
+
+/// 点 (x, y) を希望位置に、その点が属すモニタの作業領域内へ収めた左上座標を返す。
 /// モニタ情報が取れなければ素通し（劣化）。
 pub(crate) fn place_on_monitor(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
     unsafe {
@@ -175,6 +227,11 @@ pub(crate) fn place_on_monitor(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
 ///
 /// モニタは「ユーザーが今開いたアプリ」＝フォアグラウンド窓が属すモニタ。副モニタで
 /// アプリを開いたときにメイン画面へ飛ぶのを防ぐ。窓が取れなければプライマリへ劣化。
+///
+/// 戻り値はモニタ矩形の**内側へ 1px 退避した**右下角の点（巡2 A3）。`rcWork.right/bottom`
+/// そのものは半開区間の MonitorFromPoint で右/下に隣接モニタがあれば隣モニタへ帰属し、
+/// この点をアンカーに取る dpi_for_monitor/place_on_monitor が隣モニタ基準になってしまう。
+/// -1 しても flash 側の fit_to_work_area が `(right-w, bottom-h)` へ寄せるため着地は同一。
 pub(crate) fn harmless_anchor() -> (i32, i32) {
     unsafe {
         let mut mi = MONITORINFO {
@@ -189,7 +246,7 @@ pub(crate) fn harmless_anchor() -> (i32, i32) {
             MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)
         };
         if GetMonitorInfoW(hmon, &mut mi).as_bool() {
-            (mi.rcWork.right, mi.rcWork.bottom)
+            (mi.rcWork.right - 1, mi.rcWork.bottom - 1)
         } else {
             // 最終劣化: (0,0) を出し、place_on_monitor に見える位置へクランプさせる。
             (0, 0)
@@ -294,6 +351,18 @@ pub(crate) unsafe fn create_popup(
     }
 }
 
+/// ポップアップ共通の拡張スタイル。`WS_EX_TOOLWINDOW` は Alt-Tab/タスクビューの列挙から
+/// 除外するため（本窓は owner 無しトップレベル可視窓で、ToolWindow 無しだと古典的列挙
+/// 条件を満たしてしまう — UIバグ6）。`noredirection` は D2D 試行時のみ（GDI フォール
+/// バック窓にはリダイレクションサーフェスが要る）。
+pub(crate) fn popup_ex_styles(noredirection: bool) -> WINDOW_EX_STYLE {
+    let mut style = WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+    if noredirection {
+        style |= WS_EX_NOREDIRECTIONBITMAP;
+    }
+    style
+}
+
 /// 2 段バックエンド判定つきの生成。まず DComp 前提（WS_EX_NOREDIRECTIONBITMAP 付き）で
 /// 生成して D2D レンダラを試す。NOREDIRECTIONBITMAP 窓には GDI 描画が一切映らない
 /// （リダイレクションサーフェスが無い）ため「同じ HWND で D2D 失敗→GDI」はできず、
@@ -303,18 +372,13 @@ pub(crate) unsafe fn create_backed_popup(
     width: i32,
     height: i32,
 ) -> Option<(HWND, Option<SurfaceRenderer>)> {
-    let hwnd = create_popup(
-        class_name,
-        WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
-        width,
-        height,
-    )?;
+    let hwnd = create_popup(class_name, popup_ex_styles(true), width, height)?;
     let renderer = SurfaceRenderer::new(hwnd, width as u32, height as u32).ok();
     if renderer.is_some() {
         return Some((hwnd, renderer));
     }
     let _ = DestroyWindow(hwnd);
-    let hwnd = create_popup(class_name, WS_EX_TOPMOST | WS_EX_NOACTIVATE, width, height)?;
+    let hwnd = create_popup(class_name, popup_ex_styles(false), width, height)?;
     Some((hwnd, None))
 }
 
@@ -376,6 +440,25 @@ pub(crate) struct Backend {
     /// 退場フェード進行中フラグ。hide/dismiss の再入で 1.0 へ跳ね直さないためのガード。
     /// 遅延 hide タイマの発火（実際の SW_HIDE）と出現処理（play_entrance）で解除する。
     pub fading_out: bool,
+    /// 現在の退場フェード完了タイマの世代 ID（0=無効）。KillTimer はキューへ投稿済みの
+    /// WM_TIMER を除去できない（Win32 仕様）ため、フェード開始ごとに**新しいタイマ ID** を
+    /// 発行し、WM_TIMER 側で「現在の世代 ID と一致するか」を比較して古い発火を切り捨てる。
+    /// bool(fading_out)だけでは「旧フェードのタイマ発火が新フェード中に届き、表示中の窓を
+    /// 誤って SW_HIDE する」世代の取り違えを防げない（3窓共通の仕組み — 敵対レビュー巡1）。
+    pub fade_timer_id: usize,
+    /// 表示時間タイマ（HUD の自動消去）の世代 ID（0=無効）。フェード完了タイマと同じ
+    /// 仕組み・同じ発行カウンタを共有する（巡2 B1 — WM_TIMER 側は wparam を
+    /// is_current_show_timer / is_current_fade_timer の両方に照会して区別する。
+    /// 発行元が同じ単調カウンタなので 2 系統が同じ ID を持つことはない）。
+    pub show_timer_id: usize,
+}
+
+/// 世代タイマ ID の発行（1000 開始・単調増加）。1000 未満は各窓の静的タイマ ID と
+/// 衝突しないためのマージン。フェード完了・表示時間の 2 系統で共有する。
+fn next_fade_timer_id() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(1000);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Backend {
@@ -388,6 +471,65 @@ impl Backend {
             fmt_cache: Vec::new(),
             fade_in_started: None,
             fading_out: false,
+            fade_timer_id: 0,
+            show_timer_id: 0,
+        }
+    }
+
+    /// 表示時間タイマ（単発）を武装する。前世代を掃除してから新しい世代 ID で SetTimer
+    /// する（フェード完了タイマと同じ世代規律 — 巡2 B1）。失敗は false＝即時退場へ劣化。
+    pub unsafe fn arm_show_timer(&mut self, hwnd: HWND, ms: u32) -> bool {
+        if self.show_timer_id != 0 {
+            let _ = KillTimer(Some(hwnd), self.show_timer_id);
+            self.show_timer_id = 0;
+        }
+        let id = next_fade_timer_id();
+        if SetTimer(Some(hwnd), id, ms, None) == 0 {
+            return false;
+        }
+        self.show_timer_id = id;
+        true
+    }
+
+    /// WM_TIMER の wparam が現在の表示時間世代か（0=無効とは一致しない）。
+    pub fn is_current_show_timer(&self, id: usize) -> bool {
+        id != 0 && id == self.show_timer_id
+    }
+
+    /// 退場フェードの完了タイマを武装する。前世代のタイマを掃除してから新しい世代 ID で
+    /// SetTimer する。失敗（タイマ資源枯渇）は false＝呼び出し側は即時 hide へ劣化する。
+    pub unsafe fn arm_fade_timer(&mut self, hwnd: HWND, ms: u32) -> bool {
+        self.kill_fade_timer(hwnd);
+        let id = next_fade_timer_id();
+        if SetTimer(Some(hwnd), id, ms, None) == 0 {
+            self.fade_timer_id = 0;
+            return false;
+        }
+        self.fade_timer_id = id;
+        true
+    }
+
+    /// 現在のフェード世代タイマを掃除し、世代を無効化（再表示の割り込みで使う）。
+    /// 戻り値は掃除した旧ID（0=元々無効）。
+    pub unsafe fn cancel_fade_timer(&mut self, hwnd: HWND) -> usize {
+        let old = self.fade_timer_id;
+        if old != 0 {
+            let _ = KillTimer(Some(hwnd), old);
+        }
+        self.fade_timer_id = 0;
+        old
+    }
+
+    /// WM_TIMER の wparam が現在のフェード世代か（0=無効とは一致しない）。
+    pub fn is_current_fade_timer(&self, id: usize) -> bool {
+        id != 0 && id == self.fade_timer_id
+    }
+
+    /// フェード世代タイマの内部掃除だけを行う（arm の前世代処理用）。
+    unsafe fn kill_fade_timer(&mut self, hwnd: HWND) {
+        if self.fade_timer_id != 0 {
+            let _ = KillTimer(Some(hwnd), self.fade_timer_id);
+            self.fade_timer_id = 0;
         }
     }
 
@@ -470,8 +612,13 @@ impl Backend {
         // ファミリ/サイズが変わったら旧エントリは以後ヒットしないので捨てる。
         self.fmt_cache
             .retain(|(b, _, _, fam, _)| *b == px_bits && fam == family_utf16z);
-        self.fmt_cache
-            .push((px_bits, align.0, trim_ellipsis, family_utf16z.to_vec(), fmt.clone()));
+        self.fmt_cache.push((
+            px_bits,
+            align.0,
+            trim_ellipsis,
+            family_utf16z.to_vec(),
+            fmt.clone(),
+        ));
         Some(fmt)
     }
 
@@ -622,9 +769,10 @@ pub(crate) fn play_entrance<T: PopupState>(state: &mut T, motion: bool, was_visi
         b.fade_in_started = None;
         return;
     };
-    if motion && !was_visible && r.supports_opacity() && r
-        .animate_opacity(0.0, 1.0, tokens::MOTION_IN_MS)
-        .is_ok()
+    if motion
+        && !was_visible
+        && r.supports_opacity()
+        && r.animate_opacity(0.0, 1.0, tokens::MOTION_IN_MS).is_ok()
     {
         b.fade_in_started = Some(Instant::now());
     } else {
@@ -788,7 +936,12 @@ mod tests {
 
     #[test]
     fn fit_to_work_area_keeps_window_on_screen() {
-        let work = RECT { left: 0, top: 0, right: 1000, bottom: 800 };
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 800,
+        };
         // 収まる位置はそのまま。
         assert_eq!(fit_to_work_area(100, 100, 200, 300, work), (100, 100));
         // 右はみ出しは右端に寄せる。
@@ -798,18 +951,36 @@ mod tests {
         // 両方。
         assert_eq!(fit_to_work_area(900, 700, 200, 300, work), (800, 500));
         // ウィンドウが作業領域より広い場合は左/上端にクランプ（負座標にしない）。
-        let small = RECT { left: 0, top: 0, right: 100, bottom: 100 };
+        let small = RECT {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
         assert_eq!(fit_to_work_area(90, 90, 200, 200, small), (0, 0));
         // 作業領域が原点以外（マルチモニタ）でも左/上端へクランプ。
-        let off = RECT { left: 1920, top: 0, right: 2920, bottom: 800 };
+        let off = RECT {
+            left: 1920,
+            top: 0,
+            right: 2920,
+            bottom: 800,
+        };
         assert_eq!(fit_to_work_area(1800, 100, 200, 300, off), (1920, 100));
     }
 
     #[test]
     fn flip_above_caret_when_bottom_overflows() {
-        let work = RECT { left: 0, top: 0, right: 1000, bottom: 800 };
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 800,
+        };
         // 収まる位置はフリップしない（キャレット直下のまま）。
-        assert_eq!(fit_below_or_flip_above(100, 100, Some(80), 200, 300, work), (100, 100));
+        assert_eq!(
+            fit_below_or_flip_above(100, 100, Some(80), 200, 300, work),
+            (100, 100)
+        );
         // 下端はみ出し＋キャレット上端あり → キャレット直上（bottom=caret_top）へフリップ。
         // クランプなら (100, 500) でキャレット行（y=680..700）を覆うところ。
         assert_eq!(
@@ -822,12 +993,35 @@ mod tests {
             (800, 380)
         );
         // キャレット上端が不明（既定座標フォールバック等）は従来のクランプへ劣化。
-        assert_eq!(fit_below_or_flip_above(100, 700, None, 200, 300, work), (100, 500));
+        assert_eq!(
+            fit_below_or_flip_above(100, 700, None, 200, 300, work),
+            (100, 500)
+        );
         // 上側にも収まらない（画面が低い/窓が高い）ならクランプへ劣化。
-        let short = RECT { left: 0, top: 0, right: 1000, bottom: 320 };
+        let short = RECT {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 320,
+        };
         assert_eq!(
             fit_below_or_flip_above(100, 310, Some(290), 200, 300, short),
             (100, 20)
         );
+    }
+
+    #[test]
+    fn popup_ex_styles_always_toolwindow() {
+        // D2D/GDI 両パスで TOOLWINDOW が立つこと（Alt-Tab/タスクビュー列挙の除外 —
+        // UIバグ6）。NOREDIRECTIONBITMAP は D2D 試行時のみ。
+        let d2d = popup_ex_styles(true);
+        let gdi = popup_ex_styles(false);
+        for s in [d2d, gdi] {
+            assert!(s.contains(WS_EX_TOOLWINDOW));
+            assert!(s.contains(WS_EX_NOACTIVATE));
+            assert!(s.contains(WS_EX_TOPMOST));
+        }
+        assert!(d2d.contains(WS_EX_NOREDIRECTIONBITMAP));
+        assert!(!gdi.contains(WS_EX_NOREDIRECTIONBITMAP));
     }
 }

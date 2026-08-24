@@ -75,6 +75,7 @@ final class ConversionServiceTests: XCTestCase {
 
     /// UU-5: reload で Zenzai 設定が差し替わる（設定アプリの変更を常駐エンジンへ反映）。
     /// 実在ファイルを weight に指定 → 有効化 / off → 無効化 を zenzaiEnabled で観測する。
+    /// cpuMeetsLlamaBaseline は巡2 D3: reload 経由のテストも CPU ゲートの環境依存を切る。
     func testReloadSwapsZenzaiConfig() throws {
         let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1))
         XCTAssertFalse(svc.zenzaiEnabled, "初期は無効")
@@ -82,10 +83,60 @@ final class ConversionServiceTests: XCTestCase {
             .appendingPathComponent("uu5-weight-\(UUID().uuidString).gguf")
         try Data("x".utf8).write(to: tmp)
         defer { try? FileManager.default.removeItem(at: tmp) }
-        svc.reload(overrides: ["NOSPACEKEY_ZENZAI": "on", "NOSPACEKEY_ZENZAI_WEIGHT": tmp.path])
+        svc.reload(
+            overrides: ["NOSPACEKEY_ZENZAI": "on", "NOSPACEKEY_ZENZAI_WEIGHT": tmp.path],
+            cpuMeetsLlamaBaseline: true)
         XCTAssertTrue(svc.zenzaiEnabled, "reload で weight が解決でき有効化されるはず")
-        svc.reload(overrides: ["NOSPACEKEY_ZENZAI": "off"])
+        svc.reload(overrides: ["NOSPACEKEY_ZENZAI": "off"], cpuMeetsLlamaBaseline: true)
         XCTAssertFalse(svc.zenzaiEnabled, "off で無効化されるはず")
+    }
+
+    /// 巡2 D9: G1-B（非 nil→別の非 nil のモデル差し替え）の reload 実経路を検証する。
+    /// 純関数テストだけでは `|| weightSwapped` の取りこぼし（無効化への誤拡大や
+    /// 差し替えでの漏れ）を検出できない — skip 復活を forceTooSlowForTesting で観測する:
+    /// 差し替え直後の 1 回目は skip が消費されて tooSlow にならず、2 回目で立つ。
+    /// あわせて D2 の回帰（非 nil→nil では skip が復活しない）も同じ手法で検証する。
+    func testReloadWeightSwapRestoresSkipAndDisableDoesNot() throws {
+        let tmpA = FileManager.default.temporaryDirectory
+            .appendingPathComponent("d9-weight-a-\(UUID().uuidString).gguf")
+        let tmpB = FileManager.default.temporaryDirectory
+            .appendingPathComponent("d9-weight-b-\(UUID().uuidString).gguf")
+        try Data("a".utf8).write(to: tmpA)
+        try Data("b".utf8).write(to: tmpB)
+        defer {
+            try? FileManager.default.removeItem(at: tmpA)
+            try? FileManager.default.removeItem(at: tmpB)
+        }
+
+        // (1) 非nil→別の非nil（差し替え）: 初回 skip が復活する（新 URL のインラインロードで
+        // cold spike が起きるため — G1-B）。
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: tmpA, inferenceLimit: 1))
+        // 同一 URL への reload（差し替えなし）で監視を「ホット」状態に固定する。空 overrides
+        // だと開発機の per-user/exeDir モデル次第で候補が動き環境依存になるため、明示 A を指す。
+        svc.reload(
+            overrides: ["NOSPACEKEY_ZENZAI": "on", "NOSPACEKEY_ZENZAI_WEIGHT": tmpA.path],
+            cpuMeetsLlamaBaseline: true)
+        svc.forceTooSlowForTesting(ms: 1000, usedZenzai: true)
+        XCTAssertTrue(svc.zenzaiTooSlow, "前提: 差し替え前は即監視で tooSlow が立つ")
+        // A→B へ差し替える。決定性の根拠は「NOSPACEKEY_ZENZAI_WEIGHT=tmpB が解決候補の
+        // 先頭で実在する（テストが書いている）ため、後続候補(per-user/exeDir)は評価される
+        // 前に採用される」こと — reload は実プロセス env+overrides が基準で空環境では
+        // ない（ZenzaiConfig.resolve の first-existing ルール。巡3 Z8 で根拠を修正）。
+        svc.reload(
+            overrides: ["NOSPACEKEY_ZENZAI": "on", "NOSPACEKEY_ZENZAI_WEIGHT": tmpB.path],
+            cpuMeetsLlamaBaseline: true)
+        XCTAssertEqual(svc.zenzaiWeightURLForTesting, tmpB, "差し替え後は新 weight が解決されている")
+        XCTAssertFalse(svc.zenzaiTooSlow, "reload で tooSlow はリセットされる")
+        svc.forceTooSlowForTesting(ms: 1000, usedZenzai: true)
+        XCTAssertFalse(svc.zenzaiTooSlow, "差し替え直後の 1 回目は skip で握りつぶされる（G1-B）")
+        svc.forceTooSlowForTesting(ms: 1000, usedZenzai: true)
+        XCTAssertTrue(svc.zenzaiTooSlow, "2 回目で即監視に戻る")
+
+        // (2) 非nil→nil（無効化）: skip は復活しない（純関数の意味論どおり — 巡2 D2）。
+        svc.reload(overrides: ["NOSPACEKEY_ZENZAI": "off"], cpuMeetsLlamaBaseline: true)
+        XCTAssertFalse(svc.zenzaiTooSlow, "無効化 reload でも tooSlow はリセット")
+        svc.forceTooSlowForTesting(ms: 1000, usedZenzai: true)
+        XCTAssertTrue(svc.zenzaiTooSlow, "無効化では skip が復活せず即監視（D2）")
     }
 
     /// cold start ③: zenzaiReady ゲートが閉じている間（本番では listening 後〜warmUp 完了前 =

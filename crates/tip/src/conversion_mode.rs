@@ -47,6 +47,18 @@ pub fn should_apply_default_direct(enabled: bool, already_applied: bool) -> bool
     enabled && !already_applied
 }
 
+/// SP7 改定: apply_default_direct の成否ポリシー。成功 = compartment が取れた、かつ
+/// （書込が不要=already-direct、または SetValue 成功）。失敗（false）のとき呼び出し元は
+/// default_direct_applied を立てず（次回 Activate で再試行）、direct_mode_owned も
+/// 立てない（langbar Cell・打鍵ゲートは live 値を追従させる）。
+pub fn default_direct_success(
+    compartment_available: bool,
+    needs_write: bool,
+    write_ok: bool,
+) -> bool {
+    compartment_available && (!needs_write || write_ok)
+}
+
 /// AddItem 直前の langbar Cell に入れる値。
 /// 直後の `apply_default_direct` が走れて（`will_apply`）、かつ compartment が取れるときだけ
 /// 楽観的に直接入力（A）を出す。取れなければ live 読みのまま（失敗時に表示A・入力あ を残さない）。
@@ -110,7 +122,7 @@ mod tests {
         const ROMAN: u32 = 0x0010;
         assert_eq!(to_direct(CONVMODE_NATIVE), 0); // ひらがな → 半角英数
         assert_eq!(to_direct(0), 0); // 既に半角英数 → そのまま
-        // 全角ひらがな(NATIVE|FULLSHAPE) からは FULLSHAPE も落として半角を保証する。
+                                     // 全角ひらがな(NATIVE|FULLSHAPE) からは FULLSHAPE も落として半角を保証する。
         assert_eq!(to_direct(CONVMODE_NATIVE | CONVMODE_FULLSHAPE), 0);
         // ROMAN 等その他のビットは保存する。
         assert_eq!(to_direct(CONVMODE_NATIVE | ROMAN), ROMAN);
@@ -123,6 +135,22 @@ mod tests {
         assert!(!should_apply_default_direct(true, true)); // 有効 & 適用済み → しない（手動トグル尊重）
         assert!(!should_apply_default_direct(false, false)); // 無効 → しない
         assert!(!should_apply_default_direct(false, true));
+    }
+
+    #[test]
+    fn default_direct_success_truth_table() {
+        // compartment なしは常に失敗（needs_write/write_ok に依らず再試行へ）。
+        assert!(!default_direct_success(false, false, false));
+        assert!(!default_direct_success(false, false, true));
+        assert!(!default_direct_success(false, true, false));
+        assert!(!default_direct_success(false, true, true));
+        // compartment あり・already-direct（書込不要）は成功（write_ok は無関係）。
+        assert!(default_direct_success(true, false, false));
+        assert!(default_direct_success(true, false, true));
+        // compartment あり・要書込は SetValue の成否に従う。失敗は false ＝
+        // owned も applied も立てず、langbar は live 値へ戻す（表示A・入力あ を残さない）。
+        assert!(default_direct_success(true, true, true));
+        assert!(!default_direct_success(true, true, false));
     }
 
     #[test]
@@ -156,18 +184,30 @@ mod tests {
         assert_eq!(before, 0);
         assert_eq!(toggled(before), CONVMODE_NATIVE);
         // 未所有なら live をそのまま XOR
-        assert_eq!(toggle_before_mode(false, true, CONVMODE_NATIVE), CONVMODE_NATIVE);
+        assert_eq!(
+            toggle_before_mode(false, true, CONVMODE_NATIVE),
+            CONVMODE_NATIVE
+        );
         assert_eq!(toggled(toggle_before_mode(false, true, CONVMODE_NATIVE)), 0);
     }
 
     #[test]
     fn empty_or_non_i4_compartment_value_defaults_to_native() {
         // 未設定(VT_EMPTY)の compartment は NATIVE 既定へ落ちる（本バグの本体）。
-        assert_eq!(mode_from_compartment_value(&VARIANT::default()), CONVMODE_NATIVE);
+        assert_eq!(
+            mode_from_compartment_value(&VARIANT::default()),
+            CONVMODE_NATIVE
+        );
         // 明示的に VT_I4 でセットされた値はそのまま返る（direct/native とも保存）。
         assert_eq!(mode_from_compartment_value(&VARIANT::from(0i32)), 0);
-        assert_eq!(mode_from_compartment_value(&VARIANT::from(1i32)), CONVMODE_NATIVE);
+        assert_eq!(
+            mode_from_compartment_value(&VARIANT::from(1i32)),
+            CONVMODE_NATIVE
+        );
         // 非 I4 型(VT_BOOL)も NATIVE 既定へ落ちる。
-        assert_eq!(mode_from_compartment_value(&VARIANT::from(true)), CONVMODE_NATIVE);
+        assert_eq!(
+            mode_from_compartment_value(&VARIANT::from(true)),
+            CONVMODE_NATIVE
+        );
     }
 }

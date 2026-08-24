@@ -2,25 +2,26 @@
 //! 窓無し/ポンプ要否は未確定なので、防御的に message-only 窓＋pump を持つ。
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use windows::core::{w, Interface};
 use windows::Win32::Foundation::{FALSE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+    COINIT_APARTMENTTHREADED,
 };
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
+use windows::Win32::UI::TextServices::ITfUIElementSink;
 use windows::Win32::UI::TextServices::{
-    ITfCandidateListUIElement, ITfCandidateListUIElementBehavior, ITfCompartmentMgr, ITfContext,
-    ITfDocumentMgr, ITfInputProcessorProfileMgr, ITfInputProcessorProfiles, ITfKeystrokeMgr,
-    ITfSource, ITfThreadMgr, ITfUIElementMgr,
-    CLSID_TF_InputProcessorProfiles, CLSID_TF_ThreadMgr,
-    GUID_COMPARTMENT_KEYBOARD_DISABLED, GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
-    GUID_TFCAT_TIP_KEYBOARD,
+    CLSID_TF_InputProcessorProfiles, CLSID_TF_ThreadMgr, ITfCandidateListUIElement,
+    ITfCandidateListUIElementBehavior, ITfCompartmentMgr, ITfContext, ITfDocumentMgr,
+    ITfInputProcessorProfileMgr, ITfInputProcessorProfiles, ITfKeystrokeMgr, ITfSource,
+    ITfThreadMgr, ITfUIElementMgr, GUID_COMPARTMENT_KEYBOARD_DISABLED,
+    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_TFCAT_TIP_KEYBOARD,
     TF_INPUTPROCESSORPROFILE, TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE, TF_IPPMF_ENABLEPROFILE,
     TF_IPP_FLAG_ACTIVE, TF_IPP_FLAG_ENABLED, TF_PROFILETYPE_INPUTPROCESSOR,
 };
-use windows::Win32::UI::TextServices::ITfUIElementSink;
-use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DispatchMessageW, PeekMessageW, SetForegroundWindow, ShowWindow,
     TranslateMessage, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WS_POPUP,
@@ -41,6 +42,15 @@ thread_local! {
 /// 子プロセス側マーカー: これが立っていれば既にゲート専用デスクトップ上で動いている。
 pub const OWN_DESKTOP_ENV: &str = "NOSPACEKEY_TB_ON_GATE_DESKTOP";
 
+// Keep this in sync with crates/tip/src/text_service.rs.
+// TIP rejects a mode toggle when it arrives less than 300 ms after the prior
+// one. The harness cannot observe TIP's last_mode_toggle Instant, so every
+// requested transition first clears the full guard window. When it actually
+// toggles, it also clears the following window before returning so a scenario
+// may intentionally toggle again immediately (item13 C / item38).
+const MODE_TOGGLE_REPEAT_GUARD: Duration = Duration::from_millis(300);
+const MODE_TOGGLE_GUARD_MARGIN: Duration = Duration::from_millis(20);
+
 /// 子プロセス側: 専用デスクトップ上での起動を認識し、前面補助(ensure_foreground_window の
 /// SetActiveWindow/SetFocus 分岐)を有効化する。
 pub fn mark_own_desktop() {
@@ -59,8 +69,8 @@ pub fn mark_own_desktop() {
 pub fn respawn_on_gate_desktop(args: &[String]) -> i32 {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
     use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
+    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
     use windows::Win32::System::StationsAndDesktops::{CreateDesktopW, DESKTOP_CONTROL_FLAGS};
     use windows::Win32::System::Threading::{
         CreateProcessW, GetExitCodeProcess, WaitForSingleObject, INFINITE, PROCESS_CREATION_FLAGS,
@@ -69,10 +79,18 @@ pub fn respawn_on_gate_desktop(args: &[String]) -> i32 {
     unsafe {
         // GENERIC_ALL(0x10000000): 窓生成・切替・読み書きの全権。既存同名デスクトップは開かれる。
         let _desktop = match CreateDesktopW(
-            w!("nospacekey-gate"), None, None, DESKTOP_CONTROL_FLAGS(0), 0x1000_0000, None,
+            w!("nospacekey-gate"),
+            None,
+            None,
+            DESKTOP_CONTROL_FLAGS(0),
+            0x1000_0000,
+            None,
         ) {
             Ok(d) => d,
-            Err(e) => { eprintln!("own-desktop FAIL: CreateDesktopW {e:?}"); return 2; }
+            Err(e) => {
+                eprintln!("own-desktop FAIL: CreateDesktopW {e:?}");
+                return 2;
+            }
         };
 
         // 自分自身を同引数(--own-desktop 除去済み)で再起動。子は env マーカーで認識する。
@@ -88,8 +106,16 @@ pub fn respawn_on_gate_desktop(args: &[String]) -> i32 {
         // stdout/stderr(呼び出し側のリダイレクト先ファイル)を子へ継承する。
         let hout = GetStdHandle(STD_OUTPUT_HANDLE).unwrap_or(HANDLE::default());
         let herr = GetStdHandle(STD_ERROR_HANDLE).unwrap_or(HANDLE::default());
-        let _ = SetHandleInformation(hout, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(HANDLE_FLAG_INHERIT.0));
-        let _ = SetHandleInformation(herr, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(HANDLE_FLAG_INHERIT.0));
+        let _ = SetHandleInformation(
+            hout,
+            HANDLE_FLAG_INHERIT.0,
+            HANDLE_FLAGS(HANDLE_FLAG_INHERIT.0),
+        );
+        let _ = SetHandleInformation(
+            herr,
+            HANDLE_FLAG_INHERIT.0,
+            HANDLE_FLAGS(HANDLE_FLAG_INHERIT.0),
+        );
 
         let mut desktop_name: Vec<u16> = "nospacekey-gate\0".encode_utf16().collect();
 
@@ -104,14 +130,26 @@ pub fn respawn_on_gate_desktop(args: &[String]) -> i32 {
                 lpDesktop: PWSTR(desktop_name.as_mut_ptr()),
                 ..Default::default()
             };
-            let mut ctf_cmd: Vec<u16> =
-                "C:\\Windows\\System32\\ctfmon.exe\0".encode_utf16().collect();
+            let mut ctf_cmd: Vec<u16> = "C:\\Windows\\System32\\ctfmon.exe\0"
+                .encode_utf16()
+                .collect();
             match CreateProcessW(
-                None, Some(PWSTR(ctf_cmd.as_mut_ptr())), None, None, false,
-                PROCESS_CREATION_FLAGS(0), None, None, &ctf_si, &mut ctfmon_pi,
+                None,
+                Some(PWSTR(ctf_cmd.as_mut_ptr())),
+                None,
+                None,
+                false,
+                PROCESS_CREATION_FLAGS(0),
+                None,
+                None,
+                &ctf_si,
+                &mut ctfmon_pi,
             ) {
                 Ok(()) => {
-                    eprintln!("DIAG own-desktop: ctfmon pid={} on gate desktop", ctfmon_pi.dwProcessId);
+                    eprintln!(
+                        "DIAG own-desktop: ctfmon pid={} on gate desktop",
+                        ctfmon_pi.dwProcessId
+                    );
                     // Cicero 初期化の猶予(経験的に短くてよい)。
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
@@ -130,13 +168,24 @@ pub fn respawn_on_gate_desktop(args: &[String]) -> i32 {
         };
         let mut pi = PROCESS_INFORMATION::default();
         if let Err(e) = CreateProcessW(
-            None, Some(PWSTR(cmdline.as_mut_ptr())), None, None, true,
-            PROCESS_CREATION_FLAGS(0), None, None, &mut si, &mut pi,
+            None,
+            Some(PWSTR(cmdline.as_mut_ptr())),
+            None,
+            None,
+            true,
+            PROCESS_CREATION_FLAGS(0),
+            None,
+            None,
+            &mut si,
+            &mut pi,
         ) {
             eprintln!("own-desktop FAIL: CreateProcessW {e:?}");
             return 2;
         }
-        eprintln!("DIAG own-desktop: child pid={} spawned on winsta0\\nospacekey-gate", pi.dwProcessId);
+        eprintln!(
+            "DIAG own-desktop: child pid={} spawned on winsta0\\nospacekey-gate",
+            pi.dwProcessId
+        );
         let w = WaitForSingleObject(pi.hProcess, INFINITE);
         let mut code: u32 = 2;
         if w == WAIT_OBJECT_0 {
@@ -162,14 +211,18 @@ pub struct ComSta;
 impl ComSta {
     /// STA で COM を初期化する。呼び出し側は host より先にこれを束縛すること。
     pub fn init() -> windows::core::Result<ComSta> {
-        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?; }
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+        }
         Ok(ComSta)
     }
 }
 
 impl Drop for ComSta {
     fn drop(&mut self) {
-        unsafe { CoUninitialize(); }
+        unsafe {
+            CoUninitialize();
+        }
     }
 }
 
@@ -220,11 +273,23 @@ fn ensure_foreground_window() -> windows::core::Result<HWND> {
     } else {
         let h = unsafe {
             CreateWindowExW(
-                WINDOW_EX_STYLE(0), w!("STATIC"), w!("nospacekey-testbench"),
-                WS_POPUP, 0, 0, 1, 1, None, None, None, None,
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("nospacekey-testbench"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
             )?
         };
-        unsafe { let _ = ShowWindow(h, SW_SHOW); }
+        unsafe {
+            let _ = ShowWindow(h, SW_SHOW);
+        }
         FOREGROUND_HWND.with(|c| c.set(h.0 as isize));
         h
     };
@@ -283,20 +348,31 @@ impl TsfHost {
             let change_lang_result = ipp.ChangeCurrentLanguage(LANGID_JA);
             // DIAG: ChangeCurrentLanguage の戻り値 HRESULT（診断用、通常経路の分岐には使わない）。
             if let Err(e) = &change_lang_result {
-                eprintln!("DIAG start: ChangeCurrentLanguage hr={:#010x} {}", e.code().0 as u32, e.message());
+                eprintln!(
+                    "DIAG start: ChangeCurrentLanguage hr={:#010x} {}",
+                    e.code().0 as u32,
+                    e.message()
+                );
             } else {
                 eprintln!("DIAG start: ChangeCurrentLanguage hr=S_OK");
             }
             let profiles: ITfInputProcessorProfileMgr = ipp.cast()?;
             let activate_result = profiles.ActivateProfile(
-                TF_PROFILETYPE_INPUTPROCESSOR, LANGID_JA,
-                &CLSID_NOSPACEKEY, &PROFILE_NOSPACEKEY, HKL::default(),
+                TF_PROFILETYPE_INPUTPROCESSOR,
+                LANGID_JA,
+                &CLSID_NOSPACEKEY,
+                &PROFILE_NOSPACEKEY,
+                HKL::default(),
                 TF_IPPMF_ENABLEPROFILE | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE,
             );
             // DIAG: ActivateProfile の戻り値 HRESULT（成功時も出力。現状は `?` で捨てていた）。
             match &activate_result {
                 Ok(()) => eprintln!("DIAG start: ActivateProfile hr=S_OK"),
-                Err(e) => eprintln!("DIAG start: ActivateProfile hr={:#010x} {}", e.code().0 as u32, e.message()),
+                Err(e) => eprintln!(
+                    "DIAG start: ActivateProfile hr={:#010x} {}",
+                    e.code().0 as u32,
+                    e.message()
+                ),
             }
             activate_result?;
             pump();
@@ -318,13 +394,64 @@ impl TsfHost {
             let ui_mgr: ITfUIElementMgr = thread_mgr.cast()?;
             let source: ITfSource = thread_mgr.cast()?;
             let ui_log = Rc::new(SinkLog::default());
-            let sink: ITfUIElementSink = UiElementSink { log: ui_log.clone() }.into();
+            let sink: ITfUIElementSink = UiElementSink {
+                log: ui_log.clone(),
+            }
+            .into();
             let ui_cookie = source.AdviseSink(&ITfUIElementSink::IID, &sink)?;
 
-            Ok(TsfHost {
-                thread_mgr, profiles, ksm, doc_mgr, _ctx: ctx, tid, store, activated: true,
-                ui_log, ui_cookie, ui_mgr,
-            })
+            let host = TsfHost {
+                thread_mgr,
+                profiles,
+                ksm,
+                doc_mgr,
+                _ctx: ctx,
+                tid,
+                store,
+                activated: true,
+                ui_log,
+                ui_cookie,
+                ui_mgr,
+            };
+
+            // 開始状態の conversion-mode をネイティブ(ひらがな)へ正規化する。
+            //
+            // 各 item が start() を呼ぶたび ChangeCurrentLanguage→ActivateProfile の
+            // プロファイル切替が走るが、conversion-mode compartment はプロセス共有で、
+            // direct(0) を書いた item の後遺症が次の item の開始時に残る。TIP の Activate は
+            // default_direct=true の one-shot しかしゆ compartment に触れないため、一度
+            // direct に落ちると誰も戻さない（Sandbox 実測 2026-08-20: item11 以降ほぼ
+            // 全 item が direct=true handled=false の素通りになり 25/51 の主因）。
+            // compartment 直書きはしない。TIP が一度モードを所有すると
+            // direct_mode_owned/langbar Cell が compartment より優先されるため、直書きは
+            // 見かけの値だけを変えて内部状態との不一致を作る。必ず TIP 自身の 0x1D
+            // トグル経路を通し、所有状態と compartment を一緒に遷移させる。
+            if !host.normalize_native_mode() {
+                eprintln!(
+                    "WARN: normalize_native_mode failed in start() — items may inherit direct mode"
+                );
+            }
+
+            // DIAG: read the compartment back. If the value is not 1 here, the
+            // normalization is being written to a different compartment than the
+            // TIP reads (observed live: keytest stays direct=true after start()).
+            if let Ok(cm) = host.thread_mgr.cast::<ITfCompartmentMgr>() {
+                if let Ok(comp) = cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION)
+                {
+                    if let Ok(v) = comp.GetValue() {
+                        match i32::try_from(&v) {
+                            Ok(n) => {
+                                eprintln!("DIAG start: conversion-mode after normalize = {n:#x}")
+                            }
+                            Err(_) => {
+                                eprintln!("DIAG start: conversion-mode read back = non-i32 variant")
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(host)
         }
     }
 
@@ -340,7 +467,9 @@ impl TsfHost {
                 false
             }
         };
-        crate::text_store::hlog(&format!("--- feed_key vk={vk:#x} KeyDown done eaten={eaten}, pump >>>"));
+        crate::text_store::hlog(&format!(
+            "--- feed_key vk={vk:#x} KeyDown done eaten={eaten}, pump >>>"
+        ));
         pump(); // 候補窓/フォーカス post を drain
         crate::text_store::hlog(&format!("=== feed_key vk={vk:#x} pump done"));
         eaten
@@ -363,14 +492,17 @@ impl TsfHost {
         ctrl_down[VK_CONTROL] |= 0x80;
         let set_ok = unsafe { SetKeyboardState(&ctrl_down) }.is_ok();
         crate::text_store::hlog(&format!(
-            "=== feed_key_with_ctrl vk={vk:#x} saved={} set_ok={set_ok} >>>", saved.is_ok()
+            "=== feed_key_with_ctrl vk={vk:#x} saved={} set_ok={set_ok} >>>",
+            saved.is_ok()
         ));
         let eaten = self.feed_key(vk);
         // 元の keyboard state へ復元（GetKeyboardState が失敗していたら全ゼロを書かず何もしない）。
         if saved.is_ok() {
             let _ = unsafe { SetKeyboardState(&state) };
         }
-        crate::text_store::hlog(&format!("=== feed_key_with_ctrl vk={vk:#x} eaten={eaten} restored"));
+        crate::text_store::hlog(&format!(
+            "=== feed_key_with_ctrl vk={vk:#x} eaten={eaten} restored"
+        ));
         eaten
     }
 
@@ -390,14 +522,17 @@ impl TsfHost {
         shift_down[VK_SHIFT] |= 0x80;
         let set_ok = unsafe { SetKeyboardState(&shift_down) }.is_ok();
         crate::text_store::hlog(&format!(
-            "=== feed_key_with_shift vk={vk:#x} saved={} set_ok={set_ok} >>>", saved.is_ok()
+            "=== feed_key_with_shift vk={vk:#x} saved={} set_ok={set_ok} >>>",
+            saved.is_ok()
         ));
         let eaten = self.feed_key(vk);
         // 元の keyboard state へ復元（GetKeyboardState が失敗していたら全ゼロを書かず何もしない）。
         if saved.is_ok() {
             let _ = unsafe { SetKeyboardState(&state) };
         }
-        crate::text_store::hlog(&format!("=== feed_key_with_shift vk={vk:#x} eaten={eaten} restored"));
+        crate::text_store::hlog(&format!(
+            "=== feed_key_with_shift vk={vk:#x} eaten={eaten} restored"
+        ));
         eaten
     }
 
@@ -411,50 +546,90 @@ impl TsfHost {
     pub fn feed_key_keydown_only(&self, vk: u32) -> bool {
         let w = WPARAM(vk as usize);
         let l = LPARAM(0x0001_0001);
-        crate::text_store::hlog(&format!("=== feed_key_keydown_only vk={vk:#x} KeyDown(no-test) >>>"));
+        crate::text_store::hlog(&format!(
+            "=== feed_key_keydown_only vk={vk:#x} KeyDown(no-test) >>>"
+        ));
         let eaten = unsafe { self.ksm.KeyDown(w, l).unwrap_or(FALSE).as_bool() };
-        crate::text_store::hlog(&format!("--- feed_key_keydown_only vk={vk:#x} done eaten={eaten}, pump >>>"));
+        crate::text_store::hlog(&format!(
+            "--- feed_key_keydown_only vk={vk:#x} done eaten={eaten}, pump >>>"
+        ));
         pump();
         eaten
     }
 
-    /// SP5 item13 用: conversion-mode compartment を半角英数(直接入力)へ設定する。
-    ///
-    /// TIP の `is_direct_mode()` は同じ実 `ITfThreadMgr` を
-    /// `ITfCompartmentMgr` に cast → `GetCompartment(GUID_..._CONVERSION)` →
-    /// `GetValue()` で読む。ここで NATIVE ビット(0x1)を落とした 0 を `SetValue` すれば
-    /// `is_direct(0)==true` になり、変換キー(0x1C)→OnKeyDown(VK_CONVERT)→再変換が発火する。
-    /// （PreserveKey(0x1C) は OS に拒否されるため OnPreservedKey 経由ではない。）
-    /// 戻り値=書き込み成功（cast/GetCompartment/SetValue が全て Ok）。
-    pub fn set_direct_mode(&self) -> bool {
+    /// conversion-mode compartment の現在値が直接入力(=NATIVE ビットが立っていない)か。
+    pub fn conversion_is_direct(&self) -> bool {
         unsafe {
-            let cm: ITfCompartmentMgr = match self.thread_mgr.cast() { Ok(c) => c, Err(_) => return false };
-            let comp = match cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
-                Ok(c) => c, Err(_) => return false,
+            let cm: ITfCompartmentMgr = match self.thread_mgr.cast() {
+                Ok(c) => c,
+                Err(_) => return false,
             };
-            // NATIVE ビットを落とした 0（VT_I4）= 直接入力。TIP は VariantToInt32 で読む。
-            let v = VARIANT::from(0i32);
-            comp.SetValue(self.tid, &v).is_ok()
+            let comp = match cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            match comp.GetValue() {
+                Ok(v) => {
+                    let n = i32::try_from(&v).unwrap_or(1);
+                    n & 0x1 == 0
+                }
+                Err(_) => false,
+            }
         }
     }
 
-    /// item14 用: conversion-mode compartment をネイティブ入力(ひらがな)へ戻す。
-    ///
-    /// item13 は `set_direct_mode` で 0(直接入力)を書いたまま終わる。この compartment は
-    /// 同一の実 `ITfThreadMgr` 上＝プロセス共有なので、scenario ごとに host を作り直しても残る。
-    /// 次に走る item14 はネイティブ前提（"nihongo"+Space で候補）だが、直接入力のままだと TIP が
-    /// キーを食わず候補が出ない。NATIVE ビット(0x1)を立てた値を書いて `is_direct(値)==false` に戻す。
-    /// 戻り値=書き込み成功（cast/GetCompartment/SetValue が全て Ok）。
-    pub fn set_native_mode(&self) -> bool {
-        unsafe {
-            let cm: ITfCompartmentMgr = match self.thread_mgr.cast() { Ok(c) => c, Err(_) => return false };
-            let comp = match cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
-                Ok(c) => c, Err(_) => return false,
-            };
-            // NATIVE ビット(0x1)を立てた値 = ひらがな（ネイティブ入力）。is_direct(1)==false。
-            let v = VARIANT::from(0x1i32);
-            comp.SetValue(self.tid, &v).is_ok()
+    fn transition_mode(&self, target_direct: bool, label: &str) -> bool {
+        let settle = MODE_TOGGLE_REPEAT_GUARD + MODE_TOGGLE_GUARD_MARGIN;
+
+        // TIP の last_mode_toggle は testbench から読めない。直前がシナリオ自身の
+        // HANKAKU_ZENKAKU だった場合も含め、まず guard 全体を確実に空ける。
+        std::thread::sleep(settle);
+        pump();
+
+        let before = self.conversion_is_direct();
+        // compartment だけでは TIP の direct_mode_owned/langbar Cell を観測できない。
+        // まず必ず 1 回トグルして TIP 自身に実効状態を書かせ、目標と逆へ出た場合だけ
+        // guard 後にもう 1 回トグルして目標へ戻す。一時的な TSF フォーカス喪失では
+        // preserved key 自体が eaten=false になるため、各試行前に focus を回収して有界 retry する。
+        let mut after = before;
+        let mut accepted = 0u8;
+        let mut attempts = 0u8;
+        for attempt in 1..=4 {
+            attempts = attempt;
+            self.reclaim_focus();
+            let eaten = self.feed_key(0x1D); // VK_NONCONVERT = TIP preserved key
+            if eaten {
+                accepted += 1;
+            }
+            // 呼び出し直後にシナリオ自身がもう一度トグルしても repeat guard に
+            // 落ちないところまで待つ（item13 C / item38 がこの契約を必要とする）。
+            std::thread::sleep(settle);
+            pump();
+            after = self.conversion_is_direct();
+            eprintln!(
+                "DIAG mode_transition_attempt: label={label} attempt={attempt} eaten={eaten} \
+                 after_direct={after}"
+            );
+            if eaten && after == target_direct {
+                break;
+            }
         }
+        let ok = accepted > 0 && after == target_direct;
+        eprintln!(
+            "DIAG mode_transition: label={label} before_direct={before} target_direct={target_direct} \
+             attempts={attempts} accepted={accepted} after_direct={after} ok={ok}"
+        );
+        ok
+    }
+
+    /// TIP 所有状態・言語バー Cell・compartment を揃えて直接入力へ遷移する。
+    pub fn enter_direct_mode(&self) -> bool {
+        self.transition_mode(true, "enter_direct")
+    }
+
+    /// TIP 所有状態・言語バー Cell・compartment を揃えてネイティブ入力へ遷移する。
+    pub fn normalize_native_mode(&self) -> bool {
+        self.transition_mode(false, "normalize_native")
     }
 
     /// item29 用: コンテキスト単位の compartment `GUID_COMPARTMENT_KEYBOARD_DISABLED` を書く。
@@ -464,13 +639,17 @@ impl TsfHost {
     /// （ui/base/ime/win/tsf_bridge.cc InitializeDisabledContext）。InputScope の方は
     /// IS_PASSWORD でなく IS_PRIVATE になるため、TIP は compartment を見ない限り
     /// パスワード欄を検知できない（実機発見バグ #1）。
-    /// conversion-mode（thread 単位・set_direct_mode）と違い cast 元は context（self._ctx）。
+    /// conversion-mode（thread 単位・enter_direct_mode）と違い cast 元は context（self._ctx）。
     /// 戻り値=書き込み成功（cast/GetCompartment/SetValue が全て Ok）。
     pub fn set_context_keyboard_disabled(&self, disabled: bool) -> bool {
         unsafe {
-            let cm: ITfCompartmentMgr = match self._ctx.cast() { Ok(c) => c, Err(_) => return false };
+            let cm: ITfCompartmentMgr = match self._ctx.cast() {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
             let comp = match cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_DISABLED) {
-                Ok(c) => c, Err(_) => return false,
+                Ok(c) => c,
+                Err(_) => return false,
             };
             let v = VARIANT::from(if disabled { 1i32 } else { 0i32 });
             comp.SetValue(self.tid, &v).is_ok()
@@ -511,31 +690,51 @@ impl TsfHost {
     // ===== SP6a item14: UIElement advertise の観測アクセサ =====
 
     /// 観測した advertise イベント（Begin/Update/End）のログ。
-    pub fn ui_log(&self) -> &SinkLog { &self.ui_log }
+    pub fn ui_log(&self) -> &SinkLog {
+        &self.ui_log
+    }
 
     /// BeginUIElement の *pbShow をどう書き換えるか設定する。
     /// Some(false)=イマーシブ模擬（ホストが描く）/ Some(true)=デスクトップ / None=変更しない。
-    pub fn force_pbshow(&self, v: Option<bool>) { self.ui_log.force_pbshow.set(v); }
+    pub fn force_pbshow(&self, v: Option<bool>) {
+        self.ui_log.force_pbshow.set(v);
+    }
 
     /// 最後に begun した UIElement の候補文字列を実 msctf 経由で読み戻す。
     /// GetUIElement→ITfCandidateListUIElement::GetCount/GetString。advert が無い/cast 失敗なら空。
     pub fn candidate_strings(&self) -> Vec<String> {
         let ids = self.ui_log.begun.borrow();
-        let Some(&id) = ids.last() else { return vec![]; };
-        let Ok(el) = (unsafe { self.ui_mgr.GetUIElement(id) }) else { return vec![]; };
-        let Ok(cl) = el.cast::<ITfCandidateListUIElement>() else { return vec![]; };
+        let Some(&id) = ids.last() else {
+            return vec![];
+        };
+        let Ok(el) = (unsafe { self.ui_mgr.GetUIElement(id) }) else {
+            return vec![];
+        };
+        let Ok(cl) = el.cast::<ITfCandidateListUIElement>() else {
+            return vec![];
+        };
         let n = unsafe { cl.GetCount() }.unwrap_or(0);
         (0..n)
-            .map(|i| unsafe { cl.GetString(i) }.map(|b| b.to_string()).unwrap_or_default())
+            .map(|i| {
+                unsafe { cl.GetString(i) }
+                    .map(|b| b.to_string())
+                    .unwrap_or_default()
+            })
             .collect()
     }
 
     /// 最後に begun した UIElement の現在選択 index を実 msctf 経由で読み戻す（取れなければ 0）。
     pub fn candidate_selection(&self) -> u32 {
         let ids = self.ui_log.begun.borrow();
-        let Some(&id) = ids.last() else { return 0; };
-        let Ok(el) = (unsafe { self.ui_mgr.GetUIElement(id) }) else { return 0; };
-        let Ok(cl) = el.cast::<ITfCandidateListUIElement>() else { return 0; };
+        let Some(&id) = ids.last() else {
+            return 0;
+        };
+        let Ok(el) = (unsafe { self.ui_mgr.GetUIElement(id) }) else {
+            return 0;
+        };
+        let Ok(cl) = el.cast::<ITfCandidateListUIElement>() else {
+            return 0;
+        };
         unsafe { cl.GetSelection() }.unwrap_or(0)
     }
 
@@ -544,10 +743,19 @@ impl TsfHost {
     /// SetSelection(k)→Finalize を呼ぶ。戻り値=cast＋呼び出しに到達できたか。
     pub fn behavior_select_and_finalize(&self, k: u32) -> bool {
         let ids = self.ui_log.begun.borrow();
-        let Some(&id) = ids.last() else { return false; };
-        let Ok(el) = (unsafe { self.ui_mgr.GetUIElement(id) }) else { return false; };
-        let Ok(beh) = el.cast::<ITfCandidateListUIElementBehavior>() else { return false; };
-        unsafe { let _ = beh.SetSelection(k); let _ = beh.Finalize(); }
+        let Some(&id) = ids.last() else {
+            return false;
+        };
+        let Ok(el) = (unsafe { self.ui_mgr.GetUIElement(id) }) else {
+            return false;
+        };
+        let Ok(beh) = el.cast::<ITfCandidateListUIElementBehavior>() else {
+            return false;
+        };
+        unsafe {
+            let _ = beh.SetSelection(k);
+            let _ = beh.Finalize();
+        }
         true
     }
 
@@ -567,7 +775,9 @@ impl TsfHost {
         // 最初の合成は spawn ブロックで即終了されるので、合成が生き残る（doc が composing）まで 'a' を打つ。
         for _ in 0..4 {
             let _ = self.feed_key(0x41); // 'a'
-            if self.store.composing() { break; }
+            if self.store.composing() {
+                break;
+            }
         }
         // Esc: 生き残った合成を取消し、エンジンセッションを終了して読みをクリアする。
         let _ = self.feed_key(0x1B); // VK_ESCAPE
@@ -601,9 +811,13 @@ impl TsfHost {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(20));
             pump(); // 溜まった WM_TIMER を配送し llm_poll_proc を発火させる
-            // preedit が「変換中…」から実結果へ置換されたら完了。
-            if !self.store.preedit().contains('…') { break; }
-            if std::time::Instant::now() >= deadline { break; }
+                    // preedit が「変換中…」から実結果へ置換されたら完了。
+            if !self.store.preedit().contains('…') {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
         }
         // 念のためもう一度 pump（最後の置換 SetText を確実に store へ反映）。
         pump();
@@ -614,8 +828,12 @@ impl TsfHost {
         if self.activated {
             unsafe {
                 self.profiles.DeactivateProfile(
-                    TF_PROFILETYPE_INPUTPROCESSOR, LANGID_JA,
-                    &CLSID_NOSPACEKEY, &PROFILE_NOSPACEKEY, HKL::default(), 0,
+                    TF_PROFILETYPE_INPUTPROCESSOR,
+                    LANGID_JA,
+                    &CLSID_NOSPACEKEY,
+                    &PROFILE_NOSPACEKEY,
+                    HKL::default(),
+                    0,
                 )?;
             }
             self.activated = false;
@@ -630,10 +848,14 @@ impl Drop for TsfHost {
         let _ = self.deactivate();
         // SP6a item14: UIElement sink を解除（Deactivate より先）。cast 失敗は無視。
         if let Ok(source) = self.thread_mgr.cast::<ITfSource>() {
-            unsafe { let _ = source.UnadviseSink(self.ui_cookie); }
+            unsafe {
+                let _ = source.UnadviseSink(self.ui_cookie);
+            }
         }
         unsafe {
-            let _ = self.doc_mgr.Pop(windows::Win32::UI::TextServices::TF_POPF_ALL);
+            let _ = self
+                .doc_mgr
+                .Pop(windows::Win32::UI::TextServices::TF_POPF_ALL);
             let _ = self.thread_mgr.Deactivate();
             // 前面窓はプロセス共有なので破棄しない（ensure_foreground_window が次 host へ持ち回る）。
         }
@@ -663,16 +885,21 @@ unsafe fn diag_check_activation_state(
         }
         Err(e) => eprintln!(
             "DIAG activation: GetActiveProfile FAIL hr={:#010x} {}",
-            e.code().0 as u32, e.message(),
+            e.code().0 as u32,
+            e.message(),
         ),
     }
 
     // IsEnabledLanguageProfile: nospacekey プロファイル自体が enabled とマークされているか。
     match ipp.IsEnabledLanguageProfile(&CLSID_NOSPACEKEY, LANGID_JA, &PROFILE_NOSPACEKEY) {
-        Ok(enabled) => eprintln!("DIAG activation: IsEnabledLanguageProfile(nospacekey, ja) = {}", enabled.as_bool()),
+        Ok(enabled) => eprintln!(
+            "DIAG activation: IsEnabledLanguageProfile(nospacekey, ja) = {}",
+            enabled.as_bool()
+        ),
         Err(e) => eprintln!(
             "DIAG activation: IsEnabledLanguageProfile FAIL hr={:#010x} {}",
-            e.code().0 as u32, e.message(),
+            e.code().0 as u32,
+            e.message(),
         ),
     }
 
@@ -681,7 +908,8 @@ unsafe fn diag_check_activation_state(
         Ok(langid) => eprintln!("DIAG activation: GetCurrentLanguage = {langid:#06x}"),
         Err(e) => eprintln!(
             "DIAG activation: GetCurrentLanguage FAIL hr={:#010x} {}",
-            e.code().0 as u32, e.message(),
+            e.code().0 as u32,
+            e.message(),
         ),
     }
 
@@ -710,7 +938,8 @@ unsafe fn diag_check_activation_state(
         }
         Err(e) => eprintln!(
             "DIAG activation: EnumProfiles FAIL hr={:#010x} {}",
-            e.code().0 as u32, e.message(),
+            e.code().0 as u32,
+            e.message(),
         ),
     }
 }
@@ -719,21 +948,33 @@ unsafe fn diag_check_activation_state(
 pub fn stage0_spike() -> i32 {
     let _com = match ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("STAGE0 FAIL: ComSta::init error {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("STAGE0 FAIL: ComSta::init error {e:?}");
+            return 2;
+        }
     };
     let host = match TsfHost::start() {
         Ok(h) => h,
-        Err(e) => { eprintln!("STAGE0 FAIL: TsfHost::start error {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("STAGE0 FAIL: TsfHost::start error {e:?}");
+            return 2;
+        }
     };
     // VK_A = 0x41。OnKeyDown→run_preedit→SetText で store.preedit() が埋まるはず。
     let eaten = host.feed_key(0x41);
     let preedit = host.store.preedit();
-    println!("STAGE0 eaten={eaten} preedit={preedit:?} full={:?}", host.store.full());
+    println!(
+        "STAGE0 eaten={eaten} preedit={preedit:?} full={:?}",
+        host.store.full()
+    );
     if eaten && !preedit.is_empty() {
         println!("STAGE0 PASS");
         0
     } else {
-        eprintln!("STAGE0 FAIL: eaten={eaten} preedit_empty={}", preedit.is_empty());
+        eprintln!(
+            "STAGE0 FAIL: eaten={eaten} preedit_empty={}",
+            preedit.is_empty()
+        );
         1
     }
 }
@@ -743,17 +984,27 @@ pub fn stage0_spike() -> i32 {
 pub fn diag() -> i32 {
     let _com = match ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("DIAG ComSta fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("DIAG ComSta fail: {e:?}");
+            return 2;
+        }
     };
-    let tip_log = std::path::Path::new(&std::env::var("TEMP").unwrap_or_default()).join("nospacekey-tip.log");
+    let tip_log =
+        std::path::Path::new(&std::env::var("TEMP").unwrap_or_default()).join("nospacekey-tip.log");
     let _ = std::fs::remove_file(&tip_log); // この実行で TIP が書くか判定するため先に消す。
 
     // (1) nospacekey COM サーバをこのプロセスで直接生成できるか（=DLL がここでロード可能か）。
     let probe: windows::core::Result<windows::core::IUnknown> =
         unsafe { CoCreateInstance(&CLSID_NOSPACEKEY, None, CLSCTX_INPROC_SERVER) };
     match probe {
-        Ok(_) => eprintln!("DIAG (1) CoCreateInstance(CLSID_NOSPACEKEY): OK — DLL はこのプロセスでロード可能"),
-        Err(e) => eprintln!("DIAG (1) CoCreateInstance(CLSID_NOSPACEKEY): FAIL hr={:#010x} {}", e.code().0 as u32, e.message()),
+        Ok(_) => eprintln!(
+            "DIAG (1) CoCreateInstance(CLSID_NOSPACEKEY): OK — DLL はこのプロセスでロード可能"
+        ),
+        Err(e) => eprintln!(
+            "DIAG (1) CoCreateInstance(CLSID_NOSPACEKEY): FAIL hr={:#010x} {}",
+            e.code().0 as u32,
+            e.message()
+        ),
     }
 
     // (2)(3) 通常の start() 経路 → feed 'a'。
@@ -761,14 +1012,21 @@ pub fn diag() -> i32 {
         Ok(host) => {
             eprintln!("DIAG (2) TsfHost::start: OK");
             let eaten = host.feed_key(0x41);
-            eprintln!("DIAG (3) feed 'a': eaten={eaten} preedit={:?} full={:?}", host.store.preedit(), host.store.full());
+            eprintln!(
+                "DIAG (3) feed 'a': eaten={eaten} preedit={:?} full={:?}",
+                host.store.preedit(),
+                host.store.full()
+            );
         }
         Err(e) => eprintln!("DIAG (2) TsfHost::start: FAIL {e:?}"),
     }
 
     // (4) TIP は何か書いたか（活性化＝Activate が走れば ev=activate を書くはず）。
     match std::fs::metadata(&tip_log) {
-        Ok(m) => eprintln!("DIAG (4) tip.log: 存在 size={}b — TIP は活性化してログ書込み", m.len()),
+        Ok(m) => eprintln!(
+            "DIAG (4) tip.log: 存在 size={}b — TIP は活性化してログ書込み",
+            m.len()
+        ),
         Err(_) => eprintln!("DIAG (4) tip.log: 無し — TIP は一度も活性化していない"),
     }
     0

@@ -14,12 +14,12 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect,
-    GetDeviceCaps, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, HFONT, LOGPIXELSX, PAINTSTRUCT, TRANSPARENT,
+    GetDeviceCaps, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, HFONT, LOGPIXELSX, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, SetTimer,
-    ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
+    DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, ShowWindow, SW_HIDE,
+    SW_SHOWNOACTIVATE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
 };
 
 use crate::langbar::mode_label_ephemeral;
@@ -33,10 +33,6 @@ const HUD_SIDE: i32 = 48;
 const HUD_FONT_POINT_TENTHS: i32 = 240;
 /// 自動消去までの時間（ms）。
 const HUD_DURATION_MS: u32 = 1200;
-/// 自動消去タイマの ID（ウィンドウ付きタイマ）。
-const HUD_TIMER_ID: usize = 1;
-/// 退場フェード完了後に SW_HIDE する遅延タイマの ID。
-const HUD_FADE_TIMER_ID: usize = 2;
 /// 自前ヘアライン枠の太さ（px、非スケール）。
 const BORDER: i32 = 1;
 
@@ -69,7 +65,8 @@ impl HudState {
     /// ファミリは候補窓と同じく theme から（GDI パスにも settings のフォントが効く）。
     unsafe fn font_for_dpi(&mut self, dpi: i32) -> Option<HFONT> {
         let family = popup::family_utf16z(&self.theme.font_family);
-        self.backend.font_for_dpi(&family, HUD_FONT_POINT_TENTHS, dpi)
+        self.backend
+            .font_for_dpi(&family, HUD_FONT_POINT_TENTHS, dpi)
     }
 }
 
@@ -94,9 +91,12 @@ unsafe fn begin_dismiss(hwnd: HWND) {
     match action {
         popup::FadeOut::AlreadyFading => {}
         popup::FadeOut::Fade(ms) => {
-            // SetTimer 失敗を無視すると fading_out が立ったまま透明な TOPMOST 窓が
+            // 世代ID付きで武装。失敗を無視すると fading_out が立ったまま透明な TOPMOST 窓が
             // 残留する（候補窓 hide と同じ理由）。失敗時は即時 hide へ劣化する。
-            if SetTimer(Some(hwnd), HUD_FADE_TIMER_ID, ms, None) == 0 {
+            let armed = hud_state(hwnd)
+                .map(|s| s.backend.arm_fade_timer(hwnd, ms))
+                .unwrap_or(false);
+            if !armed {
                 if let Some(s) = hud_state(hwnd) {
                     s.backend.fading_out = false;
                 }
@@ -116,16 +116,32 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_TIMER => unsafe {
-            if wparam.0 == HUD_TIMER_ID {
-                // 表示時間満了 → 退場（フェードできるなら来た道＝フェードで帰る）。
-                let _ = KillTimer(Some(hwnd), HUD_TIMER_ID);
-                begin_dismiss(hwnd);
-            } else if wparam.0 == HUD_FADE_TIMER_ID {
-                // 退場フェード完了 → フラグを解いて実際に隠す（次回退場の再入ガード解除）。
-                let _ = KillTimer(Some(hwnd), HUD_FADE_TIMER_ID);
-                if let Some(s) = hud_state(hwnd) {
-                    s.backend.fading_out = false;
+            // 表示時間タイマ・退場フェード完了タイマとも世代ID判定（KillTimer はキューへ
+            // 投稿済みの WM_TIMER を除去できないため、旧世代の発火を切り捨てる — 巡2 B1。
+            // 2 系統は同じ発行カウンタを共有するため wparam が両方に一致することはない）。
+            // 巡3 G6: state 欠落（WM_NCDESTROY 後等）は判定不能だが可視のまま残す理由も
+            // 無い — 1438196 構造に倣い隠して抜ける。begin_dismiss は state 欠落で
+            // FadeOut::Immediate へ落ちるため show 枝も隠れる。
+            let Some(s) = hud_state(hwnd) else {
+                if wparam.0 >= 1000 {
+                    let _ = KillTimer(Some(hwnd), wparam.0);
                 }
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return LRESULT(0);
+            };
+            let is_show = s.backend.is_current_show_timer(wparam.0);
+            let is_fade = s.backend.is_current_fade_timer(wparam.0);
+            if wparam.0 >= 1000 {
+                let _ = KillTimer(Some(hwnd), wparam.0);
+            }
+            if is_show {
+                // 表示時間満了 → 退場（フェードできるなら来た道＝フェードで帰る）。
+                s.backend.show_timer_id = 0;
+                begin_dismiss(hwnd);
+            } else if is_fade {
+                // 退場フェード完了 → フラグを解いて実際に隠す（次回退場の再入ガード解除）。
+                s.backend.fade_timer_id = 0;
+                s.backend.fading_out = false;
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
             LRESULT(0)
@@ -186,7 +202,12 @@ fn paint_gdi(hwnd: HWND) {
         let _ = SetTextColor(hdc, COLORREF(colors.text.colorref()));
         let mut text: Vec<u16> = state.label.encode_utf16().collect();
         let mut tr = rc;
-        let _ = DrawTextW(hdc, &mut text, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        let _ = DrawTextW(
+            hdc,
+            &mut text,
+            &mut tr,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
         if let Some(o) = old {
             let _ = SelectObject(hdc, o);
         }
@@ -232,7 +253,9 @@ unsafe fn paint_d2d(hwnd: HWND) {
         .chain(std::iter::once(0))
         .collect();
     let font_px = font_size_px(HUD_FONT_POINT_TENTHS, dpi);
-    let Some(fmt) = state.backend.text_format(&family, font_px, DWRITE_TEXT_ALIGNMENT_CENTER, true)
+    let Some(fmt) = state
+        .backend
+        .text_format(&family, font_px, DWRITE_TEXT_ALIGNMENT_CENTER, true)
     else {
         let _ = EndPaint(hwnd, &ps);
         return;
@@ -259,7 +282,15 @@ unsafe fn paint_d2d(hwnd: HWND) {
     };
     let brush = |c: crate::theme::Rgba| ctx.CreateSolidColorBrush(&c.d2d(), None).ok();
 
-    ctx.Clear(Some(&crate::theme::Rgba { r: 0, g: 0, b: 0, a: 0 }.d2d()));
+    ctx.Clear(Some(
+        &crate::theme::Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        }
+        .d2d(),
+    ));
     if let Some(b) = brush(t.colors.bg) {
         ctx.FillRectangle(&rectf, &b);
     }
@@ -307,7 +338,9 @@ pub struct ModeHud {
 impl ModeHud {
     /// HWND を持たない空の HUD を構築する（`TextService::new` 用）。
     pub fn empty() -> Self {
-        Self { hwnd: HWND(std::ptr::null_mut()) }
+        Self {
+            hwnd: HWND(std::ptr::null_mut()),
+        }
     }
 
     /// Deactivate から呼ぶ。プロセス終了時の msctf 後始末（LdrShutdownProcess 中の
@@ -351,7 +384,11 @@ impl ModeHud {
             self.hwnd = hwnd;
 
             // 角丸は両パス、アクリルバックドロップは D2D パスのみ。失敗は握り潰す（Win10=no-op）。
-            crate::render::apply_dwm_chrome(hwnd, theme.rounded, theme.acrylic && renderer.is_some());
+            crate::render::apply_dwm_chrome(
+                hwnd,
+                theme.rounded,
+                theme.acrylic && renderer.is_some(),
+            );
 
             popup::install_state(
                 hwnd,
@@ -369,7 +406,14 @@ impl ModeHud {
     /// `ephemeral`: ephemeral かなモード中（F8 等の一時トリガ中）なら「あ˙」で区別する。
     /// `theme` は候補窓と共有する解決済みテーマ（Task 7: 呼び出し元が flash ごとに
     /// settings/ダークモードを再評価して渡す）。
-    pub fn flash(&mut self, is_direct: bool, ephemeral: bool, x: i32, y: i32, theme: crate::theme::Theme) {
+    pub fn flash(
+        &mut self,
+        is_direct: bool,
+        ephemeral: bool,
+        x: i32,
+        y: i32,
+        theme: crate::theme::Theme,
+    ) {
         // デバイスロスト（前回 paint で検知）していたら、まず窓を破棄して null に戻す。
         // ensure_hwnd の前に行い、再生成される窓で最新テーマ・chrome を適用しなおす。
         self.recover_if_device_lost();
@@ -383,20 +427,24 @@ impl ModeHud {
                 state.label = label;
                 // Task 7: DWM chrome に効く属性（角丸/アクリル）が変わったときだけ再適用する
                 // （色だけの変化は後段の InvalidateRect による再描画で足りる）。
-                let chrome_changed = state.theme.rounded != theme.rounded
-                    || state.theme.acrylic != theme.acrylic;
+                let chrome_changed =
+                    state.theme.rounded != theme.rounded || state.theme.acrylic != theme.acrylic;
                 // 既存 HWND の場合も毎回テーマを更新する（settings 変更が次回 flash から反映）。
                 state.theme = theme;
                 if chrome_changed {
                     // アクリルは D2D バックエンドのときだけ有効（ensure_hwnd の初回適用と同条件）。
                     let d2d = state.backend.renderer.is_some();
                     crate::render::apply_dwm_chrome(
-                        self.hwnd, state.theme.rounded, state.theme.acrylic && d2d,
+                        self.hwnd,
+                        state.theme.rounded,
+                        state.theme.acrylic && d2d,
                     );
                 }
             }
         }
-        let dpi = popup::window_dpi(self.hwnd);
+        // DPI は表示先アンカー(x, y)のモニタから先に確定する（候補窓と同じ理由 — 窓の
+        // 現位置 DPI では混合DPIのモニタ越え初回フレームで窓とグリフの縮尺が食い違う、UIバグ2）。
+        let dpi = popup::dpi_for_anchor(x, y);
         let (w, h) = hud_window_size(dpi);
         let (fx, fy) = popup::place_on_monitor(x, y, w, h);
         unsafe {
@@ -410,8 +458,11 @@ impl ModeHud {
             // レイアウト＋DXGI_SCALING_STRETCH され、グリフが拡大・クリップされていた。
             // 候補窓 relayout_and_repaint と同じく無条件 resize にしてこの真因を潰す。
             popup::resize_and_invalidate::<HudState>(self.hwnd, w, h);
-            // 退場フェード中の再 flash なら遅延 hide タイマを解除して表示を続行する。
-            let _ = KillTimer(Some(self.hwnd), HUD_FADE_TIMER_ID);
+            // 退場フェード中の再 flash なら現在の世代タイマを解除して表示を続行する
+            // （旧世代のキュー済み発火は WM_TIMER 側の世代ID判定が切り捨てる）。
+            if let Some(s) = hud_state(self.hwnd) {
+                s.backend.cancel_fade_timer(self.hwnd);
+            }
             let was_visible = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE).as_bool();
             // 出現モーション（新規出現のみ短いフェード。表示中の連打・フェード割り込みは
             // 1.0 へスナップ）。候補窓と共有の popup::play_entrance。
@@ -419,11 +470,14 @@ impl ModeHud {
                 let motion = state.theme.motion;
                 popup::play_entrance(state, motion, was_visible);
             }
-            // 自動消去タイマを (再)武装。既存があれば止めてから張り直す（連打で出続ける）。
+            // 自動消去タイマを (再)武装 — フェード完了タイマと同じ世代ID規律（巡2 B1）。
+            // 連打の再 flash でも arm が前世代を掃除して張り直すので出続ける。
             // 武装に失敗したまま表示し続けると TOPMOST の HUD が永久に残る。一瞬も
             // 出せないことより残留の方が害が大きいので、失敗時は即座に退場させる。
-            let _ = KillTimer(Some(self.hwnd), HUD_TIMER_ID);
-            if SetTimer(Some(self.hwnd), HUD_TIMER_ID, HUD_DURATION_MS, None) == 0 {
+            let armed = hud_state(self.hwnd)
+                .map(|s| s.backend.arm_show_timer(self.hwnd, HUD_DURATION_MS))
+                .unwrap_or(false);
+            if !armed {
                 begin_dismiss(self.hwnd);
             }
         }

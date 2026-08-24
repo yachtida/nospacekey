@@ -9,7 +9,7 @@
 
 use std::cell::Cell;
 
-use windows::core::{implement, Result, BSTR, GUID, BOOL};
+use windows::core::{implement, Result, BOOL, BSTR, GUID};
 use windows::Win32::Foundation::{E_INVALIDARG, S_FALSE};
 use windows::Win32::UI::TextServices::{
     IEnumTfDisplayAttributeInfo, IEnumTfDisplayAttributeInfo_Impl, ITfDisplayAttributeInfo,
@@ -30,21 +30,35 @@ pub struct UnderlineInfo {
 
 impl UnderlineInfo {
     pub fn new() -> Self {
-        Self { target: false, _guard: ComObjectGuard::new() }
+        Self {
+            target: false,
+            _guard: ComObjectGuard::new(),
+        }
     }
 
     pub fn new_target() -> Self {
-        Self { target: true, _guard: ComObjectGuard::new() }
+        Self {
+            target: true,
+            _guard: ComObjectGuard::new(),
+        }
     }
 }
 
 impl ITfDisplayAttributeInfo_Impl for UnderlineInfo_Impl {
     fn GetGUID(&self) -> Result<GUID> {
-        Ok(if self.target { GUID_DISPLAY_ATTRIBUTE_TARGET } else { GUID_DISPLAY_ATTRIBUTE })
+        Ok(if self.target {
+            GUID_DISPLAY_ATTRIBUTE_TARGET
+        } else {
+            GUID_DISPLAY_ATTRIBUTE
+        })
     }
 
     fn GetDescription(&self) -> Result<BSTR> {
-        Ok(BSTR::from(if self.target { "nospacekey target clause" } else { "nospacekey input" }))
+        Ok(BSTR::from(if self.target {
+            "nospacekey target clause"
+        } else {
+            "nospacekey input"
+        }))
     }
 
     fn GetAttributeInfo(&self, pda: *mut TF_DISPLAYATTRIBUTE) -> Result<()> {
@@ -56,7 +70,11 @@ impl ITfDisplayAttributeInfo_Impl for UnderlineInfo_Impl {
             lsStyle: TF_LS_SOLID,
             fBoldLine: BOOL::from(self.target),
             crLine: TF_DA_COLOR::default(),
-            bAttr: if self.target { TF_ATTR_TARGET_CONVERTED } else { TF_ATTR_INPUT },
+            bAttr: if self.target {
+                TF_ATTR_TARGET_CONVERTED
+            } else {
+                TF_ATTR_INPUT
+            },
         };
         unsafe {
             if !pda.is_null() {
@@ -80,7 +98,11 @@ impl ITfDisplayAttributeInfo_Impl for UnderlineInfo_Impl {
 const ATTR_COUNT: u32 = 2;
 
 fn attr_at(index: u32) -> ITfDisplayAttributeInfo {
-    if index == 0 { UnderlineInfo::new().into() } else { UnderlineInfo::new_target().into() }
+    if index == 0 {
+        UnderlineInfo::new().into()
+    } else {
+        UnderlineInfo::new_target().into()
+    }
 }
 
 /// 表示属性 2 件を順に返す列挙子。
@@ -122,7 +144,9 @@ impl IEnumTfDisplayAttributeInfo_Impl for AttrEnum_Impl {
                 unsafe {
                     // 代入（`*p = v`）は旧値の drop_in_place を先に走らせる — ホストが未初期化の
                     // まま渡す配列では不定ポインタへの Release（UB）。write は上書きのみ。
-                    rginfo.add(fetched as usize).write(Some(attr_at(self.index.get())));
+                    rginfo
+                        .add(fetched as usize)
+                        .write(Some(attr_at(self.index.get())));
                 }
                 self.index.set(self.index.get() + 1);
                 fetched += 1;
@@ -147,7 +171,8 @@ impl IEnumTfDisplayAttributeInfo_Impl for AttrEnum_Impl {
     }
 
     fn Skip(&self, ulcount: u32) -> Result<()> {
-        self.index.set((self.index.get().saturating_add(ulcount)).min(ATTR_COUNT));
+        self.index
+            .set((self.index.get().saturating_add(ulcount)).min(ATTR_COUNT));
         Ok(())
     }
 }
@@ -160,10 +185,7 @@ impl ITfDisplayAttributeProvider_Impl for crate::text_service::TextService_Impl 
         Ok(AttrEnum::new().into())
     }
 
-    fn GetDisplayAttributeInfo(
-        &self,
-        guid: *const GUID,
-    ) -> Result<ITfDisplayAttributeInfo> {
+    fn GetDisplayAttributeInfo(&self, guid: *const GUID) -> Result<ITfDisplayAttributeInfo> {
         unsafe {
             if guid.is_null() {
                 return Err(E_INVALIDARG.into());

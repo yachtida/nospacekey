@@ -49,4 +49,36 @@ public struct LearningSettings: Equatable, Sendable {
         }
         return nil
     }
+
+    /// 同一ユーザーの別 logon session にいる Engine と学習 clear を協調させる scope。
+    /// Windows の Global kernel object 名へ生の profile path を載せず、正規化した保存先を
+    /// 安定 FNV-1a で短くする。Rust Config 側の同名関数と byte 単位で一致させること。
+    static func coordinationScope(environment: [String: String]) -> String? {
+        let raw: String
+        if let explicit = environment["NOSPACEKEY_MEMORY_DIR"], !explicit.isEmpty {
+            raw = explicit
+        } else if let local = environment["LOCALAPPDATA"], !local.isEmpty {
+            raw = local.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+                + #"\nospacekey\memory"#
+        } else {
+            return nil
+        }
+        let normalized = raw.replacingOccurrences(of: "/", with: "\\")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\\"))
+            .lowercased()
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in normalized.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(format: "%016llx", hash)
+    }
+
+    static func lifecycleMutexName(scope: String) -> String {
+        "Global\\nospacekey-learning-lifecycle-" + scope
+    }
+
+    static func presenceMutexName(scope: String, sessionID: UInt32) -> String {
+        "Global\\nospacekey-learning-presence-" + scope + "-s" + String(sessionID)
+    }
 }

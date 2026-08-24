@@ -1,40 +1,40 @@
 //! nospacekey_tip.dll — TSF Text Input Processor の COM エントリポイント。
 //! PART 1: COM スケルトン + TSF 登録 + 純粋な入力状態機械。
 
-mod globals;
-mod keymap;
-mod candidate_state;
 mod candidate_presenter;
+mod candidate_state;
 mod candidate_uielement;
+mod candidate_window;
 mod class_factory;
-mod register;
-mod text_service;
+mod config_launch;
+mod conversion_mode;
+mod display_attribute;
+mod edit_session;
+pub(crate) mod engine_link;
+mod focus;
+mod globals;
 mod input_state;
 mod key_event_sink;
-mod edit_session;
-mod display_attribute;
-mod candidate_window;
-mod mode_hud;
-mod reading_monitor;
-mod popup;
-mod llm_worker;
-mod conversion_mode;
-mod focus;
+mod keymap;
 mod langbar;
 mod langbar_icon;
-mod config_launch;
-mod theme;
-mod render;
+mod llm_worker;
+mod mode_hud;
+mod popup;
 mod power;
-pub(crate) mod engine_link;
+mod reading_monitor;
+mod register;
+mod render;
+mod text_service;
+mod theme;
 
-use std::ffi::c_void;
-use std::sync::atomic::Ordering;
-use windows::core::{GUID, HRESULT, IUnknown, Interface, BOOL};
-use windows::Win32::Foundation::{CLASS_E_CLASSNOTAVAILABLE, TRUE, HMODULE, S_OK, S_FALSE, E_FAIL};
-use windows::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
 use class_factory::ClassFactory;
 use globals::{set_hinst, CLSID_NOSPACEKEY, DLL_REF};
+use std::ffi::c_void;
+use std::sync::atomic::Ordering;
+use windows::core::{IUnknown, Interface, BOOL, GUID, HRESULT};
+use windows::Win32::Foundation::{CLASS_E_CLASSNOTAVAILABLE, E_FAIL, HMODULE, S_FALSE, S_OK, TRUE};
+use windows::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
 
 #[no_mangle]
 extern "system" fn DllMain(inst: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {
@@ -51,7 +51,11 @@ extern "system" fn DllMain(inst: HMODULE, reason: u32, _reserved: *mut c_void) -
 }
 
 #[no_mangle]
-extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+extern "system" fn DllGetClassObject(
+    rclsid: *const GUID,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     // 登録済み CLSID 以外への要求は提供しない（COM 規約: CLASS_E_CLASSNOTAVAILABLE）。
     // 実運用ではレジストリ経由で自分の CLSID しか来ないが、規約どおり防御する。
     if rclsid.is_null() || unsafe { *rclsid } != CLSID_NOSPACEKEY {
@@ -63,7 +67,11 @@ extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID, ppv
 
 #[no_mangle]
 extern "system" fn DllCanUnloadNow() -> HRESULT {
-    if DLL_REF.load(Ordering::SeqCst) <= 0 { S_OK } else { S_FALSE }
+    if DLL_REF.load(Ordering::SeqCst) <= 0 {
+        S_OK
+    } else {
+        S_FALSE
+    }
 }
 
 #[no_mangle]
@@ -77,7 +85,9 @@ extern "system" fn DllRegisterServer() -> HRESULT {
             text_service::tip_log(&format!("ev=register_failed err={e:?}"));
             match register::unregister() {
                 Ok(()) => text_service::tip_log("ev=register_rolled_back"),
-                Err(ue) => text_service::tip_log(&format!("ev=register_rollback_failed err={ue:?}")),
+                Err(ue) => {
+                    text_service::tip_log(&format!("ev=register_rollback_failed err={ue:?}"))
+                }
             }
             E_FAIL
         }
@@ -86,5 +96,8 @@ extern "system" fn DllRegisterServer() -> HRESULT {
 
 #[no_mangle]
 extern "system" fn DllUnregisterServer() -> HRESULT {
-    match register::unregister() { Ok(()) => S_OK, Err(_) => E_FAIL }
+    match register::unregister() {
+        Ok(()) => S_OK,
+        Err(_) => E_FAIL,
+    }
 }

@@ -330,7 +330,26 @@ input.w-md { width: 140px; }
 .update-status-ok { color: var(--accent); }
 .update-status-err { color: var(--danger); }
 .update-link { display: inline-block; margin-top: 6px; }
-.update-beta { display: inline-flex; gap: 6px; align-items: center; margin-top: 4px; font-size: 13px; color: var(--text-sub); }
+.update-option { display: inline-flex; gap: 6px; align-items: center; margin-top: 4px; font-size: 13px; color: var(--text-sub); }
+.update-prompt {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  max-height: 120px;
+  opacity: 1;
+  overflow: hidden;
+  transition: opacity var(--dur-quick) var(--ease-snap);
+}
+.update-prompt.is-hidden {
+  max-height: 0;
+  margin-top: 0;
+  padding-block: 0;
+  border-color: transparent;
+  opacity: 0;
+  pointer-events: none;
+}
+.update-prompt button { margin-left: 8px; }
 #about-path { word-break: break-all; }
 #pal-reset { margin-left: auto; }
 
@@ -469,19 +488,26 @@ input.w-md { width: 140px; }
 .dict-row-actions button { padding: 3px 10px; font-size: 12px; margin-right: 4px; }
 .dict-row-actions button:last-child { margin-right: 0; }
 
-/* ---- 辞書エントリモーダル: キー割り当てレコーダと同型（中央シート + 調光スクリム） ---- */
+/* ---- 辞書エントリモーダル: ネイティブ <dialog>（キー割当レコーダと同型のシート） ----
+   showModal() が top layer・フォーカストラップ・背面inert を担保するため、
+   ここは「透明なコンテナ + scrim は ::backdrop」だけを書く。 */
 #dict-modal {
-  position: fixed;
-  inset: 0;
-  z-index: 20;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--scrim);
-  animation: scrim-in var(--dur-quick) ease-out;
+  border: none;
+  padding: 0;
+  background: transparent;
+  /* UA スタイルの dialog { color: canvasText } が body の継承を遮断するため明示
+     （.dict-sheet h2 等の色未指定要素がダークで黒系に落ちるのを防ぐ）。 */
+  color: var(--text);
 }
-#dict-modal[hidden] { display: none; }
-#dict-modal:focus { outline: none; }
+/* ::backdrop は Chromium 122 未満で root のカスタムプロパティを継承しないため、
+   --scrim/--dur-quick のトークン値をリテラル直書きする（トークン表と同値）。 */
+#dict-modal::backdrop {
+  background: rgba(0, 0, 0, 0.32);
+  animation: scrim-in 180ms ease-out;
+}
+@media (prefers-color-scheme: dark) {
+  #dict-modal::backdrop { background: rgba(0, 0, 0, 0.45); }
+}
 .dict-sheet {
   min-width: 320px;
   max-width: 420px;
@@ -519,6 +545,7 @@ input.w-md { width: 140px; }
   #toast { animation: reduced-fade 160ms ease; }
   #toast.hide { animation: reduced-fade-out 120ms ease forwards; }
   #keymap-recorder .sheet, .dict-sheet { animation: reduced-fade 160ms ease; }
+  .update-prompt { transition-duration: 1ms; }
   .nav-item:active, button:active, .theme-card:active { transform: none; }
   input[type="checkbox"]::after { transition-duration: 1ms; }
   @keyframes reduced-fade { from { opacity: 0; } }

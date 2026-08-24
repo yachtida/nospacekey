@@ -55,7 +55,7 @@ final class ZenzaiConversionTests: XCTestCase {
         XCTAssertTrue(bCands?.contains("日本語") ?? false, "expected 日本語 in \(String(describing: bCands))")
         _ = svc.commit(session: b, index: bCands!.firstIndex(of: "日本語")!)
 
-        // 切替 2: A へ戻る。B の確定文脈（completedData 等）が残っていても Zenzai 経路は読まない。
+        // 切替 2: A へ戻る。B の確定文脈（completedData 等）は切替時に一掃する。
         for ch in "hare" { _ = svc.insert(session: a, text: String(ch)) }
         XCTAssertFalse(svc.convert(session: a)?.isEmpty ?? true, "切替復帰後の A の変換が空")
     }

@@ -28,15 +28,36 @@ fn main() {
     // 特定可能にする。FileVersion/ProductName 等は winresource が CARGO_PKG_* から
     // 自動設定する。文字列にブランド名リテラルを焼かないのは命名未決定のため
     // （改名時にここを触らずに済ませる — 表示名は installer 側の MyAppName 1 箇所に集約）。
+    //
+    // アイコンリソース: タスクバー入力モード表示 (Pure Glyph 案) とプロファイル固定
+    // アイコン (Gapless N 案)。ID は langbar_icon.rs の RES_* 定数と register.rs の
+    // RegisterProfile iconIndex が参照するため**変更すると実行時整合が壊れる**。
+    // ICO の生成元は scripts/gen-ime-icons.ps1（design/icons/ から再生成）。
     #[cfg(windows)]
     {
         let ver = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
         let name = std::env::var("CARGO_PKG_NAME").expect("CARGO_PKG_NAME");
         let mut res = winresource::WindowsResource::new();
         res.set("ProductVersion", &format!("{ver}+{git_hash}"));
-        res.set("FileDescription", &format!("{name} (TSF text input processor)"));
+        res.set(
+            "FileDescription",
+            &format!("{name} (TSF text input processor)"),
+        );
+        const ICONS: &[(&str, &str)] = &[
+            ("1", "icons/mode-direct-light.ico"),
+            ("2", "icons/mode-direct-dark.ico"),
+            ("3", "icons/mode-kana-light.ico"),
+            ("4", "icons/mode-kana-dark.ico"),
+            ("5", "icons/mode-ephemeral-light.ico"),
+            ("6", "icons/mode-ephemeral-dark.ico"),
+            ("7", "icons/profile-n.ico"),
+        ];
+        for (id, path) in ICONS {
+            res.set_icon_with_id(path, id);
+            println!("cargo:rerun-if-changed={path}");
+        }
         res.compile()
-            .expect("VERSIONINFO embed failed (check rc.exe / Windows SDK on PATH)");
+            .expect("resource embed failed (check rc.exe / Windows SDK on PATH)");
     }
 }
 

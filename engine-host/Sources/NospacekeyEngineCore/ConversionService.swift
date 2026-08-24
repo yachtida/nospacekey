@@ -1,6 +1,99 @@
 import Foundation
 import KanaKanjiConverterModuleWithDefaultDictionary
 
+#if os(Windows)
+import WinSDK
+#endif
+
+/// 学習ディレクトリの一要素（リンク/ジャンクションを通常ファイルとして扱わないための
+/// production metadata seam）。Windows では FILE_ATTRIBUTE_REPARSE_POINT、その他の環境では
+/// Foundation の symbolic-link 属性を用いる。
+struct LearningPathMetadata: Sendable {
+    let isDirectory: Bool
+    let isRegularFile: Bool
+    let isReparsePoint: Bool
+}
+
+/// FileManager の metadata を安全側に正規化する。存在しない path は nil（列挙と削除の競合で
+/// 先に消えた場合）として扱い、権限その他のエラーは呼び出し側へ伝播する。
+func learningPathMetadata(for url: URL) throws -> LearningPathMetadata? {
+#if os(Windows)
+    // GetFileAttributesW はリンク先を辿らず path 自身の属性を返す。Foundation の
+    // attributesOfItem は壊れた reparse point で NotFound になり得るため、先にこれを
+    // 見ておく。reparse point は regular file として扱わず、reset/delete を拒否する。
+    let windowsAttributes = url.path.withCString(encodedAs: UTF16.self) { pointer in
+        GetFileAttributesW(pointer)
+    }
+    if windowsAttributes != UInt32.max && (windowsAttributes & 0x0000_0400) != 0 {
+        return LearningPathMetadata(
+            isDirectory: (windowsAttributes & 0x0000_0010) != 0,
+            isRegularFile: false,
+            isReparsePoint: true)
+    }
+#endif
+
+    let attributes: [FileAttributeKey: Any]
+    do {
+        attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    } catch {
+        let nsError = error as NSError
+        if (nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError) ||
+            (nsError.domain == NSPOSIXErrorDomain && nsError.code == 2) {
+            return nil
+        }
+        throw error
+    }
+
+    let type = attributes[.type] as? FileAttributeType
+    let isDirectory = type == .typeDirectory
+    let isRegularFile = type == .typeRegular
+#if os(Windows)
+    // Foundation の attributes は link 先を返すことがあるため、Windows では path 自身の
+    // file attributes を確認する。取得不能時も reparse 扱いにして fail-closed にする。
+    let isReparsePoint = windowsAttributes == UInt32.max ||
+        (windowsAttributes & 0x0000_0400) != 0
+    #else
+    let resourceValues = try? url.resourceValues(forKeys: [.isSymbolicLinkKey])
+    let isReparsePoint = type == .typeSymbolicLink ||
+        resourceValues?.isSymbolicLink == true ||
+        (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil
+    #endif
+    return LearningPathMetadata(
+        isDirectory: isDirectory,
+        isRegularFile: isRegularFile,
+        isReparsePoint: isReparsePoint)
+}
+
+/// `clearLearning()` のファイル操作だけを差し替えるための最小 seam。
+/// 本番では FileManager、テストでは列挙/削除の失敗を決定的に注入する。
+struct LearningFileSystem: @unchecked Sendable {
+    let list: (URL) throws -> [String]
+    let remove: (URL) throws -> Void
+    /// 本番では nil（ConversionService の vendor converter.resetMemory() を使う）。テストでは
+    /// 呼び出しを観測して、unsafe preflight 前に vendor reset が走らないことを固定する。
+    let resetMemory: (() -> Void)?
+    /// path 自身の metadata。nil の seam は既存の deterministic listing test 用であり、
+    /// production の `.live` は必ずこれを設定する。
+    let metadata: ((URL) throws -> LearningPathMetadata?)?
+
+    static let live = LearningFileSystem(
+        list: { try FileManager.default.contentsOfDirectory(atPath: $0.path) },
+        remove: { try FileManager.default.removeItem(at: $0) },
+        resetMemory: nil,
+        metadata: { try learningPathMetadata(for: $0) }
+    )
+
+    init(list: @escaping (URL) throws -> [String],
+         remove: @escaping (URL) throws -> Void,
+         resetMemory: (() -> Void)? = nil,
+         metadata: ((URL) throws -> LearningPathMetadata?)? = nil) {
+        self.list = list
+        self.remove = remove
+        self.resetMemory = resetMemory
+        self.metadata = metadata
+    }
+}
+
 /// KanaKanjiConverter をラップし、セッションごとに ComposingText を保持する変換サービス。
 /// COM/パイプ非依存（ユニットテスト対象）。Zenzai は config で切替える。
 ///
@@ -146,6 +239,17 @@ public final class ConversionService: @unchecked Sendable {
     /// （同一セッション継続ならリセットしない＝部分確定の左文脈を保つ。Zenzai 実稼働中は audit H2
     /// によりリセット自体をスキップする — bindConverter の注記参照）。
     private var activeConverterSession: Int?
+    /// Zenzai の遅延フォールバックが決まった後、次の converter 操作前に classic 用の共有状態を
+    /// 一度だけ破棄する予約。遅い requestCandidates の後処理中に stopComposition すると、その要求の
+    /// 結果まで壊すため、converterLock 下の次の入口で消費する。
+    private var needsClassicReset = false
+    /// vendor の classic 経路だけが読む確定・学習文脈の所有セッション。Zenzai 稼働中は
+    /// セッション切替で stopComposition を省くため、遅延フォールバック時に「現セッションの
+    /// 部分確定を残すべきか／別セッションの文脈を捨てるべきか」を値そのものではなく所有者で判定する。
+    private var completedDataSession: Int?
+    private var learningDataSession: Int?
+    /// stopComposition の実行回数。回帰テストが「予約を消しただけ」の偽修正を見逃さないための観測窓。
+    private var compositionResetCount = 0
     /// 接続 id → その接続で作られたセッション id の集合。常駐サーバは複数 TIP クライアントが
     /// それぞれ別接続で同時接続しうる（NamedPipeServer は nMaxInstances=255）ため、切断時に掃除すべき
     /// セッションを接続単位で特定する。TIP が EndSession を送らずパイプを落とす経路（EndSession
@@ -155,6 +259,19 @@ public final class ConversionService: @unchecked Sendable {
     private var connectionSessions: [Int: Set<Int>] = [:]
     private var nextId = 1
     private let workDir = FileManager.default.temporaryDirectory
+    private let fileSystem: LearningFileSystem
+    /// 学習設定が OFF でも clear の対象 root を失わないための解決済み directory。
+    /// reload の overrides は ProcessInfo.environment へ戻せないため、現在値を保持する。
+    private var learningDirectory: URL?
+    /// vendor が直近の requestCandidates で保持した learning config。requestCandidates 前は
+    /// unknown なので、OFF→ON reload 直後に stale workDir へ resetMemory しない。
+    private var vendorLearningRoot: URL?
+    private var vendorLearningEnabled = false
+    private var vendorLearningConfigKnown = false
+    /// vendor の temporary trie は public API から flush 成否を観測できない。ON→OFF 前に
+    /// flush した後は、vendor config が .nothing のままの期間に resetMemory を呼べない。
+    private enum VendorTemporaryState: Equatable { case empty, mayContainData, unobservableAfterFlush }
+    private var vendorTemporaryState: VendorTemporaryState = .empty
     /// UU-5: 常駐エンジンは起動後も `reload` で設定を差し替えられる（設定アプリの変更を反映）。
     /// `makeOptions` が convert ごとに読むため、`converterLock` 下で差し替えれば次回変換から効く
     /// （converter オブジェクト自体の再構築は不要＝Zenzai は options の weightURL で切替わる）。
@@ -232,9 +349,13 @@ public final class ConversionService: @unchecked Sendable {
     private var firstConvertLogged = false
     /// zenzaiTooSlow 監視の初回スキップカウンタ。初回 cold spike（KVキャッシュがまだ温まっていない
     /// 一時的な遅延）で本来速いPCが誤って古典へ落ちるのを防ぐため、warmUp 完了後の最初の数回の
-    /// Zenzai推論をスキップしてから監視を開始する。convert/liveConvert/typoConvert/reconvert の
-    /// いずれかが Zenzai を使う最初の推論から消費する（合計回数ベース — op別でなく呼出順非依存）。
-    /// reload で 0 にリセット（モデルは既にホットなので cold spike ガードは不要）。
+    /// Zenzai推論をスキップしてから監視を開始する。**実際に Zenzai 推論として実行されたもののみ**が
+    /// 消費する（合計回数ベース — op別でなく呼出順非依存。convert/liveConvert/typoConvert(literal)/
+    /// reconvert/文節候補のいずれかの実推論から）。古典変換・ウォームアップ待ち・forceClassic・
+    /// invalid/nonexistent weight の silent fallback・空入力・マージ/昇格/キャッシュ/自動確定の時間は
+    /// 消費しない — 誤消費は Zenzai が一度も走らないまま skip を尽くし、最初の実推論が cold spike
+    /// として即 disable される（High）。reload で 0 にリセット（モデルは既にホットなので cold spike
+    /// ガードは不要）。
     /// 読み書きとも converterLock 下。
     private var slowWatchSkipsRemaining = 1
     private let slowWatchSkipInitial = 1
@@ -257,7 +378,8 @@ public final class ConversionService: @unchecked Sendable {
     /// 届いた `{enabled:false}` を上書きして辞書が勝手に有効へ戻る競合窓ができる（spec §4.1）。
     private var desiredDictEnabled: Bool
 
-    /// 本番用: env と exe 隣の既定パスから Zenzai 設定を解決する。
+    /// 本番用: env から「明示 weight → per-user(%LOCALAPPDATA%) → exe 隣」の3段解決表で
+    /// Zenzai 設定を解決する（ZenzaiConfig.resolve と同一の表 — UIバグ8）。
     /// テストからは呼ばないこと（exe 隣のモデル有無で挙動が環境依存になる）。テストは `init(config:)` を使う。
     public convenience init() {
         let exeDir = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
@@ -285,13 +407,28 @@ public final class ConversionService: @unchecked Sendable {
     /// autoCommit の既定 `.weak` は本番既定（AutoCommitStrength.resolve の未設定時）と同値。
     /// autoCommitMaxReading の既定 25 は本番既定（AutoCommitLengthBackstop.resolve の未設定時）と同値。
     /// environment は辞書リロードの解決に使う env（既定 `[:]` ＝ resolve が nil＝辞書なし）。
-    public init(config: ZenzaiConfig,
-                learning: LearningSettings = .disabled,
-                llmClient: LLMClient = LLMClient(config: LLMConfig.resolve(environment: [:])),
-                autoCommit: AutoCommitStrength = .weak,
-                autoCommitMaxReading: Int = 25,
-                typoLearn: Bool = true,
-                environment: [String: String] = [:]) {
+    public convenience init(config: ZenzaiConfig,
+                            learning: LearningSettings = .disabled,
+                            llmClient: LLMClient = LLMClient(config: LLMConfig.resolve(environment: [:])),
+                            autoCommit: AutoCommitStrength = .weak,
+                            autoCommitMaxReading: Int = 25,
+                            typoLearn: Bool = true,
+                            environment: [String: String] = [:]) {
+        self.init(config: config, learning: learning, llmClient: llmClient,
+                  autoCommit: autoCommit, autoCommitMaxReading: autoCommitMaxReading,
+                  typoLearn: typoLearn, environment: environment,
+                  fileSystem: .live)
+    }
+
+    /// テスト用のファイル操作注入。公開 initializer は本番 seam を露出しない。
+    init(config: ZenzaiConfig,
+         learning: LearningSettings = .disabled,
+         llmClient: LLMClient = LLMClient(config: LLMConfig.resolve(environment: [:])),
+         autoCommit: AutoCommitStrength = .weak,
+         autoCommitMaxReading: Int = 25,
+         typoLearn: Bool = true,
+         environment: [String: String] = [:],
+         fileSystem: LearningFileSystem) {
         self.config = config
         self.learning = learning
         self.corrections = CorrectionStore(directory: learning.memoryDir)
@@ -301,6 +438,8 @@ public final class ConversionService: @unchecked Sendable {
         self.typoLearn = typoLearn
         self.environment = environment
         self.desiredDictEnabled = UserDictionary.enabled(environment: environment)
+        self.fileSystem = fileSystem
+        self.learningDirectory = learning.memoryDir ?? LearningSettings.resolveDir(environment: environment)
     }
 
     /// Zenzai が有効か（重みが解決できたか）。
@@ -377,11 +516,13 @@ public final class ConversionService: @unchecked Sendable {
         defer { converterLock.unlock() }
         converter.importDynamicUserDictionary(dicdata)
         // classic 経路は previousInputData 一致時に増分ラティスを使い辞書を索き直さないため、
-        // 落とさないとリロード後の同一読み再変換に新語が出ない。Zenzai 稼働中は classic
-        // キャッシュを使わないので、reset_context スパイクを払わない。
-        // activeConverterSession には触らないこと（nil を置くと bindConverter のリセットが
+        // 落とさないとリロード後の同一読み再変換に新語が出ない。Zenzai 実稼働中
+        // （!tooSlow — isZenzaiOperationalLocked）は classic キャッシュを使わないので、
+        // reset_context スパイクを払わない。tooSlow の古典フォールバック中は classic キャッシュ
+        // が経路そのものなので、リセットして新語の可視性を保つ。
+        // activeConverterSession には触れないこと（nil を置くと bindConverter のリセットが
         // スキップされ、終了セッションの文脈が次セッションへ漏れる — endSession の注記）。
-        if !isZenzaiOperationalLocked { converter.stopComposition() }
+        if !isZenzaiOperationalLocked { stopCompositionLocked() }
     }
 
     /// テスト専用: 直列キューに積まれたリロードの完了を待つ（キューは serial なので sync で足りる）。
@@ -422,42 +563,83 @@ public final class ConversionService: @unchecked Sendable {
     /// 待ちすると handler の serviceLock を握ったまま数秒固まり、全クライアントの全要求を warm-up
     /// 終了まで凍らせ ReloadConfig 自体もタイムアウトする。そこで **非ブロックで試し、取れなければ
     /// skip** する。安全な理由: converterLock が埋まっているのは spawn 直後の warm-up（or 変換中）で、
-    /// その間 config は spawn 時 env（=当時の最新 settings）のまま＝まだ変わっていない。設定変更は
-    /// 次回接続で反映される。
+    /// その間 config は spawn 時 env（=当時の最新 settings）のまま＝まだ変わっていない。busy の
+    /// Error を受けた TIP が同一接続で上限付きの遅延再送をする（EngineHost の .error 文言と
+    /// text_service.rs schedule_reload_retry 参照 — 再送後も busy なら次回接続で反映）。
     /// LLMClient は config を保持するだけ（モデル再ロード不要）。呼び出しは handler の serviceLock 下で
     /// 直列化されるため llmConvert とは競合しない。
     /// 注: Zenzai を新たに有効化した直後の初回変換はモデルをその場ロードするため一度だけ遅い（warm-up はしない）。
-    public func reload(overrides: [String: String]) {
+    /// - Returns: 設定を適用できたか。`converterLock` が warm-up/変換中で取れない場合は
+    ///   false（busy — 中身はスキップ。巡2 D5: 呼び出し側が応答へ反映して「成功」を
+    ///   詐称しないようにする）。
+    @discardableResult
+    public func reload(
+        overrides: [String: String],
+        cpuMeetsLlamaBaseline: Bool = ZenzaiConfig.runtimeCPUMeetsLlamaBaseline
+    ) -> Bool {
         var env = ProcessInfo.processInfo.environment
         for (k, v) in overrides { env[k] = v }
         let exeDir = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
             .deletingLastPathComponent()
-        let newZenzai = ZenzaiConfig.resolve(exeDir: exeDir, environment: env)
+        // cpuMeetsLlamaBaseline はテスト注入用（巡2 D3 — AVX2 非搭載機で resolve が候補探索
+        // 前に nil へ短路し、reload 経由のテストが環境依存で失敗するのを防ぐ）。
+        let newZenzai = ZenzaiConfig.resolve(
+            exeDir: exeDir, environment: env, cpuMeetsLlamaBaseline: cpuMeetsLlamaBaseline)
         let newLLM = LLMConfig.resolve(environment: env)
         let newLearning = LearningSettings.resolve(environment: env)
         // 非ブロック取得（NSLock.lock(before: 現在時刻) は空いていれば true / 埋まっていれば即 false）。
         if converterLock.lock(before: Date()) {
             defer { converterLock.unlock() }
+            // OFF では LearningSettings.memoryDir が nil になるため、明示 directory を失わない。
+            // env に新しい directory があればそれを採用し、無ければ直前の clear root を保持する。
+            let resolvedEnvironmentDirectory = LearningSettings.resolveDir(environment: env)
+            let newLearningDirectory: URL?
+            if let dir = newLearning.memoryDir {
+                newLearningDirectory = dir
+            } else if let explicit = env["NOSPACEKEY_MEMORY_DIR"], !explicit.isEmpty {
+                newLearningDirectory = resolvedEnvironmentDirectory
+            } else {
+                // A test/embedded caller may inject a memoryDir while the process env still has
+                // LOCALAPPDATA; turning learning OFF must keep clearing that injected root.
+                newLearningDirectory = self.learningDirectory ?? resolvedEnvironmentDirectory
+            }
             // Spec2: OFF へ切り替わる前に保留分を保存（.nothing では新規更新が止まり save も skip される
             // ＝保留分が「凍結」され、後で ON に戻すと古い保留分が書かれうる。先に保存して空にしておく。
             // 注: ライブラリの updateConfig(.nothing) は一時トライをクリアしない — LearningMemory.swift:645-650）。
             if self.learning.enabled && !newLearning.enabled {
                 flushLearningLocked()
                 corrections.flush()   // 学習と同じ穴: OFF 凍結前に保留分を保存
+                // commitUpdateLearningData は vendor 内で失敗を握り、成功時だけ temporary trie を
+                // 空にする。結果を観測できないまま OFF にすると resetMemory は stale root を
+                // 指し得るため、次の OFF request/再起動まで clear を fail-closed にする。
+                if vendorTemporaryState == .mayContainData {
+                    vendorTemporaryState = .unobservableAfterFlush
+                }
             }
             // audit H2: Zenzai 有効→無効の切替時は一度だけフルリセットする。稼働中に bindConverter が
             // （切替スパイク排除のため）温存してきた classic 分岐の文脈（completedData 等）と zenz の
             // KV/zenzaiCache を、古典モードへ入る前に一掃する（以後の切替リセットは classic 規律に戻る）。
-            if self.config.weightURL != nil && newZenzai.weightURL == nil { converter.stopComposition() }
-            // 訂正昇格テーブルは memoryDir と運命共同体: dir が変わったら flush して作り直す。
-            if self.learning.memoryDir != newLearning.memoryDir {
+            // 非 nil→別の非 nil（モデル差し替え — フォールバック切替含む）も stopComposition:
+            // 依存ライブラリのモデルキャッシュが URL 不一致でその場リロードするため、文脈も一掃する
+            // （敵対レビュー巡1 G1-B）。
+            // 巡2 D1/D2: 差し替え判定は「両非 nil」に限定する。旧実装の単純 URL 比較は
+            // 非 nil→nil（無効化）も真になり、(a) H2 行と二重に stopComposition を発火し、
+            // (b) 無効化で cold spike は起きないのに初回 skip を復活させていた（純関数
+            // shouldRestoreSkipOnReload の「無効化時は復活させない」意味論との矛盾）。
+            let weightSwapped = self.config.weightURL != nil && newZenzai.weightURL != nil
+                && self.config.weightURL != newZenzai.weightURL
+            if self.config.weightURL != nil && newZenzai.weightURL == nil { stopCompositionLocked() }
+            if weightSwapped { stopCompositionLocked() }
+            // 訂正昇格テーブルは学習 directory と運命共同体: dir が変わったら flush して作り直す。
+            if self.learningDirectory != newLearningDirectory {
                 corrections.flush()
-                corrections = CorrectionStore(directory: newLearning.memoryDir)
+                corrections = CorrectionStore(directory: newLearningDirectory)
             }
             // self.config の差し替え前に、旧 weightURL をキャプチャ（新規有効化判定で self.config が
             // 既に newZenzai に置き換わった後だと old==new で常に false になる — 行451 と同じパターン）。
             let oldWeightURL = self.config.weightURL
             self.learning = newLearning
+            self.learningDirectory = newLearningDirectory
             self.config = newZenzai
             self.llmClient = LLMClient(config: newLLM)
             self.autoCommit = AutoCommitStrength.resolve(environment: env)
@@ -467,20 +649,31 @@ public final class ConversionService: @unchecked Sendable {
             // 経由なので、「重い」と判定された後でもユーザーが再試行できる。Zenzai 有効のまま他設定変更
             // した時もリセットする — 環境が改善した（別GPUプロセス終了等）可能性があるため。
             if self.zenzaiTooSlow {
+                // 遅延フォールバック予約を残したまま Zenzai を再有効化しない。上のモデル無効化/
+                // 差し替えで既にリセット済みなら stopCompositionLocked が予約を消しているため二重実行しない。
+                if self.needsClassicReset { self.stopCompositionLocked() }
                 self.zenzaiTooSlow = false
                 engineLog("ev=zenzai_reset reason=reload\n")
             }
-            // 初回スキップ: モデルが既にホット（Zenzai 継続/無効→無効）なら 0 で即監視。
+            // 初回スキップ: モデルが既にホット（Zenzai 継続/無効→無効/無効化）なら 0 で即監視。
             // ただし Zenzai を新規有効化（weightURL が nil→有効値）した直後はモデルが未ロードで、
             // 初回 convert がインラインモデルロード＋初回推論（KV冷え）で本質的に遅くなる（reload の注記参照）。
             // この cold spike を吸収するため、新規有効化時だけ初回スキップを復活させる。
+            // モデル差し替え（非 nil→別の非 nil — G1-B）も新 URL でインラインロードが走るため
+            // 同じ cold spike が発生する: weightSwapped も初回スキップの対象に含める（両非nil限定 — D2）。
             let newlyEnabledZenzai = ConversionService.shouldRestoreSkipOnReload(
-                old: oldWeightURL, new: newZenzai.weightURL)
+                old: oldWeightURL, new: newZenzai.weightURL) || weightSwapped
             self.slowWatchSkipsRemaining = newlyEnabledZenzai ? self.slowWatchSkipInitial : self.slowWatchSkipAfterReload
             engineLog("ev=reload_config zenzai=\(newZenzai.weightURL != nil) inference_limit=\(newZenzai.inferenceLimit) llm=\(newLLM.enabled) learning=\(newLearning.enabled) auto_commit=\(self.autoCommit.rawValue) auto_commit_max_reading=\(self.autoCommitMaxReading) typo_learn=\(self.typoLearn)\n")
+            return true
         } else {
-            // warm-up/変換中。config は最新のまま（skip 安全）。次回接続で反映。
+            // warm-up/変換中。config は現状維持（skip 安全 — 内部状態は壊れない）。
+            // TIP が busy の Error を受けて同一接続で上限付きの遅延再送をする
+            // （EngineHost の .error 文言と text_service.rs schedule_reload_retry 参照）。
+            // 巡2 D5: 「反映されなかった」ことを応答へ伝える（旧実装は busy でも .ok を
+            // 返し、TIP 側で成功扱いになる詐称だった）。
             engineLog("ev=reload_config skipped=busy\n")
+            return false
         }
     }
 
@@ -524,22 +717,104 @@ public final class ConversionService: @unchecked Sendable {
         return rec.composing.convertTarget
     }
 
+    /// isZenzaiOperationalLocked の判定表（純粋関数 — converter/実モデルを参照しないため
+    /// truth table として直接検証できる）。実稼働 = ready × !tooSlow × weightURL あり ×
+    /// zenzStatus が成功形（"load <url>" ちょうど）の全て。tooSlow を含める理由:
+    /// zenzaiTooSlow の古典フォールバック中、変換は classic 分岐（previousInputData/lattice/
+    /// completedDataを読む）で走る。reset skip の特典（切替スパイク排除）を受けてよいのは
+    /// Zenzai 分岐で走っている間 ＝ !tooSlow の間だけ。
+    static func isZenzaiOperational(ready: Bool, tooSlow: Bool, weightURL: URL?, zenzStatus: String) -> Bool {
+        guard ready, !tooSlow, let weightURL else { return false }
+        return zenzStatus == "load \(weightURL.absoluteString)"
+    }
+
     /// Zenzai が「実際にモデルロード済みで変換に使われている」か。**converterLock 保持中に呼ぶこと**
-    /// （config/zenzStatus 読みの規律）。weightURL と ready ゲートに加え、zenzStatus の成功形
-    /// （"load <url>" ちょうど — 失敗時は空白＋エラー説明が付く。KanaKanjiConverter.getModel
-    /// 0.11.x の形式）で判定する。壊れた重み等でロード失敗し古典へサイレント劣化している間は
-    /// false ＝ bindConverter は従来どおりリセットする（classic 分岐の文脈漏れ防止が優先）。
-    /// reload で Zenzai を新規有効化した直後も、初回の Zenzai 変換が成功するまでは false（安全側）。
+    /// （config/zenzStatus 読みの規律）。実体は純粋 helper isZenzaiOperational(_:tooSlow:weightURL:
+    /// zenzStatus:)（判定表の固定はあちらの truth table テスト）。weightURL と ready ゲートに加え
+    /// **zenzaiTooSlow でないこと**と、zenzStatus の成功形（"load <url>" ちょうど — 失敗時は空白＋
+    /// エラー説明が付く。KanaKanjiConverter.getModel 0.11.x の形式）で判定する。壊れた重み等で
+    /// ロード失敗し古典へサイレント劣化している間は false ＝ bindConverter は従来どおりリセット
+    /// する（classic 分岐の文脈漏れ防止が優先）。zenzaiTooSlow の古典フォールバック中も同じ理由で
+    /// false ＝ reset 側: その間 classic 分岐が稼働中キャッシュを読むため、skip すると別セッション/
+    /// 旧辞書の previousInputData/lattice/completedData が残置される。reload で Zenzai を新規有効化
+    /// した直後も、初回の Zenzai 変換が成功するまでは false（安全側）。
     private var isZenzaiOperationalLocked: Bool {
-        guard zenzaiReady, let weight = config.weightURL else { return false }
-        return converter.zenzStatus == "load \(weight.absoluteString)"
+        ConversionService.isZenzaiOperational(
+            ready: zenzaiReady, tooSlow: zenzaiTooSlow,
+            weightURL: config.weightURL, zenzStatus: converter.zenzStatus)
+    }
+
+    /// 監視対象の requestCandidates が**実際に Zenzai 推論として走ったか**: options の .on 要求
+    /// （requestedZenzai — makeOptionsWithZenzaiUsage の報告）に加え、対象入力が非空（空入力は
+    /// 推論が走らない）で、モデルのロード成功（isZenzaiOperationalLocked — 成功 status=
+    /// "load <url>"）を満たす。要求だけでは不十分: invalid/nonexistent weight では upstream の
+    /// requestCandidates が古典へ silent fallback するため、要求が真でも実推論は走っていない
+    /// ＝false — この間の skip 消費・tooSlow 化は「Zenzai が一度も走らないまま skip を尽くし、
+    /// 最初の実推論が cold spike として即 disable」の誤消費（High）になる。
+    /// **converterLock 保持中に、監視対象の requestCandidates の直後**に呼ぶこと — zenzStatus は
+    /// converter の共有状態で、後段（setCompletedData 等）に遅らせると読みが信用できなくなる。
+    private func zenzaiInferenceUsedLocked(requestedZenzai: Bool, input: String) -> Bool {
+        requestedZenzai && !input.isEmpty && isZenzaiOperationalLocked
+    }
+
+    /// **converterLock 保持中に呼ぶこと**。共有 converter の全合成状態を破棄し、保留中の
+    /// classic リセットも同時に消費する。直接 stopComposition を呼ばず必ずここを通す。
+    private func stopCompositionLocked() {
+        converter.stopComposition()
+        needsClassicReset = false
+        completedDataSession = nil
+        learningDataSession = nil
+        compositionResetCount += 1
+    }
+
+    /// vendor の classic 文脈と、その所有セッションを同じ lock 区間で更新する。
+    private func setCompletedDataLocked(_ candidate: Candidate, session: Int) {
+        converter.setCompletedData(candidate)
+        completedDataSession = session
+    }
+
+    /// updateLearningData は vendor の `lastData` も更新するため、その所有者も追跡する。
+    private func updateLearningDataLocked(_ candidate: Candidate, session: Int) {
+        converter.updateLearningData(candidate)
+        learningDataSession = session
+        vendorTemporaryState = .mayContainData
+    }
+
+    /// requestCandidates が options を vendor の config へ反映した直後に呼ぶ。空読みでは vendor
+    /// 自身が updateIfRequired を早期 return するため root を更新しない。
+    private func noteVendorLearningConfigurationLocked(_ options: ConvertRequestOptions,
+                                                       input: ComposingText) {
+        guard !input.convertTarget.isEmpty else { return }
+        vendorLearningRoot = options.memoryDirectoryURL
+        vendorLearningEnabled = options.learningType != .nothing
+        vendorLearningConfigKnown = true
+        // vendor の LearningManager.updateConfig は learningType=.nothing で早期 return
+        // するため、temporaryMemory は消えない。OFF/noLearning request を「RAM が空になった」
+        // と扱わず、mayContainData / unobservableAfterFlush をそのまま保持する。
+    }
+
+    /// 全ての requestCandidates をここへ集約し、vendor learning root の観測窓を漏らさない。
+    /// **converterLock 保持中に呼ぶこと**。
+    private func requestCandidatesLocked(_ input: ComposingText,
+                                         options: ConvertRequestOptions) -> ConversionResult {
+        let result = converter.requestCandidates(input, options: options)
+        noteVendorLearningConfigurationLocked(options, input: input)
+        return result
+    }
+
+    /// Zenzai 遅延フォールバック後の最初の converter 操作だけをリセット境界にする。
+    /// **converterLock 保持中に呼ぶこと**。
+    private func consumePendingClassicResetLocked() {
+        guard needsClassicReset else { return }
+        stopCompositionLocked()
     }
 
     /// 共有 converter を `session` 用に束ねる。直前に別セッションが使っていたら、その完了文脈
     /// （completedData/previousInputData/lattice）をリセットしてからにする（セッション間の漏れ防止）。
     /// **converterLock 保持中に呼ぶこと**（stopComposition/zenzStatus が converter を触るため）。
     ///
-    /// audit H2 (2026-07-18): Zenzai 実稼働中はこのリセットを**スキップ**する。stopComposition は
+    /// audit H2 (2026-07-18): Zenzai 実稼働中（!tooSlow — isZenzaiOperationalLocked）は、別セッション由来の
+    /// classic 文脈がない限りこのリセットを **スキップ**する。stopComposition は
     /// zenz.endSession()→reset_context()（llama_free＋llama_init_from_model）を誘発し、prevInput が
     /// 空に戻るため、アプリ切替直後の 1 変換に KV 全再プリフィル分のレイテンシが上乗せされていた
     /// （頻度はアプリ切替に比例）。スキップが安全な根拠（upstream 0.11.2 精読）:
@@ -551,24 +826,32 @@ public final class ConversionService: @unchecked Sendable {
     /// - zenzaiCache（prefix 制約ヒント）は getNewConstraint が新しい読みに対し自己検証し、採用された
     ///   制約も all_zenzai のループが現在の左文脈で zenz 再評価・自己修正する（stale ヒントの最悪影響は
     ///   初回推論の反復増、次の入力でキャッシュは現セッションのものに置き換わる）。
-    /// 既知の許容: typoConvert の forceClassic 仮説変換だけは classic 分岐を通るため、未消費の
-    /// completedData（前セッションの確定）が afterComplete 経由で一度だけ修復候補の順位に影響しうる
-    /// （消費で自然消滅する一過性）。分離の完全性より切替スパイクの排除を優先する（audit H2 の修正案）。
+    /// classic 文脈の所有者が切替先と異なる場合は correctness を優先してリセットする。これを残すと
+    /// 遅延フォールバック後の部分確定入口で予約リセットが切替先の current lattice を破棄し、
+    /// kana2lattice_afterComplete を使えなくなる。
     /// Zenzai 有効→無効の reload 切替時は reload 側が一度フルリセットして残置状態を一掃する。
     private func bindConverter(to session: Int) {
         if let active = activeConverterSession, active != session {
-            if isZenzaiOperationalLocked {
+            if !Self.shouldResetForSessionSwitch(
+                isZenzaiOperational: isZenzaiOperationalLocked,
+                targetSession: session,
+                completedDataSession: completedDataSession,
+                learningDataSession: learningDataSession
+            ) {
                 // スキップの観測用（従来の ev=llama_reset reason=session_switch 計数と対になる）。
                 engineLog("ev=llama_reset_skipped reason=session_switch\n")
             } else {
                 // 古典変換は classic 分岐（completedData/previousInputData/lattice）を読むため、
                 // Zenzai 非稼働時は従来どおりリセットして文脈漏れを防ぐ。この分岐では zenz は
                 // ほぼ常に未ロード（未DL/ロード失敗/ready前）で reset_context は走らない。
-                // 例外は reload で有効→無効へ切った後の残置 zenz だが、reset は文脈一掃として正当。
-                converter.stopComposition()
+                // 例外は reload で有効→無効へ切った後の残置 zenz と、zenzaiTooSlow の古典
+                // フォールバック中のロード済み zenz（この間の変換は classic 分岐で稼働中キャッシュを
+                // 読むため、reset は文脈一掃として正当）。
+                stopCompositionLocked()
             }
         }
         activeConverterSession = session
+        consumePendingClassicResetLocked()
     }
 
     /// 現在の読みを変換し、変換候補のテキスト配列を返す。
@@ -580,8 +863,17 @@ public final class ConversionService: @unchecked Sendable {
         converterLock.lock()
         defer { converterLock.unlock() }
         bindConverter(to: session)
+        let (options, requestedZenzai) = makeOptionsWithZenzaiUsage(leftSideContext: leftContext)
         let t0 = DispatchTime.now()
-        let rawResults = converter.requestCandidates(rec.composing, options: makeOptions(leftSideContext: leftContext)).mainResults
+        let rawResults = requestCandidatesLocked(rec.composing, options: options).mainResults
+        // 監視に渡すのは requestCandidates の推論時間のみ。実稼働判定はこの直後で確定させる —
+        // 要求（requestedZenzai）だけでは足りず、invalid/nonexistent weight の silent fallback 中は
+        // 実推論が走っていない（zenzaiInferenceUsedLocked の注記）。
+        // 昇格・記録可否・キャッシュ等の後段は Zenzai の重さではなく、数えると古典/後段が
+        // 遅いだけで Zenzai が一度も走らないうちに恒久 disable し得た（旧実装の High）。
+        let usedZenzai = zenzaiInferenceUsedLocked(requestedZenzai: requestedZenzai,
+                                                   input: rec.composing.convertTarget)
+        let inferMs = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
         noteRecordability(reading: rec.composing.convertTarget, candidates: rawResults)
         let promotedList = promoted(rawResults, composing: rec.composing)
         let mainResults = promotedList ?? rawResults
@@ -599,7 +891,7 @@ public final class ConversionService: @unchecked Sendable {
         let results = mainResults.map { $0.text }
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
         logFirstConvertOnceLocked(ms: ms)
-        checkZenzaiTooSlowLocked(ms: ms, thresholdMs: zenzaiSlowThresholdMs)
+        checkZenzaiTooSlowLocked(ms: inferMs, thresholdMs: zenzaiSlowThresholdMs, usedZenzai: usedZenzai)
         engineLog("ev=infer kind=convert ms=\(String(format: "%.1f", ms)) n=\(results.count) target=\(rec.composing.convertTarget) ctx=\(leftContext?.count ?? 0)\n")
         return results
     }
@@ -636,13 +928,23 @@ public final class ConversionService: @unchecked Sendable {
         // literal（そのまま）変換を convert() と同じ options で先に実行する。仮説変換（使い捨て
         // ComposingText）は converter の増分キャッシュを汚す（reconvert と同じ許容済みパターン）ため、
         // 汚染の影響を literal 側に及ぼさないよう順序を固定する。
-        let literalResults = converter.requestCandidates(rec.composing, options: makeOptions(leftSideContext: leftContext)).mainResults
+        // 監視は literal の Zenzai .on 推論のみ: 仮説変換は forceClassic（古典）、マージ/重複除去は
+        // 後段処理なので、どちらも時間を数えず skip も消費させない。全区間を数える旧実装は
+        // 仮説数と辞書引きの遅さ次第で Zenzai 未実行のまま閾値を超え得た（High）。
+        let (literalOptions, literalRequestedZenzai) = makeOptionsWithZenzaiUsage(leftSideContext: leftContext)
+        let literalT0 = DispatchTime.now()
+        let literalResults = requestCandidatesLocked(rec.composing, options: literalOptions).mainResults
+        // 実稼働判定は literal の requestCandidates 直後に確定（convert と同じ規律 — 後続の
+        // forceClassic 仮説変換が converter を触る前に zenzStatus を読む）。
+        let literalUsedZenzai = zenzaiInferenceUsedLocked(requestedZenzai: literalRequestedZenzai,
+                                                          input: rec.composing.convertTarget)
+        let literalInferMs = Double(DispatchTime.now().uptimeNanoseconds &- literalT0.uptimeNanoseconds) / 1_000_000
 
         var repaired: [Candidate] = []
         for hyp in hyps {
             var hypComposing = ComposingText()
             hypComposing.insertAtCursorPosition(hyp, inputStyle: .roman2kana)
-            let hypResults = converter.requestCandidates(hypComposing, options: makeOptions(nBest: 3, forceClassic: true)).mainResults
+            let hypResults = requestCandidatesLocked(hypComposing, options: makeOptions(nBest: 3, forceClassic: true)).mainResults
             let covering = hypResults.filter { cand in
                 cand.data.reduce(0) { $0 + $1.ruby.count } == hypComposing.convertTarget.count
             }
@@ -669,7 +971,7 @@ public final class ConversionService: @unchecked Sendable {
         sessions[session] = rec
         let results = merged.map { $0.text }
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
-        checkZenzaiTooSlowLocked(ms: ms, thresholdMs: zenzaiSlowThresholdMs)
+        checkZenzaiTooSlowLocked(ms: literalInferMs, thresholdMs: zenzaiSlowThresholdMs, usedZenzai: literalUsedZenzai)
         engineLog("ev=infer kind=typo_convert ms=\(String(format: "%.1f", ms)) n=\(results.count) hyps=\(hyps.count) target=\(rec.composing.convertTarget)\n")
         return results
     }
@@ -691,8 +993,16 @@ public final class ConversionService: @unchecked Sendable {
         sessions[session] = rec
         converterLock.lock()
         defer { converterLock.unlock() }
+        bindConverter(to: session)
+        let (options, requestedZenzai) = makeOptionsWithZenzaiUsage(leftSideContext: leftContext)
         let t0 = DispatchTime.now()
-        let mainCands = converter.requestCandidates(c, options: makeOptions(leftSideContext: leftContext)).mainResults
+        let mainCands = requestCandidatesLocked(c, options: options).mainResults
+        // 監視は推論時間のみ — 昇格（promoted）の lookup/合成は後段処理（convert と同型）。
+        // 実稼働判定は requestCandidates 直後に確定（silent fallback 除外 — surface が空なら
+        // 対象入力も空で推論は走らない）。
+        let usedZenzai = zenzaiInferenceUsedLocked(requestedZenzai: requestedZenzai,
+                                                   input: c.convertTarget)
+        let inferMs = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
         noteRecordability(reading: c.convertTarget, candidates: mainCands)
         let promotedList = promoted(mainCands, composing: c)
         if let p = promotedList, p.first?.text != mainCands.first?.text {
@@ -700,7 +1010,7 @@ public final class ConversionService: @unchecked Sendable {
         }
         let results = (promotedList ?? mainCands).map { $0.text }
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
-        checkZenzaiTooSlowLocked(ms: ms, thresholdMs: zenzaiSlowThresholdMs)
+        checkZenzaiTooSlowLocked(ms: inferMs, thresholdMs: zenzaiSlowThresholdMs, usedZenzai: usedZenzai)
         engineLog("ev=infer kind=reconvert ms=\(String(format: "%.1f", ms)) n=\(results.count) target=\(c.convertTarget) ctx=\(leftContext?.count ?? 0)\n")
         return results
     }
@@ -733,9 +1043,24 @@ public final class ConversionService: @unchecked Sendable {
         converterLock.lock()
         defer { converterLock.unlock() }
         bindConverter(to: session)
+        let (options, requestedZenzai) = makeOptionsWithZenzaiUsage(nBest: 1, leftSideContext: leftContext)
         let t0 = DispatchTime.now()
-        let conversion = converter.requestCandidates(rec.composing, options: makeOptions(nBest: 1, leftSideContext: leftContext))
+        let conversion = requestCandidatesLocked(rec.composing, options: options)
         let results = conversion.mainResults
+        // 監視は推論時間のみ: 自動確定（setCompletedData/学習）・昇格・キャッシュの後段は
+        // Zenzai の重さではない（convert と同型 — 旧実装はこれら込みで数えていた）。
+        // 実稼働判定はこの直後に確定 — 自動確定の prefixComplete で対象入力（読み）が縮む前に、
+        // かつ converter を触る後段の前に zenzStatus を読む（zenzaiInferenceUsedLocked の注記）。
+        let usedZenzai = zenzaiInferenceUsedLocked(requestedZenzai: requestedZenzai,
+                                                   input: rec.composing.convertTarget)
+        let inferMs = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
+        let startedFallback = checkZenzaiTooSlowLocked(
+            ms: inferMs, thresholdMs: zenzaiSlowThresholdLiveMs, usedZenzai: usedZenzai)
+        // 別セッション由来の classic 文脈を一掃する必要がある回では、この応答の候補を
+        // 自動確定しない。確定後に次入口の reset で completedData/lastData を消すと、残り読みの
+        // afterComplete と bigram 文脈を失うため。表示は返し、次の converter 入口で一度だけ reset する。
+        let suppressAutoCommit = startedFallback && needsClassicReset
+        if suppressAutoCommit { rec.liveState = nil }
         // cacheCandidates はここでは呼ばない: 昇格(訂正1位)は「自動確定が起きなかった回」
         // だけ cache に載せる必要があり、確定回に呼ぶと短縮後読みで stale 候補を再キャッシュ
         // してしまうため、自動確定判定の後段で条件付きに行う(spec §3(c)1)。
@@ -760,7 +1085,8 @@ public final class ConversionService: @unchecked Sendable {
         }
 
         var committed: String? = nil
-        if allowAutoCommit, let threshold = autoCommit.threshold, !rec.composing.convertTarget.isEmpty {
+        if allowAutoCommit, !suppressAutoCommit,
+           let threshold = autoCommit.threshold, !rec.composing.convertTarget.isEmpty {
             var state = rec.liveState ?? LiveConversionState()
             state.update(candidate: candidate, firstClauseCandidates: conversion.firstClauseResults)
             var commitCandidate = state.candidateForCompleteFirstClause(threshold: threshold)
@@ -779,8 +1105,10 @@ public final class ConversionService: @unchecked Sendable {
             if let firstClause = commitCandidate, !firstClause.text.isEmpty {
                 // iOS InputManager.complete(candidate:) の確定順序（先頭文節のみ版）。
                 // isLearningTarget ガードは commit() の注記と同じ(lastData への生タグ流入防止)。
-                converter.setCompletedData(firstClause)
-                if learning.enabled && firstClause.isLearningTarget { converter.updateLearningData(firstClause) }
+                setCompletedDataLocked(firstClause, session: session)
+                if learning.enabled && firstClause.isLearningTarget {
+                    updateLearningDataLocked(firstClause, session: session)
+                }
                 rec.composing.prefixComplete(composingCount: firstClause.composingCount)
                 rec.invalidateCandidateCache()   // 読みが縮んだので古い候補 index は無効
                 state.didCompleteFirstClause()
@@ -811,7 +1139,6 @@ public final class ConversionService: @unchecked Sendable {
 
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
         logFirstConvertOnceLocked(ms: ms)
-        checkZenzaiTooSlowLocked(ms: ms, thresholdMs: zenzaiSlowThresholdLiveMs)
         engineLog("ev=infer kind=live ms=\(String(format: "%.1f", ms)) target=\(rec.composing.convertTarget) ctx=\(leftContext?.count ?? 0)\n")
         if let committedText = committed {
             // 確定文節は candidate.text の prefix（履歴の安定判定により両者の先頭文節テキストは一致）。
@@ -1054,11 +1381,13 @@ public final class ConversionService: @unchecked Sendable {
         converterLock.lock()
         defer { converterLock.unlock() }
         bindConverter(to: session)                                  // 別セッションの文脈をこの確定に混ぜない
-        converter.setCompletedData(candidate)                       // nospacekey ネイティブ確定順序（学習は updateLearningData で明示）
+        setCompletedDataLocked(candidate, session: session)         // nospacekey ネイティブ確定順序（学習は updateLearningData で明示）
         // isLearningTarget=false(日付テンプレート等)は vendor 側で学習本体こそ no-op だが、
         // lastData には data 末尾(生タグ DicdataElement)が無条件に残り、次確定の bigram 左要素
         // として学習メモリへ書かれる(vendor updateLearningData) — 呼び出しごと避ける。
-        if learning.enabled && candidate.isLearningTarget { converter.updateLearningData(candidate) } // Spec2: RAM 学習（ディスクは endSession で）
+        if learning.enabled && candidate.isLearningTarget {
+            updateLearningDataLocked(candidate, session: session)   // Spec2: RAM 学習（ディスクは endSession で）
+        }
 
         if isRepaired {
             // 修正変換(TypoConvert)の修復候補を確定: 読み全体を消費する（残り読みという概念が無い —
@@ -1084,7 +1413,7 @@ public final class ConversionService: @unchecked Sendable {
                         rcid: candidate.data.last?.rcid ?? CIDData.一般名詞.cid,
                         mid: candidate.lastMid,
                         value: candidate.value)])
-                converter.updateLearningData(synthetic)
+                updateLearningDataLocked(synthetic, session: session)
                 engineLog("ev=typo_learn ruby=\(rec.composing.convertTarget) word=\(candidate.text)\n")
             }
             rec.composing = ComposingText()                         // 読み全体を消費（次の入力はまっさらから）
@@ -1171,7 +1500,7 @@ public final class ConversionService: @unchecked Sendable {
             if learning.enabled {
                 var restore = ComposingText()
                 restore.insertAtCursorPosition("あ", inputStyle: .direct)
-                _ = converter.requestCandidates(restore, options: makeOptions(nBest: 1, forceClassic: true))
+                _ = requestCandidatesLocked(restore, options: makeOptions(nBest: 1, forceClassic: true))
             }
         }
         // 直前 convert のラティスは入力方式が違っても**表層一致で** surface 側が再利用される
@@ -1181,10 +1510,10 @@ public final class ConversionService: @unchecked Sendable {
         // stopComposition でのリセットは Zenzai 稼働中の llama スパイク(bindConverter 注記)で不可。
         var flush = ComposingText()
         flush.insertAtCursorPosition("あ", inputStyle: .direct)
-        _ = converter.requestCandidates(flush, options: makeOptions(nBest: 1, forceClassic: true, noLearning: true))
+        _ = requestCandidatesLocked(flush, options: makeOptions(nBest: 1, forceClassic: true, noLearning: true))
         var c = ComposingText()
         c.insertAtCursorPosition(reading, inputStyle: .direct)
-        let results = converter.requestCandidates(
+        let results = requestCandidatesLocked(
             c, options: makeOptions(forceClassic: true, noLearning: true)
         ).mainResults
         for cand in results where cand.text == text
@@ -1211,12 +1540,14 @@ public final class ConversionService: @unchecked Sendable {
         // 左文脈 = 文書の左文脈 + 先行文節の表層（連文節スコアの代替。Zenzai の品質レバー）。
         let preceding = state.clauses[..<state.selected].map { $0.text }.joined()
         let ctx = (leftContext ?? "") + preceding
+        let (options, requestedZenzai) = makeOptionsWithZenzaiUsage(leftSideContext: ctx.isEmpty ? nil : ctx)
         let ct0 = DispatchTime.now()
-        let results = converter.requestCandidates(
-            c, options: makeOptions(leftSideContext: ctx.isEmpty ? nil : ctx)
-        ).mainResults
+        let results = requestCandidatesLocked(c, options: options).mainResults
+        // 実稼働判定は requestCandidates 直後に確定（convert と同じ規律 — silent fallback 除外）。
+        let usedZenzai = zenzaiInferenceUsedLocked(requestedZenzai: requestedZenzai,
+                                                   input: c.convertTarget)
         let cms = Double(DispatchTime.now().uptimeNanoseconds &- ct0.uptimeNanoseconds) / 1_000_000
-        checkZenzaiTooSlowLocked(ms: cms, thresholdMs: zenzaiSlowThresholdMs)
+        checkZenzaiTooSlowLocked(ms: cms, thresholdMs: zenzaiSlowThresholdMs, usedZenzai: usedZenzai)
         // noteRecordability は呼ばない — 共有マップは reconvert→RecordCorrection の照合専用で、
         // 文節読みで書くと同一読みの reconvert エントリ(別接続)を丸ごと差し替え fail-closed
         // 棄却に落とす(第2R敵対レビュー③)。文節スコープの記録可否は select 時の
@@ -1391,14 +1722,16 @@ public final class ConversionService: @unchecked Sendable {
         var text = ""
         var recorded = false
         for (i, clause) in state.clauses.enumerated() {
-            converter.setCompletedData(clause)
+            setCompletedDataLocked(clause, session: session)
             // isLearningTarget ガードは commit() の注記と同じ — 文節候補窓は日付テンプレート
             // 候補(isLearningTarget=false・data.word=生タグ)を選べるため、ここを素通しすると
             // lastData 経由で次文節の bigram 左要素に生タグが乗る(第2R敵対レビュー④)。
             // skip の代償: lastData がテンプレート直前の値のまま残り、次の学習ペアが
             // テンプレートを跨いだ組になる。vendor に lastData クリア API が無く
             // (stopComposition は zenz reset のスパイク)、生タグ恒久化よりは軽微な側に倒す。
-            if learning.enabled && clause.isLearningTarget { converter.updateLearningData(clause) }
+            if learning.enabled && clause.isLearningTarget {
+                updateLearningDataLocked(clause, session: session)
+            }
             text += clause.text
             // commit(spec §2(a)) の文節スコープ版: 判定は select 時に表層基準で済ませてある
             // （clauseCorrections の注記参照）。全消費条件は文節候補が全被覆のみ
@@ -1476,7 +1809,7 @@ public final class ConversionService: @unchecked Sendable {
             // （bindConverter の session_switch と対）。計数のみ — 修正は別トラック。
             // M-2: Zenzai 無効（zenz 不在で reset は no-op）では出さない。config 読みは converterLock 下。
             if config.weightURL != nil { engineLog("ev=llama_reset reason=all_end\n") }
-            converter.stopComposition()
+            stopCompositionLocked()
             activeConverterSession = nil
         }
     }
@@ -1527,7 +1860,7 @@ public final class ConversionService: @unchecked Sendable {
             dummy.insertAtCursorPosition("tesuto", inputStyle: .roman2kana)
             // ゲート（zenzaiReady）はまだ閉なので、forceZenzai で Zenzai ON の options を組んで
             // モデルロードを誘発する（これが warm-up の眼目 — ゲート越しだと古典に落ちてしまう）。
-            _ = converter.requestCandidates(dummy, options: makeOptions(forceZenzai: true))
+            _ = self.requestCandidatesLocked(dummy, options: self.makeOptions(forceZenzai: true))
             // ロックを放す前にゲートを開ける: このロックを待っていた変換要求は、起きた時点で必ず
             // Zenzai になる（converterLock 保持中の zenzaiReadyLock 取得は makeOptions と同順＝反転しない）。
             zenzaiReady = true
@@ -1548,20 +1881,58 @@ public final class ConversionService: @unchecked Sendable {
 
     /// Zenzai 推論の重さを監視し、閾値を超えたら zenzaiTooSlow=true で古典へ固定する。
     /// **converterLock 保持中に呼ぶこと**（slowWatchSkipsRemaining の読み書きが lock 内のため）。
+    /// usedZenzai: ms が**実際に Zenzai 推論として走った** requestCandidates の計測か
+    /// （zenzaiInferenceUsedLocked — .on 要求 × 対象入力非空 × ロード成功。要求だけでは不十分:
+    /// invalid/nonexistent weight の silent fallback 中は実推論が走っていない）。
+    /// false（古典変換・ウォームアップ待ち・forceClassic・silent fallback・空入力・
+    /// マージ/昇格/キャッシュ/自動確定の後段処理）は Zenzai の重さと無関係なので、
+    /// **skip の消費も tooSlow 化もしない** — ガードは skip 消費の前に置く。誤消費は
+    /// 「Zenzai が一度も走らないまま skip が尽き、最初の実推論が cold spike として即 disable」
+    /// を招く（High: 計測範囲を推論のみに限定して解消）。
     /// 初回（slowWatchSkipsRemaining で指定）は cold spike 誤判定防止のためスキップする。
     /// zenzaiTooSlow の setter が zenzaiTooSlowLock を取るが、これは他ロックを取らない独立ロック
     /// （zenzaiReadyLock と同型）なので converterLock 保持下からの呼出は安全。
     /// thresholdMs: op別のTIP側IPCタイムアウトに合わせた閾値（convert系=800ms, liveConvert=300ms）。
-    private func checkZenzaiTooSlowLocked(ms: Double, thresholdMs: Double) {
-        guard !zenzaiTooSlow else { return }
+    /// 遅延検知で classic へ切り替わったかを返す。reset が必要なのは、vendor 内に残る
+    /// completedData/lastData のどちらかが現在とは別のセッション由来のときだけ。同一セッションの
+    /// 部分確定文脈まで無条件に消すと、次の classic 変換が afterComplete を使えなくなる。
+    @discardableResult
+    private func checkZenzaiTooSlowLocked(ms: Double, thresholdMs: Double, usedZenzai: Bool) -> Bool {
+        guard usedZenzai, !zenzaiTooSlow else { return false }
         if slowWatchSkipsRemaining > 0 {
             slowWatchSkipsRemaining -= 1
-            return
+            return false
         }
         if ms > thresholdMs {
             zenzaiTooSlow = true
+            // 現在の requestCandidates の結果処理は完了させ、次の converter 入口で一度だけ
+            // 別セッション由来の classic 文脈だけを破棄する。同一セッションまたは未確定なら、
+            // 現要求が更新した previousInputData/lattice をそのまま classic 継続へ渡す。
+            needsClassicReset = Self.requiresClassicReset(
+                activeSession: activeConverterSession,
+                completedDataSession: completedDataSession,
+                learningDataSession: learningDataSession)
             engineLog("ev=zenzai_disabled reason=slow_inference ms=\(String(format: "%.1f", ms)) threshold=\(String(format: "%.0f", thresholdMs))\n")
+            return true
         }
+        return false
+    }
+
+    /// Zenzai→classic 切替時に、classic 専用文脈が別セッション由来かを判定する純関数。
+    static func requiresClassicReset(activeSession: Int?, completedDataSession: Int?,
+                                     learningDataSession: Int?) -> Bool {
+        [completedDataSession, learningDataSession].contains { owner in
+            guard let owner else { return false }
+            return owner != activeSession
+        }
+    }
+
+    static func shouldResetForSessionSwitch(isZenzaiOperational: Bool, targetSession: Int,
+                                            completedDataSession: Int?, learningDataSession: Int?) -> Bool {
+        !isZenzaiOperational || requiresClassicReset(
+            activeSession: targetSession,
+            completedDataSession: completedDataSession,
+            learningDataSession: learningDataSession)
     }
 
     /// reload 時に初回スキップを復活させるべきか（Zenzai 新規有効化）を判定する純関数。
@@ -1572,12 +1943,40 @@ public final class ConversionService: @unchecked Sendable {
         old == nil && new != nil
     }
 
-    /// テスト専用: converterLock を取った上で checkZenzaiTooSlowLocked を呼ぶ（本番の convert/liveConvert
-    /// が converterLock 内で呼ぶのと同じ規律を再現）。private(set) の zenzaiTooSlow をテストから操作するための口。
-    func forceTooSlowForTesting(ms: Double = 1000, thresholdMs: Double = 800) {
+    /// テスト専用: slowWatchSkipsRemaining の直接観測（skip 消費の陰性検証用 — 間接観測だと
+    /// 「消費したのが誰か」が分からない）。本番呼び出し元と同じ converterLock 下で読む
+    /// （checkZenzaiTooSlowLocked の読み書きと直列化）。
+    var zenzaiSlowWatchSkipsRemainingForTesting: Int {
         converterLock.lock()
         defer { converterLock.unlock() }
-        checkZenzaiTooSlowLocked(ms: ms, thresholdMs: thresholdMs)
+        return slowWatchSkipsRemaining
+    }
+
+    /// テスト専用: 遅延フォールバックのリセット予約と、実際の stopComposition 回数を同じ
+    /// converterLock 規律で観測する。
+    var classicResetStateForTesting: (pending: Bool, count: Int) {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        return (needsClassicReset, compositionResetCount)
+    }
+
+    /// テスト専用: vendor の private な completedData/lastData を直接読めないため、対応する
+    /// 所有者メタデータだけを注入し、fallback の境界判定を決定的に検証する。
+    func setClassicContextOwnersForTesting(completed: Int?, learning: Int?) {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        completedDataSession = completed
+        learningDataSession = learning
+    }
+
+    /// テスト専用: converterLock を取った上で checkZenzaiTooSlowLocked を呼ぶ（本番の convert/liveConvert
+    /// が converterLock 内で呼ぶのと同じ規律を再現）。private(set) の zenzaiTooSlow をテストから操作するための口。
+    /// usedZenzai に既定値を付けないのは意図的 — 呼び出しごとに「Zenzai 推論の計測」か
+    /// 「古典/後段処理の計測」かをテスト側が明示させ、ガード分岐の両側を検証させるため。
+    func forceTooSlowForTesting(ms: Double = 1000, thresholdMs: Double = 800, usedZenzai: Bool) {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        checkZenzaiTooSlowLocked(ms: ms, thresholdMs: thresholdMs, usedZenzai: usedZenzai)
     }
 
     /// テスト専用: zenzaiReady（warmUp 完了ゲート）を強制設定する。private(set) の zenzaiReady を
@@ -1587,6 +1986,35 @@ public final class ConversionService: @unchecked Sendable {
     func setZenzaiReadyForTesting(_ value: Bool) {
         zenzaiReady = value
     }
+
+    /// テスト専用: makeOptionsWithZenzaiUsage の実際の決定を呼び、**同一の結果から**
+    /// (options.zenzaiMode の実効 on/off, requestedZenzai 報告) の対を曝す。options 構築のみで
+    /// converter を呼ばないためモデルロード・推論が走らない（決定的・環境非依存）。
+    /// 報告は**要求**（.on を options に載せた）の truth table 検証用 — 要求は実行の保証では
+    /// なく、実推論の資格は各経路が requestCandidates 直後に組む usedZenzai
+    /// （zenzaiInferenceUsedLocked）で判定する。要求報告が決定表から切り離されて
+    /// hardcode・diverge していない事の直接証拠が要る — 実 convert 経路の観測では候補並びが
+    /// silent degrade で古典と同値になり検出できない（testConvertFallsBackToClassicWhenTooSlow
+    /// の注記）。
+    /// 本番呼び出し元と同じ converterLock 下で呼ぶ（config/learning 読みの規律）。
+    func makeOptionsZenzaiRequestForTesting(nBest: Int = 10, leftSideContext: String? = nil,
+                                            forceZenzai: Bool = false, forceClassic: Bool = false,
+                                            noLearning: Bool = false)
+        -> (zenzaiOn: Bool, requestedZenzai: Bool) {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        let (options, requestedZenzai) = makeOptionsWithZenzaiUsage(nBest: nBest, leftSideContext: leftSideContext,
+                                                                    forceZenzai: forceZenzai, forceClassic: forceClassic,
+                                                                    noLearning: noLearning)
+        // 実効値の読み取りは本体と同一式（.off との等値比較 — 呼び出し側で読み方を組み直すと
+        // 決定の複製になる）。
+        let zenzaiOn = options.zenzaiMode != .off
+        return (zenzaiOn, requestedZenzai)
+    }
+
+    /// テスト専用（巡2 D9）: 現在解決済みの weightURL。reload のモデル差し替え
+    /// （非 nil→別の非 nil）を zenzaiEnabled の真偽だけでは観測できないための読み出し口。
+    var zenzaiWeightURLForTesting: URL? { config.weightURL }
 
     /// graceful 停止（Shutdown IPC → 応答後 exit）の前段: 保留中の学習をディスクへフラッシュする。
     /// flushLearningLocked は private かつ「converterLock 保持中に呼ぶこと」契約なので、ここで
@@ -1613,30 +2041,256 @@ public final class ConversionService: @unchecked Sendable {
     /// 学習履歴を消去する（RAM の一時トライ＋ディスクの学習ファイル）。ClearLearning IPC から呼ばれる。
     /// 戻り値 = ディスクの学習ファイルを消し切れたか。false（mmap ロック等で残存）は呼び出し側で
     /// Error 応答にする — 「Ok なのに次の変換で学習が復活する」事故を防ぐ（I-4）。
-    /// resetMemory は **学習 ON のときだけ** 呼ぶ: OFF 中はライブラリの memoryURL が %TEMP% ルート
-    /// （workDir）を指しており、reset がそこを suffix 掃除してしまう（I-5）。OFF 中の一時トライは
-    /// 常に空（更新は enabled ゲート済み＋toggle-off 時に flush 成功でライブラリがクリア）なので、
-    /// OFF 中は dir 直削除だけで足りる。
+    /// resetMemory は vendor root が直近 request で確認でき、かつ preflight 済みのときだけ呼ぶ。
+    /// OFF→ON reload 直後は vendor がまだ `.nothing + workDir` を保持し得るため、service の
+    /// learning.enabled だけを根拠に reset してはいけない。ON→OFF 前の unobservable flush 後も
+    /// RAM の安全な消去を確認できないため false を返す。
+    private func isFileNotFound(_ error: Error) -> Bool {
+        if let cocoa = error as? CocoaError, cocoa.code == .fileNoSuchFile {
+            return true
+        }
+        let nsError = error as NSError
+        return (nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError) ||
+            (nsError.domain == NSPOSIXErrorDomain && nsError.code == 2) // ENOENT
+    }
+
+    private struct LearningEntry {
+        let name: String
+        let url: URL
+        let metadata: LearningPathMetadata
+    }
+
+    private struct LearningSafetyError: Error, CustomStringConvertible {
+        let message: String
+        var description: String { message }
+    }
+
+    /// vendor LongTermLearningMemory.reset の suffix allowlist。vendor reset を使う場合は、
+    /// この判定に入る foreign name も含めて preflight で拒否し、suffix の巻き込みを防ぐ。
+    private static func vendorResetLearningName(_ name: String) -> Bool {
+        name.hasSuffix(".loudstxt3") || name.hasSuffix(".loudschars2") ||
+            name.hasSuffix(".memorymetadata") || name.hasSuffix(".louds") ||
+            name.hasSuffix(".loudstxt3.2") || name.hasSuffix(".loudschars2.2") ||
+            name.hasSuffix(".memorymetadata.2") || name.hasSuffix(".louds.2") ||
+            name.hasSuffix(".pause") || name.hasSuffix("learningMemory.txt")
+    }
+
+    /// 現 vendor 0.11.x が生成する名前だけを許可する。memory* の prefix だけでは
+    /// `memory.backup` 等の foreign file を消すため、shard 以外は exact に限定する。
+    private static func isLearningArtifactName(_ name: String) -> Bool {
+        switch name {
+        case ".pause", "corrections.json", "learningMemory.txt",
+             "memory.louds", "memory.louds.2", "memory.loudschars2", "memory.loudschars2.2",
+             "memory.memorymetadata", "memory.memorymetadata.2",
+             "memory.loudstxt3", "memory.loudstxt3.2":
+            return true
+        default:
+            break
+        }
+        for suffix in [".loudstxt3", ".loudstxt3.2"] {
+            guard name.hasPrefix("memory"), name.hasSuffix(suffix) else { continue }
+            let start = name.index(name.startIndex, offsetBy: "memory".count)
+            let end = name.index(name.endIndex, offsetBy: -suffix.count)
+            let shard = name[start..<end]
+            // Vendor shard IDs are canonical ASCII decimal: memory0, memory1, ... .
+            // Character.isNumber would also accept Unicode numerals, and a leading zero
+            // creates a foreign name that vendor reset's suffix matcher could remove.
+            guard !shard.isEmpty,
+                  shard.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+                  shard.count == 1 || shard.first != "0",
+                  Int(shard) != nil else { continue }
+            return true
+        }
+        return false
+    }
+
+    /// root と各 entry を同じ seam で確認する。metadata seam が nil なのは、既存の
+    /// deterministic list/remove test を壊さないための internal test fallback（production
+    /// `.live` には必ず metadata がある）。
+    private func scanLearningDirectory(_ dir: URL) throws -> [LearningEntry]? {
+        if let metadata = fileSystem.metadata {
+            guard let root = try metadata(dir) else { return nil }
+            guard root.isDirectory, !root.isReparsePoint else {
+                throw LearningSafetyError(message: "learning root is not a regular directory")
+            }
+        }
+        let names = try fileSystem.list(dir)
+        var result: [LearningEntry] = []
+        result.reserveCapacity(names.count)
+        for name in names {
+            let url = dir.appendingPathComponent(name, isDirectory: false)
+            if let metadata = fileSystem.metadata {
+                // 列挙直後に消えた entry は NotFound と同じ benign race。その他の metadata
+                // error は対象を安全に確定できないため throw する。
+                guard let entryMetadata = try metadata(url) else { continue }
+                result.append(LearningEntry(name: name, url: url, metadata: entryMetadata))
+            } else {
+                result.append(LearningEntry(
+                    name: name, url: url,
+                    metadata: LearningPathMetadata(isDirectory: false, isRegularFile: true,
+                                                   isReparsePoint: false)))
+            }
+        }
+        return result
+    }
+
+    private func isVendorResetSafe(_ entry: LearningEntry) -> Bool {
+        Self.isLearningArtifactName(entry.name) && entry.metadata.isRegularFile &&
+            !entry.metadata.isDirectory && !entry.metadata.isReparsePoint
+    }
+
+    private func isDirectDeleteSafe(_ entry: LearningEntry) -> Bool {
+        entry.metadata.isRegularFile && !entry.metadata.isDirectory && !entry.metadata.isReparsePoint
+    }
+
+    private func learningPathsEqual(_ lhs: URL?, _ rhs: URL?) -> Bool {
+        guard let lhs, let rhs else { return lhs == nil && rhs == nil }
+        let left = lhs.standardizedFileURL.path
+        let right = rhs.standardizedFileURL.path
+#if os(Windows)
+        return left.caseInsensitiveCompare(right) == .orderedSame
+#else
+        return left == right
+#endif
+    }
+
+    /// テスト seam があればそこへ委譲し、本番では vendor converter の resetMemory を呼ぶ。
+    /// 呼び出し元は必ず scanLearningDirectory の全件 preflight 後であること。
+    private func resetVendorMemoryLocked() {
+        if let resetMemory = fileSystem.resetMemory {
+            resetMemory()
+        } else {
+            converter.resetMemory()
+        }
+    }
+
     public func clearLearning() -> Bool {
         converterLock.lock()
         defer { converterLock.unlock() }
-        if learning.enabled {
-            converter.resetMemory()   // RAM+ディスク（memoryDir 配下）を即消去＋LOUDSキャッシュ解放
+
+        // RAM の訂正テーブルは disk preflight が失敗しても消す（既存の false/error 契約）。
+        // corrections.json 自体は下の allowlist preflight 後に seam 経由で削除する。
+        corrections.clearMemory()
+
+        let dir = learningDirectory
+        guard let dir else {
+            // root 不明のまま vendor temporary が存在する可能性がある状態で成功を返さない。
+            guard vendorTemporaryState == .empty else {
+                engineLog("ev=learning_clear clean=false reason=no_root_with_ram\n")
+                return false
+            }
+            engineLog("ev=learning_clear clean=true reason=no_dir\n")
+            return true
         }
-        corrections.clear()           // 訂正昇格は学習履歴と運命共同体(メモリ+ONなら自ファイルも)
-        let dir = learning.memoryDir
-            ?? LearningSettings.resolveDir(environment: ProcessInfo.processInfo.environment)
+
+        // resetMemory を許可できるのは、直近 vendor config が学習 ON で、root が現在の
+        // clear root と一致する場合だけ。特に OFF→ON reload 直後は vendor config がまだ
+        // .nothing+workDir のままなので、service.learning.enabled だけで reset しない。
+        let vendorRootIsWorkDir = learningPathsEqual(vendorLearningRoot, workDir)
+        let canResetVendor = learning.enabled && vendorLearningConfigKnown && vendorLearningEnabled &&
+            !vendorRootIsWorkDir && learningPathsEqual(vendorLearningRoot, dir)
+        if vendorLearningConfigKnown && vendorLearningEnabled && !learningPathsEqual(vendorLearningRoot, dir) {
+            engineLog("ev=learning_clear clean=false reason=vendor_root_unknown\n")
+            return false
+        }
+        if !vendorLearningConfigKnown && vendorTemporaryState != .empty {
+            engineLog("ev=learning_clear clean=false reason=vendor_config_unknown\n")
+            return false
+        }
+        // `.nothing` request は vendor の temporary trie を消さないため、最後の request が
+        // OFF/noLearning のままでは resetMemory を呼べない。unobservable flush 後も同じく、
+        // actual root と同期した ON request を再度観測するまで fail-closed にする。
+        guard vendorTemporaryState == .empty || canResetVendor else {
+            let reason = vendorTemporaryState == .unobservableAfterFlush
+                ? "unobservable_flush" : "vendor_ram_unknown"
+            engineLog("ev=learning_clear clean=false reason=\(reason)\n")
+            return false
+        }
+
+        let entries: [LearningEntry]?
+        do {
+            entries = try scanLearningDirectory(dir)
+        } catch {
+            // 初回列挙でディレクトリが無いのは「既に消えている」ので成功。
+            // それ以外は削除対象を確定できず、成功を偽らない。
+            let clean = isFileNotFound(error)
+            if clean && vendorTemporaryState != .empty {
+                // root metadata の確認後に directory が消えた場合でも、vendor temporary
+                // trie の存在は観測不能なまま。resetMemory は path 消失後に呼ばず、RAM
+                // clear の成功を偽装しない（再起動後に再試行できる）。
+                engineLog("ev=learning_clear clean=false phase=initial_list reason=ram_unobservable\n")
+                return false
+            }
+            engineLog("ev=learning_clear clean=\(clean) phase=initial_list error=\(error)\n")
+            return clean
+        }
+
+        // metadata seam が root 不在を nil で返すケースも NotFound semantics と同じ。
+        if entries == nil {
+            if vendorTemporaryState != .empty {
+                // root が metadata 段階で消えていても vendor temporary trie の残存は
+                // 観測不能。消えた path へ resetMemory を試さず、RAM clear を成功扱いしない。
+                engineLog("ev=learning_clear clean=false reason=no_dir_with_ram\n")
+                return false
+            }
+            engineLog("ev=learning_clear clean=true reason=no_dir\n")
+            return true
+        }
+        guard let entries else { return true }
+
+        // vendor reset の suffix 巻き込みと direct remove の unsafe target を、どの削除より
+        // 前に全件検証する。foreign.txt のような非 allowlist entry はそのまま保持する。
+        for entry in entries {
+            if canResetVendor && Self.vendorResetLearningName(entry.name) && !isVendorResetSafe(entry) {
+                engineLog("ev=learning_clear clean=false reason=unsafe_vendor_target file=\(entry.name)\n")
+                return false
+            }
+            if Self.isLearningArtifactName(entry.name) && !isDirectDeleteSafe(entry) {
+                engineLog("ev=learning_clear clean=false reason=unsafe_target file=\(entry.name)\n")
+                return false
+            }
+        }
+
+        if canResetVendor {
+            // root/全 vendor suffix target は上の preflight 済み。resetMemory は temporary trie
+            // を必ず空にする一方、disk error は内部で握るため、下の remove/verify も必須。
+            resetVendorMemoryLocked()
+            vendorTemporaryState = .empty
+        }
+
         var clean = true
-        if let dir, let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) {
-            // corrections.json を削除ループにも含めるのは learning OFF 対策: OFF 時の Store は
-            // nil dir(メモリのみ)で clear() がファイルを消せず、ここが唯一の削除経路になる。
-            for f in files where f.hasPrefix("memory") || f == ".pause" || f == "corrections.json" {
-                try? FileManager.default.removeItem(at: dir.appendingPathComponent(f))
+        for entry in entries where Self.isLearningArtifactName(entry.name) {
+            do {
+                try fileSystem.remove(entry.url)
+            } catch {
+                // 競合で先に消えた場合だけ成功扱い。それ以外は残留の有無に関わらず失敗。
+                if !isFileNotFound(error) {
+                    clean = false
+                    engineLog("ev=learning_clear clean=false phase=remove file=\(entry.name) error=\(error)\n")
+                }
             }
-            // 消し切れたか検証（mmap 共有違反等で残ると、次の変換の遅延ロードで学習が戻る）。
-            if let after = try? FileManager.default.contentsOfDirectory(atPath: dir.path) {
-                clean = !after.contains { $0.hasPrefix("memory") || $0 == ".pause" || $0 == "corrections.json" }
+        }
+
+        do {
+            guard let after = try scanLearningDirectory(dir) else {
+                vendorTemporaryState = .empty
+                engineLog("ev=learning_clear clean=true reason=no_dir\n")
+                return clean
             }
+            if after.contains(where: { entry in
+                Self.isLearningArtifactName(entry.name) ||
+                    (canResetVendor && Self.vendorResetLearningName(entry.name))
+            }) {
+                clean = false
+                engineLog("ev=learning_clear clean=false phase=verify reason=residual\n")
+            }
+        } catch {
+            // 初回列挙とは違い、検証列挙の失敗は真偽を確認できないため失敗。
+            clean = false
+            engineLog("ev=learning_clear clean=false phase=verify error=\(error)\n")
+        }
+        if clean && (vendorTemporaryState == .empty || canResetVendor) {
+            vendorTemporaryState = .empty
         }
         engineLog("ev=learning_clear clean=\(clean)\n")
         return clean
@@ -1660,7 +2314,22 @@ public final class ConversionService: @unchecked Sendable {
     /// 通すと非決定的な上に高コストなので、修復仮説は常に古典（辞書）変換に固定する。
     /// `noLearning`: 文節境界の再導出専用。学習メモリの全文1エントリが 1 位を取り返すと
     /// 再導出まで単一要素に戻ってしまうため、そのリクエストだけ学習を外す。
+    /// 実体は makeOptionsWithZenzaiUsage — フラグが不要な呼び出し側（forceClassic 仮説・辞書境界の
+    /// 再導出・warmUp）向けの薄いラッパで、決定表はここに持たない。
     private func makeOptions(nBest: Int = 10, leftSideContext: String? = nil, forceZenzai: Bool = false, forceClassic: Bool = false, noLearning: Bool = false) -> ConvertRequestOptions {
+        makeOptionsWithZenzaiUsage(nBest: nBest, leftSideContext: leftSideContext, forceZenzai: forceZenzai,
+                                   forceClassic: forceClassic, noLearning: noLearning).options
+    }
+
+    /// makeOptions の実体。options に加え、**このリクエストの zenzaiMode が .on を要求したか**を
+    /// 同一の決定（下の分岐）から報告する。監視（checkZenzaiTooSlowLocked）が「Zenzai 推論の
+    /// 時間」だけを数えるための口 — mode 判定を呼び出し側で再構築させると決定表が二重化して
+    /// すぐ齟齬るので、.on/.off はここでのみ決める。
+    /// requestedZenzai は**要求**であって実行の保証ではない: invalid/nonexistent weight では
+    /// upstream の requestCandidates が古典へ silent fallback するため、実稼働の判定は各経路が
+    /// requestCandidates 直後に zenzaiInferenceUsedLocked（要求 × 入力非空 × 実ロード成功）で行う。
+    private func makeOptionsWithZenzaiUsage(nBest: Int = 10, leftSideContext: String? = nil, forceZenzai: Bool = false, forceClassic: Bool = false, noLearning: Bool = false)
+        -> (options: ConvertRequestOptions, requestedZenzai: Bool) {
         // cold start ③: ゲートが開く（zenzaiReady）まで Zenzai を options に載せない＝古典（辞書）変換で即応。
         // forceZenzai は warmUp 専用（ゲートを開ける前のモデル先読みロードに Zenzai ON が要る）。
         // zenzaiTooSlow: 推論が恒常的に重い環境では古典固定（drop_engine 自己増幅ループ＝Space ハング防止）。
@@ -1676,7 +2345,13 @@ public final class ConversionService: @unchecked Sendable {
         } else {
             zenzai = .off
         }
-        return .init(
+        // weightURL 無しでは makeZenzaiMode 自体が .off に落ちるため、実効値は .off との
+        // 等値比較で読む（分岐条件の再評価ではなく options の実効値 — 決定の重複にならない）。
+        // ZenzaiMode は struct（.on は static ファクトリで enum case ではない）なので case
+        // 一致は不可。公開 API が .off/.on の2経路だけ（memberwise init は internal）のため
+        // != .off は enabled フラグと完全同値。
+        let requestedZenzai = zenzai != .off
+        return (.init(
             N_best: nBest,
             requireJapanesePrediction: false,
             requireEnglishPrediction: false,
@@ -1689,6 +2364,6 @@ public final class ConversionService: @unchecked Sendable {
             specialCandidateProviders: nil,
             zenzaiMode: zenzai,
             metadata: .init(versionString: "NospacekeyEngineHost")
-        )
+        ), requestedZenzai)
     }
 }

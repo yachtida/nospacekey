@@ -1,3 +1,3 @@
-pub mod protocol;
-pub mod framing;
 pub mod client;
+pub mod framing;
+pub mod protocol;

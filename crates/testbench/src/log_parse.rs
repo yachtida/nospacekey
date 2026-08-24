@@ -3,50 +3,89 @@
 #[derive(Debug, Clone)]
 pub enum Ev {
     Activate,
-    CandidatesShown { n: usize, #[allow(dead_code)] sel: usize, list: Vec<String> }, // 診断用: sel= を保持（現状未読）
-    CandidateMove { sel: usize },
+    CandidatesShown {
+        n: usize,
+        #[allow(dead_code)]
+        sel: usize,
+        list: Vec<String>,
+    }, // 診断用: sel= を保持（現状未読）
+    CandidateMove {
+        sel: usize,
+    },
     CandidatesHidden,
-    Commit { text: String, source: String },
-    EngineSpawn { pid: u32, ok: bool },
+    Commit {
+        text: String,
+        source: String,
+    },
+    /// engine process observed from either on-demand spawn or Activate-time prespawn.
+    EngineSpawn {
+        pid: u32,
+        ok: bool,
+    },
     /// 劣化した（reason=live_convert_pending / insert_failed …）。--keymap-smoke の live-off サブが
     /// reason で「LiveConvert を叩いて遅かっただけの偽 PASS」を弾く。
-    Degraded { reason: String },
+    Degraded {
+        reason: String,
+    },
     /// 外部LLM変換要求が出た（Tab→start_llm_convert）。seq は世代。
-    LlmRequest { #[allow(dead_code)] seq: u64 }, // 診断用: 世代 seq を保持（現状未読）
+    LlmRequest {
+        #[allow(dead_code)]
+        seq: u64,
+    }, // 診断用: 世代 seq を保持（現状未読）
     /// 外部LLM結果が preedit へ適用された（on_llm_outcome の成功枝）。
-    LlmApplied { #[allow(dead_code)] seq: u64 }, // 診断用: 世代 seq を保持（現状未読）
+    LlmApplied {
+        #[allow(dead_code)]
+        seq: u64,
+    }, // 診断用: 世代 seq を保持（現状未読）
     /// 修正変換（Tab→trigger_typo_convert）が読みのタイポ修復候補を候補窓に出した。
     /// n=候補数, sel=選択位置（常に 0 で開始）, list=候補列（先頭が修復第一候補）。
     /// item41 は list のみ判定に使うため n/sel は診断用に保持（現状未読）。
     TypoCandidatesShown {
-        #[allow(dead_code)] n: usize,
-        #[allow(dead_code)] sel: usize,
+        #[allow(dead_code)]
+        n: usize,
+        #[allow(dead_code)]
+        sel: usize,
         list: Vec<String>,
     },
     /// 読みモニタの表示状態遷移（action = show|update|hide|destroy）。item42 が読む。
-    ReadingMonitor { action: String },
+    ReadingMonitor {
+        action: String,
+    },
     /// SP5 再変換が候補を出した。n=候補数, kind=latin|surface（経路）, latin=対象になった元文字列。
-    ReconvertShown { n: usize, kind: String, latin: String },
+    ReconvertShown {
+        n: usize,
+        kind: String,
+        latin: String,
+    },
     /// SP5 再変換が取消され元文字列を復元した（Esc→cancel_reconvert）。
     ReconvertCancel,
     /// SP5 再変換の対象が再変換不能（漢字/混在等）で何もしなかった（do-no-harm, SP5 step-6）。
-    ReconvertSkip { reason: String },
+    ReconvertSkip {
+        reason: String,
+    },
     /// U9: composition 開始時に捕捉した左文脈の長さ（内容はログに出さない — len のみ）。
-    LeftContext { len: usize },
+    LeftContext {
+        len: usize,
+    },
     /// 確定取消（Ctrl+Backspace）が候補を出した。n=候補数, rlen=読み長, tlen=確定文字列長
     /// （本文はログに出さない — I-3）。item30 は存在チェック（`matches!(.., CommitUndoShown{..})`）
     /// のみ使うので、フィールドは診断用に保持する（現状未読）。
     CommitUndoShown {
-        #[allow(dead_code)] n: usize,
-        #[allow(dead_code)] rlen: usize,
-        #[allow(dead_code)] tlen: usize,
+        #[allow(dead_code)]
+        n: usize,
+        #[allow(dead_code)]
+        rlen: usize,
+        #[allow(dead_code)]
+        tlen: usize,
     },
     /// 確定取消が何もしなかった（do-no-harm）。reason=not_armed|composition_open|no_buffer|
     /// too_long|text_mismatch。too_long のみ tlen= が付く（他 reason は None）。診断用に保持
     /// する（現状未読、単体テストでの reason 検証は除く）。
     CommitUndoSkip {
-        #[allow(dead_code)] reason: String,
-        #[allow(dead_code)] tlen: Option<usize>,
+        #[allow(dead_code)]
+        reason: String,
+        #[allow(dead_code)]
+        tlen: Option<usize>,
     },
     /// ephemeral かな開始（enter_ephemeral_kana）。フィールド無し（存在チェックのみ）。
     EphemeralEnter,
@@ -56,10 +95,14 @@ pub enum Ev {
     /// （is_direct(next)）。item37以降: ephemeral 中トグルは settle が先に exit_ephemeral_to_direct
     /// で compartment を direct へ戻すため、この行の direct はトグル**前**が direct であることを
     /// 前提に反転した値になる＝ephemeral 起点のトグルは direct=false（かなへ昇格）で観測できる。
-    ModeToggle { direct: bool },
+    ModeToggle {
+        direct: bool,
+    },
     /// 読みの表記変換が発火した（apply_notation）。vk=実際に押されたキー（--keymap-smoke が
     /// 「リマップ先だけ発火/元キーは解放済み」を vk 値で区別するのに使う）。
-    Notation { vk: u32 },
+    Notation {
+        vk: u32,
+    },
 }
 
 fn kv<'a>(body: &'a str, key: &str) -> Option<&'a str> {
@@ -99,7 +142,9 @@ fn next_field_boundary(s: &str) -> Option<usize> {
         if b[i] == b' ' {
             let mut j = i + 1;
             if j < b.len() && (b[j].is_ascii_alphabetic() || b[j] == b'_') {
-                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') { j += 1; }
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
                 if j < b.len() && b[j] == b'=' {
                     return Some(i);
                 }
@@ -126,8 +171,12 @@ fn parse_one(body: &str) -> Option<Ev> {
     // ev=activate は SP6b/SP7 で末尾フィールド (live_conversion=…/default_direct=…) が付く。
     // 他イベント同様に接頭辞許容にする（exact 一致だと activate を取りこぼし item1 が FAIL する）。
     // 末尾の空白ガードで ev=activateX 等の誤マッチを防ぐ。
-    if body == "ev=activate" || body.starts_with("ev=activate ") { return Some(Ev::Activate); }
-    if body == "ev=candidates_hidden" || body.starts_with("ev=candidates_hidden ") { return Some(Ev::CandidatesHidden); }
+    if body == "ev=activate" || body.starts_with("ev=activate ") {
+        return Some(Ev::Activate);
+    }
+    if body == "ev=candidates_hidden" || body.starts_with("ev=candidates_hidden ") {
+        return Some(Ev::CandidatesHidden);
+    }
     if body.starts_with("ev=candidates_shown") {
         let n = kv(body, "n").and_then(|s| s.parse().ok()).unwrap_or(0);
         let sel = kv(body, "sel").and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -158,11 +207,13 @@ fn parse_one(body: &str) -> Option<Ev> {
     }
     if body.starts_with("ev=commit") {
         // text= は空白を含みうる（複数語の確定文）。次の既知キー " source=" まで取る。
-        let text = kv_spanned(body, "text", &["source"]).unwrap_or("").to_string();
+        let text = kv_spanned(body, "text", &["source"])
+            .unwrap_or("")
+            .to_string();
         let source = kv(body, "source").unwrap_or("").to_string();
         return Some(Ev::Commit { text, source });
     }
-    if body.starts_with("ev=engine_spawn") {
+    if body.starts_with("ev=engine_spawn") || body.starts_with("ev=prespawn") {
         let pid = kv(body, "pid").and_then(|s| s.parse().ok()).unwrap_or(0);
         let ok = kv(body, "ok").map(|s| s == "true").unwrap_or(false);
         return Some(Ev::EngineSpawn { pid, ok });
@@ -194,7 +245,9 @@ fn parse_one(body: &str) -> Option<Ev> {
         return Some(Ev::ReadingMonitor { action });
     }
     // SP5: ev=reconvert_cancel / ev=reconvert_skip は接頭辞 ev=reconvert_shown と区別するため先に判定する。
-    if body == "ev=reconvert_cancel" || body.starts_with("ev=reconvert_cancel ") { return Some(Ev::ReconvertCancel); }
+    if body == "ev=reconvert_cancel" || body.starts_with("ev=reconvert_cancel ") {
+        return Some(Ev::ReconvertCancel);
+    }
     if body.starts_with("ev=reconvert_skip") {
         let reason = kv(body, "reason").unwrap_or("").to_string();
         return Some(Ev::ReconvertSkip { reason });
@@ -209,8 +262,12 @@ fn parse_one(body: &str) -> Option<Ev> {
         let len = kv(body, "len").and_then(|s| s.parse().ok()).unwrap_or(0);
         return Some(Ev::LeftContext { len });
     }
-    if body == "ev=ephemeral_enter" || body.starts_with("ev=ephemeral_enter ") { return Some(Ev::EphemeralEnter); }
-    if body == "ev=ephemeral_exit" || body.starts_with("ev=ephemeral_exit ") { return Some(Ev::EphemeralExit); }
+    if body == "ev=ephemeral_enter" || body.starts_with("ev=ephemeral_enter ") {
+        return Some(Ev::EphemeralEnter);
+    }
+    if body == "ev=ephemeral_exit" || body.starts_with("ev=ephemeral_exit ") {
+        return Some(Ev::EphemeralExit);
+    }
     if body.starts_with("ev=notation") {
         // vk= は "0x7a" 形式（key_event_sink.rs の {vk:#04x}）。
         let vk = kv(body, "vk")
@@ -223,7 +280,9 @@ fn parse_one(body: &str) -> Option<Ev> {
         // skip=repeat / skip=no_compartment は direct= を持たない実トグル不発（早期 return）
         // なので、ModeToggle{direct:false} に化けさせず None へ落とす。
         if let Some(s) = kv(body, "direct") {
-            return Some(Ev::ModeToggle { direct: s == "true" });
+            return Some(Ev::ModeToggle {
+                direct: s == "true",
+            });
         }
     }
     None
@@ -246,15 +305,21 @@ fn strip_ts_prefix(body: &str) -> &str {
 /// `[pid N] ts=<epoch_ms> ev=...` の行群から、自 PID の ev だけを順に返す。
 pub fn parse_lines(lines: &[String], pid: u32) -> Vec<Ev> {
     let prefix = format!("[pid {pid}] ");
-    lines.iter().filter_map(|l| {
-        let body = l.strip_prefix(&prefix)?;
-        parse_one(strip_ts_prefix(body))
-    }).collect()
+    lines
+        .iter()
+        .filter_map(|l| {
+            let body = l.strip_prefix(&prefix)?;
+            parse_one(strip_ts_prefix(body))
+        })
+        .collect()
 }
 
 /// %TEMP%\nospacekey-tip.log を読み、自 PID の ev を返す。
 pub fn read_events(pid: u32) -> Vec<Ev> {
-    let dir = match std::env::var_os("TEMP") { Some(d) => d, None => return Vec::new() };
+    let dir = match std::env::var_os("TEMP") {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
     let path = std::path::Path::new(&dir).join("nospacekey-tip.log");
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
@@ -286,9 +351,39 @@ mod tests {
             _ => panic!("expected CandidatesShown"),
         }
         match &evs[2] {
-            Ev::Commit { text, source } => { assert_eq!(text, "日本語"); assert_eq!(source, "candidate"); }
+            Ev::Commit { text, source } => {
+                assert_eq!(text, "日本語");
+                assert_eq!(source, "candidate");
+            }
             _ => panic!("expected Commit"),
         }
+    }
+
+    #[test]
+    fn parses_activate_prespawn_as_engine_process() {
+        let pid = std::process::id();
+        let lines = vec![
+            format!("[pid {pid}] ev=prespawn at=activate ok=true pid=4716"),
+            format!("[pid {pid}] ev=prespawn at=activate ok=true pid=0"),
+            format!("[pid {pid}] ev=engine_spawn pid=6840 ok=true env_keys=5"),
+        ];
+        let evs = parse_lines(&lines, pid);
+        assert_eq!(evs.len(), 3, "evs={evs:?}");
+        assert!(matches!(
+            &evs[0],
+            Ev::EngineSpawn {
+                pid: 4716,
+                ok: true
+            }
+        ));
+        assert!(matches!(&evs[1], Ev::EngineSpawn { pid: 0, ok: true }));
+        assert!(matches!(
+            &evs[2],
+            Ev::EngineSpawn {
+                pid: 6840,
+                ok: true
+            }
+        ));
     }
 
     #[test]
@@ -329,7 +424,10 @@ mod tests {
         let evs = parse_lines(&lines, pid);
         assert_eq!(evs.len(), 3, "evs={evs:?}");
         match &evs[0] {
-            Ev::Commit { text, source } => { assert_eq!(text, "日本語"); assert_eq!(source, "live"); }
+            Ev::Commit { text, source } => {
+                assert_eq!(text, "日本語");
+                assert_eq!(source, "live");
+            }
             _ => panic!("expected Commit"),
         }
         assert!(matches!(&evs[1], Ev::Activate));
@@ -346,7 +444,10 @@ mod tests {
         let evs = parse_lines(&lines, pid);
         assert_eq!(evs.len(), 2);
         match &evs[0] {
-            Ev::ReconvertShown { n, latin, .. } => { assert_eq!(*n, 3); assert_eq!(latin, "nihongo"); }
+            Ev::ReconvertShown { n, latin, .. } => {
+                assert_eq!(*n, 3);
+                assert_eq!(latin, "nihongo");
+            }
             _ => panic!("expected ReconvertShown"),
         }
         // 接頭辞衝突（reconvert_cancel が reconvert_shown へ誤マッチしない）。
@@ -358,9 +459,9 @@ mod tests {
         // 複数語の確定文（空白含む）が next-known-key まで正しく取れること（M-2 回帰ガード）。
         // text= の値は " source=" の直前まで。"React" だけに切り詰めない。
         let pid = std::process::id();
-        let lines = vec![
-            format!("[pid {pid}] ev=commit text=React nihongo source=candidate"),
-        ];
+        let lines = vec![format!(
+            "[pid {pid}] ev=commit text=React nihongo source=candidate"
+        )];
         let evs = parse_lines(&lines, pid);
         assert_eq!(evs.len(), 1);
         match &evs[0] {
@@ -405,9 +506,9 @@ mod tests {
         // SP6b/SP7 以降、TIP は ev=activate に live_conversion=…/default_direct=… を付ける。
         // 末尾フィールド付きでも Activate として取れること（item1 回帰ガード）。
         let pid = std::process::id();
-        let lines = vec![
-            format!("[pid {pid}] ev=activate live_conversion=true default_direct=false"),
-        ];
+        let lines = vec![format!(
+            "[pid {pid}] ev=activate live_conversion=true default_direct=false"
+        )];
         let evs = parse_lines(&lines, pid);
         assert_eq!(evs.len(), 1);
         assert!(matches!(&evs[0], Ev::Activate));
@@ -425,7 +526,9 @@ mod tests {
         assert_eq!(evs.len(), 3);
         match &evs[0] {
             Ev::ReconvertShown { n, kind, latin } => {
-                assert_eq!(*n, 5); assert_eq!(kind, "surface"); assert_eq!(latin, "にほんご");
+                assert_eq!(*n, 5);
+                assert_eq!(kind, "surface");
+                assert_eq!(latin, "にほんご");
             }
             _ => panic!("expected ReconvertShown"),
         }
@@ -434,7 +537,10 @@ mod tests {
             _ => panic!("expected ReconvertSkip"),
         }
         match &evs[2] {
-            Ev::ReconvertShown { kind, latin, .. } => { assert_eq!(kind, "latin"); assert_eq!(latin, "nihongo"); }
+            Ev::ReconvertShown { kind, latin, .. } => {
+                assert_eq!(kind, "latin");
+                assert_eq!(latin, "nihongo");
+            }
             _ => panic!("expected ReconvertShown"),
         }
     }
@@ -443,9 +549,9 @@ mod tests {
     fn list_tolerates_trailing_future_field() {
         // list= の後ろに将来フィールドが付いても最終候補へ吸収しない（L-8a 回帰ガード）。
         let pid = std::process::id();
-        let lines = vec![
-            format!("[pid {pid}] ev=candidates_shown n=3 sel=0 list=日本語|二本語|二本 future=x"),
-        ];
+        let lines = vec![format!(
+            "[pid {pid}] ev=candidates_shown n=3 sel=0 list=日本語|二本語|二本 future=x"
+        )];
         let evs = parse_lines(&lines, pid);
         assert_eq!(evs.len(), 1);
         match &evs[0] {
@@ -453,7 +559,11 @@ mod tests {
                 assert_eq!(*n, 3);
                 assert_eq!(
                     list,
-                    &vec!["日本語".to_string(), "二本語".to_string(), "二本".to_string()]
+                    &vec![
+                        "日本語".to_string(),
+                        "二本語".to_string(),
+                        "二本".to_string()
+                    ]
                 );
             }
             _ => panic!("expected CandidatesShown"),
@@ -464,9 +574,7 @@ mod tests {
     fn parses_left_context_len() {
         // U9: ev=left_context len=N を Ev::LeftContext { len: N } として取れること。
         let pid = std::process::id();
-        let lines = vec![
-            format!("[pid {pid}] ev=left_context len=12"),
-        ];
+        let lines = vec![format!("[pid {pid}] ev=left_context len=12")];
         let evs = parse_lines(&lines, pid);
         assert_eq!(evs.len(), 1);
         match &evs[0] {
@@ -479,14 +587,17 @@ mod tests {
     fn list_preserves_candidates_with_spaces() {
         // 候補が空白を含んでも（` 英字=` でなければ）切らずに保持する。
         let pid = std::process::id();
-        let lines = vec![
-            format!("[pid {pid}] ev=candidates_shown n=2 sel=0 list=React 日本語|hello world"),
-        ];
+        let lines = vec![format!(
+            "[pid {pid}] ev=candidates_shown n=2 sel=0 list=React 日本語|hello world"
+        )];
         let evs = parse_lines(&lines, pid);
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             Ev::CandidatesShown { list, .. } => {
-                assert_eq!(list, &vec!["React 日本語".to_string(), "hello world".to_string()]);
+                assert_eq!(
+                    list,
+                    &vec!["React 日本語".to_string(), "hello world".to_string()]
+                );
             }
             _ => panic!("expected CandidatesShown"),
         }
@@ -558,7 +669,11 @@ mod tests {
                 assert_eq!(*n, 3);
                 assert_eq!(
                     list,
-                    &vec!["してください".to_string(), "して下さい".to_string(), "してく獺祭".to_string()]
+                    &vec![
+                        "してください".to_string(),
+                        "して下さい".to_string(),
+                        "してく獺祭".to_string()
+                    ]
                 );
             }
             _ => panic!("expected TypoCandidatesShown"),

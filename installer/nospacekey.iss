@@ -82,9 +82,8 @@
 AppId=nospacekey
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-; Stamp the produced setup.exe's own VERSIONINFO resource with the same version.
-; MyAppVersionNum is the 4-part numeric (major.minor.patch.build) -- ISCC's
-; VersionInfoVersion rejects semver pre-release/build metadata in MyAppVersion.
+; VERSIONINFO requires a four-part numeric value; the displayed version keeps
+; the full SemVer prerelease suffix from MyAppVersion.
 VersionInfoVersion={#MyAppVersionNum}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\nospacekey
@@ -123,14 +122,22 @@ Name: "zenzaimodel"; Description: "Zenzai（ニューラル変換）を使用す
 ;     replace/delete instead of Abort/Retry. ---
 Source: "..\dist\nospacekey_tip.dll"; DestDir: "{app}"; Flags: regserver 64bit ignoreversion restartreplace uninsrestartdelete
 
-; --- The engine exe gets its own line with restartreplace. The stop step in
+; --- The engine exe gets its own line with restartreplace + uninsrestartdelete.
+; The stop step in
 ;     PrepareToInstall / [UninstallRun] kills the running engine, but a surviving
 ;     TIP host's next-keystroke ensure_engine or power-resume prewarm can respawn
 ;     the OLD exe in the window between stop and file-copy. With CloseApplications=no
 ;     there is no Restart Manager rescue, so without restartreplace an in-use copy
 ;     would Abort/Retry. restartreplace turns that into "replace at reboot; the
-;     lingering old engine until then is reclaimed by the TIP proto handshake". ---
-Source: "..\dist\NospacekeyEngineHost.exe"; DestDir: "{app}"; Flags: 64bit ignoreversion restartreplace
+;     lingering old engine until then is reclaimed by the TIP proto handshake".
+;     uninsrestartdelete likewise defers deletion of a locked engine to reboot,
+;     so uninstall cannot leave a restart-pending zombie behind. ---
+Source: "..\dist\NospacekeyEngineHost.exe"; DestDir: "{app}"; Flags: 64bit ignoreversion restartreplace uninsrestartdelete
+
+; The checker is a short-lived per-user task action. Keep a dedicated entry so
+; upgrade/uninstall follows the same restartreplace discipline and the wildcard
+; cannot silently omit or duplicate it.
+Source: "..\dist\NospacekeyUpdateChecker.exe"; DestDir: "{app}"; Flags: 64bit ignoreversion restartreplace uninsrestartdelete
 
 ; --- Everything else in the staged tree: the config exe (NospacekeyConfig.exe), the
 ;     three *.resources bundles (dictionary / tokenizer / hub), ~32 Swift runtime
@@ -151,13 +158,21 @@ Source: "..\dist\NospacekeyEngineHost.exe"; DestDir: "{app}"; Flags: 64bit ignor
 ;     uninsrestartdelete here, so UNINSTALL of an in-use shared DLL can still leave
 ;     it on disk (preexisting, non-regression; the TIP line above carries
 ;     uninsrestartdelete for the DLL that matters most for clean removal). ---
-Source: "..\dist\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion restartreplace; Excludes: "nospacekey_tip.dll,NospacekeyEngineHost.exe"
+Source: "..\dist\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion restartreplace; Excludes: "nospacekey_tip.dll,NospacekeyEngineHost.exe,NospacekeyUpdateChecker.exe"
 
 [Icons]
 ; Shortcut to the settings GUI (SP6b) and to the third-party notices.
-Name: "{group}\nospacekey Settings"; Filename: "{app}\NospacekeyConfig.exe"
+Name: "{group}\nospacekey Settings"; Filename: "{app}\NospacekeyConfig.exe"; AppUserModelID: "yachtida.nospacekey"
 Name: "{group}\Third-Party Notices"; Filename: "{app}\THIRD-PARTY-NOTICES.md"
 Name: "{group}\Uninstall nospacekey"; Filename: "{uninstallexe}"
+
+[Registry]
+; Minimal protocol activation: only the fixed update intent reaches Config's exact
+; parser; arbitrary schemes/paths are ignored by the application.
+Root: HKCR; Subkey: "nospacekey"; ValueType: string; ValueName: ""; ValueData: "URL:nospacekey Protocol"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "nospacekey"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCR; Subkey: "nospacekey\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\NospacekeyConfig.exe,0"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "nospacekey\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\NospacekeyConfig.exe"" ""%1"""; Flags: uninsdeletekey
 
 [UninstallDelete]
 ; The Zenzai model is placed by [Code] (download), NOT by [Files], so the
@@ -180,6 +195,8 @@ Filename: "{app}\NospacekeyConfig.exe"; Parameters: "--stop-engine"; Flags: runh
 ;    Absent-process exit code 128 is ignored ([UninstallRun] ignores failures by default).
 Filename: "{cmd}"; Parameters: "/C taskkill /F /IM NospacekeyEngineHost.exe /T"; Flags: runhidden waituntilterminated; RunOnceId: "StopEngineForce"
 Filename: "{cmd}"; Parameters: "/C taskkill /F /IM NospacekeyConfig.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopConfigForce"
+Filename: "{cmd}"; Parameters: "/C taskkill /F /IM NospacekeyUpdateChecker.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopUpdateCheckerForce"
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ""Get-ScheduledTask -TaskPath '\nospacekey\' -ErrorAction SilentlyContinue | Where-Object {{ $_.TaskName -like 'UpdateCheck-*' } | Unregister-ScheduledTask -Confirm:$false"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveUpdateTasks"
 
 [Code]
 var
@@ -267,5 +284,9 @@ begin
   // learning is already flushed to disk at each endSession and is untouched here.
   Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM NospacekeyEngineHost.exe /T', '', SW_HIDE, ewWaitUntilTerminated, R);
   Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM NospacekeyConfig.exe', '', SW_HIDE, ewWaitUntilTerminated, R);
+  // The per-user checker may be mid-request while an upgrade replaces its
+  // image. It is short-lived and state writes are atomic, so a best-effort
+  // force stop closes this file-use window; the scheduled task remains.
+  Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM NospacekeyUpdateChecker.exe /T', '', SW_HIDE, ewWaitUntilTerminated, R);
   Result := '';
 end;

@@ -8,7 +8,6 @@
 //!   "custom" は light スロットを採用（C 段のカスタム編集 UI が light を編集する運用）。
 //! - 色文字列は `#RRGGBB`。パース失敗は**フィールド単位**で内蔵既定へフォールバック（起動不能にしない）。
 //! - アクリル時は背景 bg だけを半透明にし、前景/アクセント/枠は不透明のまま。
-//! - D2D 用の色は premultiplied-alpha（swapchain が premultiplied のため）。
 
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 
@@ -33,23 +32,34 @@ pub mod tokens {
 /// 背景 bg に適用するアクリル時のアルファ（0..255）。~0.7。spec の 0.6–0.8 域。
 const ACRYLIC_BG_ALPHA: u8 = 179; // 0.70 * 255 ≈ 179
 
-/// 8bit RGBA。GDI(COLORREF)/D2D(premultiplied f32) 両方へ変換できる。
+/// 8bit RGBA。GDI(COLORREF)/D2D(straight f32) 両方へ変換できる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rgba { pub r: u8, pub g: u8, pub b: u8, pub a: u8 }
+pub struct Rgba {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
 
 impl Rgba {
     /// GDI 用 COLORREF（0x00BBGGRR）。α は捨てる（GDI パスは不透明前提）。
     pub fn colorref(&self) -> u32 {
         (self.b as u32) << 16 | (self.g as u32) << 8 | (self.r as u32)
     }
-    /// D2D 用 premultiplied-alpha の 0..1 正規化色。
+    /// D2D 用 straight-alpha の 0..1 正規化色。
+    ///
+    /// D2D1_COLOR_F は brush/Clear とも straight alpha が仕様（Direct2D Brushes Overview:
+    /// "Regardless of the alpha mode of the render target, D2D1_COLOR_F values are always
+    /// interpreted as straight alpha"）。premultiplied ターゲット（本 renderer の
+    /// D2D1_ALPHA_MODE_PREMULTIPLIED swapchain）への変換は D2D が書き出し時に行うため、
+    /// ここで α を掛けると二重乗算で RGB が a² に沈む（UIバグ1: アクリル背景の色が
+    /// 濁る — 修正済み）。
     pub fn d2d(&self) -> D2D1_COLOR_F {
-        let a = self.a as f32 / 255.0;
         D2D1_COLOR_F {
-            r: (self.r as f32 / 255.0) * a,
-            g: (self.g as f32 / 255.0) * a,
-            b: (self.b as f32 / 255.0) * a,
-            a,
+            r: self.r as f32 / 255.0,
+            g: self.g as f32 / 255.0,
+            b: self.b as f32 / 255.0,
+            a: self.a as f32 / 255.0,
         }
     }
 }
@@ -57,8 +67,13 @@ impl Rgba {
 /// 解決済みの 7 色。
 #[derive(Debug, Clone, Copy)]
 pub struct ThemeColors {
-    pub bg: Rgba, pub text: Rgba, pub index: Rgba,
-    pub sel_bg: Rgba, pub sel_text: Rgba, pub sel_index: Rgba, pub border: Rgba,
+    pub bg: Rgba,
+    pub text: Rgba,
+    pub index: Rgba,
+    pub sel_bg: Rgba,
+    pub sel_text: Rgba,
+    pub sel_index: Rgba,
+    pub border: Rgba,
 }
 
 /// 候補ウィンドウ/HUD が共有する解決済みテーマ。
@@ -88,9 +103,17 @@ fn color_or(hex: &str, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
 impl Theme {
     pub fn resolve(app: &settings::Appearance, is_dark: bool) -> Theme {
         let use_dark = app.theme == "dark" || (app.theme == "auto" && is_dark);
-        let pal = if use_dark { &app.palette_dark } else { &app.palette_light };
+        let pal = if use_dark {
+            &app.palette_dark
+        } else {
+            &app.palette_light
+        };
         // 対応する内蔵既定（フィールド単位フォールバック用）。
-        let def = if use_dark { settings::default_dark_palette() } else { settings::default_light_palette() };
+        let def = if use_dark {
+            settings::default_dark_palette()
+        } else {
+            settings::default_light_palette()
+        };
         let acrylic = app.backdrop == "acrylic";
         let bg_alpha = if acrylic { ACRYLIC_BG_ALPHA } else { 255 };
 
@@ -112,7 +135,11 @@ impl Theme {
 
         Theme {
             colors,
-            font_family: if app.font_family.trim().is_empty() { "Yu Gothic UI".into() } else { app.font_family.clone() },
+            font_family: if app.font_family.trim().is_empty() {
+                "Yu Gothic UI".into()
+            } else {
+                app.font_family.clone()
+            },
             font_point_tenths: (app.font_point * 10.0).round() as i32,
             rounded: app.corner != "square",
             acrylic,
@@ -126,7 +153,9 @@ impl Default for Theme {
     /// 既定 Appearance を light で解決した初期値。ウィンドウ構築時のプレースホルダ用
     /// （実際の表示前に show/flash が settings 由来の Theme で必ず上書きするので、
     /// この値がそのまま描画されることはない）。
-    fn default() -> Self { Theme::resolve(&settings::Appearance::default(), false) }
+    fn default() -> Self {
+        Theme::resolve(&settings::Appearance::default(), false)
+    }
 }
 
 // ============================================================================
@@ -226,7 +255,10 @@ impl AppearanceSource {
     pub fn new() -> Self {
         // 初期値は内蔵既定。cached_mtime=None なので、ファイルが存在すれば初回の
         // current_appearance() で必ず実ファイルから読み直される。
-        Self { cached_mtime: None, cached: settings::Appearance::default() }
+        Self {
+            cached_mtime: None,
+            cached: settings::Appearance::default(),
+        }
     }
 
     /// mtime を見て必要なら再読込し、現在の Appearance を返す。
@@ -269,7 +301,9 @@ impl AppearanceSource {
 }
 
 impl Default for AppearanceSource {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -309,8 +343,11 @@ mod tests {
         let mut app = Appearance::default();
         app.theme = "light".into();
         app.backdrop = "opaque".into();
-        let t = Theme::resolve(&app, /*is_dark=*/true); // theme=light なので is_dark は無視
-        assert_eq!((t.colors.bg.r, t.colors.bg.g, t.colors.bg.b), (0xFF, 0xFF, 0xFF));
+        let t = Theme::resolve(&app, /*is_dark=*/ true); // theme=light なので is_dark は無視
+        assert_eq!(
+            (t.colors.bg.r, t.colors.bg.g, t.colors.bg.b),
+            (0xFF, 0xFF, 0xFF)
+        );
         assert_eq!(t.colors.bg.a, 255); // opaque
         assert!(!t.acrylic);
         assert!(t.rounded);
@@ -321,10 +358,16 @@ mod tests {
     fn resolve_auto_follows_is_dark() {
         let app = Appearance::default(); // theme=auto, acrylic, round
         let dark = Theme::resolve(&app, true);
-        assert_eq!((dark.colors.bg.r, dark.colors.bg.g, dark.colors.bg.b), (0x2C, 0x2C, 0x2E));
+        assert_eq!(
+            (dark.colors.bg.r, dark.colors.bg.g, dark.colors.bg.b),
+            (0x2C, 0x2C, 0x2E)
+        );
         assert!(dark.is_dark);
         let light = Theme::resolve(&app, false);
-        assert_eq!((light.colors.bg.r, light.colors.bg.g, light.colors.bg.b), (0xFF, 0xFF, 0xFF));
+        assert_eq!(
+            (light.colors.bg.r, light.colors.bg.g, light.colors.bg.b),
+            (0xFF, 0xFF, 0xFF)
+        );
         assert!(!light.is_dark);
     }
 
@@ -344,30 +387,66 @@ mod tests {
         let mut app = Appearance::default();
         app.theme = "light".into();
         app.palette_light.text = "not-a-color".into(); // 壊れた1フィールドだけ
-        app.palette_light.bg = "#010203".into();       // 有効
+        app.palette_light.bg = "#010203".into(); // 有効
         let t = Theme::resolve(&app, false);
         // 壊れた text は内蔵 light 既定(#1D1D1F)へフォールバック。
-        assert_eq!((t.colors.text.r, t.colors.text.g, t.colors.text.b), (0x1D, 0x1D, 0x1F));
+        assert_eq!(
+            (t.colors.text.r, t.colors.text.g, t.colors.text.b),
+            (0x1D, 0x1D, 0x1F)
+        );
         // 有効な bg はそのまま採用。
-        assert_eq!((t.colors.bg.r, t.colors.bg.g, t.colors.bg.b), (0x01, 0x02, 0x03));
+        assert_eq!(
+            (t.colors.bg.r, t.colors.bg.g, t.colors.bg.b),
+            (0x01, 0x02, 0x03)
+        );
     }
 
     #[test]
     fn colorref_is_bgr_order() {
         // COLORREF は 0x00BBGGRR。#0078D7 → R=0x00 G=0x78 B=0xD7 → 0x00D77800。
-        let c = Rgba { r: 0x00, g: 0x78, b: 0xD7, a: 255 };
+        let c = Rgba {
+            r: 0x00,
+            g: 0x78,
+            b: 0xD7,
+            a: 255,
+        };
         assert_eq!(c.colorref(), 0x00D7_7800);
     }
 
     #[test]
-    fn d2d_is_premultiplied_and_normalized() {
+    fn d2d_is_straight_alpha_and_normalized() {
+        // D2D1_COLOR_F は straight alpha が仕様（ターゲットの α モードに関わらず）。
         // 不透明白 → (1,1,1,1)。
-        let w = Rgba { r: 255, g: 255, b: 255, a: 255 }.d2d();
+        let w = Rgba {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        }
+        .d2d();
         assert!((w.r - 1.0).abs() < 1e-3 && (w.a - 1.0).abs() < 1e-3);
-        // 半透明(α=128)白 → premultiplied なので r≈a≈0.502。
-        let h = Rgba { r: 255, g: 255, b: 255, a: 128 }.d2d();
-        assert!((h.a - 128.0/255.0).abs() < 1e-3);
-        assert!((h.r - h.a).abs() < 1e-3); // premultiplied: r == a for white
+        // 半透明(α=128)白 → straight なので RGB は沈まず 1.0 のまま、α のみ 0.502。
+        // （旧実装は premultiplied で r==a だった — brush が更に α を掛けて a² に沈む UIバグ1）
+        let h = Rgba {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 128,
+        }
+        .d2d();
+        assert!((h.a - 128.0 / 255.0).abs() < 1e-3);
+        assert!((h.r - 1.0).abs() < 1e-3);
+        // 濃色の RGB も素通し。
+        let c = Rgba {
+            r: 0x10,
+            g: 0x20,
+            b: 0x30,
+            a: 128,
+        }
+        .d2d();
+        assert!((c.r - 0x10 as f32 / 255.0).abs() < 1e-3);
+        assert!((c.g - 0x20 as f32 / 255.0).abs() < 1e-3);
+        assert!((c.b - 0x30 as f32 / 255.0).abs() < 1e-3);
     }
 
     #[test]

@@ -10,15 +10,19 @@ pub use renderer::{is_device_lost, SurfaceRenderer};
 use std::ffi::c_void;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWCP_DEFAULT, DWMWCP_ROUND,
+    DwmSetWindowAttribute, DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_ROUND,
 };
 
 /// 角丸・アクリルバックドロップを適用する。失敗は握り潰す（Win10=no-op）。
 /// `rounded=false` は明示的に角なし、`acrylic=false` はバックドロップ無効（不透明）。
 pub fn apply_dwm_chrome(hwnd: HWND, rounded: bool, acrylic: bool) {
     unsafe {
-        let corner = if rounded { DWMWCP_ROUND } else { DWMWCP_DEFAULT };
+        let corner = if rounded {
+            DWMWCP_ROUND
+        } else {
+            DWMWCP_DEFAULT
+        };
         let corner_val = corner.0 as u32;
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -26,7 +30,11 @@ pub fn apply_dwm_chrome(hwnd: HWND, rounded: bool, acrylic: bool) {
             &corner_val as *const _ as *const c_void,
             std::mem::size_of::<u32>() as u32,
         );
-        let backdrop = if acrylic { DWMSBT_TRANSIENTWINDOW } else { DWMSBT_NONE };
+        let backdrop = if acrylic {
+            DWMSBT_TRANSIENTWINDOW
+        } else {
+            DWMSBT_NONE
+        };
         let backdrop_val = backdrop.0 as u32;
         let _ = DwmSetWindowAttribute(
             hwnd,

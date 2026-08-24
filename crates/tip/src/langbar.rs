@@ -9,14 +9,14 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use windows::core::{implement, BOOL, BSTR, GUID, IUnknown, Interface, Ref, Result};
+use windows::core::{implement, IUnknown, Interface, Ref, Result, BOOL, BSTR, GUID};
 use windows::Win32::Foundation::{E_NOINTERFACE, E_NOTIMPL, POINT, RECT};
+use windows::Win32::Graphics::Gdi::HBITMAP;
 use windows::Win32::UI::TextServices::{
     ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemSink, ITfLangBarItem_Impl,
     ITfMenu, ITfSource, ITfSource_Impl, TfLBIClick, GUID_LBI_INPUTMODE, TF_LANGBARITEMINFO,
     TF_LBI_CLK_RIGHT, TF_LBI_STYLE_BTN_BUTTON,
 };
-use windows::Win32::Graphics::Gdi::HBITMAP;
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 
 use ids::CLSID_NOSPACEKEY;
@@ -48,13 +48,6 @@ pub(crate) const MENU_ID_TOGGLE_MODE: u32 = 2;
 /// Rc 共有し、Activate 期間だけ Some になる（sink と同じ共有パターン）。型を1箇所に固めて
 /// 両側の宣言を一致させる。
 pub(crate) type ModeToggleHandle = Rc<RefCell<Option<Box<dyn Fn()>>>>;
-
-/// conversion-mode から言語バーに出すモードラベルを返す純関数。
-/// direct(半角英数)=「A」, native(ひらがな)=「あ」。ephemeral 非対応の旧 API。
-/// `mode_label_ephemeral(is_direct, false)` へ委譲する（非回帰）。
-pub fn mode_label(is_direct: bool) -> &'static str {
-    mode_label_ephemeral(is_direct, false)
-}
 
 /// conversion-mode と ephemeral かなフラグから言語バー/HUD/トレイに出すモードラベルを返す純関数。
 /// direct(半角英数)=「A」, 永続かな=「あ」, ephemeral かな（F8 等の一時トリガ中）=「あ˙」。
@@ -97,7 +90,13 @@ impl ModeLangBarItem {
         sink: Rc<RefCell<Option<ITfLangBarItemSink>>>,
         on_toggle: ModeToggleHandle,
     ) -> Self {
-        Self { is_direct, ephemeral, sink, on_toggle, _guard: ComObjectGuard::new() }
+        Self {
+            is_direct,
+            ephemeral,
+            sink,
+            on_toggle,
+            _guard: ComObjectGuard::new(),
+        }
     }
 }
 
@@ -181,12 +180,14 @@ impl ITfLangBarItemButton_Impl for ModeLangBarItem_Impl {
             use windows::core::w;
             use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
             use windows::Win32::UI::WindowsAndMessaging::{
-                AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_STRING,
-                TPM_NONOTIFY, TPM_RETURNCMD,
+                AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_STRING, TPM_NONOTIFY,
+                TPM_RETURNCMD,
             };
             unsafe {
                 // 生成失敗はメニューを出さないだけ（TIP 経路では panic 厳禁）。
-                let Ok(hmenu) = CreatePopupMenu() else { return Ok(()) };
+                let Ok(hmenu) = CreatePopupMenu() else {
+                    return Ok(());
+                };
                 // ラベルは InitMenu と一致させる。AppendMenuW 失敗も握りつぶす（項目が欠けるだけ）。
                 let _ = AppendMenuW(hmenu, MF_STRING, MENU_ID_SETTINGS as usize, w!("設定"));
                 let _ = AppendMenuW(
@@ -219,7 +220,9 @@ impl ITfLangBarItemButton_Impl for ModeLangBarItem_Impl {
     }
     fn InitMenu(&self, pmenu: Ref<ITfMenu>) -> Result<()> {
         crate::text_service::tip_log("ev=langbar_initmenu");
-        let Some(menu) = pmenu.as_ref() else { return Ok(()) };
+        let Some(menu) = pmenu.as_ref() else {
+            return Ok(());
+        };
         // AddMenuItem(0.62) の pch は &[u16] で cch=slice.len()。NUL 終端を含めると余分な文字が
         // 表示されるので、終端なしの UTF-16 をそのまま渡す。
         let settings: Vec<u16> = "設定".encode_utf16().collect();
@@ -256,8 +259,9 @@ impl ITfLangBarItemButton_Impl for ModeLangBarItem_Impl {
     // このためキャッシュしたハンドルを返してはならない（破棄後のダングリング返却になる）。
     // 呼び出しは OnUpdate(TF_LBI_ICON) 契機のみで低頻度なので毎回生成でよい。
     fn GetIcon(&self) -> Result<HICON> {
-        // SAFETY: GetDpiForSystem は引数なしの純粋な問い合わせ。render_mode_icon は GDI
-        // オブジェクトを自スコープ内で完結させ、成功時のみ所有権付きの HICON を返す。
+        // SAFETY: GetDpiForSystem は引数なしの純粋な問い合わせ。render_mode_icon は
+        // DLL リソースから LoadImageW（LR_SHARED 無し＝呼び出し側所有のコピー）で
+        // HICON を取り出す。所有権は GetIcon 契約どおりシステムへ渡る。
         // STA スレッド（TSF 呼び出し文脈）から呼ばれる。
         let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() } as i32;
         match unsafe {
@@ -268,7 +272,10 @@ impl ITfLangBarItemButton_Impl for ModeLangBarItem_Impl {
         }
     }
     fn GetText(&self) -> Result<BSTR> {
-        Ok(BSTR::from(mode_label_ephemeral(self.is_direct.get(), self.ephemeral.get())))
+        Ok(BSTR::from(mode_label_ephemeral(
+            self.is_direct.get(),
+            self.ephemeral.get(),
+        )))
     }
 }
 
@@ -292,12 +299,12 @@ impl ITfSource_Impl for ModeLangBarItem_Impl {
 
 #[cfg(test)]
 mod tests {
-    use super::{mode_label, mode_label_ephemeral};
+    use super::mode_label_ephemeral;
 
     #[test]
     fn mode_label_maps_direct_and_native() {
-        assert_eq!(mode_label(true), "A"); // 半角英数
-        assert_eq!(mode_label(false), "あ"); // ひらがな
+        assert_eq!(mode_label_ephemeral(true, false), "A"); // 半角英数
+        assert_eq!(mode_label_ephemeral(false, false), "あ"); // ひらがな
     }
 
     #[test]
@@ -305,8 +312,8 @@ mod tests {
         assert_eq!(mode_label_ephemeral(false, false), "あ");
         assert_eq!(mode_label_ephemeral(true, false), "A");
         assert_eq!(mode_label_ephemeral(false, true), "あ˙");
-        assert_eq!(mode_label(false), "あ");
-        assert_eq!(mode_label(true), "A");
+        // direct 中は ephemeral 状態自体が存在しない＝フラグは無視される。
+        assert_eq!(mode_label_ephemeral(true, true), "A");
     }
 }
 

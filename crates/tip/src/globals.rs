@@ -14,27 +14,35 @@ pub use ids::{
 };
 
 /// SP5: モードトグル（ひらがな⇄半角英数）の preserved key 識別 GUID。
-pub const GUID_PRESERVEDKEY_MODE_TOGGLE: GUID = GUID::from_u128(0xc6963839_c572_45cb_a66d_25a4a4d704ba);
+pub const GUID_PRESERVEDKEY_MODE_TOGGLE: GUID =
+    GUID::from_u128(0xc6963839_c572_45cb_a66d_25a4a4d704ba);
 /// SP5: 再変換（直前ラテン列を変換）の preserved key 識別 GUID。
-pub const GUID_PRESERVEDKEY_RECONVERT: GUID = GUID::from_u128(0x4006ec1a_2ef6_4f61_9822_174d550783cc);
+pub const GUID_PRESERVEDKEY_RECONVERT: GUID =
+    GUID::from_u128(0x4006ec1a_2ef6_4f61_9822_174d550783cc);
 /// US(ANSI)配列向け: モードトグル（Alt+;）の preserved key 識別 GUID。一度確定したら変更しない。
 /// （Alt+` は OS がシステム IME on/off に予約し TIP へ届かないため Alt+; を採用。2026-06-25 実機確認）
-pub const GUID_PRESERVEDKEY_MODE_TOGGLE_US: GUID = GUID::from_u128(0x87a01c5a_b74f_47af_98a8_d5c588d6f747);
+pub const GUID_PRESERVEDKEY_MODE_TOGGLE_US: GUID =
+    GUID::from_u128(0x87a01c5a_b74f_47af_98a8_d5c588d6f747);
 /// US(ANSI)配列向け: 再変換（Alt+/）の preserved key 識別 GUID。一度確定したら変更しない。
-pub const GUID_PRESERVEDKEY_RECONVERT_US: GUID = GUID::from_u128(0x23822a23_3ca1_401e_9b1c_4bfa1e6f0efb);
+pub const GUID_PRESERVEDKEY_RECONVERT_US: GUID =
+    GUID::from_u128(0x23822a23_3ca1_401e_9b1c_4bfa1e6f0efb);
 /// 半角/全角(0xF3)向け: モードトグルの preserved key 識別 GUID。一度確定したら変更しない。
 /// bare 0x1C/0x1D と同じく OS 拒否があり得る — 拒否/未配送ホストは OnKeyDown 救済
 /// (resolve_action の bare_special 経路)が受ける(spec §3)。
-pub const GUID_PRESERVEDKEY_MODE_TOGGLE_HZ: GUID = GUID::from_u128(0x3f8b6a92_1d47_4c05_8e2a_7b9c0d4e5f16);
+pub const GUID_PRESERVEDKEY_MODE_TOGGLE_HZ: GUID =
+    GUID::from_u128(0x3f8b6a92_1d47_4c05_8e2a_7b9c0d4e5f16);
 /// 品質ループ③: 誤変換フィードバック記録（Ctrl+変換 0x1C, JIS）の preserved key 識別 GUID。
 /// 既存4登録と衝突しない新 GUID。一度確定したら変更しない。
-pub const GUID_PRESERVEDKEY_FEEDBACK: GUID = GUID::from_u128(0x5b8ce2d1_7f3a_4d68_9a41_c1d20f6e3b57);
+pub const GUID_PRESERVEDKEY_FEEDBACK: GUID =
+    GUID::from_u128(0x5b8ce2d1_7f3a_4d68_9a41_c1d20f6e3b57);
 /// 品質ループ③: 誤変換フィードバック記録（Ctrl+/ 0xBF, US）の preserved key 識別 GUID。
-pub const GUID_PRESERVEDKEY_FEEDBACK_US: GUID = GUID::from_u128(0x9e4f1c3b_2a6d_4e90_b7c8_51aa0d2f8e64);
+pub const GUID_PRESERVEDKEY_FEEDBACK_US: GUID =
+    GUID::from_u128(0x9e4f1c3b_2a6d_4e90_b7c8_51aa0d2f8e64);
 
 /// SP6a: 候補リスト UIElement の識別 GUID（ITfUIElement::GetGUID が返す純粋な識別子。登録不要）。
 /// 一度確定したら変更しないこと（SP5 preserved-key GUID と同じ規律）。
-pub const GUID_UIELEMENT_CANDIDATELIST: GUID = GUID::from_u128(0x7d6f6f0a_6b3a_4e2b_9b4a_2f9e3b1c5d80);
+pub const GUID_UIELEMENT_CANDIDATELIST: GUID =
+    GUID::from_u128(0x7d6f6f0a_6b3a_4e2b_9b4a_2f9e3b1c5d80);
 
 /// DllCanUnloadNow が参照する DLL の参照カウント。
 pub static DLL_REF: AtomicI32 = AtomicI32::new(0);

@@ -24,10 +24,24 @@ pub fn zenkaku_symbol(
 ) -> Option<char> {
     Some(match c {
         '-' => 'ー',
-        ',' => if punct_full_width { '、' } else { return None },
-        '.' => if punct_full_width { '。' } else { return None },
+        ',' => {
+            if punct_full_width {
+                '、'
+            } else {
+                return None;
+            }
+        }
+        '.' => {
+            if punct_full_width {
+                '。'
+            } else {
+                return None;
+            }
+        }
         _ if !(symbol_full_width && chars.contains(c)) => return None,
-        '/' => '・', '[' => '「', ']' => '」',
+        '/' => '・',
+        '[' => '「',
+        ']' => '」',
         c if c.is_ascii_punctuation() => zenkaku_of(c),
         _ => return None,
     })
@@ -157,10 +171,22 @@ mod tests {
     #[test]
     fn prolonged_sound_and_punctuation_ignore_chars_set_content() {
         // -,. の判定は集合の内容に関わらず現行挙動のまま（長音符=無条件、句読点=punct トグルのみ）。
-        assert_eq!(zenkaku_symbol('-', false, false, SymbolCharSet::EMPTY), Some('ー'));
-        assert_eq!(zenkaku_symbol('-', true, true, SymbolCharSet::EMPTY), Some('ー'));
-        assert_eq!(zenkaku_symbol('.', true, false, SymbolCharSet::EMPTY), Some('。'));
-        assert_eq!(zenkaku_symbol(',', true, false, SymbolCharSet::EMPTY), Some('、'));
+        assert_eq!(
+            zenkaku_symbol('-', false, false, SymbolCharSet::EMPTY),
+            Some('ー')
+        );
+        assert_eq!(
+            zenkaku_symbol('-', true, true, SymbolCharSet::EMPTY),
+            Some('ー')
+        );
+        assert_eq!(
+            zenkaku_symbol('.', true, false, SymbolCharSet::EMPTY),
+            Some('。')
+        );
+        assert_eq!(
+            zenkaku_symbol(',', true, false, SymbolCharSet::EMPTY),
+            Some('、')
+        );
         assert_eq!(zenkaku_symbol('.', false, true, SymbolCharSet::ALL), None);
         assert_eq!(zenkaku_symbol(',', false, true, SymbolCharSet::ALL), None);
     }
@@ -170,7 +196,11 @@ mod tests {
         // 空集合なら全記号が半角のまま（不変条件Aのみの証明。overlay=false は別途
         // effective_chars/symbol_overlay のテストで証明する — spec §6）。
         for (c, _) in symbol_targets() {
-            assert_eq!(zenkaku_symbol(c, false, true, SymbolCharSet::EMPTY), None, "{c:?}");
+            assert_eq!(
+                zenkaku_symbol(c, false, true, SymbolCharSet::EMPTY),
+                None,
+                "{c:?}"
+            );
         }
     }
 
@@ -216,7 +246,10 @@ mod tests {
         let targets: Vec<(char, char)> = symbol_targets().collect();
         assert_eq!(targets.len(), 29);
         assert!(targets.iter().all(|(h, _)| !matches!(h, '-' | ',' | '.')));
-        assert!(targets.iter().all(|(h, full)| h != full), "プレビューは全角化されているはず");
+        assert!(
+            targets.iter().all(|(h, full)| h != full),
+            "プレビューは全角化されているはず"
+        );
         // 置換系3件のプレビューは設定画面がユーザーへ見せるドキュメントそのもの
         //（「全角スラッシュでなく中黒」— spec §5）。カタログの full 側を直接固定する。
         assert!(targets.contains(&('/', '・')));
@@ -237,16 +270,21 @@ mod tests {
                 ']' => '」',
                 _ => char::from_u32(c as u32 - 0x21 + 0xFF01).unwrap(),
             };
-            assert_eq!(zenkaku_symbol(c, false, true, defaults), Some(expected), "{c:?}");
+            assert_eq!(
+                zenkaku_symbol(c, false, true, defaults),
+                Some(expected),
+                "{c:?}"
+            );
         }
     }
 
     #[test]
     fn de_symbol_chars_skips_invalid_elements_and_keeps_valid_ones() {
         let json = r#"["!","ab",42,"?"]"#;
-        let set: BTreeSet<char> = serde_json::from_str::<Wrapper>(&format!(r#"{{"chars":{json}}}"#))
-            .unwrap()
-            .chars;
+        let set: BTreeSet<char> =
+            serde_json::from_str::<Wrapper>(&format!(r#"{{"chars":{json}}}"#))
+                .unwrap()
+                .chars;
         assert_eq!(set, BTreeSet::from(['!', '?']));
     }
 
@@ -255,7 +293,11 @@ mod tests {
         for bad in [r#""!?""#, "null", "{}"] {
             let json = format!(r#"{{"chars":{bad}}}"#);
             let set: BTreeSet<char> = serde_json::from_str::<Wrapper>(&json).unwrap().chars;
-            assert_eq!(set, default_full_width_chars(), "container {bad:?} should fall back to default 29");
+            assert_eq!(
+                set,
+                default_full_width_chars(),
+                "container {bad:?} should fall back to default 29"
+            );
         }
     }
 

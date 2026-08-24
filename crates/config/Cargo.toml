@@ -13,12 +13,24 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 settings = { path = "../settings" }
+nospacekey-update = { path = "../update" }
 ipc = { path = "../ipc" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# 巡3 Q2: 設定画面の単一インスタンス化 — TIP設定ボタン・トレイ・スタートメニューの複数
+# 起動経路から兄弟プロセスを許すと、プロセス内排他（SettingsLock/DictLock/ビジーフラグ）を
+# またいで settings.json・辞書の read-modify-save が last-writer-wins する（辞書語の消失）。
+# Windows plugin の mutex は logon-session 単位なので、main の ConfigInstanceLease が
+# user profile 内の file lock で別 session も排他する。
+tauri-plugin-single-instance = "2"
+# Win32_System_Registry は ShellExecuteExW の SHELLEXECUTEINFOW(hkeyClass) に、
+# Win32_System_IO は LockFileEx/UnlockFileEx の OVERLAPPED に必要。
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# アップデートインストーラの staging — 試行ごとに OS 乱数で一意な専用ディレクトリを作り、
+# 固定 %TEMP% 直下パスへの事前干渉（.part 置き・symlink 差替え）を成立させないため。
+tempfile = "3"
 # Zenzai モデルのダウンロード。reqwest は既に tauri 経由でツリーにあるが TLS 無しでビルド
 # されているため、HTTPS を通すには TLS backend を明示する。native-tls は Windows で schannel
 # ＝OS 信頼ストアを使う（webpki-roots を同梱する rustls より軽く、企業ルートも尊重される）。

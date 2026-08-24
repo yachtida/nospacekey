@@ -8,29 +8,47 @@ pub struct CandidateState {
 }
 
 impl CandidateState {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// 候補列と初期選択を設定。selected は範囲内へクランプ。
     pub fn set(&mut self, items: Vec<String>, selected: usize) {
-        self.selected = if items.is_empty() { 0 } else { selected.min(items.len() - 1) };
+        self.selected = if items.is_empty() {
+            0
+        } else {
+            selected.min(items.len() - 1)
+        };
         self.items = items;
     }
 
-    pub fn count(&self) -> usize { self.items.len() }
-    pub fn selected(&self) -> usize { self.selected }
-    pub fn string_at(&self, i: usize) -> Option<String> { self.items.get(i).cloned() }
-    pub fn items(&self) -> &[String] { &self.items }
+    pub fn count(&self) -> usize {
+        self.items.len()
+    }
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+    pub fn string_at(&self, i: usize) -> Option<String> {
+        self.items.get(i).cloned()
+    }
+    pub fn items(&self) -> &[String] {
+        &self.items
+    }
 
     /// 循環選択（既存 CandidateWindow と同一挙動）。空なら no-op。
     pub fn move_selection(&mut self, delta: i32) {
-        if self.items.is_empty() { return; }
+        if self.items.is_empty() {
+            return;
+        }
         let n = self.items.len() as i32;
         self.selected = (self.selected as i32 + delta).rem_euclid(n) as usize;
     }
 
     /// ホスト発の直接選択（クランプ）。空なら no-op。
     pub fn set_selection(&mut self, index: usize) {
-        if self.items.is_empty() { return; }
+        if self.items.is_empty() {
+            return;
+        }
         self.selected = index.min(self.items.len() - 1);
     }
 
@@ -62,10 +80,14 @@ mod tests {
     fn move_selection_is_cyclic() {
         let mut s = CandidateState::new();
         s.set(vec!["a".into(), "b".into(), "c".into()], 0);
-        s.move_selection(1); assert_eq!(s.selected(), 1);
-        s.move_selection(-1); assert_eq!(s.selected(), 0);
-        s.move_selection(-1); assert_eq!(s.selected(), 2); // 上端で末尾へ循環
-        s.move_selection(1); assert_eq!(s.selected(), 0);  // 下端で先頭へ
+        s.move_selection(1);
+        assert_eq!(s.selected(), 1);
+        s.move_selection(-1);
+        assert_eq!(s.selected(), 0);
+        s.move_selection(-1);
+        assert_eq!(s.selected(), 2); // 上端で末尾へ循環
+        s.move_selection(1);
+        assert_eq!(s.selected(), 0); // 下端で先頭へ
     }
     #[test]
     fn set_selection_clamps() {
@@ -81,7 +103,7 @@ mod tests {
         assert_eq!(s.count(), 0);
         assert_eq!(s.selected(), 0);
         s.move_selection(1); // パニックしない
-        s.set_selection(3);  // パニックしない
+        s.set_selection(3); // パニックしない
         assert_eq!(s.string_at(0), None);
     }
     #[test]

@@ -43,12 +43,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use crate::candidate_state::CandidateState;
 use crate::popup::{self, Backend, PopupState};
 use crate::text_service::tip_log;
 use crate::theme::tokens;
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC,
     GetDeviceCaps, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, SetBkMode,
@@ -56,8 +56,8 @@ use windows::Win32::Graphics::Gdi::{
     HFONT, LOGPIXELSX, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, SetTimer,
-    ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE, WM_LBUTTONDOWN, WM_NCDESTROY, WM_PAINT, WM_TIMER,
+    DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, ShowWindow, SW_HIDE,
+    SW_SHOWNOACTIVATE, WM_LBUTTONDOWN, WM_NCDESTROY, WM_PAINT, WM_TIMER,
 };
 
 // ポップアップ共有基盤（popup.rs）の純ヘルパ。旧来この module にあったものを移設した。
@@ -115,8 +115,6 @@ pub(crate) const MAX_VISIBLE_ROWS: usize = 9;
 const FOOTER_H: i32 = 18;
 /// 自前ヘアライン枠の太さ（px、crisp に保つため非スケール）。
 const BORDER: i32 = 1;
-/// 退場フェード完了後に SW_HIDE する遅延タイマの ID。
-const HIDE_TIMER_ID: usize = 1;
 
 /// 登録済みウィンドウクラスのアトム（プロセス内で一度だけ登録）。
 static CLASS_ATOM: OnceLock<u16> = OnceLock::new();
@@ -155,7 +153,9 @@ fn window_size(visible_rows: usize, total_count: usize, content_w: i32, dpi: i32
     let inner_w = scale(NUMBER_COL_W, dpi) + scale(GAP, dpi) + content_w;
     let raw_w = 2 * BORDER + 2 * scale(PADDING_X, dpi) + inner_w;
     let width = clamp_width(raw_w, scale(MIN_W, dpi), scale(MAX_W, dpi));
-    let height = 2 * BORDER + 2 * scale(PADDING_Y, dpi) + rows * scale(ROW_HEIGHT, dpi)
+    let height = 2 * BORDER
+        + 2 * scale(PADDING_Y, dpi)
+        + rows * scale(ROW_HEIGHT, dpi)
         + footer_extra_h(total_count, dpi);
     (width, height)
 }
@@ -274,12 +274,17 @@ pub(crate) fn visible_range(selected: usize, len: usize, max_visible: usize) -> 
 /// 出すアンカーを返す純粋関数。文字を覆わないようキャレット直下＝左下 (left, bottom) に
 /// 出し、画面下端フリップ用にキャレット上端 top も保持する。全 0 の退化矩形
 /// （GetTextExt が未書込／レイアウト未確定で既定 RECT のまま）は `None` を返し、
-/// 呼び出し側（`caret_point`）が既定座標へフォールバックする。
+/// 呼び出し側（`caret_point`）が直近の有効アンカー（初回は無害位置）へフォールバックする
+/// （UIバグ5 の (200,200) 廃止後の契約）。
 pub(crate) fn caret_rect_to_anchor(rc: RECT) -> Option<CaretAnchor> {
     if rc.left == 0 && rc.top == 0 && rc.right == 0 && rc.bottom == 0 {
         return None;
     }
-    Some(CaretAnchor { x: rc.left, y: rc.bottom, caret_top: Some(rc.top) })
+    Some(CaretAnchor {
+        x: rc.left,
+        y: rc.bottom,
+        caret_top: Some(rc.top),
+    })
 }
 
 // ============================================================================
@@ -320,7 +325,8 @@ impl WindowState {
     /// theme から取る（settings のフォント変更を GDI パス・幅測定にも反映）。
     unsafe fn font_for_dpi(&mut self, dpi: i32) -> Option<HFONT> {
         let family = popup::family_utf16z(&self.theme.font_family);
-        self.backend.font_for_dpi(&family, self.theme.font_point_tenths, dpi)
+        self.backend
+            .font_for_dpi(&family, self.theme.font_point_tenths, dpi)
     }
 }
 
@@ -388,14 +394,34 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_TIMER => unsafe {
-            if wparam.0 == HIDE_TIMER_ID {
-                let _ = KillTimer(Some(hwnd), HIDE_TIMER_ID);
-                // 退場フェード完了。フラグを解いてから実際に隠す（次回 hide の再入ガード解除）。
-                if let Some(s) = window_state(hwnd) {
-                    s.backend.fading_out = false;
+            // 退場フェード完了タイマ（世代ID判定）。KillTimer はキュー済みの WM_TIMER を
+            // 除去できないため、旧世代の発火が再表示後の新しいフェード中に届く——
+            // 現在の世代 ID と一致したときだけ完了処理を行い、古い発火は掃除だけして無視する。
+            // 巡3 G6: state 欠落（WM_NCDESTROY 後等）は判定不能だが可視のまま残す理由も
+            // 無い — 1438196 構造に倣い隠して抜ける（SW_HIDE は冪等）。
+            let Some(s) = window_state(hwnd) else {
+                if wparam.0 >= 1000 {
+                    let _ = KillTimer(Some(hwnd), wparam.0);
                 }
                 let _ = ShowWindow(hwnd, SW_HIDE);
+                return LRESULT(0);
+            };
+            if wparam.0 >= 1000 {
+                let _ = KillTimer(Some(hwnd), wparam.0);
             }
+            if !s.backend.is_current_fade_timer(wparam.0) {
+                return LRESULT(0);
+            }
+            s.backend.fade_timer_id = 0;
+            s.backend.fading_out = false;
+            // 描画ミラーはここ（実際の SW_HIDE）で初めて空にする。hide() 時点の
+            // 即時クリアは、クリック確定で InvalidateRect → drain → hide の順に
+            // マークされた遅延 WM_PAINT がフェード中に届いた際「空のカード」を
+            // 描く原因（UIバグ7）。SW_HIDE 後は OS が update region を破棄する
+            // ため、非表示後の古い候補描画は起きない。
+            s.candidates = Rc::new(Vec::new());
+            s.selected = 0;
+            let _ = ShowWindow(hwnd, SW_HIDE);
             LRESULT(0)
         },
         WM_NCDESTROY => unsafe {
@@ -487,7 +513,11 @@ fn paint_gdi(hwnd: HWND) {
             // 番号（ガター内で右寄せ、ページ内相対の 1 始まり＝数字キーと一致）。
             let mut num: Vec<u16> = format_index(abs_i - start).encode_utf16().collect();
             let mut num_rect = number;
-            let idx_color = if is_sel { colors.sel_index } else { colors.index };
+            let idx_color = if is_sel {
+                colors.sel_index
+            } else {
+                colors.index
+            };
             let _ = SetTextColor(hdc, COLORREF(idx_color.colorref()));
             let _ = DrawTextW(hdc, &mut num, &mut num_rect, num_fmt);
 
@@ -533,9 +563,7 @@ fn paint_gdi(hwnd: HWND) {
 /// D2D でも BeginPaint/EndPaint は全経路で必ず対で呼ぶ。
 unsafe fn paint_d2d(hwnd: HWND) {
     use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
-    use windows::Win32::Graphics::Direct2D::{
-        D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ROUNDED_RECT,
-    };
+    use windows::Win32::Graphics::Direct2D::{D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ROUNDED_RECT};
     use windows::Win32::Graphics::DirectWrite::{
         DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_ALIGNMENT_LEADING,
         DWRITE_TEXT_ALIGNMENT_TRAILING,
@@ -568,8 +596,12 @@ unsafe fn paint_d2d(hwnd: HWND) {
         .collect();
     let font_px = font_size_px(state.theme.font_point_tenths, dpi);
     let (Some(fmt_body), Some(fmt_num)) = (
-        state.backend.text_format(&family, font_px, DWRITE_TEXT_ALIGNMENT_LEADING, true),
-        state.backend.text_format(&family, font_px, DWRITE_TEXT_ALIGNMENT_TRAILING, true),
+        state
+            .backend
+            .text_format(&family, font_px, DWRITE_TEXT_ALIGNMENT_LEADING, true),
+        state
+            .backend
+            .text_format(&family, font_px, DWRITE_TEXT_ALIGNMENT_TRAILING, true),
     ) else {
         let _ = EndPaint(hwnd, &ps);
         return;
@@ -601,7 +633,15 @@ unsafe fn paint_d2d(hwnd: HWND) {
     let brush = |c: crate::theme::Rgba| ctx.CreateSolidColorBrush(&c.d2d(), None).ok();
 
     // 透明クリア → bg を全面に（アクリル時はバックドロップが透ける。opaque 時は α=255）。
-    ctx.Clear(Some(&crate::theme::Rgba { r: 0, g: 0, b: 0, a: 0 }.d2d()));
+    ctx.Clear(Some(
+        &crate::theme::Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        }
+        .d2d(),
+    ));
     if let Some(b) = brush(t.colors.bg) {
         ctx.FillRectangle(&rectf(&rc), &b);
     }
@@ -631,8 +671,16 @@ unsafe fn paint_d2d(hwnd: HWND) {
         }
         let num_utf16: Vec<u16> = format_index(abs_i - start).encode_utf16().collect();
         let body_utf16: Vec<u16> = state.candidates[abs_i].encode_utf16().collect();
-        let nb = if is_sel { sel_index_brush.as_ref() } else { index_brush.as_ref() };
-        let tb = if is_sel { sel_text_brush.as_ref() } else { text_brush.as_ref() };
+        let nb = if is_sel {
+            sel_index_brush.as_ref()
+        } else {
+            index_brush.as_ref()
+        };
+        let tb = if is_sel {
+            sel_text_brush.as_ref()
+        } else {
+            text_brush.as_ref()
+        };
         if let Some(b) = nb {
             // 0.62 の（RenderTarget 継承の）DrawText は 6 引数。
             ctx.DrawText(
@@ -731,7 +779,10 @@ impl CandidateWindow {
 
     /// 選択の真実源（cand_state）と preedit 同期フラグを共有するウィンドウを構築する
     /// （presenter 用）。マウスクリックによる選択がこの状態へ直接書き込まれる。
-    pub fn with_state(shared: Rc<RefCell<CandidateState>>, selection_dirty: Rc<Cell<bool>>) -> Self {
+    pub fn with_state(
+        shared: Rc<RefCell<CandidateState>>,
+        selection_dirty: Rc<Cell<bool>>,
+    ) -> Self {
         let mut w = Self::empty();
         w.shared = Some(shared);
         w.selection_dirty = Some(selection_dirty);
@@ -741,7 +792,10 @@ impl CandidateWindow {
     /// デバイスロスト後の回復。判定・破棄は popup 側の共通処理
     /// （NOREDIRECTIONBITMAP 窓は GDI 復帰できないため破棄→再生成しかない）。
     fn recover_if_device_lost(&mut self) {
-        popup::recover_if_device_lost::<WindowState>(&mut self.hwnd, "ev=candwin_device_lost_recover");
+        popup::recover_if_device_lost::<WindowState>(
+            &mut self.hwnd,
+            "ev=candwin_device_lost_recover",
+        );
     }
 
     /// 必要なら HWND を生成する。生成に失敗したら null のまま（劣化動作）。
@@ -767,7 +821,11 @@ impl CandidateWindow {
             let theme = self.theme.clone();
             // 角丸は両パス、アクリルバックドロップは D2D パスのみ（GDI は不透明背景で
             // バックドロップが無効なため）。失敗は握り潰す（Win10=no-op）。
-            crate::render::apply_dwm_chrome(hwnd, theme.rounded, theme.acrylic && renderer.is_some());
+            crate::render::apply_dwm_chrome(
+                hwnd,
+                theme.rounded,
+                theme.acrylic && renderer.is_some(),
+            );
 
             // HWND ごとの描画状態を確保し、GWLP_USERDATA に格納する
             // （WM_NCDESTROY で回収・破棄する）。
@@ -876,8 +934,10 @@ impl CandidateWindow {
         if self.hwnd.is_invalid() {
             return;
         }
-        // DPI は hwnd の HDC から（paint/measure と同一軸）。
-        let dpi = popup::window_dpi(self.hwnd);
+        // DPI はアンカー（＝これから置く位置）のモニタから先に確定する。window_dpi(hwnd)
+        // は窓の現位置（前回位置・初回は主モニタ）の DPI を返すため、混合DPI環境の
+        // モニタ越え表示で外枠とグリフの縮尺が1フレーム食い違う（UIバグ2）。
+        let dpi = popup::dpi_for_anchor(anchor.x, anchor.y);
 
         let content_w = self.measure_content_width(dpi);
         // 高さはページ単位（最大 MAX_VISIBLE_ROWS 行）で固定する。こうすると move_selection で
@@ -934,6 +994,16 @@ impl CandidateWindow {
             self.hwnd = HWND(std::ptr::null_mut());
         }
     }
+
+    /// 即時 SW_HIDE とミラークリアを対にする（フェード完了の WM_TIMER と同じ副作用）。
+    /// Immediate / SetTimer 失敗の劣化経路でも「非表示＝ミラー空」の不変条件を保つ。
+    unsafe fn hide_now(&mut self) {
+        if let Some(s) = window_state(self.hwnd) {
+            s.candidates = Rc::new(Vec::new());
+            s.selected = 0;
+        }
+        let _ = ShowWindow(self.hwnd, SW_HIDE);
+    }
 }
 
 impl Drop for CandidateWindow {
@@ -969,7 +1039,10 @@ impl CandidateUI for CandidateWindow {
         //  hwnd_ok を残して「生成失敗」と「生成したが見えない」を切り分ける）。
         tip_log(&format!(
             "ev=candwin hwnd_ok={} x={} y={} n={}",
-            !self.hwnd.is_invalid(), anchor.x, anchor.y, self.candidates.len()
+            !self.hwnd.is_invalid(),
+            anchor.x,
+            anchor.y,
+            self.candidates.len()
         ));
         if self.hwnd.is_invalid() {
             return;
@@ -981,7 +1054,11 @@ impl CandidateUI for CandidateWindow {
                 let d2d = window_state(self.hwnd)
                     .map(|s| s.backend.renderer.is_some())
                     .unwrap_or(false);
-                crate::render::apply_dwm_chrome(self.hwnd, self.theme.rounded, self.theme.acrylic && d2d);
+                crate::render::apply_dwm_chrome(
+                    self.hwnd,
+                    self.theme.rounded,
+                    self.theme.acrylic && d2d,
+                );
             }
         }
         // WM_PAINT 用に HWND ごとの描画状態（候補・選択・テーマ）を更新する。
@@ -992,8 +1069,11 @@ impl CandidateUI for CandidateWindow {
         // 最終ジオメトリで一度だけ描かれる。
         self.relayout_and_repaint(anchor);
         unsafe {
-            // 退場フェード中の再表示なら、遅延 hide タイマを解除して表示を続行する。
-            let _ = KillTimer(Some(self.hwnd), HIDE_TIMER_ID);
+            // 退場フェード中の再表示なら、現在の世代タイマを解除して表示を続行する。
+            // （旧世代のキュー済み発火は WM_TIMER 側の世代ID判定が切り捨てる）
+            if let Some(s) = window_state(self.hwnd) {
+                s.backend.cancel_fade_timer(self.hwnd);
+            }
             let was_visible = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE).as_bool();
             // 出現モーション（Apple 風: 新規出現のみ短いフェード。既に見えている窓の
             // 内容更新やフェード割り込みは 1.0 へスナップ＝表示を待たせない）。DComp が
@@ -1025,29 +1105,31 @@ impl CandidateUI for CandidateWindow {
                 match action {
                     popup::FadeOut::AlreadyFading => {}
                     popup::FadeOut::Fade(ms) => {
-                        // SetTimer 失敗（USER タイマ資源枯渇等。稀）を無視してはならない:
-                        // fading_out が立ったまま WM_TIMER が永遠に来ず、この窓は
-                        // WS_EX_TRANSPARENT を持たないため「透明だがクリックを吸う」
-                        // ゴースト窓が次の show() まで残る。失敗時は即時 hide へ劣化する。
-                        if SetTimer(Some(self.hwnd), HIDE_TIMER_ID, ms, None) == 0 {
+                        // 世代ID付きでタイマを武装。失敗（USER タイマ資源枯渇等。稀）を
+                        // 無視してはならない: fading_out が立ったまま WM_TIMER が永遠に
+                        // 来ず「透明だがクリックを吸う」ゴースト窓が次の show() まで残る。
+                        // 失敗時は即時 hide へ劣化する（ミラークリア込み）。
+                        let armed = window_state(self.hwnd)
+                            .map(|s| s.backend.arm_fade_timer(self.hwnd, ms))
+                            .unwrap_or(false);
+                        if !armed {
                             if let Some(s) = window_state(self.hwnd) {
                                 s.backend.fading_out = false;
                             }
-                            let _ = ShowWindow(self.hwnd, SW_HIDE);
+                            self.hide_now();
                         }
                     }
                     popup::FadeOut::Immediate => {
-                        let _ = ShowWindow(self.hwnd, SW_HIDE);
+                        self.hide_now();
                     }
                 }
             }
         }
-        // 描画ミラーもクリアして真実の源（cand_state 側）と乖離させない。これをしないと、
-        // 非表示後に走った無関係な WM_PAINT が破棄済みの古い候補リストを描き得る。
-        // フェード中は再描画をスケジュールしないので、最終フレームが残ったまま消えていく。
-        self.candidates = Rc::new(Vec::new());
-        self.selected = 0;
-        self.sync_state();
+        // 描画ミラーのクリアはフェード完走の WM_TIMER（または即時経路の hide_now）で
+        // 行う（UIバグ7 — hide() 時点で空にすると、クリック確定の InvalidateRect が
+        // drain→hide の後にフェード中へ届いた WM_PAINT で「空のカード」が一瞬描かれる）。
+        // WM_TIMER/hide_now 側で WindowState のミラーを空にし、外側 self.candidates は
+        // 次回 show() が必ず上書きする（非表示後は WM_PAINT が来ないため保持したままでも安全）。
     }
 
     /// 表示側の選択位置。マウスクリック（WndProc が WindowState を直接更新する）を
@@ -1088,17 +1170,43 @@ mod tests {
         // GetTextExt のキャレット矩形（スクリーン座標）。候補窓/HUD は文字を覆わないよう
         // キャレット直下＝左下 (left, bottom) に出し、フリップ用に top も保持する。
         assert_eq!(
-            caret_rect_to_anchor(RECT { left: 100, top: 40, right: 102, bottom: 60 }),
-            Some(CaretAnchor { x: 100, y: 60, caret_top: Some(40) })
+            caret_rect_to_anchor(RECT {
+                left: 100,
+                top: 40,
+                right: 102,
+                bottom: 60
+            }),
+            Some(CaretAnchor {
+                x: 100,
+                y: 60,
+                caret_top: Some(40)
+            })
         );
         // マルチモニタの負座標（左/上のモニタ）でも左下をそのまま返す。
         assert_eq!(
-            caret_rect_to_anchor(RECT { left: -1920, top: 10, right: -1918, bottom: 34 }),
-            Some(CaretAnchor { x: -1920, y: 34, caret_top: Some(10) })
+            caret_rect_to_anchor(RECT {
+                left: -1920,
+                top: 10,
+                right: -1918,
+                bottom: 34
+            }),
+            Some(CaretAnchor {
+                x: -1920,
+                y: 34,
+                caret_top: Some(10)
+            })
         );
         // 全 0 の退化矩形（GetTextExt 未書込/レイアウト未確定の既定 RECT）は None
         // ＝呼び出し側が既定座標へフォールバックする。
-        assert_eq!(caret_rect_to_anchor(RECT { left: 0, top: 0, right: 0, bottom: 0 }), None);
+        assert_eq!(
+            caret_rect_to_anchor(RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0
+            }),
+            None
+        );
     }
 
     #[test]
@@ -1134,7 +1242,10 @@ mod tests {
         let (_w, h) = window_size(9, 100, 0, 96);
         assert_eq!(
             h,
-            2 * BORDER + 2 * scale(PADDING_Y, 96) + 9 * scale(ROW_HEIGHT, 96) + 1
+            2 * BORDER
+                + 2 * scale(PADDING_Y, 96)
+                + 9 * scale(ROW_HEIGHT, 96)
+                + 1
                 + scale(FOOTER_H, 96)
         );
         assert_eq!(h, 281);
@@ -1155,7 +1266,12 @@ mod tests {
 
     #[test]
     fn footer_rects_stack_from_bottom_and_label_is_one_based() {
-        let client = RECT { left: 0, top: 0, right: 300, bottom: 113 };
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 300,
+            bottom: 113,
+        };
         let (sep, label) = footer_rects(client, 96);
         // ラベルはクライアント下端から BORDER の内側に FOOTER_H。区切りはその直上 1px。
         assert_eq!(label.bottom, 113 - BORDER);
@@ -1176,7 +1292,7 @@ mod tests {
         let dpi = 96;
         let top0 = row_top(0, dpi); // BORDER+PADDING_Y = 5
         let rh = scale(ROW_HEIGHT, dpi); // 28
-        // 上パディングより上は None。
+                                         // 上パディングより上は None。
         assert_eq!(row_at_y(top0 - 1, dpi, 3), None);
         // 各行の先頭/末尾 px が正しい行に落ちる。
         assert_eq!(row_at_y(top0, dpi, 3), Some(0));
@@ -1263,7 +1379,10 @@ mod tests {
         assert_eq!(w3, w120);
         // 本文開始位置も総件数に依らない。
         let (_r, _n, t) = column_rects(0, 400, 96);
-        assert_eq!(t.left, BORDER + scale(PADDING_X, 96) + scale(NUMBER_COL_W, 96) + scale(GAP, 96));
+        assert_eq!(
+            t.left,
+            BORDER + scale(PADDING_X, 96) + scale(NUMBER_COL_W, 96) + scale(GAP, 96)
+        );
     }
 
     #[test]

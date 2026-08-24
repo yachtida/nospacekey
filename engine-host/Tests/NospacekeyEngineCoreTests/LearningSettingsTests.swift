@@ -43,4 +43,16 @@ final class LearningSettingsTests: XCTestCase {
             URL(fileURLWithPath: #"C:\lad"#).appendingPathComponent("nospacekey").appendingPathComponent("memory"))
         XCTAssertNil(LearningSettings.resolveDir(environment: [:]))
     }
+    func testCoordinationNamesMatchRustConfig() {
+        let scope = LearningSettings.coordinationScope(environment: [
+            "LOCALAPPDATA": #"C:\Users\Example\AppData\Local"#
+        ])
+        XCTAssertEqual(scope, "540cb8761d8b7d7f")
+        XCTAssertEqual(
+            LearningSettings.lifecycleMutexName(scope: scope!),
+            #"Global\nospacekey-learning-lifecycle-540cb8761d8b7d7f"#)
+        XCTAssertEqual(
+            LearningSettings.presenceMutexName(scope: scope!, sessionID: 42),
+            #"Global\nospacekey-learning-presence-540cb8761d8b7d7f-s42"#)
+    }
 }

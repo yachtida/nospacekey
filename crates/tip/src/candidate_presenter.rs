@@ -4,17 +4,17 @@
 //! 配線(text_service)タスクへの注意: `notify` は UIElement の Behavior 経由でしか
 //! 呼ばれない。notify クロージャに **この presenter / element の Rc を捕捉させない**こと
 //! （Rc 循環＝リーク）。notify は text_service の弱参照 or イベント経路を指すべき。
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
-use windows::core::BOOL;
-use windows::Win32::UI::TextServices::{
-    ITfCandidateListUIElementBehavior, ITfUIElement, ITfUIElementMgr,
-    TF_CLUIE_COUNT, TF_CLUIE_CURRENTPAGE, TF_CLUIE_PAGEINDEX, TF_CLUIE_SELECTION, TF_CLUIE_STRING,
-};
 use crate::candidate_state::CandidateState;
 use crate::candidate_uielement::{BehaviorAction, CandidateListUIElement};
 use crate::candidate_window::{CandidateUI, CandidateWindow};
 use crate::text_service::tip_log;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use windows::core::BOOL;
+use windows::Win32::UI::TextServices::{
+    ITfCandidateListUIElementBehavior, ITfUIElement, ITfUIElementMgr, TF_CLUIE_COUNT,
+    TF_CLUIE_CURRENTPAGE, TF_CLUIE_PAGEINDEX, TF_CLUIE_SELECTION, TF_CLUIE_STRING,
+};
 
 /// 自前描画すべきか: advertise 出来ていて pbShow=FALSE のときだけ「描かない」。
 /// それ以外(advertise 無し=フォールバック / pbShow=TRUE=デスクトップ)は自前描画する。
@@ -22,7 +22,11 @@ pub(crate) fn should_draw_self(advertised: bool, pbshow: bool) -> bool {
     !advertised || pbshow
 }
 
-const CLUIE_FULL: u32 = TF_CLUIE_COUNT | TF_CLUIE_SELECTION | TF_CLUIE_STRING | TF_CLUIE_PAGEINDEX | TF_CLUIE_CURRENTPAGE;
+const CLUIE_FULL: u32 = TF_CLUIE_COUNT
+    | TF_CLUIE_SELECTION
+    | TF_CLUIE_STRING
+    | TF_CLUIE_PAGEINDEX
+    | TF_CLUIE_CURRENTPAGE;
 
 pub struct CandidatePresenter {
     window: CandidateWindow,
@@ -49,10 +53,15 @@ impl CandidatePresenter {
             // 選択の真実源（cand_state）と preedit 同期フラグを窓と共有する。窓側のマウス
             // クリック選択が presenter を介さず cand_state へ直接書けるようにするため。
             window: CandidateWindow::with_state(state.clone(), selection_dirty.clone()),
-            state, outbox, selection_dirty,
+            state,
+            outbox,
+            selection_dirty,
             updated_flags: Rc::new(Cell::new(0)),
             notify,
-            ui_mgr: None, element: None, element_id: None, pbshow: true,
+            ui_mgr: None,
+            element: None,
+            element_id: None,
+            pbshow: true,
         }
     }
 
@@ -66,7 +75,9 @@ impl CandidatePresenter {
     }
 
     fn begin_if_needed(&mut self) {
-        if self.element_id.is_some() { return; }
+        if self.element_id.is_some() {
+            return;
+        }
         let Some(mgr) = self.ui_mgr.clone() else {
             // SP6a 診断: ホストが ITfUIElementMgr を出さない＝フォールバックで自前描画。
             tip_log("ev=uielement mgr=none advertise=skip draw=self(fallback)");
@@ -75,9 +86,13 @@ impl CandidatePresenter {
         // #[implement(ITfCandidateListUIElementBehavior)] は Behavior 派生の COM
         // オブジェクトを生む。ITfUIElement へは Behavior 経由でアップキャストする。
         let behavior: ITfCandidateListUIElementBehavior = CandidateListUIElement::new(
-            self.state.clone(), self.outbox.clone(), self.selection_dirty.clone(),
-            self.updated_flags.clone(), self.notify.clone(),
-        ).into();
+            self.state.clone(),
+            self.outbox.clone(),
+            self.selection_dirty.clone(),
+            self.updated_flags.clone(),
+            self.notify.clone(),
+        )
+        .into();
         let element: ITfUIElement = behavior.into();
         let mut pbshow = BOOL::from(true);
         let mut id = 0u32;
@@ -90,8 +105,13 @@ impl CandidatePresenter {
                 // SP6a 診断: advertise 成功。pbShow=TRUE=自前描画(デスクトップ) / FALSE=ホスト描画(イマーシブ)。
                 tip_log(&format!(
                     "ev=uielement advertised=true id={} pbshow={} draw={}",
-                    id, self.pbshow,
-                    if should_draw_self(true, self.pbshow) { "self" } else { "host" }
+                    id,
+                    self.pbshow,
+                    if should_draw_self(true, self.pbshow) {
+                        "self"
+                    } else {
+                        "host"
+                    }
                 ));
             }
             Err(e) => {
@@ -105,7 +125,9 @@ impl CandidatePresenter {
     }
     fn end(&mut self) {
         if let (Some(mgr), Some(id)) = (self.ui_mgr.clone(), self.element_id.take()) {
-            unsafe { let _ = mgr.EndUIElement(id); }
+            unsafe {
+                let _ = mgr.EndUIElement(id);
+            }
         }
         self.element = None;
         self.pbshow = true;
@@ -113,10 +135,14 @@ impl CandidatePresenter {
     fn signal_update(&self, flags: u32) {
         if let (Some(mgr), Some(id)) = (self.ui_mgr.as_ref(), self.element_id) {
             self.updated_flags.set(self.updated_flags.get() | flags);
-            unsafe { let _ = mgr.UpdateUIElement(id); }
+            unsafe {
+                let _ = mgr.UpdateUIElement(id);
+            }
         }
     }
-    fn advertised(&self) -> bool { self.element_id.is_some() }
+    fn advertised(&self) -> bool {
+        self.element_id.is_some()
+    }
 
     /// Deactivate から呼ぶ。自前描画窓の DirectComposition/D3D リソースをプロセスが
     /// 健全なうちに畳む（理由は `CandidateWindow::destroy` のコメント参照）。
@@ -144,14 +170,18 @@ impl CandidateUI for CandidatePresenter {
             self.window.hide();
             // 初回 BeginUIElement はホストが全項目を取りに来るので update 不要。
             // 既存 element の再表示(候補入替)なら全項目変化を通知する。
-            if !first { self.signal_update(CLUIE_FULL); }
+            if !first {
+                self.signal_update(CLUIE_FULL);
+            }
         }
     }
     fn hide(&mut self) {
         self.window.hide();
         self.end();
     }
-    fn selected(&self) -> usize { self.state.borrow().selected() }
+    fn selected(&self) -> usize {
+        self.state.borrow().selected()
+    }
     fn move_selection(&mut self, delta: i32) {
         self.state.borrow_mut().move_selection(delta);
         if should_draw_self(self.advertised(), self.pbshow) {
@@ -170,9 +200,9 @@ mod tests {
     use super::*;
     #[test]
     fn route_selection() {
-        assert!(should_draw_self(true, true));    // デスクトップ: 自前描画
-        assert!(!should_draw_self(true, false));  // イマーシブ: 描かない
-        assert!(should_draw_self(false, false));  // mgr 無し: フォールバック自前描画
+        assert!(should_draw_self(true, true)); // デスクトップ: 自前描画
+        assert!(!should_draw_self(true, false)); // イマーシブ: 描かない
+        assert!(should_draw_self(false, false)); // mgr 無し: フォールバック自前描画
         assert!(should_draw_self(false, true));
     }
 }

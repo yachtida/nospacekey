@@ -75,11 +75,29 @@ final class CorrectionStore {
         return entries.first { $0.reading == key }?.surface
     }
 
-    func clear() {
+    /// RAM だけを消す。disk は ConversionService の learning-root preflight を通してから
+    /// seam 経由で消すため、clearLearning の partial deletion を防ぐ。
+    func clearMemory() {
         entries = []
         dirty = false
         loaded = true
-        if let url = fileURL { try? FileManager.default.removeItem(at: url) }
+    }
+
+    /// 単体利用時の clear。CorrectionStore 自身でも regular non-reparse file を確認し、
+    /// corrections.json が directory/symlink/junction のときは fail-closed（void API のため
+    /// no-op）にする。ConversionService は clearMemory()+共通 preflight を使用する。
+    func clear() {
+        clearMemory()
+        guard let url = fileURL else { return }
+        let metadata: LearningPathMetadata?
+        do {
+            metadata = try learningPathMetadata(for: url)
+        } catch {
+            return
+        }
+        guard let metadata, metadata.isRegularFile,
+              !metadata.isDirectory, !metadata.isReparsePoint else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     /// dirty 時のみ atomic write。非 throw(失敗は次の flush 契機で自然再試行)。

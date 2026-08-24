@@ -33,7 +33,9 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         style: Option<String>,
     },
-    Backspace { session: i64 },
+    Backspace {
+        session: i64,
+    },
     /// 変換要求。`left_context` はキャレット左の周辺テキスト（U9・最大40字サニタイズ済）。
     /// None なら wire 形は U9 以前と同一（skip_serializing_if）＝旧エンジン互換。
     /// エンジンは Zenzai の leftSideContext / 外部LLM の参考文脈にのみ使う。
@@ -61,8 +63,13 @@ pub enum Request {
     /// 候補確定要求。直前の Convert が返した候補列の `index` 番目をネイティブ確定する。
     /// エンジンは選択候補の消費読みだけ確定し、残り読みを保持したセッションを継続する
     /// （前方一致候補のデータロス対策）。`index` は Convert 応答 candidates の添字と 1:1。
-    Commit { session: i64, index: u32 },
-    EndSession { session: i64 },
+    Commit {
+        session: i64,
+        index: u32,
+    },
+    EndSession {
+        session: i64,
+    },
     /// ライブ変換要求。現在の読みを N_best=1 で変換し先頭1候補を返す。seq は TIP 採番（A2 の古い応答破棄用）。
     /// `auto_commit`: iOS nospacekey の「自動確定」（先頭文節が一定回数安定したら prefix を確定して
     /// 残り読みで合成を継続する — LiveConversionManager.candidateForCompleteFirstClause 相当）を
@@ -89,7 +96,9 @@ pub enum Request {
     /// 固定するため、設定アプリでの変更が接続中は反映されない。TIP が接続確立ごとに settings.json
     /// の現在値を push し、エンジンは以後の変換へ即時反映する（session を伴わないプロセス全体設定）。
     /// llm_enabled=false のとき LLM 系フィールドは空で送り、エンジンは LLM を無効化する。
-    /// zenzai_weight が空ならエンジンが既定パス（exe 隣）を解決する。応答は Ok。
+    /// zenzai_weight が空ならエンジンが per-user → exe 隣の順で解決する（3段表）。
+    /// 応答は Ok（反映済み）または Error（"reload busy ..." — warm-up/変換中でスキップ。
+    /// 巡3 Z4: TIP は busy を上限付き遅延再送する。接続は維持）。
     ReloadConfig {
         llm_enabled: bool,
         llm_api_key: String,
@@ -116,7 +125,9 @@ pub enum Request {
     /// カスタム辞書の再読込。session を伴わないプロセス全体 op。エンジンはファイルを読み直す
     /// （エントリは載せない — spec §4.1）。Swift 側 Protocol.swift と対（一字一句一致規約）。
     /// 応答は既存 Ok。
-    ReloadDictionary { enabled: bool },
+    ReloadDictionary {
+        enabled: bool,
+    },
     /// persist エンジンの graceful 停止（学習 flush → 応答後 exit）。session を伴わない
     /// プロセス全体操作。アンインストーラ/更新（NospacekeyConfig.exe --stop-engine）と
     /// version handshake（proto 不一致時の世代交代）から送る。TIP はエンジンを kill しない
@@ -125,7 +136,10 @@ pub enum Request {
     /// 再変換で選び直された訂正の通知(記録のみ・確定は既に TIP 側で完了している)。
     /// 確定契約(再変換は Commit IPC を迂回して直接挿入)を変えずに訂正シグナルだけを運ぶ。
     /// Swift 側 Protocol.swift / EngineHost.swift と対(一字一句一致規約)。応答は既存 Ok。
-    RecordCorrection { reading: String, surface: String },
+    RecordCorrection {
+        reading: String,
+        surface: String,
+    },
     /// 文節ナビゲーション(変換中の←/→)。候補表示中に TIP が送る。エンジンは文節状態が
     /// 無ければ `base_index`(直前 Convert 応答 candidates の添字＝現在選択中の候補)を種に
     /// 候補を文節列へ分解して開始し、選択文節を `offset` だけ動かす(端はクランプ)。
@@ -140,10 +154,15 @@ pub enum Request {
     },
     /// 文節ナビゲーション中: 選択文節の表層を候補 `index`(直前 ClauseView.candidates の添字)へ
     /// 差し替える。読みは変わらない(候補は全被覆のみ)ので文節境界は安定。応答は ClauseView。
-    SelectClauseCandidate { session: i64, index: u32 },
+    SelectClauseCandidate {
+        session: i64,
+        index: u32,
+    },
     /// 文節ナビゲーション中の確定。全文節の表層を連結した文字列を確定し、文節ごとに
     /// setCompletedData/学習へ乗せる。応答は既存 Committed(全消費なので reading="")。
-    CommitClauses { session: i64 },
+    CommitClauses {
+        session: i64,
+    },
 }
 
 /// エンジン -> TIP への応答。
@@ -161,14 +180,23 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proto: Option<u32>,
     },
-    Reading { reading: String },
-    Candidates { candidates: Vec<String> },
+    Reading {
+        reading: String,
+    },
+    Candidates {
+        candidates: Vec<String>,
+    },
     /// 候補確定結果。`text` は確定された候補（CommitText でアプリへ挿入）、
     /// `reading` は **残り読み**（消費されなかった分。全消費なら ""）。
     /// reading が非空なら TIP は残り読みで composition を継続しセッションを保持する。
-    Committed { text: String, reading: String },
+    Committed {
+        text: String,
+        reading: String,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// ライブ変換結果。seq は要求エコー、text は先頭1候補（preedit 全置換）、reading は現在の読み。
     /// `committed` が Some のとき、エンジンは自動確定（LiveConvert{auto_commit:true} 参照）で
     /// 先頭文節を **消費済み**: TIP は committed をアプリへ確定挿入し、text/reading（=残り）で
@@ -181,7 +209,10 @@ pub enum Response {
         committed: Option<String>,
     },
     /// 外部LLM変換結果。seq は要求エコー、text は補正済み文（preedit 全置換）。
-    LlmResult { seq: u64, text: String },
+    LlmResult {
+        seq: u64,
+        text: String,
+    },
     /// 文節ナビゲーションのビュー。`segments` は各文節の現在表層（連結＝preedit 全体）、
     /// `selected` は選択文節の添字、`candidates` は選択文節の変換候補（全被覆のみ）、
     /// `candidate_index` は candidates 中の現在選択（＝segments[selected] と同一文字列）。
@@ -200,17 +231,33 @@ mod tests {
     #[test]
     fn live_convert_request_roundtrips() {
         // auto_commit=false のとき wire 形は導入前と 1 バイトも変わらない（旧エンジン互換の証拠）。
-        let r = Request::LiveConvert { session: 7, seq: 42, left_context: None, auto_commit: false };
+        let r = Request::LiveConvert {
+            session: 7,
+            seq: 42,
+            left_context: None,
+            auto_commit: false,
+        };
         let js = serde_json::to_string(&r).unwrap();
-        assert_eq!(js, r#"{"method":"LiveConvert","params":{"session":7,"seq":42}}"#);
+        assert_eq!(
+            js,
+            r#"{"method":"LiveConvert","params":{"session":7,"seq":42}}"#
+        );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
 
     #[test]
     fn live_convert_with_auto_commit_roundtrips() {
-        let r = Request::LiveConvert { session: 7, seq: 42, left_context: None, auto_commit: true };
+        let r = Request::LiveConvert {
+            session: 7,
+            seq: 42,
+            left_context: None,
+            auto_commit: true,
+        };
         let js = serde_json::to_string(&r).unwrap();
-        assert_eq!(js, r#"{"method":"LiveConvert","params":{"session":7,"seq":42,"auto_commit":true}}"#);
+        assert_eq!(
+            js,
+            r#"{"method":"LiveConvert","params":{"session":7,"seq":42,"auto_commit":true}}"#
+        );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
 
@@ -219,7 +266,10 @@ mod tests {
     #[test]
     fn convert_without_context_keeps_legacy_wire_form() {
         // None のとき wire 形は U9 以前と 1 バイトも変わらない（旧エンジン互換の証拠）。
-        let r = Request::Convert { session: 7, left_context: None };
+        let r = Request::Convert {
+            session: 7,
+            left_context: None,
+        };
         let js = serde_json::to_string(&r).unwrap();
         assert_eq!(js, r#"{"method":"Convert","params":{"session":7}}"#);
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
@@ -227,9 +277,15 @@ mod tests {
 
     #[test]
     fn convert_with_context_roundtrips() {
-        let r = Request::Convert { session: 7, left_context: Some("私の名前は".into()) };
+        let r = Request::Convert {
+            session: 7,
+            left_context: Some("私の名前は".into()),
+        };
         let js = serde_json::to_string(&r).unwrap();
-        assert_eq!(js, r#"{"method":"Convert","params":{"session":7,"left_context":"私の名前は"}}"#);
+        assert_eq!(
+            js,
+            r#"{"method":"Convert","params":{"session":7,"left_context":"私の名前は"}}"#
+        );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
 
@@ -238,7 +294,13 @@ mod tests {
         // 旧TIP が left_context 無しで送っても None として受かる（新エンジン側デコードと同型）。
         let r: Request =
             serde_json::from_str(r#"{"method":"Convert","params":{"session":7}}"#).unwrap();
-        assert_eq!(r, Request::Convert { session: 7, left_context: None });
+        assert_eq!(
+            r,
+            Request::Convert {
+                session: 7,
+                left_context: None
+            }
+        );
     }
 
     // ---- Shift英語モード: Insert style ----
@@ -246,9 +308,16 @@ mod tests {
     #[test]
     fn insert_without_style_keeps_legacy_wire_form() {
         // None のとき wire 形は style 導入前と 1 バイトも変わらない（旧エンジン互換の証拠）。
-        let req = Request::Insert { session: 7, text: "nihongo".into(), style: None };
+        let req = Request::Insert {
+            session: 7,
+            text: "nihongo".into(),
+            style: None,
+        };
         let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(json, r#"{"method":"Insert","params":{"session":7,"text":"nihongo"}}"#);
+        assert_eq!(
+            json,
+            r#"{"method":"Insert","params":{"session":7,"text":"nihongo"}}"#
+        );
         // 旧ワイヤ(style キー無し)のデコードは style=None(後方互換)。
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(back, req);
@@ -256,9 +325,16 @@ mod tests {
 
     #[test]
     fn insert_with_style_roundtrips() {
-        let req = Request::Insert { session: 7, text: "A".into(), style: Some("direct".into()) };
+        let req = Request::Insert {
+            session: 7,
+            text: "A".into(),
+            style: Some("direct".into()),
+        };
         let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(json, r#"{"method":"Insert","params":{"session":7,"text":"A","style":"direct"}}"#);
+        assert_eq!(
+            json,
+            r#"{"method":"Insert","params":{"session":7,"text":"A","style":"direct"}}"#
+        );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(back, req);
     }
@@ -267,7 +343,10 @@ mod tests {
 
     #[test]
     fn typo_convert_request_roundtrips() {
-        let r = Request::TypoConvert { session: 7, left_context: None };
+        let r = Request::TypoConvert {
+            session: 7,
+            left_context: None,
+        };
         let js = serde_json::to_string(&r).unwrap();
         assert_eq!(js, r#"{"method":"TypoConvert","params":{"session":7}}"#);
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
@@ -275,18 +354,46 @@ mod tests {
 
     #[test]
     fn typo_convert_with_context_roundtrips() {
-        let r = Request::TypoConvert { session: 7, left_context: Some("私の名前は".into()) };
+        let r = Request::TypoConvert {
+            session: 7,
+            left_context: Some("私の名前は".into()),
+        };
         let js = serde_json::to_string(&r).unwrap();
-        assert_eq!(js, r#"{"method":"TypoConvert","params":{"session":7,"left_context":"私の名前は"}}"#);
+        assert_eq!(
+            js,
+            r#"{"method":"TypoConvert","params":{"session":7,"left_context":"私の名前は"}}"#
+        );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
 
     #[test]
     fn live_llm_reconvert_with_context_roundtrip() {
         for (r, key) in [
-            (Request::LiveConvert { session: 1, seq: 2, left_context: Some("左".into()), auto_commit: false }, "LiveConvert"),
-            (Request::LlmConvert { session: 1, seq: 2, left_context: Some("左".into()) }, "LlmConvert"),
-            (Request::Reconvert { session: 1, surface: "かな".into(), left_context: Some("左".into()) }, "Reconvert"),
+            (
+                Request::LiveConvert {
+                    session: 1,
+                    seq: 2,
+                    left_context: Some("左".into()),
+                    auto_commit: false,
+                },
+                "LiveConvert",
+            ),
+            (
+                Request::LlmConvert {
+                    session: 1,
+                    seq: 2,
+                    left_context: Some("左".into()),
+                },
+                "LlmConvert",
+            ),
+            (
+                Request::Reconvert {
+                    session: 1,
+                    surface: "かな".into(),
+                    left_context: Some("左".into()),
+                },
+                "Reconvert",
+            ),
         ] {
             let js = serde_json::to_string(&r).unwrap();
             assert!(js.contains(r#""left_context":"左""#), "{key}: {js}");
@@ -297,9 +404,17 @@ mod tests {
     #[test]
     fn live_result_response_roundtrips() {
         // committed=None のとき wire 形は導入前と 1 バイトも変わらない（旧TIP互換の証拠）。
-        let r = Response::LiveResult { seq: 42, text: "日本語".into(), reading: "にほんご".into(), committed: None };
+        let r = Response::LiveResult {
+            seq: 42,
+            text: "日本語".into(),
+            reading: "にほんご".into(),
+            committed: None,
+        };
         let js = serde_json::to_string(&r).unwrap();
-        assert_eq!(js, r#"{"result":"LiveResult","seq":42,"text":"日本語","reading":"にほんご"}"#);
+        assert_eq!(
+            js,
+            r#"{"result":"LiveResult","seq":42,"text":"日本語","reading":"にほんご"}"#
+        );
         assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), r);
     }
 
@@ -329,39 +444,70 @@ mod tests {
         .unwrap();
         assert_eq!(
             r,
-            Response::LiveResult { seq: 1, text: "日本語".into(), reading: "にほんご".into(), committed: None }
+            Response::LiveResult {
+                seq: 1,
+                text: "日本語".into(),
+                reading: "にほんご".into(),
+                committed: None
+            }
         );
     }
 
     #[test]
     fn llm_convert_request_roundtrips() {
-        let r = Request::LlmConvert { session: 3, seq: 9, left_context: None };
+        let r = Request::LlmConvert {
+            session: 3,
+            seq: 9,
+            left_context: None,
+        };
         let js = serde_json::to_string(&r).unwrap();
-        assert_eq!(js, r#"{"method":"LlmConvert","params":{"session":3,"seq":9}}"#);
+        assert_eq!(
+            js,
+            r#"{"method":"LlmConvert","params":{"session":3,"seq":9}}"#
+        );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
 
     #[test]
     fn llm_result_response_roundtrips() {
-        let r = Response::LlmResult { seq: 9, text: "この変換でおこなってください".into() };
+        let r = Response::LlmResult {
+            seq: 9,
+            text: "この変換でおこなってください".into(),
+        };
         let js = serde_json::to_string(&r).unwrap();
-        assert_eq!(js, r#"{"result":"LlmResult","seq":9,"text":"この変換でおこなってください"}"#);
+        assert_eq!(
+            js,
+            r#"{"result":"LlmResult","seq":9,"text":"この変換でおこなってください"}"#
+        );
         assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), r);
     }
 
     #[test]
     fn reconvert_request_roundtrips() {
-        let r = Request::Reconvert { session: 7, surface: "にほんご".into(), left_context: None };
+        let r = Request::Reconvert {
+            session: 7,
+            surface: "にほんご".into(),
+            left_context: None,
+        };
         let js = serde_json::to_string(&r).unwrap();
-        assert_eq!(js, r#"{"method":"Reconvert","params":{"session":7,"surface":"にほんご"}}"#);
+        assert_eq!(
+            js,
+            r#"{"method":"Reconvert","params":{"session":7,"surface":"にほんご"}}"#
+        );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
 
     #[test]
     fn commit_request_roundtrips() {
-        let r = Request::Commit { session: 7, index: 0 };
+        let r = Request::Commit {
+            session: 7,
+            index: 0,
+        };
         let js = serde_json::to_string(&r).unwrap();
-        assert_eq!(js, r#"{"method":"Commit","params":{"session":7,"index":0}}"#);
+        assert_eq!(
+            js,
+            r#"{"method":"Commit","params":{"session":7,"index":0}}"#
+        );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
 
@@ -423,7 +569,10 @@ mod tests {
         // カスタム辞書の再読込 op。Swift 側 Protocol.swift の "ReloadDictionary" と一字一句一致。
         let r = Request::ReloadDictionary { enabled: true };
         let js = serde_json::to_string(&r).unwrap();
-        assert_eq!(js, r#"{"method":"ReloadDictionary","params":{"enabled":true}}"#);
+        assert_eq!(
+            js,
+            r#"{"method":"ReloadDictionary","params":{"enabled":true}}"#
+        );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
 
@@ -457,18 +606,33 @@ mod tests {
     fn legacy_session_without_proto_deserializes_to_none() {
         // 旧エンジンの Session 応答は proto=None で受かる（committed/left_context と同型の互換規約）。
         let r: Response = serde_json::from_str(r#"{"result":"Session","session":7}"#).unwrap();
-        assert_eq!(r, Response::Session { session: 7, proto: None });
+        assert_eq!(
+            r,
+            Response::Session {
+                session: 7,
+                proto: None
+            }
+        );
     }
 
     #[test]
     fn session_with_proto_roundtrips() {
         // 新エンジンは proto を載せる。None のとき wire 形は旧形とバイト一致（legacy テストが固定）。
-        let r = Response::Session { session: 7, proto: Some(PROTO_VERSION) };
+        let r = Response::Session {
+            session: 7,
+            proto: Some(PROTO_VERSION),
+        };
         assert_eq!(
             serde_json::to_string(&r).unwrap(),
             r#"{"result":"Session","session":7,"proto":2}"#
         );
-        assert_eq!(serde_json::from_str::<Response>(&r#"{"result":"Session","session":7,"proto":2}"#.to_string()).unwrap(), r);
+        assert_eq!(
+            serde_json::from_str::<Response>(
+                &r#"{"result":"Session","session":7,"proto":2}"#.to_string()
+            )
+            .unwrap(),
+            r
+        );
     }
 
     #[test]
@@ -490,15 +654,23 @@ mod tests {
     #[test]
     fn reload_config_carries_learning_enabled() {
         let r = Request::ReloadConfig {
-            llm_enabled: false, llm_api_key: String::new(), llm_endpoint: String::new(),
-            llm_model: String::new(), llm_prompt: String::new(), llm_timeout_ms: 15000,
-            zenzai_enabled: false, zenzai_weight: String::new(),
+            llm_enabled: false,
+            llm_api_key: String::new(),
+            llm_endpoint: String::new(),
+            llm_model: String::new(),
+            llm_prompt: String::new(),
+            llm_timeout_ms: 15000,
+            zenzai_enabled: false,
+            zenzai_weight: String::new(),
             learning_enabled: true,
             typo_learn_enabled: true,
             zenzai_inference_limit: None,
         };
         let js = serde_json::to_string(&r).unwrap();
-        assert!(js.contains(r#""learning_enabled":true"#), "wire に learning_enabled が載る: {js}");
+        assert!(
+            js.contains(r#""learning_enabled":true"#),
+            "wire に learning_enabled が載る: {js}"
+        );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
 
@@ -506,14 +678,23 @@ mod tests {
     fn reload_config_inference_limit_none_omits_field() {
         // D6 env override 時/旧 TIP は None＝wire にフィールド自体が現れない（旧エンジン互換の既定形）。
         let r = Request::ReloadConfig {
-            llm_enabled: false, llm_api_key: String::new(), llm_endpoint: String::new(),
-            llm_model: String::new(), llm_prompt: String::new(), llm_timeout_ms: 15000,
-            zenzai_enabled: true, zenzai_weight: String::new(),
-            learning_enabled: true, typo_learn_enabled: true,
+            llm_enabled: false,
+            llm_api_key: String::new(),
+            llm_endpoint: String::new(),
+            llm_model: String::new(),
+            llm_prompt: String::new(),
+            llm_timeout_ms: 15000,
+            zenzai_enabled: true,
+            zenzai_weight: String::new(),
+            learning_enabled: true,
+            typo_learn_enabled: true,
             zenzai_inference_limit: None,
         };
         let js = serde_json::to_string(&r).unwrap();
-        assert!(!js.contains("zenzai_inference_limit"), "None はフィールド省略: {js}");
+        assert!(
+            !js.contains("zenzai_inference_limit"),
+            "None はフィールド省略: {js}"
+        );
         // フィールド無し wire が None に decode される（旧 TIP 形の互換固定）。
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
@@ -523,7 +704,12 @@ mod tests {
     #[test]
     fn move_clause_request_roundtrips() {
         // left_context=None のときフィールド省略（Convert と同じ互換規約）。
-        let r = Request::MoveClause { session: 7, offset: 1, base_index: 2, left_context: None };
+        let r = Request::MoveClause {
+            session: 7,
+            offset: 1,
+            base_index: 2,
+            left_context: None,
+        };
         let js = serde_json::to_string(&r).unwrap();
         assert_eq!(
             js,
@@ -550,7 +736,10 @@ mod tests {
 
     #[test]
     fn select_clause_candidate_request_roundtrips() {
-        let r = Request::SelectClauseCandidate { session: 7, index: 3 };
+        let r = Request::SelectClauseCandidate {
+            session: 7,
+            index: 3,
+        };
         let js = serde_json::to_string(&r).unwrap();
         assert_eq!(
             js,
@@ -603,7 +792,10 @@ mod tests {
 
     #[test]
     fn committed_response_roundtrips() {
-        let r = Response::Committed { text: "日本".into(), reading: "ご".into() };
+        let r = Response::Committed {
+            text: "日本".into(),
+            reading: "ご".into(),
+        };
         let js = serde_json::to_string(&r).unwrap();
         assert_eq!(js, r#"{"result":"Committed","text":"日本","reading":"ご"}"#);
         assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), r);

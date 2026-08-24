@@ -15,8 +15,19 @@ fn convert_nihongo_returns_kanji() {
         Response::Session { session, .. } => session,
         other => panic!("expected Session, got {:?}", other),
     };
-    c.request(&Request::Insert { session: sid, text: "nihongo".into(), style: None }).unwrap();
-    let cands = match c.request(&Request::Convert { session: sid, left_context: None }).unwrap() {
+    c.request(&Request::Insert {
+        session: sid,
+        text: "nihongo".into(),
+        style: None,
+    })
+    .unwrap();
+    let cands = match c
+        .request(&Request::Convert {
+            session: sid,
+            left_context: None,
+        })
+        .unwrap()
+    {
         Response::Candidates { candidates } => candidates,
         other => panic!("expected Candidates, got {:?}", other),
     };
@@ -51,9 +62,20 @@ fn tip_like_per_char_over_unique_pipe() {
     };
     // TIP と同じく1文字ずつ送る。
     for ch in "nihongo".chars() {
-        c.request(&Request::Insert { session: sid, text: ch.to_string(), style: None }).unwrap();
+        c.request(&Request::Insert {
+            session: sid,
+            text: ch.to_string(),
+            style: None,
+        })
+        .unwrap();
     }
-    let cands = match c.request(&Request::Convert { session: sid, left_context: None }).unwrap() {
+    let cands = match c
+        .request(&Request::Convert {
+            session: sid,
+            left_context: None,
+        })
+        .unwrap()
+    {
         Response::Candidates { candidates } => candidates,
         other => panic!("expected Candidates, got {:?}", other),
     };
@@ -80,9 +102,27 @@ fn live_convert_returns_kanji_per_char() {
     };
     let mut last = String::new();
     for (i, ch) in "nihongo".chars().enumerate() {
-        c.request(&Request::Insert { session: sid, text: ch.to_string(), style: None }).unwrap();
-        match c.request(&Request::LiveConvert { session: sid, seq: i as u64, left_context: None, auto_commit: false }).unwrap() {
-            Response::LiveResult { seq, text, reading, committed: _ } => {
+        c.request(&Request::Insert {
+            session: sid,
+            text: ch.to_string(),
+            style: None,
+        })
+        .unwrap();
+        match c
+            .request(&Request::LiveConvert {
+                session: sid,
+                seq: i as u64,
+                left_context: None,
+                auto_commit: false,
+            })
+            .unwrap()
+        {
+            Response::LiveResult {
+                seq,
+                text,
+                reading,
+                committed: _,
+            } => {
                 assert_eq!(seq, i as u64, "seq echoed");
                 assert!(!reading.is_empty(), "reading non-empty at len {}", i + 1);
                 last = text;
@@ -90,7 +130,10 @@ fn live_convert_returns_kanji_per_char() {
             other => panic!("expected LiveResult, got {:?}", other),
         }
     }
-    assert_eq!(last, "日本語", "final live text should be 日本語, got {last}");
+    assert_eq!(
+        last, "日本語",
+        "final live text should be 日本語, got {last}"
+    );
 }
 
 /// echo モード: engine が "LLM:"+reading を即返すことを確認（スレッド配線の決定的検証用）。
@@ -102,9 +145,13 @@ fn llm_convert_echo_returns_marker() {
     let exe = engine_exe_path();
     assert!(exe.exists(), "engine exe not built: {}", exe.display());
     let pipe = format!(r"\\.\pipe\nospacekey-engine-llm-{}", std::process::id());
-    let _child = ChildGuard(Command::new(&exe).arg(&pipe)
-        .env("NOSPACEKEY_LLM_ECHO", "1")
-        .spawn().expect("spawn engine"));
+    let _child = ChildGuard(
+        Command::new(&exe)
+            .arg(&pipe)
+            .env("NOSPACEKEY_LLM_ECHO", "1")
+            .spawn()
+            .expect("spawn engine"),
+    );
     let mut c = match EngineClient::connect_to(&pipe, Duration::from_secs(5)) {
         Ok(c) => c,
         Err(e) => panic!("connect_to({pipe}) failed: {e}"),
@@ -114,10 +161,25 @@ fn llm_convert_echo_returns_marker() {
         other => panic!("expected Session, got {:?}", other),
     };
     for ch in "nihongo".chars() {
-        c.request(&Request::Insert { session: sid, text: ch.to_string(), style: None }).unwrap();
+        c.request(&Request::Insert {
+            session: sid,
+            text: ch.to_string(),
+            style: None,
+        })
+        .unwrap();
     }
-    let text = match c.request(&Request::LlmConvert { session: sid, seq: 1, left_context: None }).unwrap() {
-        Response::LlmResult { seq, text } => { assert_eq!(seq, 1); text }
+    let text = match c
+        .request(&Request::LlmConvert {
+            session: sid,
+            seq: 1,
+            left_context: None,
+        })
+        .unwrap()
+    {
+        Response::LlmResult { seq, text } => {
+            assert_eq!(seq, 1);
+            text
+        }
         other => panic!("expected LlmResult, got {:?}", other),
     };
     assert!(text.starts_with("LLM:"), "echo marker expected, got {text}");

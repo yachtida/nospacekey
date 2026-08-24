@@ -11,16 +11,25 @@ pub mod user_dictionary;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmSettings {
     pub enabled: bool,
-    #[serde(default)] pub api_key_dpapi: String, // DPAPI blob の base64。空=未設定。
-    #[serde(default)] pub endpoint: String,
+    #[serde(default)]
+    pub api_key_dpapi: String, // DPAPI blob の base64。空=未設定。
+    #[serde(default)]
+    pub endpoint: String,
     pub model: String,
-    #[serde(default)] pub prompt: String,
+    #[serde(default)]
+    pub prompt: String,
     pub timeout_ms: u32,
 }
 impl Default for LlmSettings {
     fn default() -> Self {
-        Self { enabled: false, api_key_dpapi: String::new(), endpoint: String::new(),
-               model: "gpt-4o-mini".into(), prompt: String::new(), timeout_ms: 15000 }
+        Self {
+            enabled: false,
+            api_key_dpapi: String::new(),
+            endpoint: String::new(),
+            model: "gpt-4o-mini".into(),
+            prompt: String::new(),
+            timeout_ms: 15000,
+        }
     }
 }
 
@@ -55,10 +64,16 @@ pub struct ZenzaiSettings {
     #[serde(default = "default_zenzai_inference_limit")]
     pub inference_limit: u32,
 }
-fn default_zenzai_inference_limit() -> u32 { 1 }
+fn default_zenzai_inference_limit() -> u32 {
+    1
+}
 impl Default for ZenzaiSettings {
     fn default() -> Self {
-        Self { enabled: true, weight_path: String::new(), inference_limit: 1 }
+        Self {
+            enabled: true,
+            weight_path: String::new(),
+            inference_limit: 1,
+        }
     }
 }
 impl ZenzaiSettings {
@@ -73,31 +88,57 @@ impl ZenzaiSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LiveSettings { pub enabled: bool }
-impl Default for LiveSettings { fn default() -> Self { Self { enabled: true } } }
+pub struct LiveSettings {
+    pub enabled: bool,
+}
+impl Default for LiveSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LearningSettings { pub enabled: bool }
-impl Default for LearningSettings { fn default() -> Self { Self { enabled: true } } }
+pub struct LearningSettings {
+    pub enabled: bool,
+}
+impl Default for LearningSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
 
 /// 品質ループ③: 誤変換ワンキー記録（Ctrl+変換 → feedback.jsonl）。**既定 OFF＝opt-in**
 /// （NOSPACEKEY_LOG の診断ログとは独立の opt-in — 既定状態で新規に書かれるものはゼロ）。
 /// `enabled: false` が既定なので Default は derive（clippy::derivable_impls）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FeedbackSettings { pub enabled: bool }
+pub struct FeedbackSettings {
+    pub enabled: bool,
+}
 
 /// かな入力モードで数字を既定で全角確定するか。既定 true（全角）。いつでも設定で切替可能。
 /// 候補を明示選択した確定は幅を変えない（既定確定のみ全角化）。LiveSettings と同じく既定が
 /// true なので Default は手書き（derive だと false になる）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NumberSettings { pub full_width: bool }
-impl Default for NumberSettings { fn default() -> Self { Self { full_width: true } } }
+pub struct NumberSettings {
+    pub full_width: bool,
+}
+impl Default for NumberSettings {
+    fn default() -> Self {
+        Self { full_width: true }
+    }
+}
 
 /// かな入力モードの句読点既定幅（true=全角 、。／false=半角 ,.）。既定 true なので
 /// Default は手書き（derive だと false になる）。NumberSettings と同じ流儀（設計 §E）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PunctuationSettings { pub full_width: bool }
-impl Default for PunctuationSettings { fn default() -> Self { Self { full_width: true } } }
+pub struct PunctuationSettings {
+    pub full_width: bool,
+}
+impl Default for PunctuationSettings {
+    fn default() -> Self {
+        Self { full_width: true }
+    }
+}
 
 /// かな入力モードの記号既定幅（true=全角 ・「」！？～：；等／false=半角 ASCII）。既定 false。
 /// `,` `.`（punctuation の領分）と `-`→ー（長音符=かな）はこのトグルの対象外。
@@ -109,12 +150,18 @@ impl Default for PunctuationSettings { fn default() -> Self { Self { full_width:
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolSettings {
     pub full_width: bool,
-    #[serde(default = "symbol::default_full_width_chars", deserialize_with = "symbol::de_symbol_chars")]
+    #[serde(
+        default = "symbol::default_full_width_chars",
+        deserialize_with = "symbol::de_symbol_chars"
+    )]
     pub full_width_chars: BTreeSet<char>,
 }
 impl Default for SymbolSettings {
     fn default() -> Self {
-        Self { full_width: false, full_width_chars: symbol::default_full_width_chars() }
+        Self {
+            full_width: false,
+            full_width_chars: symbol::default_full_width_chars(),
+        }
     }
 }
 impl SymbolSettings {
@@ -136,16 +183,34 @@ impl SymbolSettings {
 /// 一時的なかなモード（トリガキーで一時的にかな入力へ入り、確定で自動的に半角英数へ戻る）。
 /// ターミナル/vim 向けに「日本語モードの抜け忘れ」を防ぐ。既定 ON・トリガは F8。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EphemeralSettings { pub enabled: bool, pub trigger: String }
+pub struct EphemeralSettings {
+    pub enabled: bool,
+    pub trigger: String,
+}
 impl Default for EphemeralSettings {
-    fn default() -> Self { Self { enabled: true, trigger: "f8".into() } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            trigger: "f8".into(),
+        }
+    }
 }
 
 /// 修正変換(Tab): 読みのタイポ修復候補を提示する。`learn` は修復候補確定時の
 /// 誤読み学習(合成ペア — engine env NOSPACEKEY_TYPO_LEARN)。両方とも既定 ON。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TypoCorrectSettings { pub enabled: bool, pub learn: bool }
-impl Default for TypoCorrectSettings { fn default() -> Self { Self { enabled: true, learn: true } } }
+pub struct TypoCorrectSettings {
+    pub enabled: bool,
+    pub learn: bool,
+}
+impl Default for TypoCorrectSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            learn: true,
+        }
+    }
+}
 
 /// Shift+英字の挙動。"compose"=英語未確定モード(確定まで英字が続く・MS-IME系・既定) /
 /// "commit"=大文字を直接確定(Google/ATOK系・e0beaf3 の旧既定)。bool でなく文字列 enum
@@ -155,9 +220,15 @@ pub struct ShiftLatinSettings {
     #[serde(default = "default_shift_latin_mode")]
     pub mode: String,
 }
-fn default_shift_latin_mode() -> String { "compose".into() }
+fn default_shift_latin_mode() -> String {
+    "compose".into()
+}
 impl Default for ShiftLatinSettings {
-    fn default() -> Self { Self { mode: default_shift_latin_mode() } }
+    fn default() -> Self {
+        Self {
+            mode: default_shift_latin_mode(),
+        }
+    }
 }
 
 /// 読みモニタ: ライブ変換中に生の読み(ひらがな)をキャレット上側の小窓で常時表示する。
@@ -175,7 +246,13 @@ pub struct ReadingMonitorSettings {
     pub max_chars: u32,
 }
 impl Default for ReadingMonitorSettings {
-    fn default() -> Self { Self { enabled: true, accumulate: true, max_chars: 34 } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            accumulate: true,
+            max_chars: 34,
+        }
+    }
 }
 impl ReadingMonitorSettings {
     /// 10..=100 へクランプ。config の apply と tip の Activate 読みの両方が通る
@@ -193,66 +270,116 @@ pub struct UserDictionarySettings {
     pub enabled: bool,
 }
 impl Default for UserDictionarySettings {
-    fn default() -> Self { Self { enabled: true } }
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
-fn default_true() -> bool { true }
-fn default_max_chars() -> u32 { 34 }
+fn default_true() -> bool {
+    true
+}
+fn default_max_chars() -> u32 {
+    34
+}
 
 /// 設定アプリのアップデート確認設定。TIP は読まない（設定アプリのみが使うローカル設定）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdateSettings {
+    /// GitHub Releases の自動確認。既定 false（opt-in）。
+    #[serde(default)]
+    pub automatic_check: bool,
     /// pre-release(beta) をアップデート通知に含めるか。既定 false=安定版のみ。
     #[serde(default)]
     pub include_beta: bool,
+    /// 初回案内を閉じたか。自動確認を勝手に有効化しないため設定として保存する。
+    #[serde(default)]
+    pub automatic_check_prompt_dismissed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub version: u32,
-    #[serde(default)] pub llm: LlmSettings,
-    #[serde(default)] pub zenzai: ZenzaiSettings,
-    #[serde(default)] pub live_conversion: LiveSettings,
+    #[serde(default)]
+    pub llm: LlmSettings,
+    #[serde(default)]
+    pub zenzai: ZenzaiSettings,
+    #[serde(default)]
+    pub live_conversion: LiveSettings,
     /// Spec2: かな漢字変換の学習（確定候補を以後の順位に反映）。既定 ON。
     /// engine env `NOSPACEKEY_LEARNING`（"1"/"0"）へ resolve_env_map が常に注入する。
-    #[serde(default)] pub learning: LearningSettings,
+    #[serde(default)]
+    pub learning: LearningSettings,
     /// SP7: 真なら新しいアプリ（TIP インスタンス初回 Activate）で conversion-mode を
     /// 半角英数へ初期化する。既定 false＝従来どおりひらがな既定。ワンショットなので
     /// 無変換後のひらがなは維持する。TIP 側の挙動で engine env には注入しない。
     /// フィールド欠落の旧 settings.json は false でロード。
-    #[serde(default)] pub default_direct: bool,
+    #[serde(default)]
+    pub default_direct: bool,
     /// A 段: 外観（配色/フォント/角丸/バックドロップ）。欠落は既定 Appearance。
-    #[serde(default)] pub appearance: Appearance,
+    #[serde(default)]
+    pub appearance: Appearance,
     /// 品質ループ③: 誤変換ワンキー記録（feedback.jsonl）。既定 false=opt-in。
     /// フィールド欠落の旧 settings.json は false でロード（後方互換）。
-    #[serde(default)] pub feedback: FeedbackSettings,
+    #[serde(default)]
+    pub feedback: FeedbackSettings,
     /// かな入力モードの数字既定幅（true=全角）。欠落の旧 settings.json は true でロード。
-    #[serde(default)] pub number: NumberSettings,
+    #[serde(default)]
+    pub number: NumberSettings,
     /// かな入力モードの句読点既定幅（true=全角）。欠落の旧 settings.json は true でロード。
-    #[serde(default)] pub punctuation: PunctuationSettings,
+    #[serde(default)]
+    pub punctuation: PunctuationSettings,
     /// かな入力モードの記号既定幅（false=半角 ASCII）。欠落の旧 settings.json は false でロード。
-    #[serde(default)] pub symbol: SymbolSettings,
+    #[serde(default)]
+    pub symbol: SymbolSettings,
     /// 一時的なかなモード（トリガキーで一時的にかな入力へ、確定で自動的に半角英数へ戻る）。
     /// 欠落の旧 settings.json は既定（enabled=true, trigger="f8"）でロード。
-    #[serde(default)] pub ephemeral: EphemeralSettings,
+    #[serde(default)]
+    pub ephemeral: EphemeralSettings,
     /// 修正変換(Tab): 読みのタイポ修復候補。欠落の旧 settings.json は既定
     /// （enabled=true, learn=true）でロード。
-    #[serde(default)] pub typo_correct: TypoCorrectSettings,
+    #[serde(default)]
+    pub typo_correct: TypoCorrectSettings,
     /// Shift+英字の挙動（"compose"=英語未確定モード / "commit"=大文字直接確定）。
     /// 欠落の旧 settings.json は "compose" でロード。TIP ローカル設定（engine env 非注入）。
-    #[serde(default)] pub shift_latin: ShiftLatinSettings,
+    #[serde(default)]
+    pub shift_latin: ShiftLatinSettings,
     /// 読みモニタ（ライブ変換中の生読み常時表示）。欠落の旧 settings.json は ON でロード。
-    #[serde(default)] pub reading_monitor: ReadingMonitorSettings,
+    #[serde(default)]
+    pub reading_monitor: ReadingMonitorSettings,
     /// configurable keymap: コマンド系 12 機能のキー割り当て(spec 2026-07-16)。
     /// 欠落の旧 settings.json は全機能「既定」でロード。反映は Activate 時 1 回(D7)。
-    #[serde(default)] pub keymap: keymap::KeymapSettings,
+    #[serde(default)]
+    pub keymap: keymap::KeymapSettings,
     /// カスタム辞書(ユーザー辞書)。既定 ON。欠落の旧 settings.json は ON でロード(後方互換)。
-    #[serde(default)] pub user_dictionary: UserDictionarySettings,
+    #[serde(default)]
+    pub user_dictionary: UserDictionarySettings,
     /// アップデート確認（beta を含めるか）。欠落の旧 settings.json は既定（安定版のみ）でロード。
-    #[serde(default)] pub update: UpdateSettings,
+    #[serde(default)]
+    pub update: UpdateSettings,
 }
 impl Default for Settings {
-    fn default() -> Self { Self { version: 2, llm: Default::default(), zenzai: Default::default(), live_conversion: Default::default(), learning: Default::default(), default_direct: false, appearance: Default::default(), feedback: Default::default(), number: Default::default(), punctuation: Default::default(), symbol: Default::default(), ephemeral: EphemeralSettings::default(), typo_correct: Default::default(), shift_latin: Default::default(), reading_monitor: Default::default(), keymap: Default::default(), user_dictionary: Default::default(), update: Default::default() } }
+    fn default() -> Self {
+        Self {
+            version: 2,
+            llm: Default::default(),
+            zenzai: Default::default(),
+            live_conversion: Default::default(),
+            learning: Default::default(),
+            default_direct: false,
+            appearance: Default::default(),
+            feedback: Default::default(),
+            number: Default::default(),
+            punctuation: Default::default(),
+            symbol: Default::default(),
+            ephemeral: EphemeralSettings::default(),
+            typo_correct: Default::default(),
+            shift_latin: Default::default(),
+            reading_monitor: Default::default(),
+            keymap: Default::default(),
+            user_dictionary: Default::default(),
+            update: Default::default(),
+        }
+    }
 }
 
 /// A 段の外観設定。全フィールド `#[serde(default)]` で後方互換（欠落フィールドは既定へ）。
@@ -260,13 +387,20 @@ impl Default for Settings {
 /// パース失敗は Theme 解決層でフィールド単位に既定へフォールバックする（ここでは文字列のまま保持）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Palette {
-    #[serde(default)] pub bg: String,
-    #[serde(default)] pub text: String,
-    #[serde(default)] pub index: String,
-    #[serde(default)] pub sel_bg: String,
-    #[serde(default)] pub sel_text: String,
-    #[serde(default)] pub sel_index: String,
-    #[serde(default)] pub border: String,
+    #[serde(default)]
+    pub bg: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub index: String,
+    #[serde(default)]
+    pub sel_bg: String,
+    #[serde(default)]
+    pub sel_text: String,
+    #[serde(default)]
+    pub sel_index: String,
+    #[serde(default)]
+    pub border: String,
 }
 
 /// 内蔵ライトパレット。Apple 風 UI パターン集（docs/apple-design-ui-patterns.md）の
@@ -275,8 +409,12 @@ pub struct Palette {
 /// sel_index はアクセント地に白 70% を合成した淡青（GDI が不透明色しか扱えないため事前合成）。
 pub fn default_light_palette() -> Palette {
     Palette {
-        bg: "#FFFFFF".into(), text: "#1D1D1F".into(), index: "#86868B".into(),
-        sel_bg: "#0071E3".into(), sel_text: "#FFFFFF".into(), sel_index: "#B3D4F7".into(),
+        bg: "#FFFFFF".into(),
+        text: "#1D1D1F".into(),
+        index: "#86868B".into(),
+        sel_bg: "#0071E3".into(),
+        sel_text: "#FFFFFF".into(),
+        sel_index: "#B3D4F7".into(),
         border: "#E0E0E0".into(),
     }
 }
@@ -286,21 +424,31 @@ pub fn default_light_palette() -> Palette {
 /// #2C2C2E 地に合成した #4E4E4F、sel_index はアクセント地に白 70% を合成した淡青。
 pub fn default_dark_palette() -> Palette {
     Palette {
-        bg: "#2C2C2E".into(), text: "#F5F5F7".into(), index: "#98989D".into(),
-        sel_bg: "#0A84FF".into(), sel_text: "#FFFFFF".into(), sel_index: "#B6DAFF".into(),
+        bg: "#2C2C2E".into(),
+        text: "#F5F5F7".into(),
+        index: "#98989D".into(),
+        sel_bg: "#0A84FF".into(),
+        sel_text: "#FFFFFF".into(),
+        sel_index: "#B6DAFF".into(),
         border: "#4E4E4F".into(),
     }
 }
 
 impl Default for Palette {
-    fn default() -> Self { default_light_palette() }
+    fn default() -> Self {
+        default_light_palette()
+    }
 }
 
 /// v1 時代の内蔵ライトパレット（既定刷新前の焼き付き値の検出専用。新規利用禁止）。
 fn legacy_v1_light_palette() -> Palette {
     Palette {
-        bg: "#FAFAFA".into(), text: "#202020".into(), index: "#A0A0A0".into(),
-        sel_bg: "#0078D7".into(), sel_text: "#FFFFFF".into(), sel_index: "#C8DCF0".into(),
+        bg: "#FAFAFA".into(),
+        text: "#202020".into(),
+        index: "#A0A0A0".into(),
+        sel_bg: "#0078D7".into(),
+        sel_text: "#FFFFFF".into(),
+        sel_index: "#C8DCF0".into(),
         border: "#E0E0E0".into(),
     }
 }
@@ -308,8 +456,12 @@ fn legacy_v1_light_palette() -> Palette {
 /// v1 時代の内蔵ダークパレット（同上）。
 fn legacy_v1_dark_palette() -> Palette {
     Palette {
-        bg: "#2B2B2B".into(), text: "#F0F0F0".into(), index: "#7A7A7A".into(),
-        sel_bg: "#0078D7".into(), sel_text: "#FFFFFF".into(), sel_index: "#1E3A5F".into(),
+        bg: "#2B2B2B".into(),
+        text: "#F0F0F0".into(),
+        index: "#7A7A7A".into(),
+        sel_bg: "#0078D7".into(),
+        sel_text: "#FFFFFF".into(),
+        sel_index: "#1E3A5F".into(),
         border: "#3C3C3C".into(),
     }
 }
@@ -334,25 +486,57 @@ fn migrate(mut s: Settings) -> Settings {
     s
 }
 
+/// 巡3 Z3: 手書き settings.json 由来の相対 weight_path を正規化する choke point。
+/// 設定UIの validate 絶対パス必須（適用経由のみ）を迂回した値は、Config/TIP/engine の
+/// CWD 差で「UI は導入済み表示・エンジンは古典劣化」の解離を起こす（UIバグ8 と同型）。
+/// 非空かつ非絶対のパスは空へ畳み、ZenzaiConfig.resolve の 3 段表（per-user→exe 隣）へ
+/// フォールバックさせる — 次回 save() でファイルも自己修復される。全消費者
+/// （UI/TIP/DL の read-modify-save）が load を通るため、この 1 点で全迂回を閉じられる。
+fn normalize_loaded(mut s: Settings) -> Settings {
+    if !s.zenzai.weight_path.is_empty()
+        && !std::path::Path::new(&s.zenzai.weight_path).is_absolute()
+    {
+        s.zenzai.weight_path.clear();
+    }
+    s
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Appearance {
     /// "auto" | "light" | "dark" | "custom"。
-    #[serde(default = "appearance_theme_default")] pub theme: String,
+    #[serde(default = "appearance_theme_default")]
+    pub theme: String,
     /// "acrylic" | "opaque"。
-    #[serde(default = "appearance_backdrop_default")] pub backdrop: String,
-    #[serde(default = "appearance_font_family_default")] pub font_family: String,
-    #[serde(default = "appearance_font_point_default")] pub font_point: f32,
+    #[serde(default = "appearance_backdrop_default")]
+    pub backdrop: String,
+    #[serde(default = "appearance_font_family_default")]
+    pub font_family: String,
+    #[serde(default = "appearance_font_point_default")]
+    pub font_point: f32,
     /// "round" | "square"。
-    #[serde(default = "appearance_corner_default")] pub corner: String,
-    #[serde(default = "default_light_palette")] pub palette_light: Palette,
-    #[serde(default = "default_dark_palette")] pub palette_dark: Palette,
+    #[serde(default = "appearance_corner_default")]
+    pub corner: String,
+    #[serde(default = "default_light_palette")]
+    pub palette_light: Palette,
+    #[serde(default = "default_dark_palette")]
+    pub palette_dark: Palette,
 }
 
-fn appearance_theme_default() -> String { "auto".into() }
-fn appearance_backdrop_default() -> String { "acrylic".into() }
-fn appearance_font_family_default() -> String { "Yu Gothic UI".into() }
-fn appearance_font_point_default() -> f32 { 10.5 }
-fn appearance_corner_default() -> String { "round".into() }
+fn appearance_theme_default() -> String {
+    "auto".into()
+}
+fn appearance_backdrop_default() -> String {
+    "acrylic".into()
+}
+fn appearance_font_family_default() -> String {
+    "Yu Gothic UI".into()
+}
+fn appearance_font_point_default() -> f32 {
+    10.5
+}
+fn appearance_corner_default() -> String {
+    "round".into()
+}
 
 impl Default for Appearance {
     fn default() -> Self {
@@ -383,13 +567,197 @@ pub fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
 }
 
 impl Settings {
-    pub fn from_json_str(s: &str) -> Settings { serde_json::from_str(s).map(migrate).unwrap_or_default() }
-    pub fn to_json(&self) -> String { serde_json::to_string_pretty(self).unwrap_or_default() }
+    pub fn from_json_str(s: &str) -> Settings {
+        // 巡4 J6: migrate と対の第2パース経路でも normalize_loaded を通す（lib の migrate
+        // doc が「load_reporting / from_json_str の両経路」と契約する正規化 choke point）。
+        serde_json::from_str(s)
+            .map(|s| normalize_loaded(migrate(s)))
+            .unwrap_or_default()
+    }
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_default()
+    }
 }
 
-/// %LOCALAPPDATA%\nospacekey\settings.json。無ければ None（呼び元は既定で劣化）。
+/// %LOCALAPPDATA%\nospacekey\settings.json。無しおよび空文字なら None（呼び元は既定で劣化）。
+/// 空文字を通すとカレントディレクトリ基準の相対パスになり、プロセス毎に別ファイルを
+/// 指しうる（巡2 D7 — download.rs の DL 先と同じ規律）。
 pub fn settings_path() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("nospacekey").join("settings.json"))
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|d| !d.is_empty())
+        .map(|d| PathBuf::from(d).join("nospacekey").join("settings.json"))
+}
+
+/// Corruption recovery uses a durable append-only ledger.  A successful
+/// quarantine creates one empty `pending` file and Config acknowledges it by
+/// creating the matching empty `ack` file.  Neither side removes, renames, or
+/// overwrites ledger entries, so a crash before acknowledgement is retried on
+/// the next launch.  The zero-byte files intentionally remain as a
+/// non-destructive ledger; their names contain no user data and the scan only
+/// considers valid tokens. The parent is the per-user settings directory, so
+/// scanning it fully avoids starving a fresh entry behind old ledger files.
+const CORRUPT_RECOVERY_PENDING_PREFIX: &str = "settings.json.corrupt-recovered.";
+const CORRUPT_RECOVERY_PENDING_SUFFIX: &str = ".pending";
+const CORRUPT_RECOVERY_ACK_SUFFIX: &str = ".ack";
+const CORRUPT_RECOVERY_TOKEN_MAX_LEN: usize = 64;
+
+fn corrupt_recovery_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let serial = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}{:09}{}{}",
+        now.as_secs(),
+        now.subsec_nanos(),
+        std::process::id(),
+        serial
+    )
+}
+
+fn marker_name(prefix: &str, token: &str, suffix: &str) -> String {
+    format!("{prefix}{token}{suffix}")
+}
+
+fn valid_corrupt_recovery_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= CORRUPT_RECOVERY_TOKEN_MAX_LEN
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn pending_token_from_name(name: &str) -> Option<&str> {
+    let token = name
+        .strip_prefix(CORRUPT_RECOVERY_PENDING_PREFIX)?
+        .strip_suffix(CORRUPT_RECOVERY_PENDING_SUFFIX)?;
+    valid_corrupt_recovery_token(token).then_some(token)
+}
+
+fn ack_path_for_pending(pending: &Path, token: &str) -> PathBuf {
+    pending.with_file_name(marker_name(
+        CORRUPT_RECOVERY_PENDING_PREFIX,
+        token,
+        CORRUPT_RECOVERY_ACK_SUFFIX,
+    ))
+}
+
+fn marker_entry_is_regular(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn create_new_ledger_file(path: &Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        // If an attacker pre-creates a reparse point at this exact ledger
+        // name, create_new must not follow it or write through to its target.
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    options.open(path).map(|_| ())
+}
+
+fn create_corrupt_recovery_pending(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    // A timestamp + pid + process-local serial is bounded, ASCII, and avoids
+    // path scanning.  A create_new collision is retried with a fresh serial;
+    // every successful quarantine gets its own durable ledger entry.
+    for _ in 0..4 {
+        let name = marker_name(
+            CORRUPT_RECOVERY_PENDING_PREFIX,
+            &corrupt_recovery_token(),
+            CORRUPT_RECOVERY_PENDING_SUFFIX,
+        );
+        match create_new_ledger_file(&parent.join(name)) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return,
+        }
+    }
+}
+
+/// Read-only check for an unacknowledged, valid pending ledger entry. Malformed
+/// names and non-regular entries are ignored; valid entries are scanned even
+/// when the append-only ledger has accumulated older acknowledgements.
+pub fn has_pending_corrupt_recovery_notice() -> bool {
+    let Some(path) = settings_path() else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(token) = pending_token_from_name(&name) else {
+            continue;
+        };
+        if !marker_entry_is_regular(&entry_path) {
+            continue;
+        }
+        let ack = ack_path_for_pending(&entry_path, token);
+        if !marker_entry_is_regular(&ack) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Acknowledge every valid pending ledger entry by creating, never replacing,
+/// its matching `.ack`.  Existing files and races are intentionally benign.
+pub fn acknowledge_corrupt_recovery_notices() {
+    let Some(path) = settings_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(token) = pending_token_from_name(&name) else {
+            continue;
+        };
+        if !marker_entry_is_regular(&entry_path) {
+            continue;
+        }
+        let ack = ack_path_for_pending(&entry_path, token);
+        if marker_entry_is_regular(&ack) {
+            continue;
+        }
+        let _ = create_new_ledger_file(&ack);
+    }
 }
 
 /// UU-7: settings.json をロードした結果の要因。`load()` は Settings しか返さず失敗を握り潰すため、
@@ -409,8 +777,11 @@ pub enum LoadOutcome {
     NoPath,
     /// 空/空白のみ（torn write 痕跡）。既定で劣化。
     Empty,
-    /// JSON 破損（原本は退避）。既定で劣化。
+    /// JSON 破損（read-only loader が検出、mutation loader では退避成功済み）。既定で劣化。
     Corrupt,
+    /// JSON 破損を検出したが rename/copy のどちらでも原本を退避できなかった。
+    /// 原本を既定値で上書きしないため、mutation は拒否する。
+    CorruptQuarantineFailed,
 }
 
 /// UU-7: `std::fs` の read エラー種別を `LoadOutcome` へ分類する純関数（テスト可能）。
@@ -427,70 +798,137 @@ pub fn load() -> Settings {
     load_reporting().0
 }
 
-/// 読み取り結果とその要因を返す（`load()` の実体）。UU-7: 呼び出し側が失敗要因を診断できる。
+/// 読み取り結果とその要因を返す。既存の reporting 呼び出しは破損原本の退避まで行い、
+/// `Corrupt`/`CorruptQuarantineFailed` で成否を区別する。
 pub fn load_reporting() -> (Settings, LoadOutcome) {
-    let Some(path) = settings_path() else { return (Settings::default(), LoadOutcome::NoPath); };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) => return (Settings::default(), classify_read_error(e.kind())),
+    let Some(path) = settings_path() else {
+        return (Settings::default(), LoadOutcome::NoPath);
     };
-    // 空（0バイト/空白のみ）ファイルは、書き込み途中で中断された torn write の典型的痕跡で、
-    // 保全すべき鍵を含まない。これを「破損」として .corrupt へ退避するのは無駄なクラッタを生むので、
-    // ここでは退避せず既定へ劣化する（後続の save() が正規の内容で上書きする）。save() は原子的 rename
-    // を使うので、行儀のよい writer 経由なら load() が torn write（途中状態）を観測することはない。
+    let (settings, outcome) = load_for_mutation_from_with(
+        &path,
+        |path| std::fs::read_to_string(path),
+        |from, to| std::fs::rename(from, to).map(|_| ()),
+        |from, to| std::fs::copy(from, to),
+    );
+    if outcome == LoadOutcome::Corrupt {
+        // Corrupt means quarantine succeeded in the mutation loader.  Ledger
+        // creation is only a best-effort notification handoff and must never
+        // affect the already-completed quarantine result.
+        create_corrupt_recovery_pending(&path);
+    }
+    (settings, outcome)
+}
+
+/// Read `settings.json` and report its outcome without mutating any file.
+///
+/// This read-only API resolves [`settings_path`], reads once, and parses only.
+/// It never creates, renames, copies, removes, or otherwise writes the settings
+/// file, including when syntax or typed corruption produces `Corrupt`.
+/// Consumers that must preserve the settings path (for example, the background
+/// update checker) must use this API instead of [`load_reporting`].
+pub fn load_reporting_read_only() -> (Settings, LoadOutcome) {
+    let Some(path) = settings_path() else {
+        return (Settings::default(), LoadOutcome::NoPath);
+    };
+    load_reporting_from_with(&path, |path| std::fs::read_to_string(path))
+}
+
+/// Read-modify-save 用の loader。読み取り失敗や quarantine 失敗を既定値へ畳まず、
+/// `Err` で返すため、呼び出し側は原本を既定値で上書きできない。
+/// `Empty` は従来どおり torn-write 痕跡として既定値での mutation を許可する。
+pub fn load_for_mutation() -> Result<Settings, LoadOutcome> {
+    let Some(path) = settings_path() else {
+        return Err(LoadOutcome::NoPath);
+    };
+    let (settings, outcome) = load_for_mutation_from_with(
+        &path,
+        |path| std::fs::read_to_string(path),
+        |from, to| std::fs::rename(from, to).map(|_| ()),
+        |from, to| std::fs::copy(from, to),
+    );
+    if outcome == LoadOutcome::Corrupt {
+        // The public mutation path also completes the TIP -> Config handoff.
+        // Ledger creation is best effort and must not change the quarantine
+        // result or put the preserved original at risk.
+        create_corrupt_recovery_pending(&path);
+    }
+    match outcome {
+        LoadOutcome::Loaded | LoadOutcome::Missing | LoadOutcome::Empty | LoadOutcome::Corrupt => {
+            Ok(settings)
+        }
+        _ => Err(outcome),
+    }
+}
+
+/// read-only loader の注入 seam。テストと診断用に、読み込みだけを行い破損原本を保持する。
+pub(crate) fn load_reporting_from_with<R>(path: &Path, read: R) -> (Settings, LoadOutcome)
+where
+    R: Fn(&Path) -> std::io::Result<String>,
+{
+    let text = match read(path) {
+        Ok(t) => t,
+        Err(error) => return (Settings::default(), classify_read_error(error.kind())),
+    };
+    parse_settings_text(&text)
+}
+
+/// mutation loader の注入 seam。rename/copy を別々に受け取り、copy fallback の欠落と
+/// 両方失敗時の原本保持をテスト可能にする（辞書 loader と同じ設計）。
+pub(crate) fn load_for_mutation_from_with<R, M, C>(
+    path: &Path,
+    read: R,
+    rename: M,
+    copy: C,
+) -> (Settings, LoadOutcome)
+where
+    R: Fn(&Path) -> std::io::Result<String>,
+    M: Fn(&Path, &Path) -> std::io::Result<()>,
+    C: Fn(&Path, &Path) -> std::io::Result<u64>,
+{
+    let (settings, outcome) = load_reporting_from_with(path, read);
+    if outcome != LoadOutcome::Corrupt {
+        return (settings, outcome);
+    }
+    let destination = quarantine_dest_path(path);
+    if rename(path, &destination).is_ok() || copy(path, &destination).is_ok() {
+        return (Settings::default(), LoadOutcome::Corrupt);
+    }
+    eprintln!(
+        "nospacekey settings: 壊れた settings.json を退避できませんでした（{}）。\
+         後続の save() が暗号化済み API キーを上書きする恐れがあります。\
+         手動で原本をバックアップしてください。",
+        path.display()
+    );
+    (Settings::default(), LoadOutcome::CorruptQuarantineFailed)
+}
+
+fn parse_settings_text(text: &str) -> (Settings, LoadOutcome) {
     if text.trim().is_empty() {
         return (Settings::default(), LoadOutcome::Empty);
     }
-    match serde_json::from_str::<Settings>(&text) {
-        Ok(s) => (migrate(s), LoadOutcome::Loaded),
-        Err(_) => {
-            // 壊れた設定でも全消去（特に DPAPI 暗号化済み API キー）を黙って起こさないよう、
-            // 原本を `*.json.corrupt.<unix秒>.<nanos>` へ退避してから既定へ劣化する。退避しておけば
-            // 後続の save() が既定値で上書きしても、ユーザは壊れた原本から鍵を手動復旧できる。
-            //
-            // 退避名は固定の `*.json.corrupt` ではなく一意化する。固定名だと2度目の破損が
-            // 1度目の（まだ復旧可能な）退避を上書き破壊してしまうため。time/chrono 依存は
-            // 持たないので SystemTime の UNIX 秒＋nanos＋pid から一意サフィックスを作る。
-            // さらに、クロック解像度が粗い/連続リトライで同一 tick に当たっても既存退避を
-            // 絶対に再利用しないよう、衝突したら連番を付けて未使用名を確定させる（exists チェック）。
-            //
-            // 失敗ハンドリング: rename を黙って捨ててはならない。rename が失敗したまま既定を返すと、
-            // 後続の save() が壊れた原本（＝暗号化鍵）を既定値で上書きして恒久消失させうる。
-            // そこで rename 失敗時は copy で退避を試み（原本は所定位置に残るが鍵は保全される）、
-            // 両方失敗した場合のみ既定を返しつつ stderr に明確な警告を出す（load() は決して
-            // panic せず Settings を返し続ける＝infallible を維持する）。
-            let base = {
-                let d = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                format!("json.corrupt.{}.{}.{}", d.as_secs(), d.subsec_nanos(), std::process::id())
-            };
-            // pid を含むのでプロセス間衝突は無く、ここは逐次実行なので exists() チェックで競合しない。
-            // 既存退避（rename/copy いずれの上書きも）を避け、必ず未使用の退避名を選ぶ。
-            let mut bak = path.with_extension(&base);
-            let mut n = 1u32;
-            while bak.exists() {
-                bak = path.with_extension(format!("{base}.{n}"));
-                n += 1;
-            }
-            if std::fs::rename(&path, &bak).is_ok() {
-                // 原本は一意名で安全に退避済み。既定へ劣化してよい。
-                return (Settings::default(), LoadOutcome::Corrupt);
-            }
-            // rename 失敗（ロック/権限/別ボリューム等）。原本を所定位置に残したまま copy で退避を試みる。
-            if std::fs::copy(&path, &bak).is_ok() {
-                return (Settings::default(), LoadOutcome::Corrupt);
-            }
-            // rename も copy も失敗。退避できなかったことを明示し、鍵消失リスクを警告する。
-            eprintln!(
-                "nospacekey settings: 壊れた settings.json を退避できませんでした（{}）。\
-                 後続の save() が暗号化済み API キーを上書きする恐れがあります。\
-                 手動で原本をバックアップしてください。",
-                path.display()
-            );
-            (Settings::default(), LoadOutcome::Corrupt)
-        }
+    match serde_json::from_str::<Settings>(text) {
+        Ok(s) => (normalize_loaded(migrate(s)), LoadOutcome::Loaded),
+        Err(_) => (Settings::default(), LoadOutcome::Corrupt),
     }
+}
+
+fn quarantine_dest_path(path: &Path) -> PathBuf {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let base = format!(
+        "json.corrupt.{}.{}.{}",
+        d.as_secs(),
+        d.subsec_nanos(),
+        std::process::id()
+    );
+    let mut destination = path.with_extension(&base);
+    let mut suffix = 1u32;
+    while destination.exists() {
+        destination = path.with_extension(format!("{base}.{suffix}"));
+        suffix += 1;
+    }
+    destination
 }
 
 /// 親dir作成＋一時ファイル経由の原子的置換。
@@ -498,7 +936,8 @@ pub fn load_reporting() -> (Settings, LoadOutcome) {
 /// プロセス毎に一意化する（固定名だと2プロセス同時 save で書き込み/rename が競合し
 /// 片方が NotFound や破損を起こす）。失敗時は残骸 tmp をベストエフォートで掃除する。
 pub fn save(s: &Settings) -> std::io::Result<()> {
-    let path = settings_path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
+    let path = settings_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
     // シリアライズ失敗時に settings.json を空ファイルで上書きして破壊しないよう、ここで ?
     // で中断する（to_json は unwrap_or_default で "" に落ちるため save では使わない）。
     let json = serde_json::to_string_pretty(s).map_err(std::io::Error::other)?;
@@ -508,7 +947,9 @@ pub fn save(s: &Settings) -> std::io::Result<()> {
 /// `save()` から抽出した汎用の原子保存ヘルパ（辞書ファイル保存でも使う想定）。
 /// 親 dir 作成→一時ファイルへ書き→rename（短リトライ付き）→AppContainer read ACE 付与、まで行う。
 pub(crate) fn save_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     // 元の save() は settings.json 専用に with_extension(".json" 前提) で組んでいたが、
     // save_atomic は拡張子を問わず呼ばれる汎用ヘルパなので、拡張子の有無に依存しない
     // 文字列連結（`{path}.tmp.{pid}`）にする。
@@ -613,27 +1054,127 @@ pub fn resolve_env_map(
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    let mut put = |k: &str, v: String| { if env_lookup(k).is_none() { out.push((k.to_string(), v)); } };
+    let mut put = |k: &str, v: String| {
+        if env_lookup(k).is_none() {
+            out.push((k.to_string(), v));
+        }
+    };
     if llm_effective_enabled(s) {
-        if let Some(key) = api_key_plain { if !key.is_empty() { put("NOSPACEKEY_LLM_API_KEY", key.to_string()); } }
-        if !s.llm.endpoint.is_empty() { put("NOSPACEKEY_LLM_ENDPOINT", s.llm.endpoint.clone()); }
+        if let Some(key) = api_key_plain {
+            if !key.is_empty() {
+                put("NOSPACEKEY_LLM_API_KEY", key.to_string());
+            }
+        }
+        if !s.llm.endpoint.is_empty() {
+            put("NOSPACEKEY_LLM_ENDPOINT", s.llm.endpoint.clone());
+        }
         // endpoint/prompt と同じく空なら注入しない（エンジン側が既定 model へフォールバックする）。
-        if !s.llm.model.is_empty() { put("NOSPACEKEY_LLM_MODEL", s.llm.model.clone()); }
-        if !s.llm.prompt.is_empty() { put("NOSPACEKEY_LLM_PROMPT", s.llm.prompt.clone()); }
+        if !s.llm.model.is_empty() {
+            put("NOSPACEKEY_LLM_MODEL", s.llm.model.clone());
+        }
+        if !s.llm.prompt.is_empty() {
+            put("NOSPACEKEY_LLM_PROMPT", s.llm.prompt.clone());
+        }
         put("NOSPACEKEY_LLM_TIMEOUT_MS", s.llm.timeout_ms.to_string());
     }
-    put("NOSPACEKEY_ZENZAI", if s.zenzai.enabled { "on".into() } else { "off".into() });
-    if !s.zenzai.weight_path.is_empty() { put("NOSPACEKEY_ZENZAI_WEIGHT", s.zenzai.weight_path.clone()); }
-    put("NOSPACEKEY_ZENZAI_INFERENCE_LIMIT", s.zenzai.effective_inference_limit().to_string());
-    put("NOSPACEKEY_LEARNING", if s.learning.enabled { "1".into() } else { "0".into() });
-    put("NOSPACEKEY_TYPO_LEARN", if s.typo_correct.learn { "1".into() } else { "0".into() });
-    put("NOSPACEKEY_USER_DICT_ENABLED", if s.user_dictionary.enabled { "1".into() } else { "0".into() });
+    put(
+        "NOSPACEKEY_ZENZAI",
+        if s.zenzai.enabled {
+            "on".into()
+        } else {
+            "off".into()
+        },
+    );
+    if !s.zenzai.weight_path.is_empty() {
+        put("NOSPACEKEY_ZENZAI_WEIGHT", s.zenzai.weight_path.clone());
+    }
+    put(
+        "NOSPACEKEY_ZENZAI_INFERENCE_LIMIT",
+        s.zenzai.effective_inference_limit().to_string(),
+    );
+    put(
+        "NOSPACEKEY_LEARNING",
+        if s.learning.enabled {
+            "1".into()
+        } else {
+            "0".into()
+        },
+    );
+    put(
+        "NOSPACEKEY_TYPO_LEARN",
+        if s.typo_correct.learn {
+            "1".into()
+        } else {
+            "0".into()
+        },
+    );
+    put(
+        "NOSPACEKEY_USER_DICT_ENABLED",
+        if s.user_dictionary.enabled {
+            "1".into()
+        } else {
+            "0".into()
+        },
+    );
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static LOCALAPPDATA_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn localappdata_test_lock() -> MutexGuard<'static, ()> {
+        LOCALAPPDATA_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct LocalAppDataGuard {
+        previous: Option<OsString>,
+    }
+
+    impl LocalAppDataGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("LOCALAPPDATA");
+            std::env::set_var("LOCALAPPDATA", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for LocalAppDataGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("LOCALAPPDATA", value),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+        }
+    }
+
+    // ---- 巡4 J6: normalize_loaded（相対 weight_path の切り捨て）----
+
+    #[test]
+    fn from_json_str_normalizes_relative_weight_path() {
+        // 手書き settings.json 相当 — 相対パスは CWD 分裂の元なので空へ畳み、
+        // 3段解決表（per-user→exe 隣）へフォールバックさせる。version は Settings の
+        // 必須フィールド（無いとパース全体が失敗し既定へ落ちる）。
+        let json =
+            r#"{"version": 2, "zenzai": {"enabled": true, "weight_path": "models\\w.gguf"}}"#;
+        let s = Settings::from_json_str(json);
+        assert_eq!(s.zenzai.weight_path, "");
+    }
+
+    #[test]
+    fn from_json_str_keeps_absolute_weight_path() {
+        let json =
+            r#"{"version": 2, "zenzai": {"enabled": true, "weight_path": "C:\\models\\w.gguf"}}"#;
+        let s = Settings::from_json_str(json);
+        assert_eq!(s.zenzai.weight_path, r"C:\models\w.gguf");
+    }
 
     // ---- save_atomic: rename 短リトライ ----
     #[test]
@@ -643,7 +1184,10 @@ mod tests {
         let r = rename_with_retry(Path::new("a"), Path::new("b"), |_f, _t| {
             calls.set(calls.get() + 1);
             if calls.get() == 1 {
-                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sharing violation"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "sharing violation",
+                ))
             } else {
                 Ok(())
             }
@@ -655,7 +1199,10 @@ mod tests {
     #[test]
     fn rename_with_retry_gives_up_after_retries() {
         let r = rename_with_retry(Path::new("a"), Path::new("b"), |_f, _t| {
-            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sv"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "sv",
+            ))
         });
         assert!(r.is_err());
     }
@@ -675,9 +1222,15 @@ mod tests {
     #[test]
     fn classify_read_error_distinguishes_permission_denied() {
         use std::io::ErrorKind;
-        assert_eq!(classify_read_error(ErrorKind::NotFound), LoadOutcome::Missing);
+        assert_eq!(
+            classify_read_error(ErrorKind::NotFound),
+            LoadOutcome::Missing
+        );
         // AppContainer/LPAC ホストからの読み取り拒否は独立要因（診断できるように）。
-        assert_eq!(classify_read_error(ErrorKind::PermissionDenied), LoadOutcome::PermissionDenied);
+        assert_eq!(
+            classify_read_error(ErrorKind::PermissionDenied),
+            LoadOutcome::PermissionDenied
+        );
         assert_eq!(classify_read_error(ErrorKind::Other), LoadOutcome::IoError);
     }
 
@@ -748,7 +1301,9 @@ mod tests {
         let map = resolve_env_map(&s, None, |k| {
             (k == "NOSPACEKEY_ZENZAI_INFERENCE_LIMIT").then(|| "5".to_string())
         });
-        assert!(map.iter().all(|(k, _)| k != "NOSPACEKEY_ZENZAI_INFERENCE_LIMIT"));
+        assert!(map
+            .iter()
+            .all(|(k, _)| k != "NOSPACEKEY_ZENZAI_INFERENCE_LIMIT"));
     }
     #[test]
     fn default_direct_defaults_false() {
@@ -757,7 +1312,10 @@ mod tests {
     }
     #[test]
     fn default_direct_roundtrip() {
-        let s = Settings { default_direct: true, ..Default::default() };
+        let s = Settings {
+            default_direct: true,
+            ..Default::default()
+        };
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(back.default_direct);
     }
@@ -766,6 +1324,22 @@ mod tests {
         // 旧 settings.json（default_direct フィールドなし）でも false でロードできる（後方互換）。
         let s = Settings::from_json_str(r#"{"version":1}"#);
         assert!(!s.default_direct);
+    }
+    #[test]
+    fn old_update_settings_default_to_opt_in_and_prompt_visible() {
+        let s = Settings::from_json_str(r#"{"version":2,"update":{"include_beta":true}}"#);
+        assert!(!s.update.automatic_check);
+        assert!(s.update.include_beta);
+        assert!(!s.update.automatic_check_prompt_dismissed);
+    }
+    #[test]
+    fn update_settings_roundtrip_preserves_opt_in_fields() {
+        let mut s = Settings::default();
+        s.update.automatic_check = true;
+        s.update.automatic_check_prompt_dismissed = true;
+        let loaded = Settings::from_json_str(&s.to_json());
+        assert!(loaded.update.automatic_check);
+        assert!(loaded.update.automatic_check_prompt_dismissed);
     }
     #[test]
     fn json_roundtrip() {
@@ -781,6 +1355,364 @@ mod tests {
     fn corrupt_json_falls_back_to_default() {
         let s = Settings::from_json_str("{ this is not json ");
         assert!(!s.llm.enabled);
+    }
+
+    #[test]
+    fn read_only_reporting_seam_does_not_quarantine_corrupt_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "nospacekey-settings-read-only-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"version":"2"}"#).unwrap();
+
+        let (loaded, outcome) = load_reporting_from_with(&path, |_| std::fs::read_to_string(&path));
+        assert_eq!(outcome, LoadOutcome::Corrupt);
+        assert!(!loaded.llm.enabled);
+        assert!(path.exists());
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("corrupt")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_only_reporting_production_api_preserves_corrupt_file() {
+        let _lock = localappdata_test_lock();
+        let base = std::env::temp_dir().join(format!(
+            "nospacekey-settings-read-only-production-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _env = LocalAppDataGuard::set(&base);
+        let path = settings_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        for original in [br#"{ broken"#.as_slice(), br#"{"version":"2"}"#.as_slice()] {
+            std::fs::write(&path, original).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let (loaded, outcome) = load_reporting_read_only();
+            assert_eq!(outcome, LoadOutcome::Corrupt);
+            assert!(!loaded.llm.enabled);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".corrupt.")));
+            assert!(!has_pending_corrupt_recovery_notice());
+        }
+
+        let mut expected = Settings::default();
+        expected.update.automatic_check = true;
+        std::fs::write(&path, expected.to_json()).unwrap();
+        let (loaded, outcome) = load_reporting_read_only();
+        assert_eq!(outcome, LoadOutcome::Loaded);
+        assert!(loaded.update.automatic_check);
+
+        std::fs::remove_file(&path).unwrap();
+        let (_, outcome) = load_reporting_read_only();
+        assert_eq!(outcome, LoadOutcome::Missing);
+
+        // A directory at the file path exercises a real non-NotFound read
+        // error (the exact platform mapping is IoError or PermissionDenied).
+        std::fs::create_dir_all(&path).unwrap();
+        let (_, outcome) = load_reporting_read_only();
+        assert!(matches!(
+            outcome,
+            LoadOutcome::IoError | LoadOutcome::PermissionDenied
+        ));
+
+        std::env::remove_var("LOCALAPPDATA");
+        let (_, outcome) = load_reporting_read_only();
+        assert_eq!(outcome, LoadOutcome::NoPath);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn corrupt_recovery_ledger_is_at_least_once_and_acknowledged() {
+        let _lock = localappdata_test_lock();
+        let base = std::env::temp_dir().join(format!(
+            "nospacekey-settings-corrupt-marker-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _env = LocalAppDataGuard::set(&base);
+        let path = settings_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for original in ["{ broken", r#"{"version":"2"}"#] {
+            std::fs::write(&path, original).unwrap();
+            let (_, outcome) = load_reporting();
+            assert_eq!(outcome, LoadOutcome::Corrupt);
+            // Simulate a crash before Config acknowledges: the durable pending
+            // entry remains visible on the next process/startup.
+            assert!(has_pending_corrupt_recovery_notice());
+        }
+        std::thread::scope(|scope| {
+            scope.spawn(acknowledge_corrupt_recovery_notices);
+            scope.spawn(acknowledge_corrupt_recovery_notices);
+        });
+        assert!(!has_pending_corrupt_recovery_notice());
+        // A second consumer is harmless and never removes the ledger entries.
+        acknowledge_corrupt_recovery_notices();
+        assert!(!has_pending_corrupt_recovery_notice());
+        // The quarantine remains user-recoverable; only the dedicated ledger
+        // acknowledgement is added by Config.
+        assert!(std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt.")));
+        assert!(std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(CORRUPT_RECOVERY_PENDING_SUFFIX)));
+        assert!(std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(CORRUPT_RECOVERY_ACK_SUFFIX)));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pending_notice_scan_reaches_fresh_entry_after_old_ledger_entries() {
+        let _lock = localappdata_test_lock();
+        let base = std::env::temp_dir().join(format!(
+            "nospacekey-settings-corrupt-ledger-scan-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _env = LocalAppDataGuard::set(&base);
+        let path = settings_path().unwrap();
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+
+        // More than the old 256-entry cap of malformed entries and already
+        // acknowledged ledger entries must not hide a fresh pending notice.
+        for index in 0..300 {
+            std::fs::write(
+                parent.join(format!("a-invalid-ledger-entry-{index:03}")),
+                "",
+            )
+            .unwrap();
+            let token = format!("old{index:03}");
+            let pending = path.with_file_name(marker_name(
+                CORRUPT_RECOVERY_PENDING_PREFIX,
+                &token,
+                CORRUPT_RECOVERY_PENDING_SUFFIX,
+            ));
+            std::fs::write(&pending, "").unwrap();
+            std::fs::write(ack_path_for_pending(&pending, &token), "").unwrap();
+        }
+        let fresh_token = "zzzz-fresh";
+        let fresh = path.with_file_name(marker_name(
+            CORRUPT_RECOVERY_PENDING_PREFIX,
+            fresh_token,
+            CORRUPT_RECOVERY_PENDING_SUFFIX,
+        ));
+        std::fs::write(fresh, "").unwrap();
+
+        assert!(has_pending_corrupt_recovery_notice());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn public_mutation_loader_creates_pending_for_syntax_and_typed_corruption() {
+        let _lock = localappdata_test_lock();
+        let base = std::env::temp_dir().join(format!(
+            "nospacekey-settings-corrupt-public-loader-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _env = LocalAppDataGuard::set(&base);
+        let path = settings_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        for original in ["{ broken", r#"{"version":"2"}"#] {
+            std::fs::write(&path, original).unwrap();
+            let loaded = load_for_mutation().expect("corrupt settings are quarantined");
+            assert!(!loaded.llm.enabled);
+            assert!(!path.exists());
+            assert!(has_pending_corrupt_recovery_notice());
+            acknowledge_corrupt_recovery_notices();
+            assert!(!has_pending_corrupt_recovery_notice());
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn corrupt_recovery_ledger_never_overwrites_precreated_entries() {
+        let _lock = localappdata_test_lock();
+        let base = std::env::temp_dir().join(format!(
+            "nospacekey-settings-corrupt-ledger-link-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _env = LocalAppDataGuard::set(&base);
+        let path = settings_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let token = "precreated";
+        let pending = path.with_file_name(marker_name(
+            CORRUPT_RECOVERY_PENDING_PREFIX,
+            token,
+            CORRUPT_RECOVERY_PENDING_SUFFIX,
+        ));
+        std::fs::write(&pending, "pending").unwrap();
+        let ack = ack_path_for_pending(&pending, token);
+
+        #[cfg(unix)]
+        {
+            let target = base.join("target");
+            std::fs::write(&target, "keep").unwrap();
+            std::os::unix::fs::symlink(&target, &ack).unwrap();
+            acknowledge_corrupt_recovery_notices();
+            assert!(ack.symlink_metadata().unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&ack, "keep").unwrap();
+            acknowledge_corrupt_recovery_notices();
+            assert_eq!(std::fs::read_to_string(&ack).unwrap(), "keep");
+        }
+        // A pre-created symlink is not treated as acknowledgement (and remains
+        // retryable); on Windows the regular pre-created file is already an
+        // acknowledgement, but it still must not be overwritten.
+        #[cfg(unix)]
+        assert!(has_pending_corrupt_recovery_notice());
+        #[cfg(not(unix))]
+        assert!(!has_pending_corrupt_recovery_notice());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn loaded_missing_empty_and_read_only_corruption_do_not_create_pending_notice() {
+        let _lock = localappdata_test_lock();
+        let base = std::env::temp_dir().join(format!(
+            "nospacekey-settings-corrupt-ledger-clean-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _env = LocalAppDataGuard::set(&base);
+        let path = settings_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let valid = Settings::default().to_json();
+        std::fs::write(&path, valid).unwrap();
+        assert_eq!(load_reporting().1, LoadOutcome::Loaded);
+        assert!(!has_pending_corrupt_recovery_notice());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(load_reporting().1, LoadOutcome::Missing);
+        assert!(!has_pending_corrupt_recovery_notice());
+        std::fs::write(&path, " \n").unwrap();
+        assert_eq!(load_reporting().1, LoadOutcome::Empty);
+        assert!(!has_pending_corrupt_recovery_notice());
+        std::fs::write(&path, "{ broken").unwrap();
+        assert_eq!(load_reporting_read_only().1, LoadOutcome::Corrupt);
+        assert!(!has_pending_corrupt_recovery_notice());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn syntax_and_typed_corruption_share_recovery_outcome() {
+        for text in ["{ broken", r#"{"version":"2"}"#] {
+            let (settings, outcome) = parse_settings_text(text);
+            assert_eq!(outcome, LoadOutcome::Corrupt);
+            assert!(!settings.llm.enabled);
+        }
+    }
+
+    #[test]
+    fn mutation_loader_refuses_unreadable_settings_before_save() {
+        use std::cell::Cell;
+        let path = PathBuf::from(r"C:\settings.json");
+        let rename_called = Cell::new(false);
+        let copy_called = Cell::new(false);
+        let result = load_for_mutation_from_with(
+            &path,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            |_from, _to| {
+                rename_called.set(true);
+                Ok(())
+            },
+            |_from, _to| {
+                copy_called.set(true);
+                Ok(1)
+            },
+        );
+        assert_eq!(result.1, LoadOutcome::PermissionDenied);
+        assert!(!result.0.llm.enabled);
+        assert!(!rename_called.get());
+        assert!(!copy_called.get());
+    }
+
+    #[test]
+    fn mutation_loader_allows_empty_and_quarantine_success() {
+        let path = PathBuf::from(r"C:\settings.json");
+        let empty = load_for_mutation_from_with(
+            &path,
+            |_| Ok("  \n".to_string()),
+            |_from, _to| Ok(()),
+            |_from, _to| Ok(1),
+        );
+        assert_eq!(empty.1, LoadOutcome::Empty);
+        assert!(!empty.0.llm.enabled);
+
+        let corrupt = load_for_mutation_from_with(
+            &path,
+            |_| Ok("not json".to_string()),
+            |_from, _to| Ok(()),
+            |_from, _to| Ok(1),
+        );
+        assert_eq!(corrupt.1, LoadOutcome::Corrupt);
+        assert!(!corrupt.0.llm.enabled);
+    }
+
+    #[test]
+    fn mutation_loader_preserves_corrupt_original_when_quarantine_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "nospacekey-settings-quarantine-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let original = "not json";
+        std::fs::write(&path, original).unwrap();
+        let result = load_for_mutation_from_with(
+            &path,
+            |path| std::fs::read_to_string(path),
+            |_from, _to| Err(std::io::Error::other("locked")),
+            |_from, _to| Err(std::io::Error::other("locked")),
+        );
+        assert_eq!(result.1, LoadOutcome::CorruptQuarantineFailed);
+        assert!(!result.0.llm.enabled);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn llm_effective_is_false_while_frozen_even_when_enabled() {
@@ -812,11 +1744,12 @@ mod tests {
     #[test]
     fn save_then_load_roundtrip_and_corrupt_is_backed_up() {
         // LOCALAPPDATA を一意な temp dir に向けて save→load を往復し、壊れた原本が
-        // 退避されること（黙って既定で潰されないこと）を確認する。LOCALAPPDATA を触る
-        // テストはこれだけなので並行実行でも env 競合しない。
-        let base = std::env::temp_dir().join(format!("nospacekey-settings-test-{}", std::process::id()));
+        // reporting seam は原本を保持し、通常の load() は従来どおり退避することを確認する。
+        let _lock = localappdata_test_lock();
+        let base =
+            std::env::temp_dir().join(format!("nospacekey-settings-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        std::env::set_var("LOCALAPPDATA", &base);
+        let _env = LocalAppDataGuard::set(&base);
 
         let mut s = Settings::default();
         s.llm.enabled = true;
@@ -826,9 +1759,7 @@ mod tests {
         assert!(loaded.llm.enabled);
         assert_eq!(loaded.llm.api_key_dpapi, "blob");
 
-        // 壊れた JSON を書いてから load → 既定に劣化しつつ原本は *.json.corrupt.* へ退避。
-        // 退避名は一意化（タイムスタンプ＋pid）されるので固定名ではなく、ディレクトリを走査して
-        // `settings.json.corrupt` 始まりのファイルが存在することを確認する。
+        // 壊れた JSON を load すると、従来どおり原本は一意名へ退避される。
         let path = settings_path().unwrap();
         let dir = path.parent().unwrap().to_path_buf();
         let count_backups = || {
@@ -838,7 +1769,15 @@ mod tests {
                 .filter(|e| {
                     e.file_name()
                         .to_string_lossy()
-                        .starts_with("settings.json.corrupt")
+                        .starts_with("settings.json.corrupt.")
+                        && !e
+                            .file_name()
+                            .to_string_lossy()
+                            .ends_with(CORRUPT_RECOVERY_PENDING_SUFFIX)
+                        && !e
+                            .file_name()
+                            .to_string_lossy()
+                            .ends_with(CORRUPT_RECOVERY_ACK_SUFFIX)
                 })
                 .count()
         };
@@ -846,7 +1785,7 @@ mod tests {
         std::fs::write(&path, "{ broken json ").unwrap();
         let after = load();
         assert!(!after.llm.enabled); // 既定へ劣化
-        assert!(count_backups() >= 1); // 原本は一意名で退避済み
+        assert!(count_backups() >= 1); // load_reporting が原本を退避
 
         // 2度目の破損 → 2つ目の別退避が生まれ、1度目の退避が上書き破壊されないこと。
         // 退避名は nanos/pid に加え、衝突時は連番でずらして必ず未使用名を選ぶので、
@@ -858,7 +1797,7 @@ mod tests {
         // 空ファイル（torn write の痕跡）は破損退避せず既定へ劣化する（.corrupt を増やさない）。
         let before_empty = count_backups();
         std::fs::write(&path, "").unwrap();
-        let after_empty = load();
+        let after_empty = load_for_mutation().expect("empty settings may be mutated");
         assert!(!after_empty.llm.enabled); // 既定へ劣化
         assert_eq!(count_backups(), before_empty); // 空ファイルは退避しない
 
@@ -871,7 +1810,7 @@ mod tests {
         assert_eq!(parse_hex_color("#0078D7"), Some((0x00, 0x78, 0xD7)));
         assert_eq!(parse_hex_color("#ffffff"), Some((0xFF, 0xFF, 0xFF))); // 小文字可
         assert_eq!(parse_hex_color("FAFAFA"), None); // # 無し
-        assert_eq!(parse_hex_color("#FFF"), None);   // 3 桁は非対応
+        assert_eq!(parse_hex_color("#FFF"), None); // 3 桁は非対応
         assert_eq!(parse_hex_color("#GGGGGG"), None); // 非 16 進
         assert_eq!(parse_hex_color(""), None);
     }
@@ -920,13 +1859,19 @@ mod tests {
 
         // resolve_env_map: 常に NOSPACEKEY_LEARNING を注入（NOSPACEKEY_ZENZAI と同じ「常時 put」）。
         let env = resolve_env_map(&s, None, |_| None);
-        assert!(env.iter().any(|(k, v)| k == "NOSPACEKEY_LEARNING" && v == "1"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "NOSPACEKEY_LEARNING" && v == "1"));
         let mut off = s.clone();
         off.learning.enabled = false;
         let env = resolve_env_map(&off, None, |_| None);
-        assert!(env.iter().any(|(k, v)| k == "NOSPACEKEY_LEARNING" && v == "0"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "NOSPACEKEY_LEARNING" && v == "0"));
         // D6: ユーザーが env で明示 override していれば注入しない。
-        let env = resolve_env_map(&s, None, |k| (k == "NOSPACEKEY_LEARNING").then(|| "0".into()));
+        let env = resolve_env_map(&s, None, |k| {
+            (k == "NOSPACEKEY_LEARNING").then(|| "0".into())
+        });
         assert!(!env.iter().any(|(k, _)| k == "NOSPACEKEY_LEARNING"));
     }
 
@@ -982,7 +1927,10 @@ mod tests {
         // symbol オブジェクトごと欠落した旧 JSON は SymbolSettings::default()（手書き）を通る。
         let s = Settings::from_json_str(r#"{"version":2}"#);
         assert!(!s.symbol.full_width);
-        assert_eq!(s.symbol.full_width_chars, symbol::default_full_width_chars());
+        assert_eq!(
+            s.symbol.full_width_chars,
+            symbol::default_full_width_chars()
+        );
         assert_eq!(s.symbol.full_width_chars.len(), 29);
     }
 
@@ -992,7 +1940,10 @@ mod tests {
         // default（`default = "symbol::default_full_width_chars"`）を通る。
         let s = Settings::from_json_str(r#"{"version":2,"symbol":{"full_width":true}}"#);
         assert!(s.symbol.full_width);
-        assert_eq!(s.symbol.full_width_chars, symbol::default_full_width_chars());
+        assert_eq!(
+            s.symbol.full_width_chars,
+            symbol::default_full_width_chars()
+        );
     }
 
     #[test]
@@ -1019,7 +1970,10 @@ mod tests {
         let s = Settings::from_json_str(js);
         assert_eq!(s.symbol.full_width_chars, BTreeSet::from(['!', '?']));
         assert!(s.symbol.full_width);
-        assert!(!s.number.full_width, "不正要素があっても兄弟設定は壊れない（spec §6）");
+        assert!(
+            !s.number.full_width,
+            "不正要素があっても兄弟設定は壊れない（spec §6）"
+        );
     }
 
     #[test]
@@ -1031,7 +1985,11 @@ mod tests {
                 r#"{{"version":2,"symbol":{{"full_width":true,"full_width_chars":{bad}}},"number":{{"full_width":false}}}}"#
             );
             let s = Settings::from_json_str(&js);
-            assert_eq!(s.symbol.full_width_chars, symbol::default_full_width_chars(), "container {bad:?}");
+            assert_eq!(
+                s.symbol.full_width_chars,
+                symbol::default_full_width_chars(),
+                "container {bad:?}"
+            );
             assert!(s.symbol.full_width);
             assert!(!s.number.full_width);
         }
@@ -1040,7 +1998,9 @@ mod tests {
     #[test]
     fn out_of_scope_char_is_preserved_in_set_but_ineffective() {
         // `-`（対象外）だけの1文字要素は捨てずに保持してよい（将来対象が広がった場合に活きる）。
-        let s = Settings::from_json_str(r#"{"version":2,"symbol":{"full_width":true,"full_width_chars":["-"]}}"#);
+        let s = Settings::from_json_str(
+            r#"{"version":2,"symbol":{"full_width":true,"full_width_chars":["-"]}}"#,
+        );
         assert!(s.symbol.full_width_chars.contains(&'-'));
         assert!(s.symbol.effective_chars().is_empty());
         assert!(!s.symbol.symbol_overlay());
@@ -1116,13 +2076,19 @@ mod tests {
 
         // resolve_env_map: 常に NOSPACEKEY_TYPO_LEARN を注入（NOSPACEKEY_LEARNING と同じ「常時 put」）。
         let env = resolve_env_map(&s, None, |_| None);
-        assert!(env.iter().any(|(k, v)| k == "NOSPACEKEY_TYPO_LEARN" && v == "1"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "NOSPACEKEY_TYPO_LEARN" && v == "1"));
         let mut off = s.clone();
         off.typo_correct.learn = false;
         let env = resolve_env_map(&off, None, |_| None);
-        assert!(env.iter().any(|(k, v)| k == "NOSPACEKEY_TYPO_LEARN" && v == "0"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "NOSPACEKEY_TYPO_LEARN" && v == "0"));
         // D6: ユーザーが env で明示 override していれば注入しない。
-        let env = resolve_env_map(&s, None, |k| (k == "NOSPACEKEY_TYPO_LEARN").then(|| "0".into()));
+        let env = resolve_env_map(&s, None, |k| {
+            (k == "NOSPACEKEY_TYPO_LEARN").then(|| "0".into())
+        });
         assert!(!env.iter().any(|(k, _)| k == "NOSPACEKEY_TYPO_LEARN"));
     }
 
@@ -1221,7 +2187,11 @@ mod tests {
         // OFF も往復する。
         let mut off = s.clone();
         off.reading_monitor.accumulate = false;
-        assert!(!Settings::from_json_str(&off.to_json()).reading_monitor.accumulate);
+        assert!(
+            !Settings::from_json_str(&off.to_json())
+                .reading_monitor
+                .accumulate
+        );
     }
 
     #[test]
@@ -1235,7 +2205,12 @@ mod tests {
         // roundtrip。
         let mut m = s.clone();
         m.reading_monitor.max_chars = 50;
-        assert_eq!(Settings::from_json_str(&m.to_json()).reading_monitor.max_chars, 50);
+        assert_eq!(
+            Settings::from_json_str(&m.to_json())
+                .reading_monitor
+                .max_chars,
+            50
+        );
         // effective_max_chars は 10..=100 へクランプ(手編集 settings.json への防御)。
         m.reading_monitor.max_chars = 9;
         assert_eq!(m.reading_monitor.effective_max_chars(), 10);
@@ -1257,7 +2232,9 @@ mod tests {
         let mut s = Settings::default();
         s.user_dictionary.enabled = false;
         let m = resolve_env_map(&s, None, |_| None);
-        assert!(m.iter().any(|(k, v)| k == "NOSPACEKEY_USER_DICT_ENABLED" && v == "0"));
+        assert!(m
+            .iter()
+            .any(|(k, v)| k == "NOSPACEKEY_USER_DICT_ENABLED" && v == "0"));
     }
 
     #[test]

@@ -42,8 +42,12 @@ impl DocState {
         }
     }
 
-    pub fn len(&self) -> i32 { self.buf.borrow().len() as i32 }
-    pub fn selection(&self) -> (i32, i32) { (self.acp_start.get(), self.acp_end.get()) }
+    pub fn len(&self) -> i32 {
+        self.buf.borrow().len() as i32
+    }
+    pub fn selection(&self) -> (i32, i32) {
+        (self.acp_start.get(), self.acp_end.get())
+    }
     /// TIP の明示 SetSelection（ITfContext::SetSelection 経由）。キャレットを指定位置へ
     /// 動かし、「明示指定された」ことを記録する（確定時のアンカー戻しを抑止する）。
     pub fn set_selection(&self, start: i32, end: i32) {
@@ -76,10 +80,18 @@ impl DocState {
         }
         let new_end = start + text.len() as i32;
         let delta = new_end - end; // = text.len() - (end - start)
-        // 変更区間 [start,end) に「跨って」居るキャレットは start へ畳む防御枝。実際の合成経路
-        // ではキャレットは常に comp.start(==start) か区間外なので、この中間枝は通らない（畳み先が
-        // start でも new_end でも観測に影響しない）。先頭/末尾居座りの再現に必要なのは前2枝のみ。
-        let adjust = |p: i32| if p <= start { p } else if p >= end { p + delta } else { start };
+                                   // 変更区間 [start,end) に「跨って」居るキャレットは start へ畳む防御枝。実際の合成経路
+                                   // ではキャレットは常に comp.start(==start) か区間外なので、この中間枝は通らない（畳み先が
+                                   // start でも new_end でも観測に影響しない）。先頭/末尾居座りの再現に必要なのは前2枝のみ。
+        let adjust = |p: i32| {
+            if p <= start {
+                p
+            } else if p >= end {
+                p + delta
+            } else {
+                start
+            }
+        };
         self.acp_start.set(adjust(self.acp_start.get()));
         self.acp_end.set(adjust(self.acp_end.get()));
         self.sel_explicit.set(false);
@@ -128,9 +140,13 @@ impl DocState {
         }
         self.comp.set(None);
     }
-    pub fn composing(&self) -> bool { self.comp.get().is_some() }
+    pub fn composing(&self) -> bool {
+        self.comp.get().is_some()
+    }
 
-    pub fn full(&self) -> String { String::from_utf16_lossy(&self.buf.borrow()) }
+    pub fn full(&self) -> String {
+        String::from_utf16_lossy(&self.buf.borrow())
+    }
 
     /// [start,end) を UTF-16 のコピーで返す（COM 書き出し用、borrow を跨がない）。
     pub fn slice(&self, start: i32, end: i32) -> Vec<u16> {
@@ -190,7 +206,9 @@ impl DocState {
 mod tests {
     use super::DocState;
 
-    fn u16s(s: &str) -> Vec<u16> { s.encode_utf16().collect() }
+    fn u16s(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
 
     #[test]
     fn set_text_does_not_move_caret() {
@@ -206,7 +224,7 @@ mod tests {
     #[test]
     fn preedit_committed_split_via_composition() {
         let d = DocState::new();
-        d.start_composition();              // comp 開始 = 現在キャレット(0)
+        d.start_composition(); // comp 開始 = 現在キャレット(0)
         d.set_text(0, 0, &u16s("にほんご")); // 合成中の SetText
         assert_eq!(d.preedit(), "にほんご");
         assert_eq!(d.committed(), "");
@@ -225,10 +243,10 @@ mod tests {
         // 確定文字列を書いたあと TIP が SetSelection しない（旧バグ実装）と、
         // キャレットは合成開始位置（アンカー=0）へ戻る＝打ち始めの先頭。
         let d = DocState::new();
-        d.start_composition();              // アンカー=0
-        d.set_text(0, 0, &u16s("あ"));       // preedit。SetText はキャレットを動かさない→先頭0
-        d.set_text(0, 1, &u16s("あ"));       // commit SetText。やはり先頭0のまま
-        d.end_composition();                // 明示 SetSelection 無し → caret はアンカー0へ
+        d.start_composition(); // アンカー=0
+        d.set_text(0, 0, &u16s("あ")); // preedit。SetText はキャレットを動かさない→先頭0
+        d.set_text(0, 1, &u16s("あ")); // commit SetText。やはり先頭0のまま
+        d.end_composition(); // 明示 SetSelection 無し → caret はアンカー0へ
         assert_eq!(d.selection(), (0, 0));
     }
 
@@ -238,9 +256,9 @@ mod tests {
         let d = DocState::new();
         d.start_composition();
         d.set_text(0, 0, &u16s("あ"));
-        d.set_text(0, 1, &u16s("あ"));       // commit SetText。SetText 単独では先頭0のまま
-        d.set_selection(1, 1);              // TIP の明示 SetSelection(末尾)→ここで初めて末尾へ
-        d.end_composition();                // 明示済み → アンカー戻し抑止
+        d.set_text(0, 1, &u16s("あ")); // commit SetText。SetText 単独では先頭0のまま
+        d.set_selection(1, 1); // TIP の明示 SetSelection(末尾)→ここで初めて末尾へ
+        d.end_composition(); // 明示済み → アンカー戻し抑止
         assert_eq!(d.selection(), (1, 1));
     }
 
@@ -252,10 +270,10 @@ mod tests {
         d.start_composition();
         d.set_text(0, 0, &u16s("あ"));
         d.set_text(0, 1, &u16s("あ"));
-        d.set_selection(1, 1);              // 修正: 末尾へ
+        d.set_selection(1, 1); // 修正: 末尾へ
         d.end_composition();
         let (s, _) = d.selection();
-        d.start_composition();              // 2 語目はキャレット位置から
+        d.start_composition(); // 2 語目はキャレット位置から
         d.set_text(s, s, &u16s("い"));
         d.set_text(s, s + 1, &u16s("い"));
         d.set_selection(s + 1, s + 1);
@@ -267,7 +285,7 @@ mod tests {
         d.start_composition();
         d.set_text(0, 0, &u16s("あ"));
         d.set_text(0, 1, &u16s("あ"));
-        d.end_composition();                // 末尾へ動かさない → caret はアンカー0
+        d.end_composition(); // 末尾へ動かさない → caret はアンカー0
         let (s, _) = d.selection();
         assert_eq!(s, 0);
         d.start_composition();
@@ -282,7 +300,7 @@ mod tests {
         let d = DocState::new();
         d.start_composition();
         d.set_text(0, 0, &u16s("にほんご"));
-        d.set_text(0, 4, &[]);   // 取消: 合成範囲を空に
+        d.set_text(0, 4, &[]); // 取消: 合成範囲を空に
         d.end_composition();
         assert_eq!(d.full(), "");
         assert_eq!(d.committed(), "");
@@ -314,9 +332,9 @@ mod tests {
         // pub API はバッファ外/逆順の範囲でも panic せずクランプする（slice() と同じ防御規約）。
         let d = DocState::new();
         d.set_text(0, 0, &u16s("abc")); // "abc"
-        d.set_text(1, 99, &u16s("X"));  // end>len → [1,3) を置換 → "aX"
+        d.set_text(1, 99, &u16s("X")); // end>len → [1,3) を置換 → "aX"
         assert_eq!(d.full(), "aX");
-        d.set_text(5, 2, &u16s("Z"));   // start>len かつ start>end → start=end=len → 末尾挿入 → "aXZ"
+        d.set_text(5, 2, &u16s("Z")); // start>len かつ start>end → start=end=len → 末尾挿入 → "aXZ"
         assert_eq!(d.full(), "aXZ");
     }
 

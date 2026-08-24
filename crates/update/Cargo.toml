@@ -1,0 +1,37 @@
+[package]
+name = "nospacekey-update"
+version.workspace = true
+repository.workspace = true
+edition = "2021"
+
+[lib]
+name = "nospacekey_update"
+
+[[bin]]
+name = "NospacekeyUpdateChecker"
+path = "src/main.rs"
+
+[dependencies]
+settings = { path = "../settings" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures-util = "0.3"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_WinRT",
+]

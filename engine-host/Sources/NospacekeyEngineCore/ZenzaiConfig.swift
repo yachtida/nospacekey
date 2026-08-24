@@ -1,7 +1,8 @@
 import Foundation
 import WinSDK
 
-/// Zenzai の有効化・重みパス・推論上限を env と exe 隣の既定パスから解決する純粋ロジック。
+/// Zenzai の有効化・重みパス・推論上限を、明示 weight → per-user(%LOCALAPPDATA%) → exe 隣の
+/// 3段解決表から解決する純粋ロジック（設定UI crates/config/src/download.rs の detect_model と同一の表）。
 /// グローバル状態に触れず、`environment`/`exeDir`/`fileExists` を注入してユニットテスト可能にする。
 public struct ZenzaiConfig: Equatable {
     /// 重みファイル URL。nil なら古典変換（Zenzai 無効）。
@@ -33,12 +34,15 @@ public struct ZenzaiConfig: Equatable {
         return true
     }()
 
-    /// 解決順:
+    /// 解決順（設定UI crates/config/src/download.rs の detect_model と同一の表）:
     /// 1. env `NOSPACEKEY_ZENZAI=off`（大文字小文字不問）→ 強制古典（weightURL=nil）
     /// 2. CPU が llama ビルドのベースライン（AVX2）未満 → 強制古典（クラッシュ防止）
     /// 3. env `NOSPACEKEY_ZENZAI_WEIGHT` のパス
-    /// 4. 既定 `<exeDir>/models/ggml-model-Q5_K_M.gguf`
-    /// 3/4 の候補が実在すれば weightURL に採用、無ければ nil（古典）。
+    /// 4. `%LOCALAPPDATA%\nospacekey\models\ggml-model-Q5_K_M.gguf`（設定UIの per-user DL 先）
+    /// 5. 既定 `<exeDir>/models/ggml-model-Q5_K_M.gguf`
+    /// 3〜5 のうち最初に**実在**した候補を採用、無ければ nil（古典）。明示パスが設定済みでも
+    /// 消失していれば次候補へフォールバックする — UI 側 detect_model と同じ挙動に揃えることで
+    /// 「UI は導入済み表示・エンジンは古典にサイレント劣化」の解離を防ぐ（UIバグ8）。
     public static func resolve(
         exeDir: URL,
         environment: [String: String],
@@ -54,19 +58,27 @@ public struct ZenzaiConfig: Equatable {
             return ZenzaiConfig(weightURL: nil, inferenceLimit: limit)
         }
 
-        let candidatePath: String
+        var candidates: [String] = []
         if let explicit = environment["NOSPACEKEY_ZENZAI_WEIGHT"], !explicit.isEmpty {
-            candidatePath = explicit
-        } else {
-            // .path は Windows では区切りが `/` になり得るが、既定の
-            // FileManager.default.fileExists は両区切りを受理する。
-            candidatePath = exeDir
+            candidates.append(explicit)
+        }
+        if let localAppData = environment["LOCALAPPDATA"], !localAppData.isEmpty {
+            candidates.append(
+                URL(fileURLWithPath: localAppData)
+                    .appendingPathComponent("nospacekey")
+                    .appendingPathComponent("models")
+                    .appendingPathComponent(defaultWeightFileName)
+                    .path
+            )
+        }
+        candidates.append(
+            exeDir
                 .appendingPathComponent("models")
                 .appendingPathComponent(defaultWeightFileName)
                 .path
-        }
+        )
 
-        if fileExists(candidatePath) {
+        for candidatePath in candidates where fileExists(candidatePath) {
             return ZenzaiConfig(weightURL: URL(fileURLWithPath: candidatePath), inferenceLimit: limit)
         }
         return ZenzaiConfig(weightURL: nil, inferenceLimit: limit)

@@ -11,6 +11,7 @@ pub const PROFILE_NOSPACEKEY: GUID = GUID::from_u128(0xffca79b0_79b3_4e21_b240_3
 /// 下線表示用の表示属性GUID。
 pub const GUID_DISPLAY_ATTRIBUTE: GUID = GUID::from_u128(0xb8045359_1149_414d_84cd_d8891f69d477);
 /// 変換対象文節（文節ナビゲーションの選択文節）の太下線表示用の表示属性GUID。
-pub const GUID_DISPLAY_ATTRIBUTE_TARGET: GUID = GUID::from_u128(0x5b1a6f0e_9d24_4c31_8a75_36c4de00b917);
+pub const GUID_DISPLAY_ATTRIBUTE_TARGET: GUID =
+    GUID::from_u128(0x5b1a6f0e_9d24_4c31_8a75_36c4de00b917);
 /// 日本語（ja-JP）の LANGID。
 pub const LANGID_JA: u16 = 0x0411;

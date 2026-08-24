@@ -1,8 +1,10 @@
 //! SP6b: Windows DPAPI でユーザ束縛の at-rest 暗号化。base64 で保存。別マシン/ユーザでは復号不可→None。
 use base64::Engine;
-use windows::Win32::Foundation::{LocalFree, HLOCAL};
-use windows::Win32::Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB};
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::{LocalFree, HLOCAL};
+use windows::Win32::Security::Cryptography::{
+    CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
+};
 use zeroize::Zeroizing;
 
 /// API が割り当てた出力 blob を LocalFree で解放する。
@@ -58,7 +60,8 @@ pub fn decrypt(b64: &str) -> Option<Zeroizing<String>> {
     unsafe {
         CryptUnprotectData(&in_blob, None, None, None, None, 0, &mut out).ok()?;
         // 復号された plaintext を Zeroizing にコピー（drop 時にゼロ化）。
-        let plain = Zeroizing::new(std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec());
+        let plain =
+            Zeroizing::new(std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec());
         // OS 所有の blob を LocalFree 前に in-place でゼロ化し、plaintext を残さない。
         if !out.pbData.is_null() {
             std::ptr::write_bytes(out.pbData, 0, out.cbData as usize);

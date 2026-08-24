@@ -276,8 +276,7 @@ mod prewarm_tests {
     #[test]
     fn absent_is_respawn() {
         // connect 失敗（不在）→ ユーザ不在中にモデルロードを済ませる → Respawn。
-        let probe: std::io::Result<bool> =
-            Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let probe: std::io::Result<bool> = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
         assert_eq!(prewarm_action(&probe), PrewarmAction::Respawn);
     }
 
@@ -306,6 +305,9 @@ mod prewarm_tests {
             let _r = RunningResetter(&flag);
             assert!(flag.load(Ordering::SeqCst));
         }
-        assert!(!flag.load(Ordering::SeqCst), "Drop で running が false に戻る");
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "Drop で running が false に戻る"
+        );
     }
 }

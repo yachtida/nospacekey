@@ -68,6 +68,10 @@ pub struct SettingsDto {
     pub user_dictionary_enabled: bool,
     /// アップデート通知に pre-release(beta) を含めるか（既定 false=安定版のみ）。
     pub update_include_beta: bool,
+    /// GitHub Releases の自動確認（既定 false=opt-in）。
+    pub update_automatic_check: bool,
+    /// 初回案内を閉じたか（自動確認を勝手に有効化しない）。
+    pub update_automatic_check_prompt_dismissed: bool,
     pub keymap: settings::keymap::KeymapSettings,
     pub appearance: settings::Appearance,
 }
@@ -95,7 +99,12 @@ pub fn to_dto(s: &settings::Settings) -> SettingsDto {
         number_full_width: s.number.full_width,
         punctuation_full_width: s.punctuation.full_width,
         symbol_full_width: s.symbol.full_width,
-        symbol_full_width_chars: s.symbol.full_width_chars.iter().map(|c| c.to_string()).collect(),
+        symbol_full_width_chars: s
+            .symbol
+            .full_width_chars
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
         reading_monitor_enabled: s.reading_monitor.enabled,
         reading_monitor_accumulate: s.reading_monitor.accumulate,
         reading_monitor_max_chars: s.reading_monitor.max_chars,
@@ -104,6 +113,8 @@ pub fn to_dto(s: &settings::Settings) -> SettingsDto {
         shift_latin_mode: s.shift_latin.mode.clone(),
         user_dictionary_enabled: s.user_dictionary.enabled,
         update_include_beta: s.update.include_beta,
+        update_automatic_check: s.update.automatic_check,
+        update_automatic_check_prompt_dismissed: s.update.automatic_check_prompt_dismissed,
         keymap: s.keymap.clone(),
         appearance: s.appearance.clone(),
     }
@@ -156,6 +167,15 @@ pub fn validate(dto: &SettingsDto) -> Vec<FieldError> {
                 settings::ZENZAI_INFERENCE_LIMIT_RANGE.start(),
                 settings::ZENZAI_INFERENCE_LIMIT_RANGE.end()
             ),
+        });
+    }
+    // 巡2 D8: 明示 weight_path は絶対パス必須。相対パスは設定UIと TIP/engine の
+    // カレントディレクトリが異なるため別ファイルを指し、「UI は導入済み表示・エンジンは
+    // 古典へ劣化」の解離を起こす（UIバグ8と同型）。ここで機械的に弾いて UI に通知する。
+    if !dto.weight_path.is_empty() && !std::path::Path::new(&dto.weight_path).is_absolute() {
+        errs.push(FieldError {
+            field: "weight_path".into(),
+            message: "モデルのパスは絶対パスで指定してください。".into(),
         });
     }
     // 列挙値はラジオUI由来だが、defense-in-depth で検証する（TIP 側は未知値を握り潰すため
@@ -309,6 +329,9 @@ pub fn apply_dto(
     s.shift_latin.mode = dto.shift_latin_mode; // validate 済み（同上）
     s.user_dictionary.enabled = dto.user_dictionary_enabled;
     s.update.include_beta = dto.update_include_beta;
+    s.update.automatic_check = dto.update_automatic_check;
+    s.update.automatic_check_prompt_dismissed =
+        dto.update_automatic_check_prompt_dismissed || dto.update_automatic_check;
     s.keymap = dto.keymap;
     s.appearance = dto.appearance;
     Ok(s)
@@ -323,6 +346,17 @@ pub fn apply_dto(
 /// 不変条件(ロストアップデート無し)を単体テストから直接固定する場所を確保するため
 /// (commands.rs は `State` から借りて渡すだけの薄層)。
 pub struct DictLock(pub std::sync::Mutex<()>);
+
+/// settings.json へのアクセスを直列化する mutex。用途は2つ:
+/// (1) 適用(apply_settings)とモデルDL終端(download_zenzai_model の設定書き戻し)の
+///     read-modify-save が並行で last-writer-wins するのを防ぐ（I/O の async 化で
+///     コマンド並行性が増えたため）。
+/// (2) 辞書系コマンドの reload_sender / dict_sync_engine は settings.json を読んでから
+///     ReloadDictionary をパイプ送信するまで**書き込みをしないまま保持する**（ms 級の
+///     逆転で読んだ直後の値が古くなり、mutation の送信が旧値を送り返すのを防ぐ —
+///     commands.rs 巡4 B3。ロック順は Dict→Settings の一方向のみ）。
+/// 「書き込み区間だけ」の保護ではない点に注意（保持区間はパイプ送信を含む）。
+pub struct SettingsLock(pub std::sync::Mutex<()>);
 
 /// ReloadDictionary の伝播結果(spec §4.2)。保存成功とは独立の付帯情報として返す
 /// (mutation はファイル保存が成功した時点で成功であり、エンジン都合で Err にしない)。
@@ -400,7 +434,9 @@ fn invalid_field(ruby: &str) -> &'static str {
 fn load_locked(path: &Path) -> Result<settings::user_dictionary::LoadedDict, DictCmdError> {
     settings::user_dictionary::load_from(path).map_err(|e| match e {
         settings::user_dictionary::DictLoadError::Unreadable => DictCmdError::Unreadable,
-        settings::user_dictionary::DictLoadError::QuarantineFailed => DictCmdError::QuarantineFailed,
+        settings::user_dictionary::DictLoadError::QuarantineFailed => {
+            DictCmdError::QuarantineFailed
+        }
     })
 }
 
@@ -409,18 +445,30 @@ fn save_and_send(
     entries: &[settings::user_dictionary::UserDictEntry],
     send: &dyn Fn() -> EngineStatus,
 ) -> Result<MutationReport, DictCmdError> {
-    settings::user_dictionary::save_to(path, entries).map_err(|e| DictCmdError::Io { message: e.to_string() })?;
+    settings::user_dictionary::save_to(path, entries).map_err(|e| DictCmdError::Io {
+        message: e.to_string(),
+    })?;
     Ok(MutationReport { engine: send() })
 }
 
 /// §5.1/§6.2 共通のソートキー `(normalize_key(ruby), word)` の辞書式昇順で DTO 化する。
 fn to_sorted_dtos(mut entries: Vec<settings::user_dictionary::UserDictEntry>) -> Vec<DictEntryDto> {
-    entries.sort_by_cached_key(|e| (settings::user_dictionary::normalize_key(&e.ruby), e.word.clone()));
+    entries.sort_by_cached_key(|e| {
+        (
+            settings::user_dictionary::normalize_key(&e.ruby),
+            e.word.clone(),
+        )
+    });
     entries
         .into_iter()
         .map(|e| {
             let pos_display = settings::user_dictionary::canonical_pos(e.pos.as_deref());
-            DictEntryDto { ruby: e.ruby, word: e.word, pos: e.pos, pos_display }
+            DictEntryDto {
+                ruby: e.ruby,
+                word: e.word,
+                pos: e.pos,
+                pos_display,
+            }
         })
         .collect()
 }
@@ -442,9 +490,11 @@ pub fn dict_list_logic(lock: &DictLock, path: &Path) -> Result<ListReport, DictC
         }),
         Err(settings::user_dictionary::DictLoadError::Unreadable) => Err(DictCmdError::Unreadable),
         // 隔離不能=mutation 拒否状態だが、閲覧自体は落とさず「壊れている」ことだけ伝える。
-        Err(settings::user_dictionary::DictLoadError::QuarantineFailed) => {
-            Ok(ListReport { entries: Vec::new(), deduped: 0, corrupt: "quarantine_failed".to_string() })
-        }
+        Err(settings::user_dictionary::DictLoadError::QuarantineFailed) => Ok(ListReport {
+            entries: Vec::new(),
+            deduped: 0,
+            corrupt: "quarantine_failed".to_string(),
+        }),
     }
 }
 
@@ -456,8 +506,9 @@ pub fn dict_add_logic(
     word: &str,
     pos: &str,
 ) -> Result<MutationReport, DictCmdError> {
-    settings::user_dictionary::validate_entry(ruby, word)
-        .map_err(|_| DictCmdError::Invalid { field: invalid_field(ruby).to_string() })?;
+    settings::user_dictionary::validate_entry(ruby, word).map_err(|_| DictCmdError::Invalid {
+        field: invalid_field(ruby).to_string(),
+    })?;
     let _guard = lock.0.lock().unwrap();
     let mut loaded = load_locked(path)?;
     let entry = settings::user_dictionary::UserDictEntry {
@@ -466,7 +517,11 @@ pub fn dict_add_logic(
         pos: Some(pos.to_string()),
     };
     let key = settings::user_dictionary::entry_key(&entry);
-    if loaded.entries.iter().any(|e| settings::user_dictionary::entry_key(e) == key) {
+    if loaded
+        .entries
+        .iter()
+        .any(|e| settings::user_dictionary::entry_key(e) == key)
+    {
         return Err(DictCmdError::Duplicate);
     }
     loaded.entries.push(entry);
@@ -484,8 +539,9 @@ pub fn dict_update_logic(
     word: &str,
     pos: &str,
 ) -> Result<MutationReport, DictCmdError> {
-    settings::user_dictionary::validate_entry(ruby, word)
-        .map_err(|_| DictCmdError::Invalid { field: invalid_field(ruby).to_string() })?;
+    settings::user_dictionary::validate_entry(ruby, word).map_err(|_| DictCmdError::Invalid {
+        field: invalid_field(ruby).to_string(),
+    })?;
     let _guard = lock.0.lock().unwrap();
     let mut loaded = load_locked(path)?;
     // 対象特定はキー組一致のみ(validate を通さない — 移行産の非かな読みエントリも編集可能にする)。
@@ -506,7 +562,11 @@ pub fn dict_update_logic(
     };
     let new_key = settings::user_dictionary::entry_key(&new_entry);
     // 自己除外(§3.2): 編集対象自身とのキー一致は重複としない。
-    if loaded.entries.iter().enumerate().any(|(i, e)| i != idx && settings::user_dictionary::entry_key(e) == new_key)
+    if loaded
+        .entries
+        .iter()
+        .enumerate()
+        .any(|(i, e)| i != idx && settings::user_dictionary::entry_key(e) == new_key)
     {
         return Err(DictCmdError::Duplicate);
     }
@@ -549,10 +609,14 @@ pub fn dict_import_logic(
     let parsed = settings::user_dictionary::parse_tsv(bytes);
     let _guard = lock.0.lock().unwrap();
     let mut loaded = load_locked(path)?;
-    let report =
-        settings::user_dictionary::merge_imported(&mut loaded.entries, parsed.rows, parsed.had_replacement);
-    settings::user_dictionary::save_to(path, &loaded.entries)
-        .map_err(|e| DictCmdError::Io { message: e.to_string() })?;
+    let report = settings::user_dictionary::merge_imported(
+        &mut loaded.entries,
+        parsed.rows,
+        parsed.had_replacement,
+    );
+    settings::user_dictionary::save_to(path, &loaded.entries).map_err(|e| DictCmdError::Io {
+        message: e.to_string(),
+    })?;
     Ok(ImportReportDto {
         added: report.added,
         skipped_dup: report.skipped_dup,
@@ -564,11 +628,20 @@ pub fn dict_import_logic(
 
 /// tsv は UTF-8 BOM 無しで書く(呼び出し元がファイルへ書き出す)。lock は `dict_list_logic`
 /// と同じ理由(`load_from` の隔離 rename)。
-pub fn dict_export_logic(lock: &DictLock, path: &Path) -> Result<(String, ExportReportDto), DictCmdError> {
+pub fn dict_export_logic(
+    lock: &DictLock,
+    path: &Path,
+) -> Result<(String, ExportReportDto), DictCmdError> {
     let _guard = lock.0.lock().unwrap();
     let loaded = load_locked(path)?;
     let out = settings::user_dictionary::to_google_tsv(&loaded.entries);
-    Ok((out.tsv, ExportReportDto { written: out.written, skipped_control: out.skipped_control }))
+    Ok((
+        out.tsv,
+        ExportReportDto {
+            written: out.written,
+            skipped_control: out.skipped_control,
+        },
+    ))
 }
 
 /// spec §4.2: settings 読み取りが `Loaded`/`Missing` 以外(共有違反等の I/O エラー)なら
@@ -615,7 +688,8 @@ mod tests {
         // 範囲外（0=空欄の NaN→0 化含む / 11）はフィールドエラー。
         for bad in [0u32, 11] {
             dto.zenzai_inference_limit = bad;
-            let errs = apply_dto(dto.clone(), &settings::Settings::default(), |_| None).unwrap_err();
+            let errs =
+                apply_dto(dto.clone(), &settings::Settings::default(), |_| None).unwrap_err();
             assert!(
                 errs.iter().any(|e| e.field == "zenzai_inference_limit"),
                 "{bad} は弾く: {errs:?}"
@@ -722,8 +796,10 @@ mod tests {
 
     #[test]
     fn apply_preserves_version_and_maps_fields() {
-        let mut prev = settings::Settings::default();
-        prev.version = 7;
+        let prev = settings::Settings {
+            version: 7,
+            ..Default::default()
+        };
         let mut dto = base_dto();
         dto.llm_enabled = true;
         dto.endpoint = "https://example.invalid/v1".into();
@@ -789,7 +865,10 @@ mod tests {
         dto.punctuation_full_width = false;
         let applied = apply_dto(dto, &settings::Settings::default(), |v| Some(v.to_string()))
             .expect("妥当な DTO は適用できる");
-        assert!(!applied.punctuation.full_width, "DTO の OFF が Settings に写る");
+        assert!(
+            !applied.punctuation.full_width,
+            "DTO の OFF が Settings に写る"
+        );
     }
 
     #[test]
@@ -813,7 +892,10 @@ mod tests {
         let s = settings::Settings::default();
         let dto = to_dto(&s);
         assert_eq!(dto.symbol_full_width_chars.len(), 29);
-        assert!(dto.symbol_full_width_chars.iter().all(|c| c.chars().count() == 1));
+        assert!(dto
+            .symbol_full_width_chars
+            .iter()
+            .all(|c| c.chars().count() == 1));
         // DTO → Settings: 部分集合(Issue #1 の例 — `/` `@` を外す)
         let mut dto = to_dto(&settings::Settings::default());
         dto.symbol_full_width_chars.retain(|c| c != "/" && c != "@");
@@ -856,7 +938,10 @@ mod tests {
         // チェックボックス UI は不正値を生成し得ないため、apply は FieldError でなく黙殺で正規化する。
         let mut dto = to_dto(&settings::Settings::default());
         dto.symbol_full_width_chars = vec!["!".into(), "ab".into(), "".into(), "?".into()];
-        assert!(validate(&dto).is_empty(), "不正要素があっても FieldError は出さない");
+        assert!(
+            validate(&dto).is_empty(),
+            "不正要素があっても FieldError は出さない"
+        );
         let applied = apply_dto(dto, &settings::Settings::default(), |v| Some(v.to_string()))
             .expect("妥当な DTO は適用できる");
         assert_eq!(applied.symbol.full_width_chars, BTreeSet::from(['!', '?']));
@@ -874,20 +959,29 @@ mod tests {
         dto.reading_monitor_enabled = false;
         let applied = apply_dto(dto, &settings::Settings::default(), |v| Some(v.to_string()))
             .expect("妥当な DTO は適用できる");
-        assert!(!applied.reading_monitor.enabled, "DTO の OFF が Settings に写る");
+        assert!(
+            !applied.reading_monitor.enabled,
+            "DTO の OFF が Settings に写る"
+        );
     }
 
     #[test]
     fn reading_monitor_accumulate_roundtrips_between_dto_and_settings() {
         let mut s = settings::Settings::default();
-        assert!(to_dto(&s).reading_monitor_accumulate, "既定 ON が DTO に写る");
+        assert!(
+            to_dto(&s).reading_monitor_accumulate,
+            "既定 ON が DTO に写る"
+        );
         s.reading_monitor.accumulate = false;
         assert!(!to_dto(&s).reading_monitor_accumulate);
         let mut dto = to_dto(&settings::Settings::default());
         dto.reading_monitor_accumulate = false;
         let applied = apply_dto(dto, &settings::Settings::default(), |v| Some(v.to_string()))
             .expect("妥当な DTO は適用できる");
-        assert!(!applied.reading_monitor.accumulate, "DTO の OFF が Settings に写る");
+        assert!(
+            !applied.reading_monitor.accumulate,
+            "DTO の OFF が Settings に写る"
+        );
     }
 
     #[test]
@@ -913,7 +1007,11 @@ mod tests {
     fn shift_latin_mode_roundtrips_between_dto_and_settings() {
         // Settings → DTO（既定 compose が写る）
         let mut s = settings::Settings::default();
-        assert_eq!(to_dto(&s).shift_latin_mode, "compose", "既定 compose が DTO に写る");
+        assert_eq!(
+            to_dto(&s).shift_latin_mode,
+            "compose",
+            "既定 compose が DTO に写る"
+        );
         s.shift_latin.mode = "commit".into();
         assert_eq!(to_dto(&s).shift_latin_mode, "commit");
         // DTO → Settings（apply_dto、encrypt は成功スタブ）
@@ -921,7 +1019,10 @@ mod tests {
         dto.shift_latin_mode = "commit".into();
         let applied = apply_dto(dto, &settings::Settings::default(), |v| Some(v.to_string()))
             .expect("妥当な DTO は適用できる");
-        assert_eq!(applied.shift_latin.mode, "commit", "DTO の commit が Settings に写る");
+        assert_eq!(
+            applied.shift_latin.mode, "commit",
+            "DTO の commit が Settings に写る"
+        );
     }
 
     #[test]
@@ -955,13 +1056,17 @@ mod tests {
         let dto = to_dto(&s);
         assert!(!dto.ephemeral_enabled);
         assert_eq!(dto.ephemeral_trigger, "f9");
-        let back = apply_dto(dto.clone(), &settings::Settings::default(), |v| Some(v.to_string()))
-            .expect("妥当な DTO は適用できる");
+        let back = apply_dto(dto.clone(), &settings::Settings::default(), |v| {
+            Some(v.to_string())
+        })
+        .expect("妥当な DTO は適用できる");
         assert_eq!(back.ephemeral.trigger, "f9");
         // 未知 trigger は validate が拒否する（apply_dto も Err で拒否する）。
         let mut bad = dto.clone();
         bad.ephemeral_trigger = "ctrl_z".into();
-        assert!(validate(&bad).iter().any(|e| e.field == "ephemeral_trigger"));
+        assert!(validate(&bad)
+            .iter()
+            .any(|e| e.field == "ephemeral_trigger"));
         assert!(apply_dto(bad, &settings::Settings::default(), |v| Some(v.to_string())).is_err());
     }
 
@@ -1025,7 +1130,9 @@ mod tests {
         let mut dto = base_dto();
         dto.keymap.to_hiragana = Some("F7".into());
         let errs = validate(&dto);
-        assert!(errs.iter().any(|e| e.field == "keymap.to_hiragana" && e.message.contains("カタカナ")));
+        assert!(errs
+            .iter()
+            .any(|e| e.field == "keymap.to_hiragana" && e.message.contains("カタカナ")));
         assert!(errs.iter().any(|e| e.field == "keymap.to_katakana"));
         // feature off の機能の既定キーは空き地(feedback off で Ctrl+Slash は妥当)。
         let mut dto = base_dto();
@@ -1070,8 +1177,13 @@ mod tests {
                 let (lock, path, prefix) = (lock.clone(), path.clone(), prefix.to_string());
                 std::thread::spawn(move || {
                     for i in 0..50 {
-                        let ruby = format!("{}{}", prefix, "かきくけこ".chars().cycle().take(i + 1).collect::<String>());
-                        dict_add_logic(&lock, &path, &no_send, &ruby, &format!("W{i}"), "名詞").unwrap();
+                        let ruby = format!(
+                            "{}{}",
+                            prefix,
+                            "かきくけこ".chars().cycle().take(i + 1).collect::<String>()
+                        );
+                        dict_add_logic(&lock, &path, &no_send, &ruby, &format!("W{i}"), "名詞")
+                            .unwrap();
                     }
                 })
             })
@@ -1096,14 +1208,26 @@ mod tests {
     fn list_and_export_share_sorted_order() {
         let lock = DictLock(std::sync::Mutex::new(()));
         let path = temp_dict_path("sort");
-        for (r, w) in [("アップル", "Apple2"), ("あっぷる", "Apple1"), ("いぬ", "犬")] {
+        for (r, w) in [
+            ("アップル", "Apple2"),
+            ("あっぷる", "Apple1"),
+            ("いぬ", "犬"),
+        ] {
             dict_add_logic(&lock, &path, &no_send, r, w, "名詞").unwrap();
         }
-        let names: Vec<_> = dict_list_logic(&lock, &path).unwrap().entries.iter().map(|e| e.word.clone()).collect();
+        let names: Vec<_> = dict_list_logic(&lock, &path)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.word.clone())
+            .collect();
         assert_eq!(names, ["Apple1", "Apple2", "犬"]); // (normalize_key, word) 辞書式(かな種混在OK)
-        // export も同一順(テスト名どおり両方を固定 — list だけだと to_google_tsv 未ソートで緑)
+                                                       // export も同一順(テスト名どおり両方を固定 — list だけだと to_google_tsv 未ソートで緑)
         let (tsv, _) = dict_export_logic(&lock, &path).unwrap();
-        let words: Vec<_> = tsv.lines().map(|l| l.split('\t').nth(1).unwrap().to_string()).collect();
+        let words: Vec<_> = tsv
+            .lines()
+            .map(|l| l.split('\t').nth(1).unwrap().to_string())
+            .collect();
         assert_eq!(words, ["Apple1", "Apple2", "犬"]);
     }
 
@@ -1112,19 +1236,37 @@ mod tests {
         let lock = DictLock(std::sync::Mutex::new(()));
         let path = temp_dict_path("upd");
         dict_add_logic(&lock, &path, &no_send, "やちだ", "谷内田", "名詞").unwrap();
-        dict_update_logic(&lock, &path, &no_send, "やちだ", "谷内田", "やちだ", "谷内田", "姓").unwrap(); // 自己除外
+        dict_update_logic(
+            &lock,
+            &path,
+            &no_send,
+            "やちだ",
+            "谷内田",
+            "やちだ",
+            "谷内田",
+            "姓",
+        )
+        .unwrap(); // 自己除外
         assert_eq!(
-            dict_update_logic(&lock, &path, &no_send, "ない", "無い", "あ", "a", "名詞").unwrap_err(),
+            dict_update_logic(&lock, &path, &no_send, "ない", "無い", "あ", "a", "名詞")
+                .unwrap_err(),
             DictCmdError::NotFound
         ); // is_err() だけだと別エラーでも緑=UI分岐が偽緑
-        assert_eq!(dict_delete_logic(&lock, &path, &no_send, "ない", "無い").unwrap_err(), DictCmdError::NotFound); // phantom insert 禁止
+        assert_eq!(
+            dict_delete_logic(&lock, &path, &no_send, "ない", "無い").unwrap_err(),
+            DictCmdError::NotFound
+        ); // phantom insert 禁止
     }
 
     #[test]
     fn delete_after_dup_file_leaves_no_remnant() {
         // 重複入りファイルへ delete → 保存後に同一キー残骸 0 件(dedup済みリスト経由の固定 — spec§8)
         let path = temp_dict_path("dupdel");
-        std::fs::write(&path, r#"[{"ruby":"あっぷる","word":"Apple"},{"ruby":"アップル","word":"Apple"}]"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"[{"ruby":"あっぷる","word":"Apple"},{"ruby":"アップル","word":"Apple"}]"#,
+        )
+        .unwrap();
         let lock = DictLock(std::sync::Mutex::new(()));
         dict_delete_logic(&lock, &path, &no_send, "あっぷる", "Apple").unwrap();
         assert_eq!(dict_list_logic(&lock, &path).unwrap().entries.len(), 0);
@@ -1139,7 +1281,7 @@ mod tests {
             dict_add_logic(&lock, &path, &no_send, "がっこう", "学校", "名詞").unwrap_err(),
             DictCmdError::Duplicate
         ); // キー組経由(is_err だと別エラーでも緑)
-        // word 側: ワ行濁点
+           // word 側: ワ行濁点
         dict_add_logic(&lock, &path, &no_send, "いすず", "いすヷ", "名詞").unwrap();
         assert_eq!(
             dict_add_logic(&lock, &path, &no_send, "いすず", "いすワ\u{3099}", "名詞").unwrap_err(),
@@ -1164,12 +1306,11 @@ mod tests {
         std::fs::write(&path, br#"[{"ruby":"x""#).unwrap();
         let lock = DictLock(std::sync::Mutex::new(()));
         dict_add_logic(&lock, &path, &no_send, "あ", "亜", "名詞").unwrap();
-        assert!(path
-            .parent()
+        assert!(path.parent().unwrap().read_dir().unwrap().any(|e| e
             .unwrap()
-            .read_dir()
-            .unwrap()
-            .any(|e| e.unwrap().file_name().to_string_lossy().contains(".corrupt.")));
+            .file_name()
+            .to_string_lossy()
+            .contains(".corrupt.")));
         let entries = dict_list_logic(&lock, &path).unwrap().entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].word, "亜");
@@ -1201,7 +1342,9 @@ mod tests {
             let _ = dict_list_logic(&l2, &p2);
             tx.send(()).unwrap();
         });
-        assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err()); // 保持中は返らない
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err()); // 保持中は返らない
         drop(guard);
         assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok()); // 解放後に返る
     }
@@ -1210,10 +1353,14 @@ mod tests {
     fn unreadable_mutation_refuses_and_preserves_file() {
         // dir を辞書パスに指定(=読取 I/O エラー)→ dict_add_logic が Err(Unreadable) を返し、
         // 隔離も保存も起きない(一過性 I/O 失敗で「空+1件」上書きしない — F-1 の mutation 側)
-        let dir = std::env::temp_dir().join(format!("nsk-cfg-dict-{}-unreadable", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nsk-cfg-dict-{}-unreadable", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let lock = DictLock(std::sync::Mutex::new(()));
-        assert_eq!(dict_add_logic(&lock, &dir, &no_send, "あ", "亜", "名詞").unwrap_err(), DictCmdError::Unreadable);
+        assert_eq!(
+            dict_add_logic(&lock, &dir, &no_send, "あ", "亜", "名詞").unwrap_err(),
+            DictCmdError::Unreadable
+        );
         assert!(dir.exists()); // ディレクトリのまま(何も書かれていない)
     }
 
@@ -1225,7 +1372,9 @@ mod tests {
         let path = temp_dict_path("invalid");
         assert_eq!(
             dict_add_logic(&lock, &path, &no_send, "kanji漢字", "x", "名詞").unwrap_err(),
-            DictCmdError::Invalid { field: "ruby".to_string() }
+            DictCmdError::Invalid {
+                field: "ruby".to_string()
+            }
         );
     }
 }

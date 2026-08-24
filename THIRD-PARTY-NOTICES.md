@@ -230,12 +230,13 @@ runtime files. See the Visual Studio redistributable license for full terms.
 
 ---
 
-## Rust crates (statically linked into `nospacekey_tip.dll` and `NospacekeyConfig.exe`)
+## Rust crates (statically linked into `nospacekey_tip.dll`, `NospacekeyConfig.exe`, and `NospacekeyUpdateChecker.exe`)
 
 **What they are:** The Rust binaries in this distribution — the TSF text
-service `nospacekey_tip.dll` and the settings GUI `NospacekeyConfig.exe` (Tauri) —
-statically link the following third-party crates from crates.io. The list is
-the union of the two binaries' *runtime* dependency graphs, resolved for the
+service `nospacekey_tip.dll`, the settings GUI `NospacekeyConfig.exe` (Tauri),
+and the opt-in checker `NospacekeyUpdateChecker.exe` — statically link the
+following third-party crates from crates.io. The list is the union of the
+three binaries' *runtime* dependency graphs, resolved for the
 `x86_64-pc-windows-msvc` target. Build-time-only tools and procedural macros
 (e.g. `serde_derive`, `tauri-build`, `winresource`) are excluded because their
 code is not contained in the distributed binaries.
@@ -244,7 +245,7 @@ Regenerate with:
 
 ```
 cargo tree --target x86_64-pc-windows-msvc -e normal,no-proc-macro \
-  -p nospacekey_tip -p config --prefix none | sort -u
+  -p nospacekey_tip -p config -p nospacekey-update --prefix none | sort -u
 ```
 
 **License elections for dual/multi-licensed crates:** where a crate is offered
@@ -265,32 +266,53 @@ notice in the subsections immediately after this table.
 | `alloc-no-stdlib` | 2.0.4 | BSD-3-Clause | Daniel Reiter Horn |
 | `alloc-stdlib` | 0.2.4 | BSD-3-Clause | Daniel Reiter Horn |
 | `anyhow` | 1.0.103 | MIT OR Apache-2.0 | David Tolnay |
+| `atomic-waker` | 1.1.2 | Apache-2.0 OR MIT | Stjepan Glavina; Contributors to futures-rs |
 | `base64` | 0.22.1 | MIT OR Apache-2.0 | Marshall Pierce |
 | `bitflags` | 2.13.0 | MIT OR Apache-2.0 | The Rust Project Developers |
+| `block-buffer` | 0.10.4 | MIT OR Apache-2.0 | RustCrypto Developers |
 | `brotli` | 8.0.4 | BSD-3-Clause AND MIT | Daniel Reiter Horn; The Brotli Authors |
 | `brotli-decompressor` | 5.0.3 | BSD-3-Clause/MIT | Daniel Reiter Horn; The Brotli Authors |
 | `byteorder` | 1.5.0 | Unlicense OR MIT | Andrew Gallant |
 | `bytes` | 1.12.0 | MIT | Carl Lerche; Sean McArthur |
 | `cfb` | 0.7.3 | MIT | Matthew D. Steele |
 | `cfg-if` | 1.0.4 | MIT OR Apache-2.0 | Alex Crichton |
+| `chrono` | 0.4.45 | MIT OR Apache-2.0 | Kang Seonghoon; contributors |
 | `cookie` | 0.18.1 | MIT OR Apache-2.0 | Sergio Benitez; Alex Crichton |
+| `cpufeatures` | 0.2.17 | MIT OR Apache-2.0 | RustCrypto Developers |
 | `crossbeam-channel` | 0.5.15 | MIT OR Apache-2.0 | the crossbeam-channel developers |
 | `crossbeam-utils` | 0.8.21 | MIT OR Apache-2.0 | the crossbeam-utils developers |
+| `crypto-common` | 0.1.7 | MIT OR Apache-2.0 | RustCrypto Developers |
 | `ctor` | 0.8.0 | Apache-2.0 OR MIT | Matt Mastracci |
 | `deranged` | 0.5.8 | MIT OR Apache-2.0 | Jacob Pratt |
+| `digest` | 0.10.7 | MIT OR Apache-2.0 | RustCrypto Developers |
 | `dirs` | 6.0.0 | MIT OR Apache-2.0 | Simon Ochsenreither |
 | `dirs-sys` | 0.5.0 | MIT OR Apache-2.0 | Simon Ochsenreither |
 | `dpi` | 0.1.2 | Apache-2.0 AND MIT | the dpi developers |
 | `dunce` | 1.0.5 | CC0-1.0 OR MIT-0 OR Apache-2.0 | Kornel |
 | `equivalent` | 1.0.2 | Apache-2.0 OR MIT | the equivalent developers |
 | `erased-serde` | 0.4.10 | MIT OR Apache-2.0 | David Tolnay |
+| `fastrand` | 2.4.1 | Apache-2.0 OR MIT | Stjepan Glavina |
 | `fnv` | 1.0.7 | Apache-2.0 / MIT | Alex Crichton |
 | `form_urlencoded` | 1.2.2 | MIT OR Apache-2.0 | The rust-url developers |
+| `futures-channel` | 0.3.32 | MIT OR Apache-2.0 | Alex Crichton; The Tokio Authors |
+| `futures-core` | 0.3.32 | MIT OR Apache-2.0 | Alex Crichton; The Tokio Authors |
+| `futures-sink` | 0.3.32 | MIT OR Apache-2.0 | Alex Crichton; The Tokio Authors |
+| `futures-task` | 0.3.32 | MIT OR Apache-2.0 | Alex Crichton; The Tokio Authors |
+| `futures-util` | 0.3.32 | MIT OR Apache-2.0 | Alex Crichton; The Tokio Authors |
+| `generic-array` | 0.14.7 | MIT | Bartłomiej Kamiński; Aaron Trent |
 | `getrandom` | 0.3.4 | MIT OR Apache-2.0 | The Rand Project Developers |
+| `getrandom` | 0.4.3 | MIT OR Apache-2.0 | The Rand Project Developers |
 | `glob` | 0.3.3 | MIT OR Apache-2.0 | The Rust Project Developers |
 | `hashbrown` | 0.17.1 | MIT OR Apache-2.0 | the hashbrown developers |
 | `heck` | 0.5.0 | MIT OR Apache-2.0 | the heck developers |
+| `hex` | 0.4.3 | MIT OR Apache-2.0 | KokaKiwi |
 | `http` | 1.4.2 | MIT OR Apache-2.0 | Alex Crichton; Carl Lerche; Sean McArthur |
+| `http-body` | 1.0.1 | MIT | Carl Lerche; Lucio Franco; Sean McArthur |
+| `http-body-util` | 0.1.3 | MIT | Carl Lerche; Lucio Franco; Sean McArthur |
+| `httparse` | 1.10.1 | MIT OR Apache-2.0 | Sean McArthur |
+| `hyper` | 1.10.1 | MIT | Sean McArthur |
+| `hyper-tls` | 0.6.0 | MIT/Apache-2.0 | Sean McArthur |
+| `hyper-util` | 0.1.20 | MIT | Sean McArthur |
 | `icu_collections` | 2.2.0 | Unicode-3.0 | The ICU4X Project Developers |
 | `icu_locale_core` | 2.2.0 | Unicode-3.0 | The ICU4X Project Developers |
 | `icu_normalizer` | 2.2.0 | Unicode-3.0 | The ICU4X Project Developers |
@@ -302,6 +324,7 @@ notice in the subsections immediately after this table.
 | `idna_adapter` | 1.2.2 | Apache-2.0 OR MIT | The rust-url developers |
 | `indexmap` | 2.14.0 | Apache-2.0 OR MIT | the indexmap developers |
 | `infer` | 0.19.0 | MIT | Bojan |
+| `ipnet` | 2.12.0 | MIT OR Apache-2.0 | Kris Price |
 | `itoa` | 1.0.18 | MIT OR Apache-2.0 | David Tolnay |
 | `json-patch` | 3.0.1 | MIT/Apache-2.0 | Ivan Dubrov |
 | `jsonptr` | 0.6.3 | MIT OR Apache-2.0 | chance dinkins; André Sá de Mello |
@@ -312,8 +335,11 @@ notice in the subsections immediately after this table.
 | `log` | 0.4.33 | MIT OR Apache-2.0 | The Rust Project Developers |
 | `memchr` | 2.8.2 | Unlicense OR MIT | Andrew Gallant; bluss |
 | `mime` | 0.3.17 | MIT OR Apache-2.0 | Sean McArthur |
+| `mio` | 1.2.1 | MIT | Carl Lerche; Thomas de Zeeuw; Tokio Contributors |
 | `muda` | 0.19.3 | Apache-2.0 OR MIT | the muda developers |
+| `native-tls` | 0.2.18 | MIT OR Apache-2.0 | Steven Fackler |
 | `num-conv` | 0.2.2 | MIT OR Apache-2.0 | Jacob Pratt |
+| `num-traits` | 0.2.19 | MIT OR Apache-2.0 | The Rust Project Developers |
 | `once_cell` | 1.21.4 | MIT OR Apache-2.0 | Aleksey Kladov |
 | `option-ext` | 0.2.0 | MPL-2.0 | Simon Ochsenreither |
 | `parking_lot` | 0.12.5 | MIT OR Apache-2.0 | Amanieu d'Antras |
@@ -330,8 +356,11 @@ notice in the subsections immediately after this table.
 | `regex` | 1.12.4 | MIT OR Apache-2.0 | The Rust Project Developers; Andrew Gallant |
 | `regex-automata` | 0.4.14 | MIT OR Apache-2.0 | The Rust Project Developers; Andrew Gallant |
 | `regex-syntax` | 0.8.11 | MIT OR Apache-2.0 | The Rust Project Developers; Andrew Gallant |
+| `reqwest` | 0.13.4 | MIT OR Apache-2.0 | Sean McArthur |
 | `rfd` | 0.16.0 | MIT | Poly |
+| `rustls-pki-types` | 1.15.0 | MIT OR Apache-2.0 | Dirkjan Ochtman |
 | `same-file` | 1.0.6 | Unlicense/MIT | Andrew Gallant |
+| `schannel` | 0.1.29 | MIT | Steven Fackler; Steffen Butzer |
 | `scopeguard` | 1.2.0 | MIT OR Apache-2.0 | bluss |
 | `semver` | 1.0.28 | MIT OR Apache-2.0 | David Tolnay |
 | `serde` | 1.0.228 | MIT OR Apache-2.0 | Erick Tryzelaar; David Tolnay |
@@ -341,30 +370,44 @@ notice in the subsections immediately after this table.
 | `serde_spanned` | 1.1.1 | MIT OR Apache-2.0 | the serde_spanned developers |
 | `serde_with` | 3.21.0 | MIT OR Apache-2.0 | Jonas Bushart; Marcin Kaźmierczak |
 | `serialize-to-javascript` | 0.1.2 | MIT OR Apache-2.0 | Chip Reed |
+| `sha2` | 0.10.9 | MIT OR Apache-2.0 | RustCrypto Developers |
 | `siphasher` | 1.0.3 | MIT/Apache-2.0 | Frank Denis |
+| `slab` | 0.4.12 | MIT | Carl Lerche |
 | `smallvec` | 1.15.2 | MIT OR Apache-2.0 | The Servo Project Developers |
+| `socket2` | 0.6.4 | MIT OR Apache-2.0 | Alex Crichton; Thomas de Zeeuw |
 | `softbuffer` | 0.4.8 | MIT OR Apache-2.0 | the softbuffer developers |
 | `stable_deref_trait` | 1.2.1 | MIT OR Apache-2.0 | Robert Grosse |
+| `sync_wrapper` | 1.0.2 | Apache-2.0 | Actyx AG |
 | `tao` | 0.35.3 | Apache-2.0 | Tauri Programme within The Commons Conservancy; The winit contributors |
 | `tauri` | 2.11.5 | Apache-2.0 OR MIT | Tauri Programme within The Commons Conservancy |
 | `tauri-plugin-dialog` | 2.7.1 | Apache-2.0 OR MIT | Tauri Programme within The Commons Conservancy |
 | `tauri-plugin-fs` | 2.5.1 | Apache-2.0 OR MIT | Tauri Programme within The Commons Conservancy |
+| `tauri-plugin-single-instance` | 2.4.3 | Apache-2.0 OR MIT | Tauri Programme within The Commons Conservancy |
 | `tauri-runtime` | 2.11.3 | Apache-2.0 OR MIT | Tauri Programme within The Commons Conservancy |
 | `tauri-runtime-wry` | 2.11.4 | Apache-2.0 OR MIT | Tauri Programme within The Commons Conservancy |
 | `tauri-utils` | 2.9.3 | Apache-2.0 OR MIT | Tauri Programme within The Commons Conservancy |
+| `tempfile` | 3.27.0 | MIT OR Apache-2.0 | Steven Allen; The Rust Project Developers; Ashley Mannix; Jason White |
 | `thiserror` | 1.0.69 | MIT OR Apache-2.0 | David Tolnay |
 | `thiserror` | 2.0.18 | MIT OR Apache-2.0 | David Tolnay |
 | `time` | 0.3.53 | MIT OR Apache-2.0 | Jacob Pratt; Time contributors |
 | `time-core` | 0.1.9 | MIT OR Apache-2.0 | Jacob Pratt; Time contributors |
 | `tinystr` | 0.8.3 | Unicode-3.0 | The ICU4X Project Developers |
 | `tokio` | 1.52.3 | MIT | Tokio Contributors |
+| `tokio-native-tls` | 0.3.1 | MIT | Tokio Contributors |
+| `tokio-util` | 0.7.18 | MIT | Tokio Contributors |
 | `toml` | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | the toml developers |
 | `toml_datetime` | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | the toml_datetime developers |
 | `toml_parser` | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | the toml_parser developers |
 | `toml_writer` | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | the toml_writer developers |
+| `tower` | 0.5.3 | MIT | Tower Maintainers |
+| `tower-http` | 0.6.11 | MIT | Tower Maintainers |
+| `tower-layer` | 0.3.3 | MIT | Tower Maintainers |
+| `tower-service` | 0.3.3 | MIT | Tower Maintainers |
 | `tracing` | 0.1.44 | MIT | Eliza Weisman; Tokio Contributors |
 | `tracing-core` | 0.1.36 | MIT | Tokio Contributors |
+| `try-lock` | 0.2.5 | MIT | Sean McArthur |
 | `typeid` | 1.0.3 | MIT OR Apache-2.0 | David Tolnay |
+| `typenum` | 1.20.1 | MIT OR Apache-2.0 | Paho Lurie-Gregg |
 | `unic-char-property` | 0.9.0 | MIT/Apache-2.0 | The UNIC Project Developers |
 | `unic-char-range` | 0.9.0 | MIT/Apache-2.0 | The UNIC Project Developers |
 | `unic-common` | 0.9.0 | MIT/Apache-2.0 | The UNIC Project Developers |
@@ -376,6 +419,7 @@ notice in the subsections immediately after this table.
 | `utf8_iter` | 1.0.4 | Apache-2.0 OR MIT | Henri Sivonen |
 | `uuid` | 1.23.4 | Apache-2.0 OR MIT | Ashley Mannix; Dylan DPC; Hunar Roop Kahlon |
 | `walkdir` | 2.5.0 | Unlicense/MIT | Andrew Gallant |
+| `want` | 0.3.1 | MIT | Sean McArthur |
 | `webview2-com` | 0.38.2 | MIT | the webview2-com developers |
 | `webview2-com-sys` | 0.38.2 | MIT | the webview2-com-sys developers |
 | `winapi-util` | 0.1.11 | Unlicense OR MIT | Andrew Gallant |
@@ -417,7 +461,7 @@ notice in the subsections immediately after this table.
 | `zerovec` | 0.11.6 | Unicode-3.0 | The ICU4X Project Developers |
 | `zmij` | 1.0.21 | MIT | David Tolnay |
 
-Total: 155 crates.
+Total: 198 crates.
 
 ### BSD-3-Clause (alloc-no-stdlib, alloc-stdlib, brotli, brotli-decompressor)
 

@@ -14,5 +14,6 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_RemoteDesktop",   # Spec2: current_session_id (ProcessIdToSessionId)
-    "Win32_System_IO",              # A' テスト: ConnectNamedPipe（遅延応答サーバの接続待ち）
+    "Win32_System_IO",              # overlapped Read/Write deadline glue
+    "Win32_System_Threading",       # event-backed overlapped waits
 ] }

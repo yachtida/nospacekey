@@ -5,13 +5,21 @@
 pub use ipc::client::stable_pipe_name;
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum EngineAction { UseExisting, SpawnThenConnect, DegradeNoSpawn }
+pub enum EngineAction {
+    UseExisting,
+    SpawnThenConnect,
+    DegradeNoSpawn,
+}
 
 /// connect 試行結果と「このプロセスで spawn 済みか」から次アクションを決める純粋関数。
 pub fn decide(connected: bool, already_spawn_attempted: bool) -> EngineAction {
-    if connected { EngineAction::UseExisting }
-    else if already_spawn_attempted { EngineAction::DegradeNoSpawn }
-    else { EngineAction::SpawnThenConnect }
+    if connected {
+        EngineAction::UseExisting
+    } else if already_spawn_attempted {
+        EngineAction::DegradeNoSpawn
+    } else {
+        EngineAction::SpawnThenConnect
+    }
 }
 
 use windows::core::HSTRING;
@@ -41,7 +49,11 @@ pub struct ReconnectBackoff {
 
 impl ReconnectBackoff {
     pub fn new() -> Self {
-        Self { failures: 0, next_allowed: None, probe_suppressed: false }
+        Self {
+            failures: 0,
+            next_allowed: None,
+            probe_suppressed: false,
+        }
     }
 
     /// 現在ログ用に保持している失敗回数。
@@ -94,7 +106,10 @@ impl ReconnectBackoff {
 /// プロセス跨ぎで「engine singleton 起動」を直列化する best-effort RAII ガード。
 /// acquire 中に他ホストが既に起こしていれば、呼び出し側は再接続で拾える。
 /// 取得できなくても起動は進める（最悪 engine が一時的に2個＝既知の軽微な限界）。
-pub struct SpawnGuard { handle: Option<HANDLE>, owned: bool }
+pub struct SpawnGuard {
+    handle: Option<HANDLE>,
+    owned: bool,
+}
 impl SpawnGuard {
     pub fn acquire(pipe: &str) -> Self {
         let name = format!("Global\\nospacekey-spawn-{}", pipe.replace('\\', "_"));
@@ -109,9 +124,15 @@ impl SpawnGuard {
                     // WAIT_ABANDONED means the previous owner died holding the mutex; we still
                     // own it and must release it in Drop, otherwise the lock leaks permanently.
                     let owned = r == WAIT_OBJECT_0 || r == WAIT_ABANDONED;
-                    Self { handle: Some(h), owned }
+                    Self {
+                        handle: Some(h),
+                        owned,
+                    }
                 }
-                Err(_) => Self { handle: None, owned: false },
+                Err(_) => Self {
+                    handle: None,
+                    owned: false,
+                },
             }
         }
     }
@@ -120,7 +141,9 @@ impl Drop for SpawnGuard {
     fn drop(&mut self) {
         if let Some(h) = self.handle.take() {
             unsafe {
-                if self.owned { let _ = ReleaseMutex(h); }
+                if self.owned {
+                    let _ = ReleaseMutex(h);
+                }
                 let _ = CloseHandle(h);
             }
         }
@@ -132,10 +155,10 @@ mod decide_tests {
     use super::*;
     #[test]
     fn decide_table() {
-        assert_eq!(decide(true,  false), EngineAction::UseExisting);
-        assert_eq!(decide(true,  true ), EngineAction::UseExisting);
+        assert_eq!(decide(true, false), EngineAction::UseExisting);
+        assert_eq!(decide(true, true), EngineAction::UseExisting);
         assert_eq!(decide(false, false), EngineAction::SpawnThenConnect);
-        assert_eq!(decide(false, true ), EngineAction::DegradeNoSpawn);
+        assert_eq!(decide(false, true), EngineAction::DegradeNoSpawn);
     }
 }
 

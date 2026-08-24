@@ -86,6 +86,25 @@ final class EngineHostHandlerTests: XCTestCase {
         XCTAssertEqual(resultTag(handler(1, Data(#"{"method":"ClearLearning"}"#.utf8))), "Ok")
     }
 
+    func testClearLearningFailureIsReturnedAsIpcError() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nospacekey-clear-error-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileSystem = LearningFileSystem(
+            list: { _ in throw NSError(domain: "EngineHostHandlerTests", code: 1) },
+            remove: { _ in }
+        )
+        let svc = ConversionService(
+            config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+            learning: LearningSettings(enabled: false, memoryDir: dir),
+            fileSystem: fileSystem)
+        let handler = makeEngineHandler(service: svc, serviceLock: NSLock())
+
+        let outcome = handler(1, Data(#"{"method":"ClearLearning"}"#.utf8))
+        XCTAssertEqual(resultTag(outcome), "Error")
+    }
+
     // 訂正昇格: RecordCorrection の decode→dispatch→反映。reading/surface は switch の
     // 位置バインドなので、入れ替えバグはこの end-to-end 観測でしか検出できない
     // （reading をかな・surface を漢字にして、入れ替わると かなフィルタで棄却され lookup が nil になる）。
@@ -180,6 +199,31 @@ final class EngineHostHandlerTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 2), .success,
                        "ReloadDictionary ハンドラが converterLock を待っている")
         XCTAssertEqual(resultTag((reply.data ?? Data(), false)), "Ok")
+    }
+
+    // 巡3 Z8/D5: ReloadConfig は converterLock が warm-up/変換中で取れないとき busy を
+    // Error("reload busy ...") で返す — 無条件 .ok を返す成功詐称（旧実装）への回帰固定。
+    // beginConverterLockHoldForTesting で busy 条件を決定的に作る（ReloadDictionary 版と同型）。
+    func testReloadConfigBusyReturnsErrorNotOk() {
+        let svc = makeService()
+        let handler = makeEngineHandler(service: svc, serviceLock: NSLock())
+        let release = svc.beginConverterLockHoldForTesting()
+        defer { release() }
+        let reply = ReplyBox()
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            let out = handler(1, Data(#"{"method":"ReloadConfig","params":{"llm_enabled":false,"llm_api_key":"","llm_endpoint":"","llm_model":"","llm_prompt":"","llm_timeout_ms":15000,"zenzai_enabled":false,"zenzai_weight":""}}"#.utf8))
+            reply.data = out.reply
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 2), .success,
+                       "ReloadConfig ハンドラが converterLock を待っている（非ブロックのはず）")
+        let data = reply.data ?? Data()
+        XCTAssertEqual(resultTag((data, false)), "Error")
+        let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let message = obj?["message"] as? String ?? ""
+        XCTAssertTrue(message.hasPrefix("reload busy"),
+                      "busy の Error であるべき（actual: \(message)）— .ok に戻すデグレ")
     }
 
     func testCrossConnectionSessionAccessIsDeniedAsNoSession() {
