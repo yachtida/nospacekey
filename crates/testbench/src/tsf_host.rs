@@ -4,12 +4,13 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use windows::core::{w, Interface};
+use windows::core::{s, w, Error, Interface, HRESULT};
 use windows::Win32::Foundation::{FALSE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::TextServices::ITfUIElementSink;
@@ -17,8 +18,8 @@ use windows::Win32::UI::TextServices::{
     CLSID_TF_InputProcessorProfiles, CLSID_TF_ThreadMgr, ITfCandidateListUIElement,
     ITfCandidateListUIElementBehavior, ITfCompartmentMgr, ITfContext, ITfDocumentMgr,
     ITfInputProcessorProfileMgr, ITfInputProcessorProfiles, ITfKeystrokeMgr, ITfSource,
-    ITfThreadMgr, ITfUIElementMgr, GUID_COMPARTMENT_KEYBOARD_DISABLED,
-    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_TFCAT_TIP_KEYBOARD,
+    ITfThreadMgr, ITfUIElementMgr, InputScope, GUID_COMPARTMENT_KEYBOARD_DISABLED,
+    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_TFCAT_TIP_KEYBOARD, IS_TEXT,
     TF_INPUTPROCESSORPROFILE, TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE, TF_IPPMF_ENABLEPROFILE,
     TF_IPP_FLAG_ACTIVE, TF_IPP_FLAG_ENABLED, TF_PROFILETYPE_INPUTPROCESSOR,
 };
@@ -31,6 +32,22 @@ use ids::{CLSID_NOSPACEKEY, LANGID_JA, PROFILE_NOSPACEKEY};
 
 use crate::text_store::{HarnessTextStore, StoreState};
 use crate::uielement_sink::{SinkLog, UiElementSink};
+
+fn set_test_input_scope(hwnd: HWND, inputscope: InputScope) -> windows::core::Result<()> {
+    type SetInputScopeFn = unsafe extern "system" fn(HWND, InputScope) -> HRESULT;
+    unsafe {
+        // inputscope.h exports SetInputScope from Msctf.dll, but some Windows
+        // SDK installations do not expose msctf.lib on the Rust linker path.
+        // Resolve the system API dynamically and keep the module loaded for the
+        // short-lived testbench process.
+        let module = LoadLibraryW(w!("Msctf.dll"))?;
+        let Some(proc) = GetProcAddress(module, s!("SetInputScope")) else {
+            return Err(Error::from_thread());
+        };
+        let set_input_scope: SetInputScopeFn = core::mem::transmute(proc);
+        set_input_scope(hwnd, inputscope).ok()
+    }
+}
 
 thread_local! {
     // --own-desktop: enter_own_desktop が成功したら true。ensure_foreground_window が
@@ -293,21 +310,38 @@ fn ensure_foreground_window() -> windows::core::Result<HWND> {
         FOREGROUND_HWND.with(|c| c.set(h.0 as isize));
         h
     };
-    let fg_ok = unsafe { SetForegroundWindow(hwnd).as_bool() };
-    // --own-desktop: 専用デスクトップは入力デスクトップでないため SetForegroundWindow が
-    // 失敗/無意味になりうる。msctf のフォーカス追跡はスレッドキューのアクティブ/フォーカス
-    // 状態を見るので、キュー内状態を明示的に立てて「前面フォーカスを持つ窓」を成立させる。
-    if OWN_DESKTOP.with(|c| c.get()) {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
-        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-        unsafe {
-            let _ = SetActiveWindow(hwnd);
-            let _ = SetFocus(Some(hwnd));
-            // DIAG: 前面状態の実測(own-desktop の関門切り分け用)。
-            let fg = GetForegroundWindow();
+    // SetForegroundWindow 単独では、呼出し元の Codex/terminal が前面ロックを保持していると
+    // best-effort の false で終わり、AdviseKeyEventSink(fForeground=true) へ一切キーが届かない。
+    // 現在の前面スレッドへ入力キューを短時間だけ接続し、自ウィンドウを active/focus/foreground
+    // にしてすぐ切り離す。これは testbench の実機ゲート専用で、TIP 製品コードには入らない。
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let current_thread = GetCurrentThreadId();
+        let foreground_before = GetForegroundWindow();
+        let foreground_thread = if foreground_before.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground_before, None)
+        };
+        let attached = foreground_thread != 0
+            && foreground_thread != current_thread
+            && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetActiveWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+        let fg_ok = SetForegroundWindow(hwnd).as_bool();
+        if attached {
+            let _ = AttachThreadInput(current_thread, foreground_thread, false);
+        }
+        let foreground_after = GetForegroundWindow();
+        if foreground_after != hwnd {
             eprintln!(
-                "DIAG own-desktop: SetForegroundWindow ok={fg_ok} GetForegroundWindow={:?} self={:?} is_self={}",
-                fg, hwnd, fg == hwnd
+                "DIAG foreground: attached={attached} set_ok={fg_ok} before={:?} after={:?} self={:?}",
+                foreground_before, foreground_after, hwnd
             );
         }
     }
@@ -326,17 +360,22 @@ impl TsfHost {
             // msctf が TIP を活性化するには「前面フォーカスを持つ実ウィンドウ」を持つスレッド
             // である必要がある（TIP の AdviseKeyEventSink(fForeground=true) も前面を要求）。
             // 窓はプロセスで 1 枚を前面維持して再利用する（毎回作り直すと前面ロックで失敗する）。
-            ensure_foreground_window()?;
+            let hwnd = ensure_foreground_window()?;
             pump();
 
             // doc/context を自前 store で生成。
-            let (store_if, store) = HarnessTextStore::create();
+            let (store_if, store) = HarnessTextStore::create(hwnd);
             let doc_mgr: ITfDocumentMgr = thread_mgr.CreateDocumentMgr()?;
             let mut ctx: Option<ITfContext> = None;
             let mut ec: u32 = 0;
             doc_mgr.CreateContext(tid, 0, &store_if, &mut ctx, &mut ec)?;
             let ctx = ctx.expect("CreateContext で ITfContext が None");
             doc_mgr.Push(&ctx)?;
+            // Real text controls attach an explicit non-sensitive input scope
+            // to their HWND. Prediction intentionally fails closed when the
+            // scope is unknown, so the harness must model an ordinary text
+            // field rather than relying on an absent property.
+            set_test_input_scope(hwnd, IS_TEXT)?;
             pump();
 
             // 登録済み nospacekey プロファイルを自スレッドへ適用（Activate→AdviseKeyEventSink）。
@@ -557,25 +596,25 @@ impl TsfHost {
         eaten
     }
 
-    /// conversion-mode compartment の現在値が直接入力(=NATIVE ビットが立っていない)か。
-    pub fn conversion_is_direct(&self) -> bool {
-        unsafe {
-            let cm: ITfCompartmentMgr = match self.thread_mgr.cast() {
-                Ok(c) => c,
-                Err(_) => return false,
-            };
-            let comp = match cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) {
-                Ok(c) => c,
-                Err(_) => return false,
-            };
-            match comp.GetValue() {
-                Ok(v) => {
-                    let n = i32::try_from(&v).unwrap_or(1);
-                    n & 0x1 == 0
-                }
-                Err(_) => false,
-            }
+    /// TIP の実効モードを、通常文字キーが処理対象になるかで観測する。
+    /// conversion compartment は TIP の `direct_mode_owned` と食い違うホストがあるため、
+    /// モード遷移の成否判定にはこちらを使う。TestKeyDown だけなので文書は変更しない。
+    /// Nospacekey 以外のプロファイルがアクティブなら TestKeyDown=false を direct と誤認せず None。
+    fn effective_mode_is_direct(&self) -> Option<bool> {
+        let mut active = TF_INPUTPROCESSORPROFILE::default();
+        if unsafe {
+            self.profiles
+                .GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &mut active)
         }
+        .is_err()
+            || active.clsid != CLSID_NOSPACEKEY
+            || active.guidProfile != PROFILE_NOSPACEKEY
+        {
+            return None;
+        }
+        let w = WPARAM(0x41); // A
+        let l = LPARAM(0x0001_0001);
+        Some(!unsafe { self.ksm.TestKeyDown(w, l).unwrap_or(FALSE).as_bool() })
     }
 
     fn transition_mode(&self, target_direct: bool, label: &str) -> bool {
@@ -586,11 +625,24 @@ impl TsfHost {
         std::thread::sleep(settle);
         pump();
 
-        let before = self.conversion_is_direct();
-        // compartment だけでは TIP の direct_mode_owned/langbar Cell を観測できない。
-        // まず必ず 1 回トグルして TIP 自身に実効状態を書かせ、目標と逆へ出た場合だけ
-        // guard 後にもう 1 回トグルして目標へ戻す。一時的な TSF フォーカス喪失では
-        // preserved key 自体が eaten=false になるため、各試行前に focus を回収して有界 retry する。
+        self.reclaim_focus();
+        let Some(before) = self.effective_mode_is_direct() else {
+            eprintln!(
+                "DIAG mode_transition: label={label} target_direct={target_direct} \
+                 ok=false reason=inactive_profile"
+            );
+            return false;
+        };
+        if before == target_direct {
+            eprintln!(
+                "DIAG mode_transition: label={label} before_direct={before} \
+                 target_direct={target_direct} attempts=0 accepted=0 after_direct={before} ok=true"
+            );
+            return true;
+        }
+        // 実効状態が目標と異なる場合だけ TIP 自身の preserved-key 経路でトグルする。
+        // 一時的な TSF フォーカス喪失では preserved key 自体が eaten=false になるため、
+        // 各試行前に focus を回収して有界 retry する。
         let mut after = before;
         let mut accepted = 0u8;
         let mut attempts = 0u8;
@@ -605,7 +657,14 @@ impl TsfHost {
             // 落ちないところまで待つ（item13 C / item38 がこの契約を必要とする）。
             std::thread::sleep(settle);
             pump();
-            after = self.conversion_is_direct();
+            let Some(observed) = self.effective_mode_is_direct() else {
+                eprintln!(
+                    "DIAG mode_transition_attempt: label={label} attempt={attempt} eaten={eaten} \
+                     state=inactive_profile"
+                );
+                continue;
+            };
+            after = observed;
             eprintln!(
                 "DIAG mode_transition_attempt: label={label} attempt={attempt} eaten={eaten} \
                  after_direct={after}"
@@ -681,6 +740,7 @@ impl TsfHost {
     /// （TestKeyDown が direct モードでも false を返す）。自分のドキュメントへ SetFocus し直して
     /// フォーカス/配送を取り戻す。クリーン VM では奪うアプリが居ないので実質 no-op。
     pub fn reclaim_focus(&self) {
+        let _ = ensure_foreground_window();
         unsafe {
             let _ = self.thread_mgr.SetFocus(&self.doc_mgr);
         }

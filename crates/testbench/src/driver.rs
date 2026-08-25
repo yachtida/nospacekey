@@ -2,7 +2,9 @@
 
 use crate::scenarios::{typed, Vk};
 use crate::tsf_host::TsfHost;
-use std::time::Instant;
+use ipc::client::{stable_pipe_name, EngineClient};
+use ipc::protocol::{Request, Response};
+use std::time::{Duration, Instant};
 
 /// 1 シナリオの観測結果。
 pub struct StepObs {
@@ -240,13 +242,14 @@ pub struct Item13Result {
 
 /// item13 経路 C のイベント位置照合（純ロジック、TSF 不要でテスト可能）。
 ///
-/// 「最初の reconvert_shown(latin) より **後ろ** に reconvert_cancel が出ているか」を返す。
+/// 「対象文字数が一致する最初の reconvert_shown より **後ろ** に reconvert_cancel が出ているか」を返す。
 /// トグルが reconvert を畳んだ証跡を「素通しの偶発キャンセル」と区別するための核。
-/// latin が見つからない／キャンセルが先に出ている／どちらも無い場合は false。
-fn cancel_followed_shown(evs: &[Ev], latin: &str) -> bool {
-    let shown = evs
-        .iter()
-        .position(|e| matches!(e, Ev::ReconvertShown { latin: l, .. } if l == latin));
+/// shown が見つからない／キャンセルが先に出ている／どちらも無い場合は false。
+fn cancel_followed_shown(evs: &[Ev], expected_chars: usize) -> bool {
+    let shown = evs.iter().position(|e| {
+        matches!(e, Ev::ReconvertShown { kind, chars, .. }
+            if kind == "latin" && *chars == expected_chars)
+    });
     let cancel = evs.iter().rposition(|e| matches!(e, Ev::ReconvertCancel));
     matches!((shown, cancel), (Some(s), Some(c)) if c > s)
 }
@@ -262,7 +265,7 @@ fn cancel_followed_shown(evs: &[Ev], latin: &str) -> bool {
 /// 3) 変換キー（VK_CONVERT 0x1C）を注入。PreserveKey(0x1C) は OS に拒否され preserved key に
 ///    ならない（実バグ）ため、msctf は通常キーとして OnTestKeyDown/OnKeyDown へ配送 →
 ///    VK_CONVERT arm → start_reconvert。ReconvertStart が末尾ラテン run "nihongo" を range 読み戻しし
-///    （ev=reconvert_shown latin=nihongo）、その range で非空 StartComposition（store の
+///    （ev=reconvert_shown chars=7）、その range で非空 StartComposition（store の
 ///    OnStartComposition → composing=true）、g1 リプレイで候補（日本語…）を preedit へ。
 /// 4-A) Esc → cancel_reconvert → RestoreText で元ラテンを書き戻し composition を閉じる
 ///      → 文書が "React nihongo" へ復元（ev=reconvert_cancel）。
@@ -274,7 +277,7 @@ fn cancel_followed_shown(evs: &[Ev], latin: &str) -> bool {
 ///
 /// 自己証明（偽 PASS 防止）:
 ///   - preserved-key が食われた（reconvert_eaten=true）こと。
-///   - ev=reconvert_shown が出て latin=nihongo（range 読み戻しが効いた）こと。
+///   - ev=reconvert_shown が出て chars=7（range 読み戻しが効いた）こと。
 ///   - 再変換中に composing=true（非空 StartComposition が成立した）こと。
 ///
 /// これらが無いと「0x1C が素通ししただけで文書はもとから React nihongo のまま」でも
@@ -314,7 +317,7 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
 
     let evs_a: Vec<Ev> = read_events(pid).into_iter().skip(base_a).collect();
     let shown = evs_a.iter().find_map(|e| match e {
-        Ev::ReconvertShown { n, latin, .. } => Some((*n, latin.clone())),
+        Ev::ReconvertShown { n, chars, .. } => Some((*n, *chars)),
         _ => None,
     });
 
@@ -363,11 +366,11 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
     // 先に cancel_reconvert（ev=reconvert_cancel ＋ RestoreText 復元 ＋ ラッチクリア）する。
     //
     // 自己証明（C1 修正を revert すると落ちる）:
-    //   - C-2: トグル前に必ず reconvert_shown(latin=nihongo) が出る（候補が確実に上がっている）。
+    //   - C-2: トグル前に必ず reconvert_shown(chars=7) が出る（候補が確実に上がっている）。
     //   - C-3a: トグル後に reconvert_cancel が「その reconvert_shown より後ろの位置」で出る
     //           （cancel_reconvert がトグルに連動して呼ばれた＝ラッチが畳まれた証跡）。
     //           ＋文書が "React nihongo" へ復元（RestoreText が走った＝composition も閉じた）。
-    //   - C-4: 再度（direct へ戻して）再変換すると **2 本目の** reconvert_shown(latin=nihongo)
+    //   - C-4: 再度（direct へ戻して）再変換すると **2 本目の** reconvert_shown(chars=7)
     //          が出る。バグ版はラッチが true のまま残り再入ガードで return するので 2 本目は
     //          絶対に出ない＝この存在チェックが偽 PASS を許さない。
     host.store.reset();
@@ -383,7 +386,7 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
     // この経路で最初に出た reconvert_shown の位置（base_c 起点の相対 index）。
     let shown1_pos = evs_c1
         .iter()
-        .position(|e| matches!(e, Ev::ReconvertShown { latin, .. } if latin == "nihongo"));
+        .position(|e| matches!(e, Ev::ReconvertShown { chars: 7, .. }));
 
     // C-2) 候補表示中にモードトグル（VK_NONCONVERT 0x1D）。C1 修正なら cancel_reconvert→toggle。
     let toggle_eaten_c = host.feed_key(0x1D); // VK_NONCONVERT
@@ -395,10 +398,10 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
     let cancel_pos = evs_c2
         .iter()
         .rposition(|e| matches!(e, Ev::ReconvertCancel));
-    let cancel_after_shown = cancel_followed_shown(&evs_c2, "nihongo");
+    let cancel_after_shown = cancel_followed_shown(&evs_c2, 7);
 
     // C-3) 機能がブリックしていないことの証明: direct へ戻して再シード → もう一度再変換 →
-    //      2 本目の reconvert_shown(latin=nihongo) が出る（ラッチが残っていたら出ない）。
+    //      2 本目の reconvert_shown(chars=7) が出る（ラッチが残っていたら出ない）。
     host.reclaim_focus(); // 実機フレーク防御: 奪われた配送/フォーカスを取り戻してから再変換する。
     let direct_c2 = host.enter_direct_mode(); // トグルで native へ移ったので direct へ戻す。
     host.store.seed_committed("React nihongo");
@@ -408,7 +411,7 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
     let evs_c3: Vec<Ev> = read_events(pid).into_iter().skip(mid_c).collect();
     let second_shown = evs_c3
         .iter()
-        .any(|e| matches!(e, Ev::ReconvertShown { latin, .. } if latin == "nihongo"));
+        .any(|e| matches!(e, Ev::ReconvertShown { chars: 7, .. }));
     // 後片付け（2 本目の候補を閉じて次 item / Drop へ綺麗な状態で渡す）。
     let _ = host.feed_key(0x1B); // Esc
                                  // conversion-mode compartment はプロセス共有で direct のまま残るので、後続 scenario が
@@ -426,9 +429,9 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
          recon_eaten_c2={recon_eaten_c2} composing_c2={composing_c2} second_shown={second_shown}"
     );
 
-    // 経路 A 必須: preserved-key 発火（食われ）＋ reconvert_shown（latin=nihongo）＋ 合成成立
+    // 経路 A 必須: preserved-key 発火（食われ）＋ reconvert_shown（chars=7）＋ 合成成立
     //              ＋ Esc 復元（文書が "React nihongo" へ戻る）＋ ev=reconvert_cancel。
-    let shown_ok = matches!(&shown, Some((n, latin)) if *n >= 1 && latin == "nihongo");
+    let shown_ok = matches!(&shown, Some((n, chars)) if *n >= 1 && *chars == 7);
     // 復元後キャレットが復元文字列の末尾にあること（"nihongo" は文書末なので文書末 == 末尾）。
     // RestoreText が末尾へ SetSelection しないと先頭（合成開始位置）へ戻り、この条件が落ちる。
     let restored_end = restored.encode_utf16().count() as i32;
@@ -446,7 +449,7 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
         && committed_b != "React nihongo";
 
     // 経路 C 必須（C1 修正のロック）:
-    //   - 1 本目の reconvert_shown(latin=nihongo) が出た（トグル前に候補が確実に上がっていた）。
+    //   - 1 本目の reconvert_shown(chars=7) が出た（トグル前に候補が確実に上がっていた）。
     //   - トグル後に reconvert_cancel が「その shown より後ろ」で出た（=トグルが畳んだ）。
     //   - 文書が "React nihongo" へ復元され、トグル後は合成中でない（composition が閉じた）。
     //   - 2 本目の reconvert_shown が出た（ラッチが残らず再変換が再び発火＝ブリックしていない）。
@@ -507,7 +510,9 @@ pub fn run_item17(host: &TsfHost) -> Item17Result {
     let base = read_events(pid).len();
     host.feed_key(0x1C); // VK_CONVERT
     let evs = read_events(pid);
-    let surface_shown = evs[base..].iter().any(|e| matches!(e, Ev::ReconvertShown { kind, latin, .. } if kind == "surface" && latin == "にほんご"));
+    let surface_shown = evs[base..]
+        .iter()
+        .any(|e| matches!(e, Ev::ReconvertShown { kind, chars: 4, .. } if kind == "surface"));
 
     // Esc → 復元
     host.feed_key(0x1B); // VK_ESCAPE
@@ -1216,6 +1221,186 @@ pub fn run_item31(host: &TsfHost) -> Item31Result {
     Item31Result { passed, detail }
 }
 
+pub struct Item32Result {
+    pub passed: bool,
+    pub detail: String,
+}
+
+fn wait_for_prediction_preedit(host: &TsfHost) -> String {
+    for _ in 0..30 {
+        host.settle_debounce();
+        let preedit = host.store.preedit();
+        if !preedit.is_empty() {
+            return preedit;
+        }
+    }
+    String::new()
+}
+
+fn commit_prediction_context(host: &TsfHost, romanized: &str) -> bool {
+    let before = host.store.committed().chars().count();
+    for _ in 0..4 {
+        for key in typed(romanized) {
+            let _ = host.feed_key(key.0);
+        }
+        host.settle_debounce();
+        let _ = host.feed_key(0x20); // Space: explicit candidate selection
+        let _ = host.feed_key(0x0D); // Enter: explicit full commit
+        if host
+            .store
+            .committed()
+            .chars()
+            .count()
+            .saturating_sub(before)
+            >= 8
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn wait_for_prediction_runtime_ready() -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let pipe = stable_pipe_name();
+    let mut client = loop {
+        match EngineClient::connect_to(&pipe, Duration::from_millis(500)) {
+            Ok(client) => break client,
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("engine connect failed: {:?}", error.kind())),
+        }
+    };
+    let session = match client.request(&Request::StartSession) {
+        Ok(Response::Session { session, .. }) => session,
+        Ok(_) => return Err("engine returned an unexpected StartSession response".into()),
+        Err(error) => return Err(format!("StartSession failed: {:?}", error.kind())),
+    };
+    let token_ids = vec![
+        1, 46_275, 30_751, 55_574, 31_120, 29_314, 30_857, 78_564, 78_466, 66_700, 99_248,
+    ];
+    let result = loop {
+        let request = Request::Predict {
+            session,
+            seq: 1,
+            token_ids: token_ids.clone(),
+        };
+        match client.request(&request) {
+            Ok(Response::Prediction { .. }) => break Ok(()),
+            Ok(Response::PredictionUnavailable { state, .. }) if state == "loading" => {
+                if Instant::now() >= deadline {
+                    break Err("prediction runtime readiness timed out".into());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(Response::PredictionUnavailable { state, .. }) => {
+                break Err(format!("prediction runtime unavailable: {state}"));
+            }
+            Ok(_) => break Err("prediction runtime returned an unexpected response".into()),
+            Err(error) => {
+                break Err(format!(
+                    "prediction readiness request failed: {:?}",
+                    error.kind()
+                ))
+            }
+        }
+    };
+    let _ = client.request(&Request::EndSession { session });
+    result
+}
+
+/// item32: real TSF composition path for inline prediction: show, accept, dismiss and focus-stale.
+/// This explicit mode needs the pinned model/runtime and opt-in setting, so it is not part of the
+/// model-free default scenario suite.
+pub fn run_item32(host: &TsfHost) -> Item32Result {
+    let pid = std::process::id();
+    let _ = host.normalize_native_mode();
+    host.warm_up();
+    if let Err(error) = wait_for_prediction_runtime_ready() {
+        return Item32Result {
+            passed: false,
+            detail: error,
+        };
+    }
+    host.store.reset();
+    let base = read_events(pid).len();
+
+    let first_context_ready = commit_prediction_context(host, "kyouhaasakaraame");
+    let committed_before = host.store.committed();
+    let first_ghost = wait_for_prediction_preedit(host);
+    let accepted_eaten = host.feed_key(0x27); // Right
+    let committed_after = host.store.committed();
+
+    let second_ghost = wait_for_prediction_preedit(host); // accept re-arms prediction
+    let dismissed_eaten = host.feed_key(0x1B); // Esc
+    host.settle_debounce();
+    let empty_after_dismiss = host.store.preedit().is_empty();
+
+    // A pending/re-armed result must not survive a document focus transition.
+    let focus_ok = host.lose_and_regain_focus().is_ok();
+    for _ in 0..10 {
+        host.settle_debounce();
+    }
+    let empty_after_focus = host.store.preedit().is_empty();
+
+    // Force the prediction-only TSF edit session to be rejected after a valid explicit commit.
+    // The field must stay empty and ordinary IME input must remain usable after the lock clears.
+    let rejection_context_ready = commit_prediction_context(host, "ashitamokaigi");
+    host.store.force_lock_rejection(true);
+    for _ in 0..10 {
+        host.settle_debounce();
+    }
+    host.store.force_lock_rejection(false);
+    let empty_after_error = host.store.preedit().is_empty();
+    let input_after_error = host.feed_key(0x41); // A: prediction failure must not disable IME input.
+    let normal_input_after_error = input_after_error && !host.store.preedit().is_empty();
+    let _ = host.feed_key(0x1B);
+    let events: Vec<Ev> = read_events(pid).into_iter().skip(base).collect();
+    let log =
+        std::path::Path::new(&std::env::var("TEMP").unwrap_or_default()).join("nospacekey-tip.log");
+    let pid_tag = format!("[pid {pid}]");
+    let log_text = std::fs::read_to_string(log).unwrap_or_default();
+    let accepted_logged = log_text
+        .lines()
+        .any(|line| line.contains(&pid_tag) && line.contains("ev=prediction_accept"));
+    let dismissed_logged = log_text
+        .lines()
+        .any(|line| line.contains(&pid_tag) && line.contains("ev=prediction_dismiss"));
+
+    let passed = first_context_ready
+        && rejection_context_ready
+        && !committed_before.is_empty()
+        && !first_ghost.is_empty()
+        && accepted_eaten
+        && committed_after.chars().count() > committed_before.chars().count()
+        && !second_ghost.is_empty()
+        && dismissed_eaten
+        && empty_after_dismiss
+        && focus_ok
+        && empty_after_focus
+        && empty_after_error
+        && normal_input_after_error
+        && accepted_logged
+        && dismissed_logged
+        && events
+            .iter()
+            .any(|event| matches!(event, Ev::Commit { source, .. } if source == "candidate"));
+    let detail = format!(
+        "first_context_ready={first_context_ready} rejection_context_ready={rejection_context_ready} \
+         committed_before_len={} first_ghost_len={} accepted_eaten={accepted_eaten} \
+         committed_after_len={} second_ghost_len={} dismissed_eaten={dismissed_eaten} \
+         empty_after_dismiss={empty_after_dismiss} focus_ok={focus_ok} \
+         empty_after_focus={empty_after_focus} empty_after_error={empty_after_error} \
+         normal_input_after_error={normal_input_after_error} \
+         accept_log={accepted_logged} dismiss_log={dismissed_logged}",
+        committed_before.chars().count(), first_ghost.chars().count(),
+        committed_after.chars().count(), second_ghost.chars().count(),
+    );
+    Item32Result { passed, detail }
+}
+
 /// 溜まった WM_TIMER / post を drain する小ヘルパ（Behavior の notify→確定反映を確実にする）。
 /// settle_debounce は内部で sleep + pump するので、それを数回繰り返してホスト発の確定 post を捌く。
 fn pump_settle(host: &TsfHost) {
@@ -1264,11 +1449,11 @@ pub fn run_item9(host: &mut TsfHost) -> (bool, bool) {
 mod tests {
     use super::{cancel_followed_shown, Ev};
 
-    fn shown(latin: &str) -> Ev {
+    fn shown(chars: usize) -> Ev {
         Ev::ReconvertShown {
             n: 3,
             kind: "latin".into(),
-            latin: latin.into(),
+            chars,
         }
     }
     fn cancel() -> Ev {
@@ -1283,41 +1468,41 @@ mod tests {
     #[test]
     fn cancel_after_matching_shown_is_true() {
         // shown(nihongo) → cancel の順。トグルが畳んだ正常系。
-        let evs = vec![shown("nihongo"), cancel()];
-        assert!(cancel_followed_shown(&evs, "nihongo"));
+        let evs = vec![shown(7), cancel()];
+        assert!(cancel_followed_shown(&evs, 7));
     }
 
     #[test]
     fn cancel_before_shown_is_false() {
         // cancel が先、shown が後（前経路の残骸など）。トグル連動とは認めない。
-        let evs = vec![cancel(), shown("nihongo")];
-        assert!(!cancel_followed_shown(&evs, "nihongo"));
+        let evs = vec![cancel(), shown(7)];
+        assert!(!cancel_followed_shown(&evs, 7));
     }
 
     #[test]
     fn shown_without_cancel_is_false() {
         // C1 修正を revert したバグ版を模す: トグルしても cancel が出ない。
-        let evs = vec![shown("nihongo")];
-        assert!(!cancel_followed_shown(&evs, "nihongo"));
+        let evs = vec![shown(7)];
+        assert!(!cancel_followed_shown(&evs, 7));
     }
 
     #[test]
     fn cancel_without_matching_shown_is_false() {
-        // latin が一致する shown が無ければ false（別 latin の候補だけ＋cancel）。
-        let evs = vec![shown("react"), cancel()];
-        assert!(!cancel_followed_shown(&evs, "nihongo"));
+        // 文字数が一致する shown が無ければ false（別対象の候補だけ＋cancel）。
+        let evs = vec![shown(5), cancel()];
+        assert!(!cancel_followed_shown(&evs, 7));
     }
 
     #[test]
     fn empty_is_false() {
-        assert!(!cancel_followed_shown(&[], "nihongo"));
+        assert!(!cancel_followed_shown(&[], 7));
     }
 
     #[test]
     fn uses_first_shown_and_last_cancel() {
         // 1 本目 shown → cancel（トグル畳み）→ 2 本目 shown（再変換が再び発火）。
         // 最初の shown(0) より後ろに cancel(1) が居るので true。
-        let evs = vec![shown("nihongo"), cancel(), shown("nihongo")];
-        assert!(cancel_followed_shown(&evs, "nihongo"));
+        let evs = vec![shown(7), cancel(), shown(7)];
+        assert!(cancel_followed_shown(&evs, 7));
     }
 }

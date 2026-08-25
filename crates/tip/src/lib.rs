@@ -14,6 +14,7 @@ pub(crate) mod engine_link;
 mod focus;
 mod globals;
 mod input_state;
+// Task 4 wires the model-free state/worker to the runtime IPC.
 mod key_event_sink;
 mod keymap;
 mod langbar;
@@ -22,6 +23,10 @@ mod llm_worker;
 mod mode_hud;
 mod popup;
 mod power;
+#[allow(dead_code)]
+mod prediction_state;
+#[allow(dead_code)]
+mod prediction_worker;
 mod reading_monitor;
 mod register;
 mod render;

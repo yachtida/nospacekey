@@ -51,11 +51,11 @@ pub enum Ev {
     ReadingMonitor {
         action: String,
     },
-    /// SP5 再変換が候補を出した。n=候補数, kind=latin|surface（経路）, latin=対象になった元文字列。
+    /// SP5 再変換が候補を出した。n=候補数, kind=latin|surface（経路）, chars=対象文字数。
     ReconvertShown {
         n: usize,
         kind: String,
-        latin: String,
+        chars: usize,
     },
     /// SP5 再変換が取消され元文字列を復元した（Esc→cancel_reconvert）。
     ReconvertCancel,
@@ -255,8 +255,8 @@ fn parse_one(body: &str) -> Option<Ev> {
     if body.starts_with("ev=reconvert_shown") {
         let n = kv(body, "n").and_then(|s| s.parse().ok()).unwrap_or(0);
         let kind = kv(body, "kind").unwrap_or("latin").to_string();
-        let latin = kv(body, "latin").unwrap_or("").to_string();
-        return Some(Ev::ReconvertShown { n, kind, latin });
+        let chars = kv(body, "chars").and_then(|s| s.parse().ok()).unwrap_or(0);
+        return Some(Ev::ReconvertShown { n, kind, chars });
     }
     if body.starts_with("ev=left_context") {
         let len = kv(body, "len").and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -438,15 +438,15 @@ mod tests {
     fn parses_reconvert_events() {
         let pid = std::process::id();
         let lines = vec![
-            format!("[pid {pid}] ev=reconvert_shown n=3 latin=nihongo"),
+            format!("[pid {pid}] ev=reconvert_shown n=3 kind=latin chars=7"),
             format!("[pid {pid}] ev=reconvert_cancel"),
         ];
         let evs = parse_lines(&lines, pid);
         assert_eq!(evs.len(), 2);
         match &evs[0] {
-            Ev::ReconvertShown { n, latin, .. } => {
+            Ev::ReconvertShown { n, chars, .. } => {
                 assert_eq!(*n, 3);
-                assert_eq!(latin, "nihongo");
+                assert_eq!(*chars, 7);
             }
             _ => panic!("expected ReconvertShown"),
         }
@@ -518,17 +518,17 @@ mod tests {
     fn parses_reconvert_kind_and_skip() {
         let pid = std::process::id();
         let lines = vec![
-            format!("[pid {pid}] ev=reconvert_shown n=5 kind=surface latin=にほんご"),
+            format!("[pid {pid}] ev=reconvert_shown n=5 kind=surface chars=4"),
             format!("[pid {pid}] ev=reconvert_skip reason=non_kana"),
-            format!("[pid {pid}] ev=reconvert_shown n=3 latin=nihongo"), // kind 無し → latin 既定
+            format!("[pid {pid}] ev=reconvert_shown n=3 chars=7"), // kind 無し → latin 既定
         ];
         let evs = parse_lines(&lines, pid);
         assert_eq!(evs.len(), 3);
         match &evs[0] {
-            Ev::ReconvertShown { n, kind, latin } => {
+            Ev::ReconvertShown { n, kind, chars } => {
                 assert_eq!(*n, 5);
                 assert_eq!(kind, "surface");
-                assert_eq!(latin, "にほんご");
+                assert_eq!(*chars, 4);
             }
             _ => panic!("expected ReconvertShown"),
         }
@@ -537,9 +537,9 @@ mod tests {
             _ => panic!("expected ReconvertSkip"),
         }
         match &evs[2] {
-            Ev::ReconvertShown { kind, latin, .. } => {
+            Ev::ReconvertShown { kind, chars, .. } => {
                 assert_eq!(kind, "latin");
-                assert_eq!(latin, "nihongo");
+                assert_eq!(*chars, 7);
             }
             _ => panic!("expected ReconvertShown"),
         }

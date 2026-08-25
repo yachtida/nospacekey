@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "NospacekeyConfig",
-  "version": "1.2.2-beta.7",
+  "version": "1.2.2-beta.8",
   "identifier": "jp.nospacekey.config",
   "build": {
     "frontendDist": "ui"
@@ -11,10 +11,10 @@
     "windows": [
       {
         "title": "nospacekey 設定",
-        "width": 780,
-        "height": 560,
-        "minWidth": 680,
-        "minHeight": 480,
+        "width": 920,
+        "height": 640,
+        "minWidth": 760,
+        "minHeight": 520,
         "center": true
       }
     ],

@@ -32,7 +32,11 @@ bundled with this distribution but which a user may optionally download.
 **What it is:** LLM inference library. This distribution bundles the prebuilt
 runtime libraries `llama.dll`, `ggml.dll`, `ggml-base.dll`, and `ggml-cpu.dll`,
 which the engine host loads at runtime to perform Zenzai neural conversion on
-the CPU. Built from the azooKey/llama.cpp fork, tag `b4846`.
+the CPU. Built from the azooKey/llama.cpp fork, tag `b4846`. The optional
+`prediction-runtime` also bundles `llama-server.exe`, `llama-server-impl.dll`,
+`llama-common.dll`, `mtmd.dll`, and the same ggml runtime family, built from
+upstream llama.cpp revision `c060ca974c773c7c3d17fd1b66dc9d312bc292c0` for
+local inline prediction.
 
 **License:** MIT
 
@@ -61,6 +65,29 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+---
+
+## LLM-jp-3-150m
+
+**What it is:** The optional local language model and tokenizer used for inline
+prediction. The app downloads the pinned upstream tokenizer and the project's
+pinned Q8_0 conversion only after an explicit user action; the model is not
+part of the source tree or base installer.
+
+**Source:** `llm-jp/llm-jp-3-150m`, revision
+`b112feef602fff752e4dac4c30af6a2c2fa41c7a`
+
+**Modifications:** The project's redistributed model artifact,
+`llm-jp-3-150m-q8_0-c060ca9.gguf`, was converted to GGUF and quantized to Q8_0
+from that upstream checkpoint using llama.cpp revision
+`c060ca974c773c7c3d17fd1b66dc9d312bc292c0`.
+No fine-tuning or additional training was performed. The tokenizer is
+downloaded unchanged from the pinned upstream revision.
+
+**License:** Apache License, Version 2.0 (full text below)
+
+**Copyright:** LLM-jp contributors
 
 ---
 

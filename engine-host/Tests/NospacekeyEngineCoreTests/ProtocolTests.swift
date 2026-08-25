@@ -145,6 +145,8 @@ final class ProtocolTests: XCTestCase {
             .error("no session"),
             .liveResult(seq: 1, text: "", reading: "", committed: nil),
             .llmResult(seq: 2, text: ""),
+            .prediction(seq: 3, text: ""),
+            .predictionUnavailable(seq: 4, state: "loading"),
             .committed(text: "", reading: ""),              // 全消費（残り読み空）でもフレーム本体は非空
         ]
         for c in cases {
@@ -178,6 +180,36 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(try decode(#"{"method":"EndSession","params":{"session":7}}"#).sessionId, 7)
         XCTAssertEqual(try decode(#"{"method":"LiveConvert","params":{"session":7,"seq":1}}"#).sessionId, 7)
         XCTAssertEqual(try decode(#"{"method":"LlmConvert","params":{"session":7,"seq":1}}"#).sessionId, 7)
+        XCTAssertEqual(try decode(#"{"method":"Predict","params":{"session":7,"seq":2,"token_ids":[1,2]}}"#).sessionId, 7)
+    }
+
+    func testDecodePredictionRequest() throws {
+        let json = #"{"method":"Predict","params":{"session":7,"seq":42,"token_ids":[1,50014,28998,65484,29282]}}"#
+        let req = try JSONDecoder().decode(Request.self, from: Data(json.utf8))
+        guard case .predict(let session, let seq, let tokenIDs) = req else {
+            return XCTFail("not predict: \(req)")
+        }
+        XCTAssertEqual(session, 7)
+        XCTAssertEqual(seq, 42)
+        XCTAssertEqual(tokenIDs, [1, 50_014, 28_998, 65_484, 29_282])
+    }
+
+    func testEncodePredictionResponses() throws {
+        let prediction = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(Response.prediction(seq: 42, text: "会議です"))) as! [String: Any]
+        XCTAssertEqual(prediction["result"] as? String, "Prediction")
+        XCTAssertEqual(prediction["seq"] as? Int, 42)
+        XCTAssertEqual(prediction["text"] as? String, "会議です")
+
+        let unavailable = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(Response.predictionUnavailable(seq: 43, state: "loading"))) as! [String: Any]
+        XCTAssertEqual(unavailable["result"] as? String, "PredictionUnavailable")
+        XCTAssertEqual(unavailable["seq"] as? Int, 43)
+        XCTAssertEqual(unavailable["state"] as? String, "loading")
+    }
+
+    func testPredictionBumpsProtocolGeneration() {
+        XCTAssertEqual(ProtocolVersion.current, 3)
     }
 
     // ---- Shift英語モード: Insert style（Rust protocol.rs のテストと wire 形一致）----
@@ -217,11 +249,11 @@ final class ProtocolTests: XCTestCase {
 
     func testEncodeSessionCarriesProto() throws {
         // 新エンジン: Session 応答に proto を載せる。dict 比較（キー順非保証のためバイト一致比較はしない）。
-        let res = Response.session(7, proto: 2)
+        let res = Response.session(7, proto: 3)
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
         XCTAssertEqual(obj["session"] as? Int, 7)
-        XCTAssertEqual(obj["proto"] as? Int, 2)
+        XCTAssertEqual(obj["proto"] as? Int, 3)
     }
 
     func testEncodeSessionWithoutProtoOmitsKey() throws {

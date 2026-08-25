@@ -12,8 +12,8 @@ use windows::Win32::System::Com::{IDataObject, FORMATETC};
 use windows::Win32::UI::TextServices::{
     ITextStoreACP, ITextStoreACPSink, ITextStoreACP_Impl, ITfCompositionView,
     ITfContextOwnerCompositionSink, ITfContextOwnerCompositionSink_Impl, ITfRange,
-    TEXT_STORE_LOCK_FLAGS, TS_ATTRVAL, TS_E_INVALIDPOS, TS_E_NOLOCK, TS_RT_PLAIN, TS_RUNINFO,
-    TS_SELECTIONSTYLE, TS_SELECTION_ACP, TS_STATUS, TS_TEXTCHANGE,
+    TEXT_STORE_LOCK_FLAGS, TS_ATTRVAL, TS_E_INVALIDPOS, TS_E_NOLOCK, TS_E_SYNCHRONOUS, TS_RT_PLAIN,
+    TS_RUNINFO, TS_SELECTIONSTYLE, TS_SELECTION_ACP, TS_STATUS, TS_TEXTCHANGE,
 };
 
 use crate::doc_state::DocState;
@@ -45,6 +45,7 @@ pub struct StoreState {
     pub doc: DocState,
     sink: RefCell<Option<ITextStoreACPSink>>,
     locked: Cell<bool>,
+    reject_locks: Cell<bool>,
 }
 
 impl StoreState {
@@ -53,11 +54,16 @@ impl StoreState {
             doc: DocState::new(),
             sink: RefCell::new(None),
             locked: Cell::new(false),
+            reject_locks: Cell::new(false),
         }
     }
-    // テスト専用: ロック保持を擬似する。
+    /// 実機 item32 用: アプリ側が文書ロックを保持中の状態を擬似し、TSF の同期ロック要求を拒否する。
+    pub fn force_lock_rejection(&self, v: bool) {
+        self.reject_locks.set(v);
+    }
+    /// SetText/InsertTextAtSelection の単体テストだけで書込ロック保持を擬似する。
     #[cfg(test)]
-    pub fn force_locked(&self, v: bool) {
+    fn force_write_lock(&self, v: bool) {
         self.locked.set(v);
     }
     // ホスト/テストからの委譲（DocState の getter を素通し）。
@@ -97,13 +103,18 @@ impl StoreState {
 #[implement(ITextStoreACP, ITfContextOwnerCompositionSink)]
 pub struct HarnessTextStore {
     st: Rc<StoreState>,
+    hwnd: HWND,
 }
 
 impl HarnessTextStore {
     /// COM インタフェースと、ホストが getter を読むための共有状態を返す。
-    pub fn create() -> (ITextStoreACP, Rc<StoreState>) {
+    pub fn create(hwnd: HWND) -> (ITextStoreACP, Rc<StoreState>) {
         let st = Rc::new(StoreState::new());
-        let store: ITextStoreACP = HarnessTextStore { st: st.clone() }.into();
+        let store: ITextStoreACP = HarnessTextStore {
+            st: st.clone(),
+            hwnd,
+        }
+        .into();
         (store, st)
     }
 }
@@ -121,6 +132,12 @@ impl ITextStoreACP_Impl for HarnessTextStore_Impl {
     }
     /// 同期ロックモデルの核心。即座に OnLockGranted を再入し、S_OK を返す。
     fn RequestLock(&self, dwlockflags: u32) -> Result<HRESULT> {
+        if self.st.reject_locks.get() {
+            hlog(&format!(
+                "RequestLock flags={dwlockflags:#x} rejected=TS_E_SYNCHRONOUS"
+            ));
+            return Ok(TS_E_SYNCHRONOUS);
+        }
         let sink = self
             .st
             .sink
@@ -450,7 +467,7 @@ impl ITextStoreACP_Impl for HarnessTextStore_Impl {
         })
     }
     fn GetWnd(&self, _: u32) -> Result<HWND> {
-        Ok(HWND(std::ptr::null_mut()))
+        Ok(self.hwnd)
     }
 }
 
@@ -487,6 +504,7 @@ impl ITfContextOwnerCompositionSink_Impl for HarnessTextStore_Impl {
 #[cfg(test)]
 mod tests {
     use super::HarnessTextStore;
+    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::TextServices::{
         ITextStoreACP, TS_IAS_NOQUERY, TS_IAS_QUERYONLY, TS_SELECTIONSTYLE, TS_SELECTION_ACP,
         TS_TEXTCHANGE,
@@ -501,9 +519,9 @@ mod tests {
 
     #[test]
     fn insert_query_then_settext_roundtrip() {
-        let (store, st) = HarnessTextStore::create();
+        let (store, st) = HarnessTextStore::create(HWND::default());
         let acp: ITextStoreACP = store;
-        st.force_locked(true); // テスト用にロック保持を擬似（実機は RequestLock 経由）
+        st.force_write_lock(true); // COM 経由を省略し、書込メソッド単体のロック前提だけ満たす。
 
         // QUERYONLY: 現在選択 [0,0) を返し、変異しない。
         let mut a = 0i32;
@@ -555,9 +573,9 @@ mod tests {
 
     #[test]
     fn insert_noquery_mutates_and_reports_change() {
-        let (store, st) = HarnessTextStore::create();
+        let (store, st) = HarnessTextStore::create(HWND::default());
         let acp: ITextStoreACP = store;
-        st.force_locked(true);
+        st.force_write_lock(true);
         let mut a = 0i32;
         let mut b = 0i32;
         let mut ch = TS_TEXTCHANGE::default();

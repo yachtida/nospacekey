@@ -15,13 +15,34 @@ func encodeResponse(_ response: Response) -> Data {
 /// リクエスト1件（connId, フレーム body）を処理して応答フレーム body を返すハンドラを構築する。
 /// runEngineHost から分離した唯一の理由はテスト可能化（パイプ無しで request/response を検証する）。
 /// serviceLock で ConversionService への全アクセスを直列化する規律は従来どおり。
-func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Sendable (Int, Data) -> (reply: Data, exitAfterReply: Bool) {
+func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
+                       predictionService: PredictionService = PredictionService()) -> @Sendable (Int, Data) -> (reply: Data, exitAfterReply: Bool) {
     return { connId, body in
+        let req: Request
+        do {
+            req = try Framing.decode(Request.self, from: body)
+        } catch {
+            return (encodeResponse(.error("\(error)")), false)
+        }
+
+        // 予測はモデル待ちの間も通常変換の serviceLock を保持しない。所有権だけ短く確認する。
+        if case .predict(let session, let seq, let tokenIDs) = req {
+            serviceLock.lock()
+            let owns = service.connectionOwns(session: Int(session), connection: connId)
+            serviceLock.unlock()
+            guard owns else { return (encodeResponse(.error("no session")), false) }
+            guard (2...480).contains(tokenIDs.count), tokenIDs.first == 1,
+                  tokenIDs.allSatisfy({ $0 < 99_584 }) else {
+                return (encodeResponse(.predictionUnavailable(seq: seq, state: "invalid_prompt")), false)
+            }
+            return (encodeResponse(predictionService.predict(seq: seq, tokenIDs: tokenIDs)), false)
+        }
+
+        // Ping は観測なので予測を壊さない。それ以外の操作は古い予測を表示不能にする。
+        if case .ping = req {} else { predictionService.cancel() }
         serviceLock.lock(); defer { serviceLock.unlock() }
         let response: Response
         var exitAfterReply = false
-        do {
-            let req = try Framing.decode(Request.self, from: body)
             // セッション所有権（UU-2）: session を伴う op は、その session を作成した接続からのみ
             // 受け付ける。session id は全接続共有の単調増加値なので、照合しないと別クライアントが
             // 他人のセッションを破棄・汚染できる。非所有（および未知 id）は既存の "no session" へ
@@ -32,6 +53,9 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
             // insert/backspace/convert/liveConvert は未知セッションのとき nil を返す（空の正当な
             // 結果と区別する）。nil は一律 .error("no session") にして TIP 側で degrade させる。
             switch req {
+            case .predict:
+                // 上のロック外レーンで必ず処理済み。網羅性のためだけの防御分岐。
+                response = .error("prediction routing error")
             case .ping: response = .pong
             // 接続id を渡してセッションの所有者を記録する（切断時に cleanupConnection で掃除するため）。
             case .startSession: response = .session(Int64(service.startSession(connection: connId)), proto: ProtocolVersion.current)
@@ -64,6 +88,11 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                 case .failure(let e): response = .error(e.message)
                 }
             case .reloadConfig(let p):
+                if let enabled = p.inline_prediction_enabled {
+                    var predictionEnvironment = ProcessInfo.processInfo.environment
+                    predictionEnvironment["NOSPACEKEY_INLINE_PREDICTION"] = enabled ? "1" : "0"
+                    predictionService.reload(config: .resolve(environment: predictionEnvironment))
+                }
                 // UU-5: TIP が push した最新設定を、LLMConfig.resolve / ZenzaiConfig.resolve が読む
                 // env キーの「上書き集合」へ写す（reload が実プロセス env に重ねる — #2）。
                 var overrides: [String: String] = [:]
@@ -162,13 +191,11 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                 // ここで exit しないのは、応答を書き終える前にプロセスを殺すと TIP が broken pipe に
                 // 落ちる（degrade 経路）ため。実際の exit(0) は writeAll 成功後に exitHook が
                 // serviceLock を取り直して（進行中の別接続要求を drain して）から行う。
+                predictionService.shutdown()
                 service.prepareForShutdown()
                 exitAfterReply = true
                 response = .ok
             }
-        } catch {
-            response = .error("\(error)")
-        }
         return (encodeResponse(response), exitAfterReply)
     }
 }
@@ -309,7 +336,9 @@ public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, one
     service.startWarmUp()
 
     let serviceLock = NSLock()
-    let handle = makeEngineHandler(service: service, serviceLock: serviceLock)
+    let predictionService = PredictionService.configured(environment: environment)
+    let handle = makeEngineHandler(service: service, serviceLock: serviceLock,
+                                   predictionService: predictionService)
 
     // NOTE: `handle` 内で参照される `service` は @Sendable クロージャ内でキャプチャされる。
     // ConversionService はスレッドセーフではないが、serviceLock で排他制御されているため安全。

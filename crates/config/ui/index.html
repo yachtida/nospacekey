@@ -7,14 +7,35 @@
 </head>
 <body>
   <div class="app">
-    <nav class="sidebar">
-      <div class="brand">nospacekey</div>
-      <button class="nav-item active" data-page="general">一般</button>
-      <button class="nav-item" data-page="engine">変換エンジン</button>
-      <button class="nav-item" data-page="appearance">外観</button>
-      <button class="nav-item" data-page="keymap">キー設定</button>
-      <button class="nav-item" data-page="dictionary">辞書</button>
-      <button class="nav-item" data-page="about">情報</button>
+    <nav class="sidebar" aria-label="設定カテゴリ">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">N</span>
+        <span>nospacekey</span>
+      </div>
+      <button class="nav-item active" data-page="general">
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5h12M7 5a1.5 1.5 0 1 0-3 0 1.5 1.5 0 0 0 3 0ZM4 10h12m0 0a1.5 1.5 0 1 0-3 0 1.5 1.5 0 0 0 3 0ZM4 15h12M7 15a1.5 1.5 0 1 0-3 0 1.5 1.5 0 0 0 3 0Z"/></svg>
+        <span>一般</span>
+      </button>
+      <button class="nav-item" data-page="engine">
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true"><rect x="5" y="5" width="10" height="10" rx="2"/><path d="M8 1.75v2M12 1.75v2M8 16.25v2M12 16.25v2M1.75 8h2M16.25 8h2M1.75 12h2M16.25 12h2M8 8h4v4H8z"/></svg>
+        <span>変換エンジン</span>
+      </button>
+      <button class="nav-item" data-page="appearance">
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3"/><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.35 4.35l1.4 1.4M14.25 14.25l1.4 1.4M15.65 4.35l-1.4 1.4M5.75 14.25l-1.4 1.4"/></svg>
+        <span>外観</span>
+      </button>
+      <button class="nav-item" data-page="keymap">
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="5" width="15" height="10" rx="2"/><path d="M5 8h1M8 8h1M11 8h1M14 8h1M5 11h1M8 11h1M11 11h4M5 13h8"/></svg>
+        <span>キー設定</span>
+      </button>
+      <button class="nav-item" data-page="dictionary">
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 4.5A2.5 2.5 0 0 1 6 2h4v14H6a2.5 2.5 0 0 0-2.5 2V4.5ZM16.5 4.5A2.5 2.5 0 0 0 14 2h-4v14h4a2.5 2.5 0 0 1 2.5 2V4.5Z"/></svg>
+        <span>辞書</span>
+      </button>
+      <button class="nav-item" data-page="about">
+        <svg class="nav-icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 9v5M10 6.25v.5"/></svg>
+        <span>情報</span>
+      </button>
     </nav>
     <main class="content">
       <section class="page active" id="page-general">
@@ -173,6 +194,38 @@
                 <input type="text" id="e-weight" data-bind="weight_path">
                 <button id="e-weight-browse" type="button">参照…</button>
               </div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <h2>インライン予測（アルファ版）</h2>
+          <div class="row">
+            <label for="e-inline-prediction">入力候補</label>
+            <div class="grow">
+              <label><input type="checkbox" id="e-inline-prediction"
+                data-bind="inline_prediction_enabled"> 明示確定後に文の続きを薄く表示する</label>
+              <div data-error-for="inline_prediction_enabled" class="field-error"></div>
+              <p class="hint">アルファ版機能です。動作や仕様は今後変更される可能性があります。
+                既定はオフです。候補はローカルCPUだけで生成され、右矢印または End で受理、
+                Esc で却下します。変更は入力先を切り替えると反映されます。</p>
+            </div>
+          </div>
+          <div class="row">
+            <label>モデル</label>
+            <div class="grow">
+              <div id="prediction-model-status" class="hint">確認中…</div>
+              <div class="hstack mt-6">
+                <button id="prediction-download" type="button">モデルをダウンロード（約171MB）</button>
+                <button id="prediction-download-cancel" type="button" hidden>キャンセル</button>
+                <span id="prediction-download-status"></span>
+              </div>
+              <progress id="prediction-download-progress" value="0" max="100" hidden></progress>
+              <p class="hint">固定した <code>LLM-jp-3-150m Q8_0</code> と tokenizer を導入します。
+                モデル:
+                <a href="#" data-ext-url="https://huggingface.co/llm-jp/llm-jp-3-150m">LLM-jp</a>、
+                ライセンス:
+                <a href="#" data-ext-url="https://www.apache.org/licenses/LICENSE-2.0">Apache-2.0</a>。
+                入力内容が外部へ送信されることはありません。</p>
             </div>
           </div>
         </div>

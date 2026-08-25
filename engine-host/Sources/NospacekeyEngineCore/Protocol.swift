@@ -6,7 +6,7 @@ import Foundation
 /// 新 op が再起動まで無言で decline / no-op になる。optional フィールドの追加
 /// （encodeIfPresent で旧形とバイト一致）では bump しない。
 enum ProtocolVersion {
-    static let current: UInt32 = 2
+    static let current: UInt32 = 3
 }
 
 enum Request: Decodable {
@@ -25,6 +25,8 @@ enum Request: Decodable {
     case reconvert(session: Int64, surface: String, leftContext: String?)
     case liveConvert(session: Int64, seq: UInt64, leftContext: String?, autoCommit: Bool)
     case llmConvert(session: Int64, seq: UInt64, leftContext: String?)
+    // ローカルインライン予測。通常変換とは別の接続・セッションで扱う。
+    case predict(session: Int64, seq: UInt64, tokenIDs: [UInt32])
     // UU-5: 常駐エンジンへ最新設定を反映（session を伴わないプロセス全体設定）。
     case reloadConfig(ReloadConfigParams)
     // Spec2: 学習履歴の消去（session を伴わないプロセス全体操作）。
@@ -55,6 +57,7 @@ enum Request: Decodable {
     /// auto_commit は LiveConvert のみが使う（自動確定の許可 — Rust 側は false のときキー省略、
     /// 旧 TIP はキー自体を送らないので Optional。LlmConvert はこの構造体を共有するが無視する）。
     private struct LiveConvertParams: Decodable { let session: Int64; let seq: UInt64; let left_context: String?; let auto_commit: Bool? }
+    private struct PredictParams: Decodable { let session: Int64; let seq: UInt64; let token_ids: [UInt32] }
     private struct CommitParams: Decodable { let session: Int64; let index: UInt32 }
     private struct RecordCorrectionParams: Decodable { let reading: String; let surface: String }
     /// カスタム辞書: Rust `Request::ReloadDictionary` のフィールドと一字一句一致させること。
@@ -74,6 +77,8 @@ enum Request: Decodable {
         let llm_timeout_ms: UInt32
         let zenzai_enabled: Bool
         let zenzai_weight: String
+        // 旧 TIP は送らない。nil は「現行 runtime 設定を維持」。
+        let inline_prediction_enabled: Bool?
         // Spec2: 学習トグル。旧 TIP は送らないので Optional（nil なら spawn 時 env のまま）。
         let learning_enabled: Bool?
         // 修正変換(Tab): 誤読み学習(ADR-0002)のトグル。旧 TIP は送らないので Optional
@@ -100,6 +105,7 @@ enum Request: Decodable {
         case "Commit": let p = try c.decode(CommitParams.self, forKey: .params); self = .commit(session: p.session, index: p.index)
         case "LiveConvert": let p = try c.decode(LiveConvertParams.self, forKey: .params); self = .liveConvert(session: p.session, seq: p.seq, leftContext: p.left_context, autoCommit: p.auto_commit ?? false)
         case "LlmConvert": let p = try c.decode(LiveConvertParams.self, forKey: .params); self = .llmConvert(session: p.session, seq: p.seq, leftContext: p.left_context)
+        case "Predict": let p = try c.decode(PredictParams.self, forKey: .params); self = .predict(session: p.session, seq: p.seq, tokenIDs: p.token_ids)
         case "EndSession": let p = try c.decode(SessionParams.self, forKey: .params); self = .endSession(session: p.session)
         case "ReloadConfig": let p = try c.decode(ReloadConfigParams.self, forKey: .params); self = .reloadConfig(p)
         case "ClearLearning": self = .clearLearning
@@ -135,12 +141,14 @@ enum Response: Encodable {
     case error(String)
     case liveResult(seq: UInt64, text: String, reading: String, committed: String?)
     case llmResult(seq: UInt64, text: String)
+    case prediction(seq: UInt64, text: String)
+    case predictionUnavailable(seq: UInt64, state: String)
     case committed(text: String, reading: String)
     // 文節ナビゲーションのビュー。Rust 側 `Response::ClauseView` と対（一字一句一致規約）。
     case clauseView(segments: [String], selected: Int, candidates: [String], candidateIndex: Int)
 
     private enum Keys: String, CodingKey {
-        case result, session, reading, candidates, message, seq, text, committed, proto
+        case result, session, reading, candidates, message, seq, text, committed, proto, state
         case segments, selected
         case candidateIndex = "candidate_index"
     }
@@ -166,6 +174,14 @@ enum Response: Encodable {
             try c.encode("LlmResult", forKey: .result)
             try c.encode(seq, forKey: .seq)
             try c.encode(text, forKey: .text)
+        case .prediction(let seq, let text):
+            try c.encode("Prediction", forKey: .result)
+            try c.encode(seq, forKey: .seq)
+            try c.encode(text, forKey: .text)
+        case .predictionUnavailable(let seq, let state):
+            try c.encode("PredictionUnavailable", forKey: .result)
+            try c.encode(seq, forKey: .seq)
+            try c.encode(state, forKey: .state)
         case .committed(let text, let reading):
             try c.encode("Committed", forKey: .result)
             try c.encode(text, forKey: .text)
@@ -200,6 +216,7 @@ extension Request {
              .commit(let session, _),
              .liveConvert(let session, _, _, _),
              .llmConvert(let session, _, _),
+             .predict(let session, _, _),
              .moveClause(let session, _, _, _):
             return session
         case .backspace(let session),

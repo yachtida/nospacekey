@@ -7,6 +7,7 @@
 //! 設計上の唯一の真実は `OnKeyDown`。`OnTestKeyDown` は `will_handle` で同じ述語を反復し、
 //! 「このキーを実際に食うか」を返すだけにする。
 
+use std::cell::Cell;
 use windows::core::{Ref, Result, BOOL, GUID};
 use windows::Win32::Foundation::{FALSE, LPARAM, TRUE, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState, ToUnicode};
@@ -211,6 +212,41 @@ pub fn arms_undo(source: &str) -> bool {
     matches!(source, "candidate" | "live" | "clause")
 }
 
+fn prediction_commit_source(
+    source: &str,
+    suppressed: bool,
+    direct: bool,
+    ephemeral: bool,
+) -> Option<crate::prediction_state::CommitSource> {
+    if suppressed || direct || ephemeral {
+        return None;
+    }
+    match source {
+        "live" => Some(crate::prediction_state::CommitSource::Enter),
+        "candidate" => Some(crate::prediction_state::CommitSource::Candidate),
+        "clause" => Some(crate::prediction_state::CommitSource::Clause),
+        _ => None,
+    }
+}
+
+struct ScopedCellFlag<'a> {
+    cell: &'a Cell<bool>,
+    previous: bool,
+}
+
+impl<'a> ScopedCellFlag<'a> {
+    fn set(cell: &'a Cell<bool>) -> Self {
+        let previous = cell.replace(true);
+        Self { cell, previous }
+    }
+}
+
+impl Drop for ScopedCellFlag<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
+    }
+}
+
 /// 巡13(round13): 空 text の確定（空 BS cancel 拒否巻き戻し中の Enter=cancel 代わり）は
 /// 確定書類（remember_last_commit / undo 武装）を残さない — ゲートの純関数化（単体テスト固定）。
 /// cancel 成功経路も書類を残さず対称。
@@ -243,6 +279,49 @@ pub fn is_pure_modifier_vk(vk: u32) -> bool {
                 | VK_LWIN
                 | VK_RWIN
         )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PredictionKeyAction {
+    None,
+    Accept,
+    Dismiss,
+    InvalidateAndContinue,
+}
+
+fn should_invalidate_hidden_prediction(vk: u32, ghost_visible: bool, request_active: bool) -> bool {
+    request_active && !ghost_visible && !is_pure_modifier_vk(vk)
+}
+
+fn prediction_key_action(
+    vk: u32,
+    ghost_visible: bool,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+) -> PredictionKeyAction {
+    if !ghost_visible || is_pure_modifier_vk(vk) {
+        return PredictionKeyAction::None;
+    }
+    if ctrl || shift || alt {
+        return PredictionKeyAction::InvalidateAndContinue;
+    }
+    match vk {
+        VK_RIGHT | VK_END => PredictionKeyAction::Accept,
+        VK_ESCAPE => PredictionKeyAction::Dismiss,
+        _ => PredictionKeyAction::InvalidateAndContinue,
+    }
+}
+
+fn should_defer_preserved_until_prediction_cleanup(
+    action: PreservedAction,
+    cleanup_failed: bool,
+) -> bool {
+    cleanup_failed && action != PreservedAction::ToggleMode && action != PreservedAction::None
+}
+
+fn newer_preserved_action_supersedes_deferred(action: PreservedAction) -> bool {
+    action != PreservedAction::None
 }
 
 /// 押された物理キー＋現在のキーボード状態(Shift等)＋レイアウトから入力文字を求める。
@@ -536,9 +615,52 @@ pub fn commit_fields(
     )
 }
 
+fn commit_event(
+    redact_text: bool,
+    text: &str,
+    source: &str,
+    remaining: Option<&str>,
+    fields: &str,
+) -> String {
+    if redact_text {
+        let remaining = remaining
+            .map(|value| format!(" remaining_len={}", value.chars().count()))
+            .unwrap_or_default();
+        format!(
+            "ev=commit len={} source={source}{remaining} {fields}",
+            text.chars().count()
+        )
+    } else {
+        let remaining = remaining
+            .map(|value| format!(" remaining={value}"))
+            .unwrap_or_default();
+        format!("ev=commit text={text} source={source}{remaining} {fields}")
+    }
+}
+
+fn clause_commit_event(redact_text: bool, text: &str) -> String {
+    if redact_text {
+        format!("ev=clause_commit len={}", text.chars().count())
+    } else {
+        format!("ev=clause_commit text={text}")
+    }
+}
+
+fn candidates_event(prediction_enabled: bool, event: &str, candidates: &[String]) -> String {
+    if prediction_enabled {
+        format!("ev={event} n={} sel=0", candidates.len())
+    } else {
+        format!(
+            "ev={event} n={} sel=0 list={}",
+            candidates.len(),
+            candidates.join("|")
+        )
+    }
+}
+
 /// preserved key の GUID を「どのアクションか」へ分類する純関数（COM 不要でテスト可能）。
 /// JIS キー（無変換/変換）と US キー（Alt+`/Alt+/）の両 GUID を同一アクションへ束ねる。
-#[derive(PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PreservedAction {
     ToggleMode,
     Reconvert,
@@ -641,13 +763,21 @@ impl TextService_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
-        // A new StartComposition may have re-entered this key path through a COM callout before
-        // its caller returned.  Consume that shared one-shot before password/reservation gates so
-        // an old pending-end pair cannot be taken by the reentrant key.
         self.consume_started_composition();
+        self.flush_deferred_prediction_preserved_keys_if_ready();
         let raw_vk = wparam.0 as u32;
         let vk = crate::keymap::normalize_vk(raw_vk);
-        // Context identity/password gate must precede reservation.  A failed/secret context
+        if !is_pure_modifier_vk(vk) {
+            self.cancel_deferred_prediction_preserved_on_input();
+        }
+        if should_invalidate_hidden_prediction(
+            vk,
+            self.prediction_ghost_actionable(),
+            self.prediction_state.borrow().has_activity(),
+        ) {
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
+        }
+        // Context identity/password gate must precede reservation. A failed/secret context
         // invalidates any old slot so a later same-VK event cannot replay it.
         let ctx: ITfContext = match pic.ok() {
             Ok(c) => c.clone(),
@@ -679,6 +809,27 @@ impl TextService_Impl {
             PendingEndTestDecision::Reserve => return Ok(TRUE),
             PendingEndTestDecision::Busy => return Ok(FALSE),
             PendingEndTestDecision::Normal => {}
+        }
+        if self.prediction_cleanup_in_progress() && !is_pure_modifier_vk(vk) {
+            self.retry_prediction_cleanup_on_input();
+        }
+        let (prediction_ctrl, prediction_shift, prediction_alt) = mods_now();
+        match prediction_key_action(
+            vk,
+            self.prediction_ghost_actionable(),
+            prediction_ctrl,
+            prediction_shift,
+            prediction_alt,
+        ) {
+            PredictionKeyAction::Accept | PredictionKeyAction::Dismiss => return Ok(TRUE),
+            PredictionKeyAction::InvalidateAndContinue => {
+                // 素通しキーは OnKeyDown が呼ばれないホストがあるため、Test 側で先に除去する。
+                // 除去に失敗しても本来の IME/host 判定へ進め、cleanup timer を再武装する。
+                if !self.dismiss_prediction_ghost(false) {
+                    self.retry_prediction_cleanup_on_input();
+                }
+            }
+            PredictionKeyAction::None => {}
         }
         // keymap 役割解決は password gate の直後・disarm 判定より前に 1 回計算し、両入口で共有する。
         let action = self.resolve_action_now(vk);
@@ -739,11 +890,20 @@ impl TextService_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
-        // Keep the same preflight ordering as OnTestKeyDown.  This must precede context/password
-        // checks and reservation consumption because this entry can be delivered without Test.
         self.consume_started_composition();
+        self.flush_deferred_prediction_preserved_keys_if_ready();
         let raw_vk = wparam.0 as u32;
         let vk = crate::keymap::normalize_vk(raw_vk);
+        if !is_pure_modifier_vk(vk) {
+            self.cancel_deferred_prediction_preserved_on_input();
+        }
+        if should_invalidate_hidden_prediction(
+            vk,
+            self.prediction_ghost_actionable(),
+            self.prediction_state.borrow().has_activity(),
+        ) {
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
+        }
         // 半角/全角の実配送 VK/修飾の実機診断(spec §3)。正規化前の生値を残す。
         if matches!(raw_vk, 0x19 | 0xF3 | 0xF4) {
             let (c, s, a) = mods_now();
@@ -789,6 +949,35 @@ impl TextService_Impl {
         // one-shot reservation; mismatch/stale is discarded so a future same-VK event cannot eat it.
         let pending_test_reserved = self.take_pending_end_test(signature);
         let pending_at_entry = self.composition_end_pending.get();
+        if self.prediction_cleanup_in_progress() && !is_pure_modifier_vk(vk) {
+            self.retry_prediction_cleanup_on_input();
+        }
+        let (prediction_ctrl, prediction_shift, prediction_alt) = mods_now();
+        match prediction_key_action(
+            vk,
+            self.prediction_ghost_actionable(),
+            prediction_ctrl,
+            prediction_shift,
+            prediction_alt,
+        ) {
+            PredictionKeyAction::Accept => {
+                // Test 側で claim 済み。同期 edit session が拒否された場合は discard retry へ
+                // 降格するため、入力順序を逆転させず eaten は TRUE に揃える。
+                let _ = self.accept_prediction_ghost();
+                return Ok(TRUE);
+            }
+            PredictionKeyAction::Dismiss => {
+                let _ = self.dismiss_prediction_ghost(true);
+                return Ok(TRUE);
+            }
+            PredictionKeyAction::InvalidateAndContinue => {
+                // クリーンアップ失敗時も通常入力を失わない。
+                if !self.dismiss_prediction_ghost(false) {
+                    self.retry_prediction_cleanup_on_input();
+                }
+            }
+            PredictionKeyAction::None => {}
+        }
         // Ctrl/Alt 併用キー（Ctrl+C/V 等のアクセラレータ）は食わずアプリへ通す。
         // 本来 OnTestKeyDown が FALSE を返せば OnKeyDown は呼ばれないが、同じ判定をここにも
         // 置いて防御する（リファクタ耐性・意図の明示）。keymap action（confirm undo/ephemeral/
@@ -1439,7 +1628,10 @@ impl TextService_Impl {
         *self.live_text.borrow_mut() = shown.clone();
         *self.current_context.borrow_mut() = Some(ctx.clone());
         self.run_preedit(ctx, &self.widen_display_text(&shown));
-        tip_log(&format!("ev=notation vk={vk:#04x} text={shown}"));
+        tip_log(&format!(
+            "ev=notation vk={vk:#04x} chars={}",
+            shown.chars().count()
+        ));
         Ok(TRUE)
     }
 
@@ -1452,18 +1644,46 @@ impl TextService_Impl {
     }
 
     fn on_preserved_key_impl(&self, pic: Ref<'_, ITfContext>, rguid: *const GUID) -> Result<BOOL> {
+        self.flush_deferred_prediction_preserved_keys_if_ready();
         // A7: スリープ復帰の世代カウンタをキースレッドで刈り取る（classify_preserved_key より前）。
         self.poll_power_events();
         let guid = unsafe { *rguid };
         let ctx = pic.ok().ok().cloned();
         // JIS キー（無変換/変換）と US キー（Alt+`/Alt+/）の両 GUID を同一アクションへ束ねる。
         let action = classify_preserved_key(&guid);
-        // C-1: トグル/再変換/feedback 鍵は OnPreservedKey 経由（OnKeyDown を通らない）ため、
-        // ここが preserved key 経路唯一の disarm 点。awaiting_llm/password の早期 return より前で
-        // 解除する（トグル等がガードで握り潰されても armed だけは必ず落ちる）。
+        if newer_preserved_action_supersedes_deferred(action) {
+            // 旧 Reconvert/Feedback より新しい preserved 操作がユーザー順序上の真実。
+            // stale 操作を cleanup 後に再生して新しいモード／文脈へ割り込ませない。
+            self.cancel_deferred_prediction_preserved_on_input();
+        }
+        // preserved key は host が既に消費済み。cleanup 待ちへ回す場合も、この時点で
+        // 直前確定 undo の武装を必ず落とし、後発 Ctrl+Backspace の誤発火を防ぐ。
         if action != PreservedAction::None {
             self.disarm_undo();
         }
+        if action != PreservedAction::None {
+            let reason = if action == PreservedAction::ToggleMode {
+                crate::prediction_state::Invalidation::ModeChanged
+            } else {
+                crate::prediction_state::Invalidation::Input
+            };
+            self.invalidate_prediction(reason);
+            let cleanup_failed =
+                self.prediction_ghost_visible() && !self.dismiss_prediction_ghost(false);
+            if cleanup_failed {
+                if should_defer_preserved_until_prediction_cleanup(action, cleanup_failed) {
+                    // 再変換/feedback は欄の文脈へ依存するので cleanup 後へ延期する。
+                    // 後続の通常入力が来た場合は stale として上の key entry で取消す。
+                    self.defer_prediction_preserved_key(ctx.clone(), guid);
+                    return Ok(TRUE);
+                }
+                // mode toggle は後続キーの解決条件そのもの。物理 ghost の discard retry と
+                // 独立に、この preserved callback 内で論理モードを即時反映する。
+            }
+        }
+        // C-1: トグル/再変換/feedback 鍵は OnPreservedKey 経由（OnKeyDown を通らない）ため、
+        // ここが preserved key 経路唯一の disarm 点。awaiting_llm/password の早期 return より前で
+        // 解除する（トグル等がガードで握り潰されても armed だけは必ず落ちる）。
         // Bug 3: LLM 変換待機(AwaitingLlm)中はモードトグル/再変換も抑止する。待機中に
         // モードや composition を触ると入力ロック（preedit 保護）が破れる（OnKeyDown が
         // 待機中に全キーを食うのと対）。preserved key はホストが既に消費しているので、
@@ -1629,6 +1849,9 @@ impl TextService_Impl {
             self.disarm_undo();
             return true;
         }
+        // settle 内部では candidate/clause/live と同じ確定プリミティブを再利用するが、
+        // ユーザーの Enter/候補決定ではない。全 return/panic で復元する RAII flag で予測起動を抑止する。
+        let _prediction_guard = ScopedCellFlag::set(&self.prediction_commit_suppressed);
 
         // SetText 成功後の EndComposition だけが保留された状態は、InputState 上は idle でも
         // 文書には composition が残る。mode toggle / Shift 直打ちより先に、保存済み owner
@@ -1771,11 +1994,10 @@ impl TextService_Impl {
                         .borrow_mut()
                         .show(&cands, 0, anchor, theme);
                     self.reading_monitor.borrow_mut().hide();
-                    let list = cands.join("|");
-                    tip_log(&format!(
-                        "ev=candidates_shown n={} sel=0 list={}",
-                        cands.len(),
-                        list
+                    tip_log(&candidates_event(
+                        self.prediction_enabled.get(),
+                        "candidates_shown",
+                        &cands,
                     ));
                 }
                 // エンジン失敗/空: preedit はそのまま（ハングさせない）。
@@ -1804,11 +2026,10 @@ impl TextService_Impl {
                         .borrow_mut()
                         .show(&cands, 0, anchor, theme);
                     self.reading_monitor.borrow_mut().hide();
-                    let list = cands.join("|");
-                    tip_log(&format!(
-                        "ev=typo_candidates_shown n={} sel=0 list={}",
-                        cands.len(),
-                        list
+                    tip_log(&candidates_event(
+                        self.prediction_enabled.get(),
+                        "typo_candidates_shown",
+                        &cands,
                     ));
                 }
                 // エンジン失敗/空: preedit はそのまま（ハングさせない）。
@@ -1844,8 +2065,12 @@ impl TextService_Impl {
         }
         let text = ch.to_string();
         let fields = commit_fields(None, 0, "", &text, self.is_direct_mode());
-        tip_log(&format!(
-            "ev=commit text={text} source=shift_latin {fields}"
+        tip_log(&commit_event(
+            self.prediction_enabled.get(),
+            &text,
+            "shift_latin",
+            None,
+            &fields,
         ));
         // 巡3 P3: 挿入拒否は文字が挿入されないだけ（状態を畳むものが無い）— FALSE で返して
         // ホストの自前挿入に救わせる（旧実装は Ok(TRUE) で打鍵が握りつぶされていた）。
@@ -1960,7 +2185,13 @@ impl TextService_Impl {
         *self.live_text.borrow_mut() = reading.clone();
         // 表示だけ全角化する。live_text/last_reading/raw は半角 canonical のまま置く —
         // これらは劣化フォールバックや確定取消のリプレイでエンジンへ戻る素材だから。
-        self.run_preedit(ctx, &self.widen_display_text(&reading));
+        if !self.run_preedit(ctx, &self.widen_display_text(&reading)) {
+            // ghost cleanup の一過性競合などで表示だけ拒否されても、打鍵は logical/raw と
+            // engine reading に保存済み。cleanup 後に同じ読みを再描画して入力を失わない。
+            self.partial_preedit_redraw_pending.set(true);
+            self.partial_preedit_redraw_retries.set(0);
+            self.arm_partial_preedit_redraw_retry();
+        }
         self.arm_debounce();
         Ok(TRUE)
     }
@@ -2055,8 +2286,16 @@ impl TextService_Impl {
             0
         };
         let reading = self.last_reading.borrow().clone();
-        let fields = commit_fields(sel, cand_n, &reading, text, self.is_direct_mode());
-        tip_log(&format!("ev=commit text={text} source={source} {fields}"));
+        let direct = self.is_direct_mode();
+        let ephemeral = self.ephemeral_kana.get();
+        let fields = commit_fields(sel, cand_n, &reading, text, direct);
+        tip_log(&commit_event(
+            self.prediction_enabled.get(),
+            text,
+            source,
+            None,
+            &fields,
+        ));
         // 巡3 P3 + 巡4 T3: CommitText セッションが拒否された（TF_E_LOCKED 等）ら状態を畳まない —
         // 文書へは何も書かれていないのに composition/候補/セッションを破棄すると確定文字が
         // 消失する。remember_last_commit / undo 武装も do_commit の**後**に実行する
@@ -2064,6 +2303,16 @@ impl TextService_Impl {
         if !self.do_commit(ctx, text) {
             tip_log("ev=commit_rejected source=do_commit");
             return false;
+        }
+        // Phase 1 はユーザーが明示した全確定だけを起点にする。settle / live_auto / 部分確定は除外。
+        let prediction_source = prediction_commit_source(
+            source,
+            self.prediction_commit_suppressed.get(),
+            direct,
+            ephemeral,
+        );
+        if let Some(prediction_source) = prediction_source {
+            self.on_explicit_prediction_commit(prediction_source, text);
         }
         // 品質ループ③: 誤変換ワンキー記録用の直前確定バッファ（同じ採取材料を流用）。
         // 巡12(round12): 空 text（空 BS cancel 拒否巻き戻し中の Enter=cancel 代わり）は
@@ -2160,7 +2409,7 @@ impl TextService_Impl {
             tip_log("ev=clause_commit skip=empty");
             return;
         }
-        tip_log(&format!("ev=clause_commit text={text}"));
+        tip_log(&clause_commit_event(self.prediction_enabled.get(), &text));
         // 巡4 T3(a): clauses はエンジンの学習往復(CommitClauses)が済んだ後 — 挿入拒否時に
         // エンジン側だけ文脈が進んだまま残すと次入力とズレるので、接続を作り直して
         // needs_session_reseed の全リプレイで自己修復させる（partial/live_auto と同じ規律）。
@@ -2193,8 +2442,12 @@ impl TextService_Impl {
                 };
                 let reading = self.last_reading.borrow().clone();
                 let fields = commit_fields(sel, cand_n, &reading, &prefix, self.is_direct_mode());
-                tip_log(&format!(
-                    "ev=commit text={prefix} source={prefix_source} remaining={remaining} {fields}"
+                tip_log(&commit_event(
+                    self.prediction_enabled.get(),
+                    &prefix,
+                    prefix_source,
+                    Some(&remaining),
+                    &fields,
                 ));
                 // do_commit の合成終了が（ホスト依存で）OnCompositionTerminated を誘発しても
                 // エンジンセッションを畳まないようガードする。残り読みのセッションは保持する。
@@ -2280,8 +2533,12 @@ impl TextService_Impl {
         // last_reading（=消費前の全読み。この後 remaining へ上書きされる）。
         let full_reading = self.last_reading.borrow().clone();
         let fields = commit_fields(None, 0, &full_reading, prefix, self.is_direct_mode());
-        tip_log(&format!(
-            "ev=commit text={prefix} source=live_auto remaining={reading} {fields}"
+        tip_log(&commit_event(
+            self.prediction_enabled.get(),
+            prefix,
+            "live_auto",
+            Some(reading),
+            &fields,
         ));
         // do_commit の合成終了が（ホスト依存で）OnCompositionTerminated を誘発しても
         // エンジンセッションを畳まないようガードする（apply_commit_plan と同じ）。
@@ -2341,8 +2598,11 @@ impl TextService_Impl {
 #[cfg(test)]
 mod tests {
     use super::{
-        backspace_route, commit_keeps_records, ephemeral_idle_abort, is_cmd_modifier, will_handle,
-        will_handle_awaiting, will_handle_gated,
+        backspace_route, commit_keeps_records, ephemeral_idle_abort, is_cmd_modifier,
+        newer_preserved_action_supersedes_deferred, prediction_commit_source,
+        prediction_key_action, should_defer_preserved_until_prediction_cleanup,
+        should_invalidate_hidden_prediction, will_handle, will_handle_awaiting, will_handle_gated,
+        PredictionKeyAction, PreservedAction, ScopedCellFlag,
     };
     use crate::keymap::{resolve_action, ActionInput, KeyAction, Keymap};
 
@@ -2812,6 +3072,28 @@ mod tests {
         // direct モード（再変換確定）: mode=direct。
         let f = commit_fields(Some(0), 3, "にほんご", "日本語", true);
         assert_eq!(f, "sel=0 cand_n=3 rlen=4 tlen=3 mode=direct");
+    }
+
+    #[test]
+    fn prediction_enabled_commit_events_never_contain_body_text() {
+        use super::{candidates_event, clause_commit_event, commit_event};
+        let sentinel = "秘密の予測文脈";
+        let remaining = "残りの秘密";
+        let event = commit_event(
+            true,
+            sentinel,
+            "candidate",
+            Some(remaining),
+            "sel=0 cand_n=1 rlen=8 tlen=8 mode=native",
+        );
+        assert!(!event.contains(sentinel));
+        assert!(!event.contains(remaining));
+        assert!(event.contains("len=7"));
+        assert!(event.contains("remaining_len=5"));
+        assert!(!clause_commit_event(true, sentinel).contains(sentinel));
+        assert!(!candidates_event(true, "candidates_shown", &[sentinel.into()]).contains(sentinel));
+        assert!(commit_event(false, sentinel, "candidate", None, "fields").contains(sentinel));
+        assert!(candidates_event(false, "candidates_shown", &[sentinel.into()]).contains(sentinel));
     }
 
     // ---- 打鍵作法 Task2: composing 中の ←→ は食って確定畳み（意図的な仕様変更）----
@@ -4031,5 +4313,123 @@ mod tests {
         assert!(!shift_latin_is_compose("commit"));
         // 未知値は既定(compose)へ劣化 — 手編集 JSON で黙って旧挙動(直接確定)に化けない。
         assert!(shift_latin_is_compose("unknown"));
+    }
+
+    #[test]
+    fn visible_prediction_claims_only_accept_and_dismiss_keys() {
+        assert_eq!(
+            prediction_key_action(0x27, true, false, false, false),
+            PredictionKeyAction::Accept
+        );
+        assert_eq!(
+            prediction_key_action(0x23, true, false, false, false),
+            PredictionKeyAction::Accept
+        );
+        assert_eq!(
+            prediction_key_action(0x1B, true, false, false, false),
+            PredictionKeyAction::Dismiss
+        );
+        assert_eq!(
+            prediction_key_action(0x41, true, false, false, false),
+            PredictionKeyAction::InvalidateAndContinue
+        );
+        assert_eq!(
+            prediction_key_action(0x10, true, false, true, false),
+            PredictionKeyAction::None
+        );
+        assert_eq!(
+            prediction_key_action(0x27, true, false, true, false),
+            PredictionKeyAction::InvalidateAndContinue
+        );
+        assert_eq!(
+            prediction_key_action(0x23, true, true, false, false),
+            PredictionKeyAction::InvalidateAndContinue
+        );
+        assert_eq!(
+            prediction_key_action(0x27, true, true, false, true),
+            PredictionKeyAction::InvalidateAndContinue
+        );
+        assert_eq!(
+            prediction_key_action(0x27, false, false, false, false),
+            PredictionKeyAction::None
+        );
+    }
+
+    #[test]
+    fn prediction_commit_requires_native_non_suppressed_context() {
+        assert_eq!(
+            prediction_commit_source("candidate", false, false, false),
+            Some(crate::prediction_state::CommitSource::Candidate)
+        );
+        assert_eq!(
+            prediction_commit_source("candidate", true, false, false),
+            None
+        );
+        assert_eq!(prediction_commit_source("clause", true, false, false), None);
+        assert_eq!(prediction_commit_source("live", true, false, false), None);
+        assert_eq!(
+            prediction_commit_source("candidate", false, true, false),
+            None
+        );
+        assert_eq!(prediction_commit_source("clause", false, true, false), None);
+        assert_eq!(prediction_commit_source("live", false, true, false), None);
+        assert_eq!(
+            prediction_commit_source("candidate", false, false, true),
+            None
+        );
+        assert_eq!(prediction_commit_source("clause", false, false, true), None);
+        assert_eq!(prediction_commit_source("live", false, false, true), None);
+
+        let flag = std::cell::Cell::new(false);
+        {
+            let _guard = ScopedCellFlag::set(&flag);
+            assert!(flag.get());
+        }
+        assert!(!flag.get());
+    }
+
+    #[test]
+    fn mode_toggle_is_immediate_but_context_actions_wait_for_cleanup() {
+        assert!(!should_defer_preserved_until_prediction_cleanup(
+            PreservedAction::ToggleMode,
+            true,
+        ));
+        assert!(should_defer_preserved_until_prediction_cleanup(
+            PreservedAction::Reconvert,
+            true,
+        ));
+        assert!(should_defer_preserved_until_prediction_cleanup(
+            PreservedAction::Feedback,
+            true,
+        ));
+        assert!(!should_defer_preserved_until_prediction_cleanup(
+            PreservedAction::Reconvert,
+            false,
+        ));
+    }
+
+    #[test]
+    fn a_new_preserved_action_supersedes_a_deferred_context_action() {
+        assert!(newer_preserved_action_supersedes_deferred(
+            PreservedAction::ToggleMode
+        ));
+        assert!(newer_preserved_action_supersedes_deferred(
+            PreservedAction::Reconvert
+        ));
+        assert!(newer_preserved_action_supersedes_deferred(
+            PreservedAction::Feedback
+        ));
+        assert!(!newer_preserved_action_supersedes_deferred(
+            PreservedAction::None
+        ));
+    }
+
+    #[test]
+    fn hidden_pending_prediction_is_invalidated_by_non_modifier_input() {
+        assert!(should_invalidate_hidden_prediction(0x41, false, true));
+        assert!(should_invalidate_hidden_prediction(0x27, false, true));
+        assert!(!should_invalidate_hidden_prediction(0x10, false, true));
+        assert!(!should_invalidate_hidden_prediction(0x41, true, true));
+        assert!(!should_invalidate_hidden_prediction(0x41, false, false));
     }
 }

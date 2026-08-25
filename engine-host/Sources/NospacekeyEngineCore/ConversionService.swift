@@ -878,7 +878,7 @@ public final class ConversionService: @unchecked Sendable {
         let promotedList = promoted(rawResults, composing: rec.composing)
         let mainResults = promotedList ?? rawResults
         if let p = promotedList, p.first?.text != rawResults.first?.text {
-            engineLog("ev=correction_promote kind=convert reading=\(rec.composing.convertTarget)\n")
+            engineLog("ev=correction_promote kind=convert reading_chars=\(rec.composing.convertTarget.count)\n")
         }
         // commit(session:index:) が同じ並びの Candidate を index で引けるようキャッシュする。
         // 返す text 配列は mainResults と 1:1（同順）なので TIP 側 index がそのまま使える。
@@ -892,7 +892,7 @@ public final class ConversionService: @unchecked Sendable {
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
         logFirstConvertOnceLocked(ms: ms)
         checkZenzaiTooSlowLocked(ms: inferMs, thresholdMs: zenzaiSlowThresholdMs, usedZenzai: usedZenzai)
-        engineLog("ev=infer kind=convert ms=\(String(format: "%.1f", ms)) n=\(results.count) target=\(rec.composing.convertTarget) ctx=\(leftContext?.count ?? 0)\n")
+        engineLog("ev=infer kind=convert ms=\(String(format: "%.1f", ms)) n=\(results.count) target_chars=\(rec.composing.convertTarget.count) ctx_chars=\(leftContext?.count ?? 0)\n")
         return results
     }
 
@@ -972,7 +972,7 @@ public final class ConversionService: @unchecked Sendable {
         let results = merged.map { $0.text }
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
         checkZenzaiTooSlowLocked(ms: literalInferMs, thresholdMs: zenzaiSlowThresholdMs, usedZenzai: literalUsedZenzai)
-        engineLog("ev=infer kind=typo_convert ms=\(String(format: "%.1f", ms)) n=\(results.count) hyps=\(hyps.count) target=\(rec.composing.convertTarget)\n")
+        engineLog("ev=infer kind=typo_convert ms=\(String(format: "%.1f", ms)) n=\(results.count) hyps=\(hyps.count) target_chars=\(rec.composing.convertTarget.count)\n")
         return results
     }
 
@@ -1006,12 +1006,12 @@ public final class ConversionService: @unchecked Sendable {
         noteRecordability(reading: c.convertTarget, candidates: mainCands)
         let promotedList = promoted(mainCands, composing: c)
         if let p = promotedList, p.first?.text != mainCands.first?.text {
-            engineLog("ev=correction_promote kind=reconvert reading=\(c.convertTarget)\n")
+            engineLog("ev=correction_promote kind=reconvert reading_chars=\(c.convertTarget.count)\n")
         }
         let results = (promotedList ?? mainCands).map { $0.text }
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
         checkZenzaiTooSlowLocked(ms: inferMs, thresholdMs: zenzaiSlowThresholdMs, usedZenzai: usedZenzai)
-        engineLog("ev=infer kind=reconvert ms=\(String(format: "%.1f", ms)) n=\(results.count) target=\(c.convertTarget) ctx=\(leftContext?.count ?? 0)\n")
+        engineLog("ev=infer kind=reconvert ms=\(String(format: "%.1f", ms)) n=\(results.count) target_chars=\(c.convertTarget.count) ctx_chars=\(leftContext?.count ?? 0)\n")
         return results
     }
 
@@ -1113,7 +1113,7 @@ public final class ConversionService: @unchecked Sendable {
                 rec.invalidateCandidateCache()   // 読みが縮んだので古い候補 index は無効
                 state.didCompleteFirstClause()
                 committed = firstClause.text
-                engineLog("ev=live_auto_commit reason=\(reason) committed=\(firstClause.text) remaining=\(rec.composing.convertTarget)\n")
+                engineLog("ev=live_auto_commit reason=\(reason) committed_chars=\(firstClause.text.count) remaining_chars=\(rec.composing.convertTarget.count)\n")
             }
             rec.liveState = state
         }
@@ -1132,14 +1132,14 @@ public final class ConversionService: @unchecked Sendable {
                                 modelTop: results.first?.text, promoted: promotedList != nil)
             if let top = promotedList?.first, top.text != candidate.text {
                 display = top
-                engineLog("ev=correction_promote kind=live reading=\(rec.composing.convertTarget)\n")
+                engineLog("ev=correction_promote kind=live reading_chars=\(rec.composing.convertTarget.count)\n")
             }
         }
         sessions[session] = rec
 
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
         logFirstConvertOnceLocked(ms: ms)
-        engineLog("ev=infer kind=live ms=\(String(format: "%.1f", ms)) target=\(rec.composing.convertTarget) ctx=\(leftContext?.count ?? 0)\n")
+        engineLog("ev=infer kind=live ms=\(String(format: "%.1f", ms)) target_chars=\(rec.composing.convertTarget.count) ctx_chars=\(leftContext?.count ?? 0)\n")
         if let committedText = committed {
             // 確定文節は candidate.text の prefix（履歴の安定判定により両者の先頭文節テキストは一致）。
             // 残り表示 = 全体のライブ結果から確定分を落としたもの。空なら読みへ劣化（TIP 側でも防御）。
@@ -1276,13 +1276,13 @@ public final class ConversionService: @unchecked Sendable {
         // invalid_reading(TIP 採取バグ)の再現材料が残らない。
         switch recordabilityVerdict(reading: reading, surface: surface) {
         case .invalidReading:
-            engineLog("ev=correction_record_reject reason=invalid_reading reading=\(reading)\n")
+            engineLog("ev=correction_record_reject reason=invalid_reading reading_chars=\(reading.count)\n")
         case .mapMiss:
-            engineLog("ev=correction_record_reject reason=map_miss reading=\(reading)\n")
+            engineLog("ev=correction_record_reject reason=map_miss reading_chars=\(reading.count)\n")
         case .modelTop:
-            engineLog("ev=correction_record_reject reason=model_top reading=\(reading)\n")
+            engineLog("ev=correction_record_reject reason=model_top reading_chars=\(reading.count)\n")
         case .surfaceUnrecordable:
-            engineLog("ev=correction_record_reject reason=surface reading=\(reading)\n")
+            engineLog("ev=correction_record_reject reason=surface reading_chars=\(reading.count)\n")
         case .recordable:
             corrections.record(reading: reading, surface: surface)
             corrections.flush()
@@ -1414,7 +1414,7 @@ public final class ConversionService: @unchecked Sendable {
                         mid: candidate.lastMid,
                         value: candidate.value)])
                 updateLearningDataLocked(synthetic, session: session)
-                engineLog("ev=typo_learn ruby=\(rec.composing.convertTarget) word=\(candidate.text)\n")
+                engineLog("ev=typo_learn ruby_chars=\(rec.composing.convertTarget.count) word_chars=\(candidate.text.count)\n")
             }
             rec.composing = ComposingText()                         // 読み全体を消費（次の入力はまっさらから）
             rec.invalidateCandidateCache()
@@ -1566,7 +1566,7 @@ public final class ConversionService: @unchecked Sendable {
         // ruby=読み全体なので全被覆＝文節境界は壊れない。
         if let promotedList = promoted(list, composing: c) {
             if promotedList.first?.text != list.first?.text {
-                engineLog("ev=correction_promote kind=clause reading=\(reading)\n")
+                engineLog("ev=correction_promote kind=clause reading_chars=\(reading.count)\n")
             }
             list = promotedList
         }
@@ -1610,7 +1610,7 @@ public final class ConversionService: @unchecked Sendable {
             guard let cands = rec.cachedCandidates, !cands.isEmpty else {
                 engineLog("ev=clause_seed_reject reason=no_cache\n"); return nil }
             guard rec.cachedTarget == rec.composing.convertTarget else {
-                engineLog("ev=clause_seed_reject reason=stale_target cached=\(rec.cachedTarget ?? "nil") now=\(rec.composing.convertTarget)\n"); return nil }
+                engineLog("ev=clause_seed_reject reason=stale_target cached_chars=\(rec.cachedTarget?.count ?? 0) now_chars=\(rec.composing.convertTarget.count)\n"); return nil }
             guard baseIndex >= 0, baseIndex < cands.count else {
                 engineLog("ev=clause_seed_reject reason=index_range base=\(baseIndex) n=\(cands.count)\n"); return nil }
             // 修復候補は縮約仮説の読みを覆う＝literal の読みとは別物。covers は文字数比較なので
@@ -1625,7 +1625,7 @@ public final class ConversionService: @unchecked Sendable {
             // data.word から表層を再構成するため、不整合候補を種にすると preedit/確定/学習が
             // 生タグ `<date …>` へ化ける — 種にせず settle 劣化に落とす。
             guard cands[baseIndex].text == cands[baseIndex].data.map(\.word).joined() else {
-                engineLog("ev=clause_seed_reject reason=text_data_mismatch text=\(cands[baseIndex].text) joined=\(cands[baseIndex].data.map(\.word).joined())\n"); return nil }
+                engineLog("ev=clause_seed_reject reason=text_data_mismatch text_chars=\(cands[baseIndex].text.count) joined_chars=\(cands[baseIndex].data.map(\.word).joined().count)\n"); return nil }
             var clauses = Self.decomposeClauses(cands[baseIndex])
             // 1 文節は移動先が無い。ただし単一要素の合成候補（学習の全文1エントリ・訂正昇格）は
             // 「境界情報が無い」だけで文としては複数文節であり得るため、辞書境界の再導出を先に

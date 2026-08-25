@@ -5,6 +5,7 @@
 mod doc_state;
 mod driver;
 mod log_parse;
+mod manual_inline_apps;
 mod report;
 mod scenarios;
 mod text_store;
@@ -17,7 +18,7 @@ fn main() {
     // 単一スレッド起動直後・他スレッド未起動の時点で 1 度だけ設定する。
     std::env::set_var("NOSPACEKEY_LLM_ECHO", "1");
     // Task 1 で診断ログは既定OFFになったため、ヘッドレス検証では明示的に有効化する。
-    // log_parse は %TEMP%\nospacekey-tip.log の ev= 行（text=/list=/latin= 含む）を読むため必須。
+    // log_parse は %TEMP%\nospacekey-tip.log の ev= 行を読むため必須。
     // 単一スレッド起動直後・他スレッド未起動の時点で 1 度だけ設定する。
     std::env::set_var("NOSPACEKEY_LOG", "1");
     // item24(バグ#2 回帰)用: iOS 移植の自動確定(fac6315)が有効だと preedit が正当に縮み、
@@ -57,6 +58,9 @@ fn main() {
         "--item29" => run_item29_mode(),
         "--item30" => run_item30_mode(),
         "--item31" => run_item31_mode(),
+        "--item32" => run_item32_mode(),
+        "--manual-inline-apps" => manual_inline_apps::run(),
+        "--manual-inline-host-apps" => manual_inline_apps::run_host(),
         "--keymap-smoke" => run_keymap_smoke(),
         "--diag" => tsf_host::diag(),
         other => {
@@ -493,6 +497,85 @@ fn run_item31_mode() -> i32 {
         }
         Err(e) => {
             eprintln!("item31 start fail: {e:?}");
+            2
+        }
+    }
+}
+
+/// item32: opt-in inline prediction acceptance test. It uses an isolated settings profile so the
+/// real user setting remains untouched. The evaluated model/runtime paths are supplied by env.
+fn run_item32_mode() -> i32 {
+    driver::kill_engine_processes();
+    struct EngineCleanup;
+    impl Drop for EngineCleanup {
+        fn drop(&mut self) {
+            driver::kill_engine_processes();
+        }
+    }
+    let _engine_cleanup = EngineCleanup;
+    if std::env::var_os("NOSPACEKEY_PREDICTION_MODEL_DIR").is_none() {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let installed = std::path::PathBuf::from(local)
+                .join("Nospacekey")
+                .join("models")
+                .join("inline-prediction");
+            if installed.join("VERIFIED").is_file() {
+                std::env::set_var("NOSPACEKEY_PREDICTION_MODEL_DIR", installed);
+            }
+        }
+    }
+    let Some(model_dir) = std::env::var_os("NOSPACEKEY_PREDICTION_MODEL_DIR") else {
+        eprintln!("item32 requires an installed model or NOSPACEKEY_PREDICTION_MODEL_DIR");
+        return 2;
+    };
+    let model_dir = std::path::PathBuf::from(model_dir);
+    if !model_dir.join("VERIFIED").is_file() || !model_dir.join("tokenizer.json").is_file() {
+        eprintln!(
+            "item32 prediction artifact pair is incomplete: {}",
+            model_dir.display()
+        );
+        return 2;
+    }
+    let scratch = match tempfile::Builder::new()
+        .prefix("nospacekey-item32-")
+        .tempdir()
+    {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("item32 scratch dir fail: {e:?}");
+            return 2;
+        }
+    };
+    std::env::set_var("LOCALAPPDATA", scratch.path());
+    let mut settings = settings::Settings::default();
+    settings.inline_prediction.enabled = true;
+    if let Err(e) = settings::save(&settings) {
+        eprintln!("item32 settings fixture fail: {e:?}");
+        return 2;
+    }
+    let _com = match tsf_host::ComSta::init() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("item32 ComSta::init fail: {e:?}");
+            return 2;
+        }
+    };
+    match tsf_host::TsfHost::start() {
+        Ok(host) => {
+            let result = driver::run_item32(&host);
+            println!(
+                "item32 : {} ({})",
+                if result.passed { "PASS" } else { "FAIL" },
+                result.detail
+            );
+            if result.passed {
+                0
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("item32 start fail: {e:?}");
             2
         }
     }

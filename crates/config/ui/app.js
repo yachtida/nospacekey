@@ -20,7 +20,8 @@ const tauriConfirm = window.__TAURI__.dialog.confirm;
 let state = null;    // 編集中の SettingsDto
 let baseline = null; // 最終ロード/適用時点のスナップショット（dirty 判定・鍵クリア検出用）
 let dirty = false;
-// Startup reconciliation runs after setup returns.  The event listener is
+let predictionModelReady = false;
+// Startup reconciliation runs after setup returns. The event listener is
 // installed before the first get_settings call; an early event is coalesced
 // until the initial state/baseline and DOM exist.
 let startupReconcileInitialReady = false;
@@ -43,7 +44,7 @@ function setByPath(obj, path, value) {
 }
 let toastTimer = null;
 let toastHideHandler = null;
-// 出現は CSS の toast-in、退場は .hide の toast-out（入ってきた道＝下へ戻る）。
+// 出現は CSS の toast-in、退場は .hide の toast-out。
 // 表示中（フェードアウト中含む）の再呼び出しで .hide を外すだけにしてはならない:
 // animation-name が toast-out→toast-in へ変わると実行中アニメーションが破棄され、
 // toast-in の 0%（透明・縮小）から再入場＝一瞬消える瞬きになる。再呼び出し時は
@@ -583,6 +584,7 @@ function showFieldErrors(errors) {
 // DL 中に書かれた設定の運命が不定になる（「適用しました」が taskkill で消えうる）。
 let applyInFlight = false;
 let dlInFlight = false;
+let predictionDlInFlight = false;
 let updateInFlight = false;
 let clearInFlight = false;
 let promptDismissInFlight = false;
@@ -606,7 +608,7 @@ let drainQueuedUpdateIntent = () => {};
 let installerLaunched = false;
 
 function settingsOperationBusy() {
-  return applyInFlight || dlInFlight || updateInFlight || clearInFlight ||
+  return applyInFlight || dlInFlight || predictionDlInFlight || updateInFlight || clearInFlight ||
     installerLaunched || checkInFlight || defaultsInFlight || promptDismissInFlight;
 }
 
@@ -614,13 +616,14 @@ function settingsOperationBusy() {
 // defaultsInFlight flag.  The start guard already prevents a second default
 // operation; this predicate protects the await boundary and synthetic events.
 function defaultSettingsResponseBusy() {
-  return applyInFlight || dlInFlight || updateInFlight || clearInFlight ||
+  return applyInFlight || dlInFlight || predictionDlInFlight || updateInFlight || clearInFlight ||
     installerLaunched || checkInFlight || reconcileRefreshInFlight || promptDismissInFlight;
 }
 
 function syncBusyButtons() {
   const applyBtn = document.getElementById("apply-btn");
   const dlBtn = document.getElementById("zenzai-download");
+  const predictionDlBtn = document.getElementById("prediction-download");
   const updateBtn = document.getElementById("update-install");
   const checkBtn = document.getElementById("about-check-update");
   const clearBtn = document.getElementById("btn-clear-learning");
@@ -635,6 +638,13 @@ function syncBusyButtons() {
   const anyBusy = settingsOperationBusy() || reconcileRefreshInFlight;
   applyBtn.disabled = anyBusy;
   if (dlBtn) dlBtn.disabled = anyBusy;
+  if (predictionDlBtn) predictionDlBtn.disabled = anyBusy;
+  const predictionToggle = document.getElementById("e-inline-prediction");
+  if (predictionToggle) {
+    // モデル消失後も、既に有効な設定を OFF へ戻す操作だけは許す。
+    predictionToggle.disabled = anyBusy
+      || (!predictionModelReady && !Boolean(baseline?.inline_prediction_enabled));
+  }
   // 逆方向（適用/DL 飛行中にアップデートを始めさせない）もボタン状態で示す。
   // ハンドラ側ガードと二重 — 片方だけだと表示タイミングの隙間が残る。
   if (updateBtn) updateBtn.disabled = anyBusy;
@@ -773,7 +783,7 @@ async function applyNow() {
       if (!yes) return;
       // 承認後の競合防御: 予約を握っている間に他操作が始まる構造はないが、送出直前にもう
       // 一度排他を検査してから apply_settings を一度だけ送る。
-      if (dlInFlight || updateInFlight || clearInFlight || defaultsInFlight ||
+      if (dlInFlight || predictionDlInFlight || updateInFlight || clearInFlight || defaultsInFlight ||
           installerLaunched || reconcileRefreshInFlight) return;
     }
     // コマンドの async 化で適用中も UI が生きるようになったため、適用中にユーザーが
@@ -952,6 +962,86 @@ function bindZenzaiDownload() {
   });
 }
 
+// ---- インライン予測モデルのダウンロード ----
+async function refreshPredictionModelStatus() {
+  const el = document.getElementById("prediction-model-status");
+  const btn = document.getElementById("prediction-download");
+  try {
+    const status = await invoke("prediction_model_status");
+    predictionModelReady = status.state === "ready";
+    if (status.state === "ready") {
+      el.textContent = `モデル: 導入済み（${status.path}）`;
+      btn.textContent = "モデルを再ダウンロード";
+    } else if (status.state === "invalid") {
+      el.textContent = "モデル: 破損またはバージョン不一致（再ダウンロードしてください）";
+      btn.textContent = "モデルを修復（約171MB）";
+    } else if (status.state === "unavailable") {
+      el.textContent = "モデル保存先を解決できません";
+    } else {
+      el.textContent = "モデル: 未導入（インライン予測を使うにはダウンロードが必要です）";
+      btn.textContent = "モデルをダウンロード（約171MB）";
+    }
+  } catch (_) {
+    predictionModelReady = false;
+    el.textContent = "モデル状態を取得できませんでした";
+  }
+  syncBusyButtons();
+}
+
+function bindPredictionModelDownload() {
+  const btn = document.getElementById("prediction-download");
+  const cancelBtn = document.getElementById("prediction-download-cancel");
+  const bar = document.getElementById("prediction-download-progress");
+  const status = document.getElementById("prediction-download-status");
+
+  btn.addEventListener("click", async () => {
+    if (settingsOperationBusy() || reconcileRefreshInFlight) return;
+    predictionDlInFlight = true;
+    syncBusyButtons();
+    cancelBtn.hidden = false;
+    bar.hidden = false;
+    bar.removeAttribute("value");
+    status.textContent = "ダウンロード中…";
+    try {
+      const message = await invoke("download_prediction_model");
+      status.textContent = message;
+      if (state.inline_prediction_enabled === baseline.inline_prediction_enabled) {
+        state.inline_prediction_enabled = true;
+      }
+      baseline.inline_prediction_enabled = true;
+      renderAll();
+      recomputeDirty();
+      await refreshPredictionModelStatus();
+      toast("インライン予測モデルを導入しました");
+    } catch (error) {
+      const message = String(error);
+      if (message.includes("キャンセルしました")) {
+        status.textContent = "ダウンロードをキャンセルしました。";
+      } else {
+        status.textContent = `失敗: ${message}`;
+        toast(message, true);
+      }
+    } finally {
+      predictionDlInFlight = false;
+      syncBusyButtons();
+      cancelBtn.hidden = true;
+      bar.hidden = true;
+    }
+  });
+
+  cancelBtn.addEventListener("click", () => invoke("cancel_prediction_model_download"));
+  listen("prediction-download-progress", (event) => {
+    const progress = event.payload;
+    if (progress.percent != null) {
+      bar.value = progress.percent;
+      status.textContent = `${progress.file}をダウンロード中… ${progress.percent}%`;
+    } else {
+      bar.removeAttribute("value");
+      status.textContent = `${progress.file}をダウンロード中… ${(progress.received / 1048576).toFixed(1)} MB`;
+    }
+  });
+}
+
 // ---- アップデート確認（情報ページ）----
 // check_for_update → UpToDate / Available。Available ならインストーラをDL→起動。
 // ダウンロード進捗は update-download-progress イベントで受ける（zenzai DL と同型）。
@@ -999,7 +1089,8 @@ function bindUpdateCheck() {
   let queuedUpdateIntent = false;
   let consumingUpdateIntent = false;
   let consumeUpdateIntentAgain = false;
-  const isUpdateBusy = () => applyInFlight || dlInFlight || updateInFlight || clearInFlight ||
+  const isUpdateBusy = () => applyInFlight || dlInFlight || predictionDlInFlight ||
+    updateInFlight || clearInFlight ||
     installerLaunched || checkInFlight || defaultsInFlight || promptDismissInFlight ||
     reconcileRefreshInFlight;
   const openUpdatePage = () => {
@@ -1100,8 +1191,9 @@ function bindUpdateCheck() {
     try {
       const requestedIncludeBeta = Boolean(state.update_include_beta);
       const r = await invoke("check_for_update", { includeBeta: requestedIncludeBeta });
-      if (gen !== checkGen || applyInFlight || dlInFlight || updateInFlight || clearInFlight ||
-          defaultsInFlight || promptDismissInFlight || installerLaunched || reconcileRefreshInFlight) {
+      if (gen !== checkGen || applyInFlight || dlInFlight || predictionDlInFlight || updateInFlight ||
+          clearInFlight || defaultsInFlight || promptDismissInFlight || installerLaunched ||
+          reconcileRefreshInFlight) {
         // 遅延応答は破棄。自分の「確認中…」だけ後始末する(より新しい確認や他操作が表示を
         // 管理中なら触らない)。
         if (gen === checkGen && status.textContent === "確認中…") status.textContent = "";
@@ -1129,8 +1221,9 @@ function bindUpdateCheck() {
         syncBusyButtons(); // 表示と同時に排他を disabled へ反映 — 適用/DL 飛行中なら無効のまま出す
       }
     } catch (e) {
-      if (gen !== checkGen || applyInFlight || dlInFlight || updateInFlight || clearInFlight ||
-          defaultsInFlight || promptDismissInFlight || installerLaunched || reconcileRefreshInFlight) {
+      if (gen !== checkGen || applyInFlight || dlInFlight || predictionDlInFlight || updateInFlight ||
+          clearInFlight || defaultsInFlight || promptDismissInFlight || installerLaunched ||
+          reconcileRefreshInFlight) {
         // 破棄されるエラーでも、自分の世代が置いた「確認中…」だけは後始末する
         // (放置すると busy 表示が永久に残る)。より新しい世代の表示は触らない。
         if (gen === checkGen && status.textContent === "確認中…") status.textContent = "";
@@ -1177,8 +1270,8 @@ function bindUpdateCheck() {
         return;
       }
       // 承認後の競合防御(確認ダイアログは webview を止めない)。
-      if (applyInFlight || dlInFlight || clearInFlight || defaultsInFlight || promptDismissInFlight ||
-          installerLaunched || reconcileRefreshInFlight) return;
+      if (applyInFlight || dlInFlight || predictionDlInFlight || clearInFlight || defaultsInFlight ||
+          promptDismissInFlight || installerLaunched || reconcileRefreshInFlight) return;
       installBtn.hidden = true;
       cancelBtn.hidden = false;
       progress.hidden = false;
@@ -1656,6 +1749,8 @@ async function init() {
   });
   bindZenzaiDownload();
   refreshZenzaiStatus();
+  bindPredictionModelDownload();
+  refreshPredictionModelStatus();
   const info = await invoke("get_app_info");
   document.getElementById("about-version").textContent = `${info.version} (${info.build_hash})`;
   document.getElementById("about-path").textContent = info.settings_path;

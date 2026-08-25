@@ -75,6 +75,21 @@ test("settings executable uses the product profile icon", () => {
   assert.deepEqual(settingsIcon, productIcon);
 });
 
+test("dark controls keep a blue accent and a dark primary button surface", () => {
+  const css = readFileSync(new URL("../ui/style.css", import.meta.url), "utf8");
+  const darkTokens = css.match(
+    /@media \(prefers-color-scheme: dark\) \{\s*:root \{(?<tokens>[\s\S]*?)\r?\n  \}\r?\n\}/,
+  )?.groups?.tokens;
+
+  assert.ok(darkTokens, "dark theme tokens are present");
+  assert.match(darkTokens, /--accent:\s*#2f9bf4;/i);
+  assert.match(darkTokens, /--primary-bg:\s*#35363a;/i);
+  assert.match(
+    css,
+    /button\.primary\s*\{[^}]*background:\s*var\(--primary-bg\)/s,
+  );
+});
+
 test("defaults is serialized with settings operations", () => {
   const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
   assert.match(source, /let defaultsInFlight = false/);

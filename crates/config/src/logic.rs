@@ -37,6 +37,8 @@ pub struct SettingsDto {
     /// Zenzai 推論上限（1〜10、既定1）。範囲外は validate が弾く（timeout_ms と同パターン）。
     pub zenzai_inference_limit: u32,
     pub live_enabled: bool,
+    /// ローカルインライン予測（既定 OFF）。
+    pub inline_prediction_enabled: bool,
     pub default_direct: bool,
     pub learning_enabled: bool,
     /// 品質ループ③: 誤変換フィードバック記録（feedback.jsonl）。既定 false=opt-in。
@@ -93,6 +95,7 @@ pub fn to_dto(s: &settings::Settings) -> SettingsDto {
         weight_path: s.zenzai.weight_path.clone(),
         zenzai_inference_limit: s.zenzai.inference_limit,
         live_enabled: s.live_conversion.enabled,
+        inline_prediction_enabled: s.inline_prediction.enabled,
         default_direct: s.default_direct,
         learning_enabled: s.learning.enabled,
         feedback_enabled: s.feedback.enabled,
@@ -312,6 +315,7 @@ pub fn apply_dto(
     s.zenzai.weight_path = dto.weight_path;
     s.zenzai.inference_limit = dto.zenzai_inference_limit; // validate 済み（範囲内）
     s.live_conversion.enabled = dto.live_enabled;
+    s.inline_prediction.enabled = dto.inline_prediction_enabled;
     s.default_direct = dto.default_direct;
     s.learning.enabled = dto.learning_enabled;
     s.feedback.enabled = dto.feedback_enabled;
@@ -1046,6 +1050,16 @@ mod tests {
         let applied = apply_dto(dto, &settings::Settings::default(), |v| Some(v.to_string()))
             .expect("妥当な DTO は適用できる");
         assert!(applied.feedback.enabled, "DTO の ON が Settings に写る");
+    }
+
+    #[test]
+    fn inline_prediction_defaults_off_and_roundtrips_between_dto_and_settings() {
+        let defaults = settings::Settings::default();
+        assert!(!to_dto(&defaults).inline_prediction_enabled);
+        let mut dto = to_dto(&defaults);
+        dto.inline_prediction_enabled = true;
+        let applied = apply_dto(dto, &defaults, |value| Some(value.to_string())).unwrap();
+        assert!(applied.inline_prediction.enabled);
     }
 
     #[test]

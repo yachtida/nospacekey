@@ -304,6 +304,14 @@ fn load_settings_for_mutation() -> Result<settings::Settings, Vec<FieldError>> {
     })
 }
 
+fn can_enable_inline_prediction(
+    requested: bool,
+    previously_enabled: bool,
+    model_ready: bool,
+) -> bool {
+    !requested || previously_enabled || model_ready
+}
+
 // (async) 必須: 同期 command は Tauri v2 でメインスレッド実行のため、settings.json の
 // ファイル I/O が UNC/AV 介入等で遅延すると WebView ごと固まる（clear_learning_history
 // の I-1 注記と同一の規律。get_settings/apply_settings/zenzai_model_status の3つが
@@ -385,6 +393,16 @@ pub fn apply_settings(
     })?;
     // prev は適用時点のディスク上の値を読む（起動後に TIP 側で version 等が変わる可能性に備える）。
     let prev = load_settings_for_mutation()?;
+    if !can_enable_inline_prediction(
+        dto.inline_prediction_enabled,
+        prev.inline_prediction.enabled,
+        crate::prediction_download::local_model_is_ready(),
+    ) {
+        return Err(vec![FieldError {
+            field: "inline_prediction_enabled".into(),
+            message: "インライン予測を有効にするには、先にモデルを導入してください。".into(),
+        }]);
+    }
     let s = logic::apply_dto(dto, &prev, settings::dpapi::encrypt)?;
     let warning = apply_automatic_check_transaction_with_lease(
         &reconcile,
@@ -1648,6 +1666,8 @@ fn is_allowed_external_url(url: &str) -> bool {
     const ALLOW: &[&str] = &[
         "https://huggingface.co/Miwa-Keita/zenz-v3.1-small-gguf",
         "https://creativecommons.org/licenses/by-sa/4.0/",
+        "https://huggingface.co/llm-jp/llm-jp-3-150m",
+        "https://www.apache.org/licenses/LICENSE-2.0",
     ];
     ALLOW.contains(&url)
 }
@@ -1882,15 +1902,15 @@ fn request_clear_learning_once(c: &mut ipc::client::EngineClient) -> Result<(), 
 mod tests {
     use super::{
         apply_automatic_check_transaction, apply_automatic_check_transaction_with_lease,
-        clear_learning_files_with, corrupt_recovered, engine_singleton_mutex_name,
-        get_settings_with_timeout, get_symbol_catalog, has_other_same_user_session,
-        is_allowed_external_url, learning_coordination_scope, learning_lifecycle_mutex_name,
-        learning_presence_mutex_name, persist_reconcile_off, persist_reconcile_off_with_status,
-        reconcile_automatic_check_task_with_lease, releases_url, run_now_succeeded,
-        run_reconcile_worker_with, should_register_task, startup_reconcile_load_is_usable,
-        startup_reconcile_load_warning, stop_engine_exit_code, AutomaticCheckReconcileState,
-        EngineAbsenceLease, LearningEntry, LearningEntryKind, LearningScanError,
-        ReconcileCompletion, WindowsSessionUser,
+        can_enable_inline_prediction, clear_learning_files_with, corrupt_recovered,
+        engine_singleton_mutex_name, get_settings_with_timeout, get_symbol_catalog,
+        has_other_same_user_session, is_allowed_external_url, learning_coordination_scope,
+        learning_lifecycle_mutex_name, learning_presence_mutex_name, persist_reconcile_off,
+        persist_reconcile_off_with_status, reconcile_automatic_check_task_with_lease, releases_url,
+        run_now_succeeded, run_reconcile_worker_with, should_register_task,
+        startup_reconcile_load_is_usable, startup_reconcile_load_warning, stop_engine_exit_code,
+        AutomaticCheckReconcileState, EngineAbsenceLease, LearningEntry, LearningEntryKind,
+        LearningScanError, ReconcileCompletion, WindowsSessionUser,
     };
     use std::cell::{Cell, RefCell};
     use std::ffi::OsString;
@@ -2203,6 +2223,14 @@ mod tests {
     }
 
     #[test]
+    fn inline_prediction_requires_model_only_for_off_to_on_transition() {
+        assert!(!can_enable_inline_prediction(true, false, false));
+        assert!(can_enable_inline_prediction(true, false, true));
+        assert!(can_enable_inline_prediction(true, true, false));
+        assert!(can_enable_inline_prediction(false, true, false));
+    }
+
+    #[test]
     fn symbol_catalog_returns_29_entries_excluding_dash_comma_period() {
         let catalog = get_symbol_catalog();
         assert_eq!(catalog.len(), 29);
@@ -2216,6 +2244,12 @@ mod tests {
         ));
         assert!(is_allowed_external_url(
             "https://creativecommons.org/licenses/by-sa/4.0/"
+        ));
+        assert!(is_allowed_external_url(
+            "https://huggingface.co/llm-jp/llm-jp-3-150m"
+        ));
+        assert!(is_allowed_external_url(
+            "https://www.apache.org/licenses/LICENSE-2.0"
         ));
         // 近いが別物・任意 URL・UNC は弾く（前方一致ではなく完全一致）。
         assert!(!is_allowed_external_url(

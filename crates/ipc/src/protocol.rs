@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// 新 op が再起動まで無言で decline / no-op になる（v1.2.0 の辞書即時反映・文節ナビ・
 /// 訂正昇格で顕在化）。optional フィールドの追加（skip_serializing_if で旧形とバイト一致）
 /// では bump しない。Swift 側 `ProtocolVersion.current` とミラー（一字一句一致規約）。
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 
 /// `#[serde(skip_serializing_if)]` 用: false のときフィールド自体を省略する
 /// （旧エンジン/旧TIP と wire 形をバイト一致させるため）。
@@ -92,6 +92,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         left_context: Option<String>,
     },
+    /// インライン予測。通常変換と独立した接続・セッションで送り、`seq` が古い応答は TIP が破棄する。
+    /// TIP 側で正規 tokenizer により作った ID のみを渡し、生の入力文脈はプロセス間送信しない。
+    Predict {
+        session: i64,
+        seq: u64,
+        token_ids: Vec<u32>,
+    },
     /// UU-5: 常駐エンジンへ最新設定を反映させる。常駐エンジンは起動時 env で LLM/Zenzai 設定を
     /// 固定するため、設定アプリでの変更が接続中は反映されない。TIP が接続確立ごとに settings.json
     /// の現在値を push し、エンジンは以後の変換へ即時反映する（session を伴わないプロセス全体設定）。
@@ -108,6 +115,9 @@ pub enum Request {
         llm_timeout_ms: u32,
         zenzai_enabled: bool,
         zenzai_weight: String,
+        /// ローカルインライン予測。旧 TIP は送らないため false 既定。
+        #[serde(default, skip_serializing_if = "is_false")]
+        inline_prediction_enabled: bool,
         /// Spec2: かな漢字変換の学習を有効化するか。settings.learning.enabled を常に伝える。
         learning_enabled: bool,
         /// 修正変換の誤読み学習(合成ペア — 誤読み→修復表記)を有効化するか。
@@ -212,6 +222,16 @@ pub enum Response {
     LlmResult {
         seq: u64,
         text: String,
+    },
+    /// ローカルインライン予測結果。空文字列は表示しない。
+    Prediction {
+        seq: u64,
+        text: String,
+    },
+    /// 予測を出せない正常状態。入力・通常変換は継続し、TIP は表示を消すだけにする。
+    PredictionUnavailable {
+        seq: u64,
+        state: String,
     },
     /// 文節ナビゲーションのビュー。`segments` は各文節の現在表層（連結＝preedit 全体）、
     /// `selected` は選択文節の添字、`candidates` は選択文節の変換候補（全被覆のみ）、
@@ -523,6 +543,7 @@ mod tests {
             llm_timeout_ms: 15000,
             zenzai_enabled: true,
             zenzai_weight: "C:/w.gguf".into(),
+            inline_prediction_enabled: true,
             learning_enabled: true,
             typo_learn_enabled: true,
             zenzai_inference_limit: Some(3),
@@ -530,7 +551,7 @@ mod tests {
         let js = serde_json::to_string(&r).unwrap();
         assert_eq!(
             js,
-            r#"{"method":"ReloadConfig","params":{"llm_enabled":true,"llm_api_key":"sk-x","llm_endpoint":"https://e","llm_model":"gpt-4o-mini","llm_prompt":"p","llm_timeout_ms":15000,"zenzai_enabled":true,"zenzai_weight":"C:/w.gguf","learning_enabled":true,"typo_learn_enabled":true,"zenzai_inference_limit":3}}"#
+            r#"{"method":"ReloadConfig","params":{"llm_enabled":true,"llm_api_key":"sk-x","llm_endpoint":"https://e","llm_model":"gpt-4o-mini","llm_prompt":"p","llm_timeout_ms":15000,"zenzai_enabled":true,"zenzai_weight":"C:/w.gguf","inline_prediction_enabled":true,"learning_enabled":true,"typo_learn_enabled":true,"zenzai_inference_limit":3}}"#
         );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
@@ -547,6 +568,7 @@ mod tests {
             llm_timeout_ms: 15000,
             zenzai_enabled: false,
             zenzai_weight: String::new(),
+            inline_prediction_enabled: false,
             learning_enabled: false,
             typo_learn_enabled: false,
             zenzai_inference_limit: None,
@@ -624,11 +646,11 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&r).unwrap(),
-            r#"{"result":"Session","session":7,"proto":2}"#
+            r#"{"result":"Session","session":7,"proto":3}"#
         );
         assert_eq!(
             serde_json::from_str::<Response>(
-                &r#"{"result":"Session","session":7,"proto":2}"#.to_string()
+                &r#"{"result":"Session","session":7,"proto":3}"#.to_string()
             )
             .unwrap(),
             r
@@ -639,7 +661,7 @@ mod tests {
     fn old_tip_shape_decodes_new_engine_session() {
         // 旧TIP ↔ 新エンジン象限（更新後〜再起動前に本番で必ず走る）: 旧 TIP の Response 形を
         // テスト内ミラー enum（Session { session } のみ・proto フィールド無し）で再現し、新エンジンの
-        // 応答 {"result":"Session","session":7,"proto":2} が余剰フィールドを無視して decode できることを固定。
+        // 応答 {"result":"Session","session":7,"proto":3} が余剰フィールドを無視して decode できることを固定。
         // committed 先例は auto_commit:true 要求時のみ載るため実績にならない（設計ロック(d)）。
         #[derive(serde::Deserialize, Debug, PartialEq)]
         #[serde(tag = "result")]
@@ -647,7 +669,7 @@ mod tests {
             Session { session: i64 },
         }
         let r: OldTipResponse =
-            serde_json::from_str(r#"{"result":"Session","session":7,"proto":2}"#).unwrap();
+            serde_json::from_str(r#"{"result":"Session","session":7,"proto":3}"#).unwrap();
         assert_eq!(r, OldTipResponse::Session { session: 7 });
     }
 
@@ -662,6 +684,7 @@ mod tests {
             llm_timeout_ms: 15000,
             zenzai_enabled: false,
             zenzai_weight: String::new(),
+            inline_prediction_enabled: false,
             learning_enabled: true,
             typo_learn_enabled: true,
             zenzai_inference_limit: None,
@@ -686,6 +709,7 @@ mod tests {
             llm_timeout_ms: 15000,
             zenzai_enabled: true,
             zenzai_weight: String::new(),
+            inline_prediction_enabled: false,
             learning_enabled: true,
             typo_learn_enabled: true,
             zenzai_inference_limit: None,
@@ -799,5 +823,50 @@ mod tests {
         let js = serde_json::to_string(&r).unwrap();
         assert_eq!(js, r#"{"result":"Committed","text":"日本","reading":"ご"}"#);
         assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), r);
+    }
+
+    #[test]
+    fn prediction_request_roundtrips() {
+        let r = Request::Predict {
+            session: 7,
+            seq: 42,
+            token_ids: vec![1, 50_014, 28_998, 65_484, 29_282],
+        };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            js,
+            r#"{"method":"Predict","params":{"session":7,"seq":42,"token_ids":[1,50014,28998,65484,29282]}}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
+    }
+
+    #[test]
+    fn prediction_response_roundtrips() {
+        let r = Response::Prediction {
+            seq: 42,
+            text: "会議です".into(),
+        };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(js, r#"{"result":"Prediction","seq":42,"text":"会議です"}"#);
+        assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), r);
+    }
+
+    #[test]
+    fn prediction_unavailable_response_roundtrips() {
+        let r = Response::PredictionUnavailable {
+            seq: 42,
+            state: "loading".into(),
+        };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            js,
+            r#"{"result":"PredictionUnavailable","seq":42,"state":"loading"}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), r);
+    }
+
+    #[test]
+    fn prediction_bumps_protocol_generation() {
+        assert_eq!(PROTO_VERSION, 3);
     }
 }

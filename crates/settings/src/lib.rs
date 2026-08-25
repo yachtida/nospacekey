@@ -97,6 +97,12 @@ impl Default for LiveSettings {
     }
 }
 
+/// 完全ローカルのインライン予測。モデル取得前に勝手に有効化しない opt-in 機能。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InlinePredictionSettings {
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearningSettings {
     pub enabled: bool,
@@ -305,6 +311,9 @@ pub struct Settings {
     pub zenzai: ZenzaiSettings,
     #[serde(default)]
     pub live_conversion: LiveSettings,
+    /// 明示確定後のローカル続き予測。欠落する旧 settings.json は OFF。
+    #[serde(default)]
+    pub inline_prediction: InlinePredictionSettings,
     /// Spec2: かな漢字変換の学習（確定候補を以後の順位に反映）。既定 ON。
     /// engine env `NOSPACEKEY_LEARNING`（"1"/"0"）へ resolve_env_map が常に注入する。
     #[serde(default)]
@@ -364,6 +373,7 @@ impl Default for Settings {
             llm: Default::default(),
             zenzai: Default::default(),
             live_conversion: Default::default(),
+            inline_prediction: Default::default(),
             learning: Default::default(),
             default_direct: false,
             appearance: Default::default(),
@@ -1111,6 +1121,14 @@ pub fn resolve_env_map(
     put(
         "NOSPACEKEY_USER_DICT_ENABLED",
         if s.user_dictionary.enabled {
+            "1".into()
+        } else {
+            "0".into()
+        },
+    );
+    put(
+        "NOSPACEKEY_INLINE_PREDICTION",
+        if s.inline_prediction.enabled {
             "1".into()
         } else {
             "0".into()
@@ -2249,5 +2267,22 @@ mod tests {
         // 3状態を JSON 上で区別できる: None は null として明示的に書かれる
         // (skip_serializing_if を使わない — 設定アプリの dirty 判定が null/欠落で食い違わないように)。
         assert!(s.to_json().contains(r#""mode_toggle": null"#));
+    }
+
+    #[test]
+    fn inline_prediction_defaults_off_and_roundtrips() {
+        let old = Settings::from_json_str(r#"{"version":2}"#);
+        assert!(!old.inline_prediction.enabled);
+        let mut enabled = Settings::default();
+        enabled.inline_prediction.enabled = true;
+        assert!(
+            Settings::from_json_str(&enabled.to_json())
+                .inline_prediction
+                .enabled
+        );
+        let env = resolve_env_map(&enabled, None, |_| None);
+        assert!(env
+            .iter()
+            .any(|(key, value)| { key == "NOSPACEKEY_INLINE_PREDICTION" && value == "1" }));
     }
 }

@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 ipc = { path = "../ipc" }
 ids = { path = "../ids" }
 settings = { path = "../settings" }
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
 # windows 0.62 は windows-result 0.4 系。windows-registry 0.5 は 0.3 系を引き込み
 # Error 型が二重になって `?` 変換が壊れるため、0.62 と同世代の 0.6 に合わせる。
 windows-registry = "0.6"

@@ -41,7 +41,7 @@ final class EngineHostHandlerTests: XCTestCase {
         let obj = try JSONSerialization.jsonObject(
             with: handler(1, Data(#"{"method":"StartSession"}"#.utf8)).reply) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
-        XCTAssertEqual(obj["proto"] as? Int, 2)
+        XCTAssertEqual(obj["proto"] as? Int, 3)
     }
 
     // graceful 停止: Shutdown は Ok を返し、かつ「応答後に exit」を要求する（実際の exit(0) は
@@ -63,6 +63,89 @@ final class EngineHostHandlerTests: XCTestCase {
     func testMalformedBodyYieldsErrorNotCrash() {
         let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
         XCTAssertEqual(resultTag(handler(1, Data("not json".utf8))), "Error")
+    }
+
+    func testPredictionUsesOwnedSessionAndPreservesSequence() throws {
+        let predictor = PredictionService(availability: .ready) { _, _ in "会議です" }
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
+                                        predictionService: predictor)
+        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
+            return XCTFail("no session")
+        }
+        let body = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":42,"token_ids":[1,50014,28998,65484,29282]}}"#.utf8)
+        let obj = try JSONSerialization.jsonObject(with: handler(10, body).reply) as! [String: Any]
+        XCTAssertEqual(obj["result"] as? String, "Prediction")
+        XCTAssertEqual(obj["seq"] as? Int, 42)
+        XCTAssertEqual(obj["text"] as? String, "会議です")
+    }
+
+    func testPredictionRejectsAnotherConnectionsSession() {
+        let predictor = PredictionService(availability: .ready) { _, _ in "漏れてはいけない" }
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
+                                        predictionService: predictor)
+        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
+            return XCTFail("no session")
+        }
+        let body = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":1,"token_ids":[1,2]}}"#.utf8)
+        XCTAssertEqual(resultTag(handler(11, body)), "Error")
+    }
+
+    func testReloadConfigDisablesPredictionImmediately() throws {
+        let predictor = PredictionService(availability: .ready) { _, _ in "表示しない" }
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
+                                        predictionService: predictor)
+        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
+            return XCTFail("no session")
+        }
+        let reload = Data(#"{"method":"ReloadConfig","params":{"llm_enabled":false,"llm_api_key":"","llm_endpoint":"","llm_model":"","llm_prompt":"","llm_timeout_ms":15000,"zenzai_enabled":false,"zenzai_weight":"","inline_prediction_enabled":false}}"#.utf8)
+        XCTAssertEqual(resultTag(handler(10, reload)), "Ok")
+        let predict = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":7,"token_ids":[1,2]}}"#.utf8)
+        let object = try JSONSerialization.jsonObject(with: handler(10, predict).reply) as! [String: Any]
+        XCTAssertEqual(object["result"] as? String, "PredictionUnavailable")
+        XCTAssertEqual(object["state"] as? String, "disabled")
+    }
+
+    func testNormalOperationCancelsInFlightPredictionButPingDoesNot() throws {
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let predictor = PredictionService(availability: .ready) { _, _ in
+            started.signal()
+            _ = release.wait(timeout: .now() + 2)
+            return "候補です"
+        }
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
+                                        predictionService: predictor)
+        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
+            return XCTFail("no session")
+        }
+        let predict = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":8,"token_ids":[1,2]}}"#.utf8)
+
+        let pingReply = ReplyBox()
+        let pingDone = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            pingReply.data = handler(10, predict).reply
+            pingDone.signal()
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(resultTag(handler(10, Data(#"{"method":"Ping"}"#.utf8))), "Pong")
+        release.signal()
+        XCTAssertEqual(pingDone.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(resultTag((pingReply.data ?? Data(), false)), "Prediction")
+
+        let operationReply = ReplyBox()
+        let operationDone = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            operationReply.data = handler(10, predict).reply
+            operationDone.signal()
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
+        let insert = Data(#"{"method":"Insert","params":{"session":\#(sid),"text":"a"}}"#.utf8)
+        XCTAssertEqual(resultTag(handler(10, insert)), "Reading")
+        release.signal()
+        XCTAssertEqual(operationDone.wait(timeout: .now() + 2), .success)
+        let object = try JSONSerialization.jsonObject(with: operationReply.data ?? Data()) as! [String: Any]
+        XCTAssertEqual(object["result"] as? String, "PredictionUnavailable")
+        XCTAssertEqual(object["state"] as? String, "stale")
     }
 
     // UU-5: ReloadConfig は session を伴わずに Ok を返す（decode→dispatch→反映のスモーク）。
