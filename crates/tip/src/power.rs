@@ -20,29 +20,38 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ipc::client::EngineClient;
+use ipc::client::{verify_session_identity, EngineClient, EngineIdentityError};
 use ipc::protocol::{Request, Response};
 
 use crate::text_service::tip_log;
 
 /// プリウォームの分岐だけを切り出した純粋関数（Win32 非依存でテスト可能）。
 /// probe（生存確認）の結果から次アクションを決める。
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PrewarmAction {
     None,
     Respawn,
 }
 
+#[derive(Debug, PartialEq)]
+enum EngineProbeOutcome {
+    Alive,
+    HalfDead,
+    Absent,
+    IdentityMismatch {
+        actual_proto: Option<u32>,
+        actual_boot: Option<String>,
+    },
+}
+
 /// probe の結果 → 次アクション。
-/// - `Ok(true)`  : Ping に Pong → エンジン生存。何もしない。
-/// - `Ok(false)` : connect は成功したが Pong 以外／無応答 ＝ 半死。pipe を占有中なので spawn しても
-///   衝突するだけで無意味（spec 非目的）。何もしない。
-/// - `Err(_)`    : connect 失敗 ＝ 不在。ユーザ不在中にモデルロードを済ませる（Respawn）。
-pub(crate) fn prewarm_action(probe: &std::io::Result<bool /* pong received */>) -> PrewarmAction {
+/// 不在だけを respawn し、半死と identity mismatch は既存pipeを尊重する。
+fn prewarm_action(probe: &EngineProbeOutcome) -> PrewarmAction {
     match probe {
-        Ok(true) => PrewarmAction::None,
-        Ok(false) => PrewarmAction::None,
-        Err(_) => PrewarmAction::Respawn,
+        EngineProbeOutcome::Absent => PrewarmAction::Respawn,
+        EngineProbeOutcome::Alive
+        | EngineProbeOutcome::HalfDead
+        | EngineProbeOutcome::IdentityMismatch { .. } => PrewarmAction::None,
     }
 }
 
@@ -83,17 +92,38 @@ impl Drop for RunningResetter<'_> {
     }
 }
 
-/// エンジンの生存確認。connect(500ms)→Ping(request_within, +1s) を行い、
-/// `Ok(true)`=生存 / `Ok(false)`=半死 / `Err(_)`=不在 を返す（prewarm_action の入力形）。
-fn probe_engine(pipe: &str) -> std::io::Result<bool> {
-    let mut client = EngineClient::connect_to(pipe, Duration::from_millis(500))?;
+/// エンジンの生存確認。connect後にidentityを確認し、一致した接続だけへPingを送る。
+fn probe_engine(pipe: &str) -> EngineProbeOutcome {
+    let Ok(mut client) = EngineClient::connect_to(pipe, Duration::from_millis(500)) else {
+        return EngineProbeOutcome::Absent;
+    };
+    let identity = match client.request_within(
+        &Request::StartSession,
+        Instant::now() + Duration::from_secs(1),
+    ) {
+        Ok(response) => verify_session_identity(response),
+        Err(_) => return EngineProbeOutcome::HalfDead,
+    };
+    match identity {
+        Ok(_) => {}
+        Err(EngineIdentityError::Mismatch {
+            actual_proto,
+            actual_boot,
+        }) => {
+            return EngineProbeOutcome::IdentityMismatch {
+                actual_proto,
+                actual_boot,
+            }
+        }
+        Err(_) => return EngineProbeOutcome::HalfDead,
+    }
     let deadline = Instant::now() + Duration::from_secs(1);
     match client.request_within(&Request::Ping, deadline) {
-        Ok(Response::Pong) => Ok(true),
+        Ok(Response::Pong) => EngineProbeOutcome::Alive,
         // connect は成功しているので接続自体は生きている＝半死（Pong 以外/エラー応答）。
-        Ok(_) => Ok(false),
+        Ok(_) => EngineProbeOutcome::HalfDead,
         // 無応答（TimedOut）や切断。connect が通った以上「不在」ではないので半死扱い。
-        Err(_) => Ok(false),
+        Err(_) => EngineProbeOutcome::HalfDead,
     }
 }
 
@@ -116,8 +146,15 @@ fn prewarm(events: Arc<PowerEvents>) {
     let _resetter = RunningResetter(&events.prewarm_running);
 
     let probe = probe_engine(&events.pipe_name);
-    let ok = matches!(probe, Ok(true));
-    tip_log(&format!("ev=resume_probe ok={ok}"));
+    match &probe {
+        EngineProbeOutcome::IdentityMismatch {
+            actual_proto,
+            actual_boot,
+        } => tip_log(&format!(
+            "ev=resume_engine_identity_mismatch actual_proto={actual_proto:?} actual_boot={actual_boot:?} action=no_respawn"
+        )),
+        outcome => tip_log(&format!("ev=resume_probe outcome={outcome:?}")),
+    }
 
     match prewarm_action(&probe) {
         PrewarmAction::None => {}
@@ -261,23 +298,37 @@ mod prewarm_tests {
 
     #[test]
     fn alive_pong_is_none() {
-        // Ping→Pong → 生存 → 何もしない。
-        let probe: std::io::Result<bool> = Ok(true);
-        assert_eq!(prewarm_action(&probe), PrewarmAction::None);
+        assert_eq!(
+            prewarm_action(&EngineProbeOutcome::Alive),
+            PrewarmAction::None
+        );
     }
 
     #[test]
     fn half_dead_is_none() {
         // 半死（connect Ok・Pong 以外/無応答）→ pipe 占有中なので spawn せず None。
-        let probe: std::io::Result<bool> = Ok(false);
-        assert_eq!(prewarm_action(&probe), PrewarmAction::None);
+        assert_eq!(
+            prewarm_action(&EngineProbeOutcome::HalfDead),
+            PrewarmAction::None
+        );
     }
 
     #[test]
     fn absent_is_respawn() {
         // connect 失敗（不在）→ ユーザ不在中にモデルロードを済ませる → Respawn。
-        let probe: std::io::Result<bool> = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
-        assert_eq!(prewarm_action(&probe), PrewarmAction::Respawn);
+        assert_eq!(
+            prewarm_action(&EngineProbeOutcome::Absent),
+            PrewarmAction::Respawn
+        );
+    }
+
+    #[test]
+    fn identity_mismatch_never_respawns() {
+        let mismatch = EngineProbeOutcome::IdentityMismatch {
+            actual_proto: Some(ipc::protocol::PROTO_VERSION),
+            actual_boot: Some("loaded-old-build".into()),
+        };
+        assert_eq!(prewarm_action(&mismatch), PrewarmAction::None);
     }
 
     #[test]

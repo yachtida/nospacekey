@@ -3,15 +3,188 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   bindDefaultSettingsHandler,
+  canRetryZenzai,
   clearLearningSuccessMessage,
   dictionaryPage,
   mergePersistedAutomaticCheckFields,
   reconcileDefaultSettingsResponse,
   reconcileLateAutomaticCheckFields,
   reconcilePromptDismissal,
+  reduceUpdateCancellation,
   resetDictionaryScroll,
   rollbackAutomaticCheckFields,
+  acceptUpdatePhaseEvent,
+  settleUpdatePhase,
+  updateCloseBlockedMessage,
+  updateCancellationPresentation,
+  updatePhasePresentation,
+  zenzaiRuntimeStatusLabel,
 } from "../ui/app-state.mjs";
+
+test("update phases separate download cancellation from installer waiting", () => {
+  assert.deepEqual(updatePhasePresentation("downloading", { received: 2 * 1048576 }), {
+    cancelHidden: false,
+    progressHidden: false,
+    status: "ダウンロード中… 2.0 MB",
+  });
+  assert.deepEqual(updatePhasePresentation("installing"), {
+    cancelHidden: true,
+    progressHidden: true,
+    status: "インストーラの完了を待っています…",
+  });
+  assert.match(updateCloseBlockedMessage("downloading"), /「キャンセル」/);
+  assert.doesNotMatch(updateCloseBlockedMessage("installing"), /「キャンセル」/);
+  assert.match(updateCloseBlockedMessage("installing"), /インストーラ側/);
+});
+
+test("update phase events ignore settled and stale attempts and failures return to retryable idle", () => {
+  assert.equal(acceptUpdatePhaseEvent(7, true, { attempt_id: 7, phase: "installing" })?.phase,
+    "installing");
+  assert.equal(acceptUpdatePhaseEvent(7, false, { attempt_id: 7, phase: "installing" }), null);
+  assert.equal(acceptUpdatePhaseEvent(8, true, { attempt_id: 7, phase: "installing" }), null);
+  assert.equal(acceptUpdatePhaseEvent(7, true, { attempt_id: 7, phase: "unknown" }), null);
+  assert.equal(settleUpdatePhase(false), "idle");
+  assert.equal(settleUpdatePhase(true), "completed");
+});
+
+test("cancel reducer handles accepted inactive rejection and too-late outcomes monotonically", () => {
+  const pending = {
+    activeAttemptId: 7,
+    commandPending: true,
+    phase: "downloading",
+    cancelRequestedAttemptId: 7,
+    cancelError: null,
+  };
+  const accepted = reduceUpdateCancellation(pending, {
+    type: "result", attemptId: 7, outcome: "accepted",
+  });
+  assert.deepEqual(accepted, pending);
+  assert.deepEqual(updateCancellationPresentation(accepted), {
+    cancelHidden: true,
+    cancelDisabled: true,
+    progressHidden: false,
+    status: "キャンセルしています…",
+  });
+
+  const inactive = reduceUpdateCancellation(pending, {
+    type: "result", attemptId: 7, outcome: "inactive",
+  });
+  assert.equal(inactive.cancelRequestedAttemptId, null);
+  assert.equal(inactive.phase, "downloading");
+  assert.equal(updateCancellationPresentation(inactive).cancelDisabled, false);
+
+  const rejected = reduceUpdateCancellation(pending, {
+    type: "rejected", attemptId: 7, error: "IPC failed",
+  });
+  assert.equal(rejected.cancelRequestedAttemptId, null);
+  assert.equal(rejected.phase, "downloading");
+  assert.equal(rejected.cancelError, "IPC failed");
+
+  const tooLate = reduceUpdateCancellation(pending, {
+    type: "result", attemptId: 7, outcome: "too_late",
+  });
+  assert.equal(tooLate.cancelRequestedAttemptId, null);
+  assert.equal(tooLate.phase, "installing");
+  assert.equal(updateCancellationPresentation(tooLate).status,
+    "インストーラの完了を待っています…");
+  assert.strictEqual(reduceUpdateCancellation(tooLate, {
+    type: "phase", payload: { attempt_id: 7, phase: "downloading", percent: 90 },
+  }), tooLate);
+});
+
+test("cancel reducer ignores stale responses and installing events cannot regress", () => {
+  const pendingA = {
+    activeAttemptId: 7, commandPending: true, phase: "downloading",
+    cancelRequestedAttemptId: 7, cancelError: null,
+  };
+  const installing = reduceUpdateCancellation(pendingA, {
+    type: "phase", payload: { attempt_id: 7, phase: "installing" },
+  });
+  assert.equal(installing.phase, "installing");
+  assert.equal(installing.cancelRequestedAttemptId, null);
+  assert.strictEqual(reduceUpdateCancellation(installing, {
+    type: "phase", payload: { attempt_id: 7, phase: "downloading", percent: 95 },
+  }), installing);
+  assert.notStrictEqual(reduceUpdateCancellation(installing, {
+    type: "phase", payload: { attempt_id: 7, phase: "installing" },
+  }), installing);
+  assert.strictEqual(reduceUpdateCancellation(installing, {
+    type: "result", attemptId: 7, outcome: "inactive",
+  }), installing);
+
+  const settledA = { ...pendingA, commandPending: false };
+  assert.strictEqual(reduceUpdateCancellation(settledA, {
+    type: "result", attemptId: 7, outcome: "inactive",
+  }), settledA);
+
+  const pendingB = { ...pendingA, activeAttemptId: 8, cancelRequestedAttemptId: 8 };
+  assert.strictEqual(reduceUpdateCancellation(pendingB, {
+    type: "result", attemptId: 7, outcome: "too_late",
+  }), pendingB);
+
+  const beforeBegin = {
+    activeAttemptId: null, commandPending: false, phase: "idle",
+    cancelRequestedAttemptId: null, cancelError: null,
+  };
+  assert.strictEqual(reduceUpdateCancellation(beforeBegin, {
+    type: "request", attemptId: 9,
+  }), beforeBegin);
+  assert.equal(reduceUpdateCancellation({ ...pendingA, cancelRequestedAttemptId: null }, {
+    type: "request", attemptId: 7,
+  }).cancelRequestedAttemptId, 7);
+});
+
+test("live update phases accept equal progress and forward transitions only", () => {
+  const downloading = {
+    activeAttemptId: 21, commandPending: true, phase: "downloading",
+    cancelRequestedAttemptId: null, cancelError: null,
+  };
+  const progress = reduceUpdateCancellation(downloading, {
+    type: "phase", payload: { attempt_id: 21, phase: "downloading", percent: 50 },
+  });
+  assert.notStrictEqual(progress, downloading);
+  assert.equal(progress.phase, "downloading");
+  assert.equal(reduceUpdateCancellation(downloading, {
+    type: "phase", payload: { attempt_id: 21, phase: "installing" },
+  }).phase, "installing");
+
+  for (const phase of ["idle", "completed"]) {
+    const malformedPending = { ...downloading, phase };
+    for (const incoming of ["downloading", "installing"]) {
+      assert.strictEqual(reduceUpdateCancellation(malformedPending, {
+        type: "phase", payload: { attempt_id: 21, phase: incoming },
+      }), malformedPending);
+    }
+  }
+});
+
+test("Zenzai runtime labels keep model installation separate from GPU state", () => {
+  assert.equal(zenzaiRuntimeStatusLabel(null),
+    "GPU runtime状態を取得できません（エンジン未起動・旧版・応答なし）");
+  assert.equal(zenzaiRuntimeStatusLabel({ state: "disabled", reason: "user_disabled" }),
+    "GPU runtime: 無効（設定で無効）");
+  assert.equal(zenzaiRuntimeStatusLabel({ state: "preparing" }), "GPU runtime: 準備中…");
+  assert.equal(zenzaiRuntimeStatusLabel({
+    state: "gpu_active", device: "AMD Radeon(TM) 890M Graphics", backend: "Vulkan",
+  }), "GPU runtime: AMD Radeon(TM) 890M Graphics / Vulkan で稼働中");
+  assert.equal(zenzaiRuntimeStatusLabel({ state: "classic", reason: "backend_unavailable" }),
+    "GPU runtime: 古典変換中（Vulkan backendなし）");
+  assert.equal(zenzaiRuntimeStatusLabel({ state: "unknown" }), null);
+});
+
+test("Zenzai retry is enabled only for an applied classic failure with a model", () => {
+  const ready = {
+    anyBusy: false, dirty: false, enabled: true, modelReady: true,
+    statusInFlight: false, status: { state: "classic" },
+  };
+  assert.equal(canRetryZenzai(ready), true);
+  for (const override of [
+    { anyBusy: true }, { dirty: true }, { enabled: false }, { modelReady: false },
+    { statusInFlight: true }, { status: { state: "preparing" } }, { status: null },
+  ]) {
+    assert.equal(canRetryZenzai({ ...ready, ...override }), false);
+  }
+});
 
 test("dictionary page caps DOM work and reaches later entries", () => {
   const entries = Array.from({ length: 10_000 }, (_, index) => ({

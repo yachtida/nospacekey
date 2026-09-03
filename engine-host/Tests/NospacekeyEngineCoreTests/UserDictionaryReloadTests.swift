@@ -20,9 +20,11 @@ private final class Box<T>: @unchecked Sendable {
 /// spec: docs/superpowers/specs/2026-08-02-custom-dictionary-design.md §4.1
 final class UserDictionaryReloadTests: XCTestCase {
     /// environment は辞書ファイル/有効トグルを注入する唯一の入口（env 直読テスト禁止の既存契約）。
-    private func makeService(environment: [String: String] = [:]) -> ConversionService {
+    private func makeService(environment: [String: String] = [:],
+                             dictionaryRetryDelay: DispatchTimeInterval = .milliseconds(100)) -> ConversionService {
         ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
-                          environment: environment)
+                          environment: environment,
+                          dictionaryRetryDelay: dictionaryRetryDelay)
     }
 
     /// 読み（かな）を direct 挿入して変換した候補列。reconvert と同じ「かなを丸ごと入れる」経路。
@@ -124,6 +126,34 @@ final class UserDictionaryReloadTests: XCTestCase {
         reload(svc, enabled: true)
         XCTAssertTrue(convertContains(svc, reading: probeReading, word: probeWord),
                       "一過性の読み失敗で辞書が全消滅した")
+    }
+
+    func testFailedReloadRetriesLaterAndKeepsOnlyTheLatestDesiredState() throws {
+        let url = try writeTempJson(probeJson)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let svc = makeService(environment: ["NOSPACEKEY_USER_DICT": url.path],
+                              dictionaryRetryDelay: .seconds(30))
+        reload(svc, enabled: true)
+        XCTAssertTrue(convertContains(svc, reading: probeReading, word: probeWord))
+
+        try Data("{".utf8).write(to: url)
+        svc.requestDictionaryReload(enabled: true)
+        svc.flushDictionaryQueueForTesting()
+        XCTAssertTrue(convertContains(svc, reading: probeReading, word: probeWord),
+                      "待機中の再試行より前に常駐辞書を失っている")
+
+        try Data(swappedJson.utf8).write(to: url)
+        XCTAssertTrue(svc.releaseDictionaryRetryForTesting())
+        XCTAssertTrue(convertContains(svc, reading: probeReading, word: swappedWord))
+
+        try Data("{".utf8).write(to: url)
+        svc.requestDictionaryReload(enabled: true)
+        svc.flushDictionaryQueueForTesting()
+        svc.requestDictionaryReload(enabled: false)
+        svc.flushDictionaryQueueForTesting()
+        XCTAssertFalse(svc.releaseDictionaryRetryForTesting(),
+                       "新しいリロードが旧世代の待機中再試行を置換していない")
+        XCTAssertFalse(convertContains(svc, reading: probeReading, word: swappedWord))
     }
 
     /// GUI 初回登録シナリオ: 起動時に %LOCALAPPDATA%\nospacekey\user_dictionary.json が

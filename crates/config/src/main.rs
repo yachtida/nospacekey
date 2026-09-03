@@ -131,12 +131,19 @@ fn fatal_dialog(text: &str) {
 }
 
 fn main() {
+    let _version_lease = match nospacekey_lifetime::VersionLease::acquire() {
+        Ok(lease) => lease,
+        Err(_) => std::process::exit(70),
+    };
     let launch_intent = activation::parse_args(std::env::args().skip(1));
     // アンインストーラ/更新からの graceful 停止経路。Tauri/WebView2 を一切起動せず、
     // 常駐エンジンへ Shutdown を送って終了する（新規インストール時も無害＝エンジン不在で code 0）。
     // argv[1] の parse-and-ignore より前に判定する（--stop-engine は HWND として parse されないが明示）。
     if launch_intent == activation::LaunchIntent::StopEngine {
         std::process::exit(commands::stop_engine());
+    }
+    if launch_intent == activation::LaunchIntent::RepairUpdateTask {
+        std::process::exit(commands::repair_update_task_after_install());
     }
 
     // argv[1] = 親 HWND（isize 文字列）。v1 同様 parse-and-ignore。
@@ -192,6 +199,8 @@ fn main() {
             commands::open_releases_page,
             commands::open_external_url,
             commands::clear_learning_history,
+            commands::zenzai_runtime_status,
+            commands::retry_zenzai,
             download::zenzai_model_status,
             download::download_zenzai_model,
             download::cancel_zenzai_download,

@@ -1,6 +1,12 @@
 import Foundation
 import WinSDK
 
+public enum ZenzaiDisabledReason: Equatable, Sendable {
+    case userDisabled
+    case modelMissing
+    case cpuUnsupported
+}
+
 /// Zenzai の有効化・重みパス・推論上限を、明示 weight → per-user(%LOCALAPPDATA%) → exe 隣の
 /// 3段解決表から解決する純粋ロジック（設定UI crates/config/src/download.rs の detect_model と同一の表）。
 /// グローバル状態に触れず、`environment`/`exeDir`/`fileExists` を注入してユニットテスト可能にする。
@@ -10,9 +16,25 @@ public struct ZenzaiConfig: Equatable {
     /// 推論回数上限（zenz の inferenceLimit）。
     public let inferenceLimit: Int
 
-    public init(weightURL: URL?, inferenceLimit: Int) {
+    /// Trusted directory used by the patched runtime to load backend DLLs. This is
+    /// resolved from the executable directory unless a development wrapper supplies an
+    /// explicit runtime directory.
+    public let runtimeDirectory: URL?
+
+    /// Why the model was disabled when weightURL is nil. Keeping this provenance avoids
+    /// probing the runtime just to distinguish user-off from a missing model.
+    public let disabledReason: ZenzaiDisabledReason?
+
+    public init(
+        weightURL: URL?,
+        inferenceLimit: Int,
+        runtimeDirectory: URL? = nil,
+        disabledReason: ZenzaiDisabledReason? = nil
+    ) {
         self.weightURL = weightURL
         self.inferenceLimit = inferenceLimit
+        self.runtimeDirectory = runtimeDirectory
+        self.disabledReason = disabledReason
     }
 
     /// 既定モデルファイル名（HuggingFace Miwa-Keita/zenz-v3.1-small-gguf）。
@@ -52,10 +74,14 @@ public struct ZenzaiConfig: Equatable {
         let limit = environment["NOSPACEKEY_ZENZAI_INFERENCE_LIMIT"].flatMap(Int.init) ?? 1
 
         if environment["NOSPACEKEY_ZENZAI"]?.lowercased() == "off" {
-            return ZenzaiConfig(weightURL: nil, inferenceLimit: limit)
+            return ZenzaiConfig(weightURL: nil, inferenceLimit: limit,
+                                runtimeDirectory: runtimeDirectory(exeDir: exeDir, environment: environment),
+                                disabledReason: .userDisabled)
         }
         if !cpuMeetsLlamaBaseline {
-            return ZenzaiConfig(weightURL: nil, inferenceLimit: limit)
+            return ZenzaiConfig(weightURL: nil, inferenceLimit: limit,
+                                runtimeDirectory: runtimeDirectory(exeDir: exeDir, environment: environment),
+                                disabledReason: .cpuUnsupported)
         }
 
         var candidates: [String] = []
@@ -79,8 +105,22 @@ public struct ZenzaiConfig: Equatable {
         )
 
         for candidatePath in candidates where fileExists(candidatePath) {
-            return ZenzaiConfig(weightURL: URL(fileURLWithPath: candidatePath), inferenceLimit: limit)
+            return ZenzaiConfig(
+                weightURL: URL(fileURLWithPath: candidatePath),
+                inferenceLimit: limit,
+                runtimeDirectory: runtimeDirectory(exeDir: exeDir, environment: environment))
         }
-        return ZenzaiConfig(weightURL: nil, inferenceLimit: limit)
+        return ZenzaiConfig(
+            weightURL: nil,
+            inferenceLimit: limit,
+            runtimeDirectory: runtimeDirectory(exeDir: exeDir, environment: environment),
+            disabledReason: .modelMissing)
+    }
+
+    private static func runtimeDirectory(exeDir: URL, environment: [String: String]) -> URL {
+        if let value = environment["NOSPACEKEY_ZENZAI_RUNTIME_DIR"], !value.isEmpty {
+            return URL(fileURLWithPath: value)
+        }
+        return exeDir
     }
 }

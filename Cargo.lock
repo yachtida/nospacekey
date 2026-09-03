@@ -530,13 +530,15 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "1.2.2-beta.8"
+version = "1.2.2-beta.10"
 dependencies = [
  "futures-util",
  "hex",
  "ipc",
+ "nospacekey-lifetime",
  "nospacekey-update",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "settings",
@@ -641,6 +643,15 @@ name = "crossbeam-epoch"
 version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-queue"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "803d13fb3b09d88be9f4dbc29062c66b19bf7170867ceb746d2a8689bf6c7a26"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1873,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "ids"
-version = "1.2.2-beta.8"
+version = "1.2.2-beta.10"
 dependencies = [
  "windows-core 0.62.2",
 ]
@@ -1912,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "ipc"
-version = "1.2.2-beta.8"
+version = "1.2.2-beta.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -2312,11 +2323,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nospacekey-lifetime"
+version = "1.2.2-beta.10"
+dependencies = [
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "nospacekey-update"
-version = "1.2.2-beta.8"
+version = "1.2.2-beta.10"
 dependencies = [
  "chrono",
  "futures-util",
+ "nospacekey-lifetime",
  "reqwest",
  "semver",
  "serde",
@@ -2329,12 +2348,16 @@ dependencies = [
 
 [[package]]
 name = "nospacekey_tip"
-version = "1.2.2-beta.8"
+version = "1.2.2-beta.10"
 dependencies = [
+ "crossbeam-queue",
  "ids",
  "ipc",
+ "nospacekey-lifetime",
+ "semver",
  "settings",
  "tokenizers",
+ "unicode-segmentation",
  "windows 0.62.2",
  "windows-core 0.62.2",
  "windows-registry",
@@ -3517,7 +3540,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "1.2.2-beta.8"
+version = "1.2.2-beta.10"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -4134,7 +4157,7 @@ dependencies = [
 
 [[package]]
 name = "testbench"
-version = "1.2.2-beta.8"
+version = "1.2.2-beta.10"
 dependencies = [
  "ids",
  "ipc",

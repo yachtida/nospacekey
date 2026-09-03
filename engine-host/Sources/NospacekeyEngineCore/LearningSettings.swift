@@ -40,6 +40,10 @@ public struct LearningSettings: Equatable, Sendable {
 
     /// 学習の有効/無効に関わらず「学習データが置かれる場所」を解決する（履歴消去用）。
     public static func resolveDir(environment: [String: String]) -> URL? {
+        resolveBaseDir(environment: environment)?.appendingPathComponent(BuildInfo.version)
+    }
+
+    public static func resolveBaseDir(environment: [String: String]) -> URL? {
         if let explicit = environment["NOSPACEKEY_MEMORY_DIR"], !explicit.isEmpty {
             return URL(fileURLWithPath: explicit)
         }
@@ -78,7 +82,7 @@ public struct LearningSettings: Equatable, Sendable {
         "Global\\nospacekey-learning-lifecycle-" + scope
     }
 
-    static func presenceMutexName(scope: String, sessionID: UInt32) -> String {
-        "Global\\nospacekey-learning-presence-" + scope + "-s" + String(sessionID)
+    static func presenceMutexName(scope: String, build: String, sessionID: UInt32) -> String {
+        "Global\\nospacekey-learning-presence-" + scope + "-b" + build + "-s" + String(sessionID)
     }
 }

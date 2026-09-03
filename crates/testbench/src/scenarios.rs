@@ -21,6 +21,7 @@ pub const OEM_COMMA: Vk = Vk(0xBC, "OemComma"); // ','（同上、全角読点�
 pub const OEM_MINUS: Vk = Vk(0xBD, "OemMinus"); // '-'（かな合成中 → 長音符 ー）
 pub const OEM_SLASH: Vk = Vk(0xBF, "Oem2Slash"); // '/'（かな合成中 → 全角中点 ・）
 pub const F7: Vk = Vk(0x76, "F7"); // 表記変換: カタカナ（打鍵作法 Task4）
+pub const F6: Vk = Vk(0x75, "F6"); // 表記変換: ひらがな
 pub const F8: Vk = Vk(0x77, "F8"); // ephemeral かなトリガ（既定）
 pub const F10: Vk = Vk(0x79, "F10"); // 表記変換: 半角英数（既定 bare 0x79）
 pub const F11: Vk = Vk(0x7A, "F11"); // keymap リマップ検証用（--keymap-smoke: to_katakana の付け替え先）

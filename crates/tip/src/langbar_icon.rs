@@ -18,7 +18,7 @@ pub(crate) const RES_MODE_KANA_LIGHT: usize = 3;
 pub(crate) const RES_MODE_KANA_DARK: usize = 4;
 pub(crate) const RES_MODE_EPHEMERAL_LIGHT: usize = 5;
 pub(crate) const RES_MODE_EPHEMERAL_DARK: usize = 6;
-/// プロファイル固定アイコン（Gapless N 案）。RegisterProfile の iconIndex が参照する。
+/// プロファイル固定アイコン（Gapless N 案）。登録時はゼロ始まり位置へ変換して使う。
 pub(crate) const RES_PROFILE_N: usize = 7;
 
 /// モードとテーマからタスクバー表示に使うリソースIDを選ぶ純関数。

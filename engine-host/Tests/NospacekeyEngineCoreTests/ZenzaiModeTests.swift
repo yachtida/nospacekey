@@ -287,24 +287,12 @@ final class ZenzaiTooSlowTests: XCTestCase {
             activeSession: nil, completedDataSession: 7, learningDataSession: nil))
     }
 
-    func testSessionSwitchResetDecisionPreservesOnlyCurrentOrEmptyClassicContext() {
+    func testSessionSwitchDefersClassicResetWhileZenzaiIsOperational() {
         XCTAssertFalse(ConversionService.shouldResetForSessionSwitch(
-            isZenzaiOperational: true, targetSession: 7,
-            completedDataSession: nil, learningDataSession: nil))
-        XCTAssertFalse(ConversionService.shouldResetForSessionSwitch(
-            isZenzaiOperational: true, targetSession: 7,
-            completedDataSession: 7, learningDataSession: 7))
+            isZenzaiOperational: true),
+            "GPU推論がclassic文脈を読まない間は高コストなllama context再生成を遅延する")
         XCTAssertTrue(ConversionService.shouldResetForSessionSwitch(
-            isZenzaiOperational: true, targetSession: 7,
-            completedDataSession: 8, learningDataSession: nil),
-            "別セッションの部分確定文脈は Zenzai 稼働中でも切替前に破棄する")
-        XCTAssertTrue(ConversionService.shouldResetForSessionSwitch(
-            isZenzaiOperational: true, targetSession: 7,
-            completedDataSession: nil, learningDataSession: 8),
-            "別セッションの学習文脈は Zenzai 稼働中でも切替前に破棄する")
-        XCTAssertTrue(ConversionService.shouldResetForSessionSwitch(
-            isZenzaiOperational: false, targetSession: 7,
-            completedDataSession: nil, learningDataSession: nil),
+            isZenzaiOperational: false),
             "classic 稼働時のセッション切替は従来どおり常にリセットする")
     }
 

@@ -2,27 +2,55 @@ import XCTest
 @testable import NospacekeyEngineCore
 
 /// 実モデルを要求する統合テスト。NOSPACEKEY_ZENZAI_WEIGHT が実在ファイルを指す時のみ実行。
-/// それ以外（CI/未配置）では XCTSkip。llama 系 dll が PATH か test バンドル隣に必要。
+/// それ以外（CI/未配置）では XCTSkip。patched runtime directoryも必要。
 ///
-/// 注意（既知の限界）: 「日本語」を含むかの assert は古典フォールバックでも満たされるため、
-/// このテスト単体では Zenzai が実走したことを証明しない。実走の確証は
-/// llama_model_loader のロードログ（149 tensors 等）で別途確認する運用とする。
-/// 厳密な Zenzai/古典 判別はコンバータが load 成否を公開しないため SP2 では行わない（将来課題）。
+/// native statusのGPU active / backend / device / decode attemptを候補結果と併せて確認する。
 final class ZenzaiConversionTests: XCTestCase {
+    private func makeRealModelService(environment: [String: String]) throws -> ConversionService {
+        guard let path = environment["NOSPACEKEY_ZENZAI_WEIGHT"],
+              FileManager.default.fileExists(atPath: path),
+              let runtimePath = environment["NOSPACEKEY_ZENZAI_RUNTIME_DIR"],
+              FileManager.default.fileExists(atPath: runtimePath) else {
+            throw XCTSkip("実モデルまたはpatched runtime directoryが未配置 → Zenzai統合テストをskip")
+        }
+        let runtimeDirectory = URL(fileURLWithPath: runtimePath)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        return ConversionService(config: ZenzaiConfig(
+            weightURL: URL(fileURLWithPath: path),
+            inferenceLimit: 1,
+            runtimeDirectory: runtimeDirectory))
+    }
+
+    private func startWarmUpAndAssertGPU(_ service: ConversionService) {
+        service.startWarmUp()
+        let deadline = Date().addingTimeInterval(120)
+        while Date() < deadline {
+            if case .gpuActive = service.zenzaiRuntimeState { break }
+            if case .classic(let reason) = service.zenzaiRuntimeState {
+                XCTFail("warm-up latched classic: \(reason)")
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        guard case .gpuActive = service.zenzaiRuntimeState else {
+            XCTFail("warm-up（実モデルロード）がGPU activeへ遷移するはず")
+            return
+        }
+        XCTAssertTrue(service.zenzaiReady)
+        let status = service.zenzaiRuntimeStatus
+        XCTAssertEqual(status.state, .gpuActive)
+        XCTAssertEqual(status.failure, .none)
+        XCTAssertFalse(status.backend.isEmpty)
+        XCTAssertFalse(status.device.isEmpty)
+        XCTAssertGreaterThan(status.decodeAttempts, 0)
+    }
+
     func testZenzaiConvertsNihongoToKanji() throws {
         let env = ProcessInfo.processInfo.environment
-        guard let path = env["NOSPACEKEY_ZENZAI_WEIGHT"], FileManager.default.fileExists(atPath: path) else {
-            throw XCTSkip("NOSPACEKEY_ZENZAI_WEIGHT 未設定 or ファイル無し → Zenzai 統合テストを skip")
-        }
-        let svc = ConversionService(config: ZenzaiConfig(weightURL: URL(fileURLWithPath: path), inferenceLimit: 1))
+        let svc = try makeRealModelService(environment: env)
         XCTAssertTrue(svc.zenzaiEnabled)
-        // cold start ③: ゲート（zenzaiReady）を開かないと makeOptions が .off に落とし Zenzai が走らない。
-        // ゲートは背景 warmUp（実モデルロード）完了後に開くので、開くまで待ってから変換する
-        // （待たないと convert が warmUp とロックを競り、ゲート閉側に転ぶと古典で走ってしまう）。
-        svc.startWarmUp()
-        let deadline = Date().addingTimeInterval(120)
-        while !svc.zenzaiReady && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
-        XCTAssertTrue(svc.zenzaiReady, "warm-up（実モデルロード）が制限時間内に完了するはず")
+        startWarmUpAndAssertGPU(svc)
         let sid = svc.startSession()
         for ch in "nihongo" { _ = svc.insert(session: sid, text: String(ch)) }
         let candidates = svc.convert(session: sid)
@@ -31,18 +59,12 @@ final class ZenzaiConversionTests: XCTestCase {
 
     /// audit H2 回帰: Zenzai 実稼働中のセッション切替（アプリ間フォーカス切替相当）は llama reset を
     /// スキップするようになった（bindConverter の注記参照）。ここでは切替を往復させても変換・確定が
-    /// 正しく動き続けることを実走で確認する（スキップ自体の直接観測は ev=llama_reset_skipped ログの
-    /// 運用確認に委ねる — 上のテストの「実走の確証」と同じ限界注記）。
+    /// 正しく動き続けることを実走で確認する（スキップ自体の直接観測は ev=llama_reset_skipped ログで
+    /// 行うが、GPU active と decode attempt は上の typed status assertions で検証する）。
     func testSessionSwitchKeepsConvertingWithRealModel() throws {
         let env = ProcessInfo.processInfo.environment
-        guard let path = env["NOSPACEKEY_ZENZAI_WEIGHT"], FileManager.default.fileExists(atPath: path) else {
-            throw XCTSkip("NOSPACEKEY_ZENZAI_WEIGHT 未設定 or ファイル無し → Zenzai 統合テストを skip")
-        }
-        let svc = ConversionService(config: ZenzaiConfig(weightURL: URL(fileURLWithPath: path), inferenceLimit: 1))
-        svc.startWarmUp()
-        let deadline = Date().addingTimeInterval(120)
-        while !svc.zenzaiReady && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
-        XCTAssertTrue(svc.zenzaiReady, "warm-up（実モデルロード）が制限時間内に完了するはず")
+        let svc = try makeRealModelService(environment: env)
+        startWarmUpAndAssertGPU(svc)
 
         // アプリ A で変換・確定 → アプリ B へ切替えて変換 → A へ戻って続きを変換。
         let a = svc.startSession()

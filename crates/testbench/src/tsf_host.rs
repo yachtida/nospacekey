@@ -264,8 +264,159 @@ pub struct TsfHost {
     ui_mgr: ITfUIElementMgr,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PartialStartCleanupAction {
+    DeactivateProfile,
+    PopDocument,
+    DeactivateThread,
+}
+
+#[derive(Default)]
+struct PartialStartCleanupState {
+    profile_active: bool,
+    document_pushed: bool,
+    thread_active: bool,
+}
+
+impl PartialStartCleanupState {
+    fn arm_thread(&mut self) {
+        self.thread_active = true;
+    }
+
+    fn arm_document(&mut self) {
+        self.document_pushed = true;
+    }
+
+    fn arm_profile(&mut self) {
+        self.profile_active = true;
+    }
+
+    fn disarm(&mut self) {
+        *self = Self::default();
+    }
+
+    fn take_actions(&mut self) -> [Option<PartialStartCleanupAction>; 3] {
+        let actions = [
+            self.profile_active
+                .then_some(PartialStartCleanupAction::DeactivateProfile),
+            self.document_pushed
+                .then_some(PartialStartCleanupAction::PopDocument),
+            self.thread_active
+                .then_some(PartialStartCleanupAction::DeactivateThread),
+        ];
+        self.disarm();
+        actions
+    }
+}
+
+struct PartialTsfHostStart {
+    cleanup: PartialStartCleanupState,
+    thread_mgr: Option<ITfThreadMgr>,
+    doc_mgr: Option<ITfDocumentMgr>,
+    profiles: Option<ITfInputProcessorProfileMgr>,
+}
+
+impl PartialTsfHostStart {
+    fn new(thread_mgr: &ITfThreadMgr) -> Self {
+        let mut cleanup = PartialStartCleanupState::default();
+        cleanup.arm_thread();
+        // These interface clones AddRef independently, so rollback remains valid
+        // until ownership transfers to the fully constructed host.
+        Self {
+            cleanup,
+            thread_mgr: Some(thread_mgr.clone()),
+            doc_mgr: None,
+            profiles: None,
+        }
+    }
+
+    fn record_pushed_document(&mut self, doc_mgr: &ITfDocumentMgr) {
+        self.cleanup.arm_document();
+        self.doc_mgr = Some(doc_mgr.clone());
+    }
+
+    fn record_activated_profile(&mut self, profiles: &ITfInputProcessorProfileMgr) {
+        self.cleanup.arm_profile();
+        self.profiles = Some(profiles.clone());
+    }
+
+    fn disarm(mut self) {
+        self.cleanup.disarm();
+        self.profiles = None;
+        self.doc_mgr = None;
+        self.thread_mgr = None;
+    }
+}
+
+impl Drop for PartialTsfHostStart {
+    fn drop(&mut self) {
+        for action in self.cleanup.take_actions().into_iter().flatten() {
+            unsafe {
+                match action {
+                    PartialStartCleanupAction::DeactivateProfile => {
+                        if let Some(profiles) = &self.profiles {
+                            let _ = profiles.DeactivateProfile(
+                                TF_PROFILETYPE_INPUTPROCESSOR,
+                                LANGID_JA,
+                                &CLSID_NOSPACEKEY,
+                                &PROFILE_NOSPACEKEY,
+                                HKL::default(),
+                                0,
+                            );
+                        }
+                    }
+                    PartialStartCleanupAction::PopDocument => {
+                        if let Some(doc_mgr) = &self.doc_mgr {
+                            let _ = doc_mgr.Pop(windows::Win32::UI::TextServices::TF_POPF_ALL);
+                        }
+                    }
+                    PartialStartCleanupAction::DeactivateThread => {
+                        if let Some(thread_mgr) = &self.thread_mgr {
+                            let _ = thread_mgr.Deactivate();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod partial_start_tests {
+    use super::{PartialStartCleanupAction, PartialStartCleanupState};
+
+    #[test]
+    fn partial_start_releases_profile_document_and_thread_in_drop_order() {
+        let mut state = PartialStartCleanupState::default();
+        state.arm_thread();
+        state.arm_document();
+        state.arm_profile();
+
+        assert_eq!(
+            state.take_actions(),
+            [
+                Some(PartialStartCleanupAction::DeactivateProfile),
+                Some(PartialStartCleanupAction::PopDocument),
+                Some(PartialStartCleanupAction::DeactivateThread),
+            ]
+        );
+        assert_eq!(state.take_actions(), [None, None, None]);
+    }
+
+    #[test]
+    fn disarmed_partial_start_has_no_rollback_actions() {
+        let mut state = PartialStartCleanupState::default();
+        state.arm_thread();
+        state.arm_document();
+        state.arm_profile();
+        state.disarm();
+
+        assert_eq!(state.take_actions(), [None, None, None]);
+    }
+}
+
 /// 非ブロッキングなメッセージポンプ（スレッドの全メッセージを drain）。
-fn pump() {
+pub(crate) fn pump() {
     unsafe {
         let mut msg = MSG::default();
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -356,6 +507,7 @@ impl TsfHost {
             let thread_mgr: ITfThreadMgr =
                 CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
             let tid = thread_mgr.Activate()?;
+            let mut partial_start = PartialTsfHostStart::new(&thread_mgr);
 
             // msctf が TIP を活性化するには「前面フォーカスを持つ実ウィンドウ」を持つスレッド
             // である必要がある（TIP の AdviseKeyEventSink(fForeground=true) も前面を要求）。
@@ -371,6 +523,7 @@ impl TsfHost {
             doc_mgr.CreateContext(tid, 0, &store_if, &mut ctx, &mut ec)?;
             let ctx = ctx.expect("CreateContext で ITfContext が None");
             doc_mgr.Push(&ctx)?;
+            partial_start.record_pushed_document(&doc_mgr);
             // Real text controls attach an explicit non-sensitive input scope
             // to their HWND. Prediction intentionally fails closed when the
             // scope is unknown, so the harness must model an ordinary text
@@ -413,7 +566,11 @@ impl TsfHost {
                     e.message()
                 ),
             }
+            if activate_result.is_err() {
+                diag_check_activation_state(&profiles, &ipp);
+            }
             activate_result?;
+            partial_start.record_activated_profile(&profiles);
             pump();
 
             // DIAG: ActivateProfile 後の実際の活性状態を確認する。
@@ -438,6 +595,7 @@ impl TsfHost {
             }
             .into();
             let ui_cookie = source.AdviseSink(&ITfUIElementSink::IID, &sink)?;
+            partial_start.disarm();
 
             let host = TsfHost {
                 thread_mgr,
@@ -496,9 +654,33 @@ impl TsfHost {
 
     /// 本物の VK を 1 つ注入。TestKeyDown→KeyDown の順で、pfEaten を返す。
     pub fn feed_key(&self, vk: u32) -> bool {
+        self.feed_key_measured(vk).0
+    }
+
+    /// Dispatch one VK without draining the STA queue. Callers can use this to model a
+    /// host that delivers a physical burst before returning to its message loop.
+    pub(crate) fn feed_key_no_pump(&self, vk: u32) -> bool {
+        self.dispatch_key(vk).0
+    }
+
+    /// Measure only synchronous TSF dispatch into the TIP. The harness-owned
+    /// message-pump drain runs after the sample and is intentionally excluded.
+    pub fn feed_key_measured(&self, vk: u32) -> (bool, Duration) {
+        let result = self.dispatch_key(vk);
+        crate::text_store::hlog(&format!(
+            "--- feed_key vk={vk:#x} dispatch done eaten={}, pump >>>",
+            result.0
+        ));
+        pump(); // 候補窓/フォーカス post を drain
+        crate::text_store::hlog(&format!("=== feed_key vk={vk:#x} pump done"));
+        result
+    }
+
+    fn dispatch_key(&self, vk: u32) -> (bool, Duration) {
         let w = WPARAM(vk as usize);
         let l = LPARAM(0x0001_0001); // repeat=1, scancode 相当
         crate::text_store::hlog(&format!("=== feed_key vk={vk:#x} KeyDown >>>"));
+        let started = std::time::Instant::now();
         let eaten = unsafe {
             if self.ksm.TestKeyDown(w, l).unwrap_or(FALSE).as_bool() {
                 self.ksm.KeyDown(w, l).unwrap_or(FALSE).as_bool()
@@ -506,12 +688,11 @@ impl TsfHost {
                 false
             }
         };
+        let tip_dispatch = started.elapsed();
         crate::text_store::hlog(&format!(
-            "--- feed_key vk={vk:#x} KeyDown done eaten={eaten}, pump >>>"
+            "--- feed_key vk={vk:#x} KeyDown done eaten={eaten}"
         ));
-        pump(); // 候補窓/フォーカス post を drain
-        crate::text_store::hlog(&format!("=== feed_key vk={vk:#x} pump done"));
-        eaten
+        (eaten, tip_dispatch)
     }
 
     /// `vk` を Ctrl 押下状態で注入する（確定取消 Ctrl+Backspace 用。item30/31）。
@@ -691,6 +872,38 @@ impl TsfHost {
         self.transition_mode(false, "normalize_native")
     }
 
+    /// normalize_native_mode(トグル経路)が失敗したときの最終手段: スレッドの
+    /// conversion-mode compartment を直接 NATIVE(ひらがな)へ書く。start() の設計コメント
+    /// が「TIP 所有中の直書きは Cell との不一致を作る」と警戒するのは所有中の話で、
+    /// 新規ホストの TIP インスタンスはまだ何も所有していないため追従する。書込み後に
+    /// native を観測できたかどうかを返し、呼び出し元は false を環境状態エラーとして
+    /// 扱う(製品 FAIL と混ぜない)。
+    pub fn force_native_conversion_mode(&self) -> bool {
+        if self.effective_mode_is_direct() == Some(false) {
+            return true;
+        }
+        use windows::Win32::System::Variant::VARIANT;
+        use windows::Win32::UI::TextServices::{
+            ITfCompartmentMgr, GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
+        };
+        let written = unsafe {
+            let Ok(cm) = self.thread_mgr.cast::<ITfCompartmentMgr>() else {
+                return false;
+            };
+            let Ok(compartment) =
+                cm.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION)
+            else {
+                return false;
+            };
+            // TF_CONVERSIONMODE_NATIVE(0x1) = ひらがな。
+            compartment.SetValue(self.tid, &VARIANT::from(1i32)).is_ok()
+        };
+        written && {
+            pump();
+            self.effective_mode_is_direct() == Some(false)
+        }
+    }
+
     /// item29 用: コンテキスト単位の compartment `GUID_COMPARTMENT_KEYBOARD_DISABLED` を書く。
     ///
     /// Chromium/Edge はパスワード欄（TEXT_INPUT_TYPE_PASSWORD）専用の ITfContext に
@@ -834,6 +1047,10 @@ impl TsfHost {
         crate::text_store::hlog("=== warm_up >>>");
         // 最初の合成は spawn ブロックで即終了されるので、合成が生き残る（doc が composing）まで 'a' を打つ。
         for _ in 0..4 {
+            // 外部の TSF プロファイル切替が合成を terminate すると、このホストへのキー配送も
+            // 止まることがある。次の試行前に自分の document focus を取り戻さない限り、retry
+            // はすべて素通りになって warm-up 後の測定まで偽 FAIL になる。
+            self.reclaim_focus();
             let _ = self.feed_key(0x41); // 'a'
             if self.store.composing() {
                 break;

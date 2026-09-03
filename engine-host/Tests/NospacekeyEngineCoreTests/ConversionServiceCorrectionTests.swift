@@ -426,15 +426,16 @@ final class ConversionServiceCorrectionTests: XCTestCase {
                        ["E", "D", "C", "B"])   // 上限4・新しい観測が先頭
     }
 
-    func testCommitRecordFlushesImmediately() {
-        // spec §4 契機1: record 直後の無条件 flush。2個目の ConversionService を立てるのは
+    func testCommitRecordPersistsOnBackgroundLane() {
+        // Persistence follows the RAM update without holding up the commit caller.2個目の ConversionService を立てるのは
         // 辞書二重ロード+mmap 共有の不安定要因になるため、ファイルと fresh な
         // CorrectionStore の再読込で観測する(Store 自体の永続性は Task 2 で担保済み)。
         let s1 = newSession(reading: "nihongo")
         let cands = svc.convert(session: s1)!
         let r = svc.commit(session: s1, index: 1)!
         XCTAssertTrue(r.reading.isEmpty, "index1 が全被覆でない辞書出力なら読みを変える")
-        // endSession(=学習 flush)を待たずにファイルが出来ている
+        svc.flushMaintenanceForTesting()
+        // endSessionを待たずにbackground persistenceが完了している
         XCTAssertTrue(FileManager.default.fileExists(
             atPath: dir.appendingPathComponent("corrections.json").path))
         XCTAssertEqual(CorrectionStore(directory: dir).lookup(reading: "にほんご"), cands[1])

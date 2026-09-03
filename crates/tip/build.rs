@@ -1,6 +1,6 @@
 fn main() {
     // エクスポートは lib.rs の `#[no_mangle] extern "system"` 関数（DllGetClassObject /
-    // DllCanUnloadNow / DllRegisterServer / DllUnregisterServer）を rustc が cdylib から
+    // DllCanUnloadNow / DllRegisterServer / DllUnregisterServer / DllInstall）を rustc が cdylib から
     // 自動エクスポートするため、.def ファイルは不要。
     //
     // 以前は `/DEF:nospacekey_tip.def` を渡していたが、(1) リンカの作業ディレクトリは
@@ -30,11 +30,16 @@ fn main() {
     // （改名時にここを触らずに済ませる — 表示名は installer 側の MyAppName 1 箇所に集約）。
     //
     // アイコンリソース: タスクバー入力モード表示 (Pure Glyph 案) とプロファイル固定
-    // アイコン (Gapless N 案)。ID は langbar_icon.rs の RES_* 定数と register.rs の
-    // RegisterProfile iconIndex が参照するため**変更すると実行時整合が壊れる**。
+    // アイコン (Gapless N 案)。ID は langbar_icon.rs の RES_* 定数が参照し、プロファイル
+    // 登録では対応するゼロ始まり位置へ変換するため**並びを変えると実行時整合が壊れる**。
+    // PE のリソースディレクトリは文字列 ID エントリを数値 ID より先頭に置くため、
+    // 位置 = ID - 1 は「数値 ID の連番のみ」が前提。文字列 ID のアイコンは足さないこと。
     // ICO の生成元は scripts/gen-ime-icons.ps1（design/icons/ から再生成）。
-    #[cfg(windows)]
-    {
+    //
+    // cfg(windows) ではなく CARGO_CFG_TARGET_OS を見る — build script はホスト側で走るため、
+    // cfg(windows) だと非 Windows ホストからの Windows クロスビルドでリソース埋込が
+    // 黙って省略され、アイコン無し DLL が配布されてしまう(winresource README 推奨の判断)。
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let ver = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
         let name = std::env::var("CARGO_PKG_NAME").expect("CARGO_PKG_NAME");
         let mut res = winresource::WindowsResource::new();

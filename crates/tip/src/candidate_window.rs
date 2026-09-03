@@ -26,8 +26,8 @@
 //! - 横幅は各候補の実測幅に chrome（枠・パディング・番号ガター・間隔）を加えた総幅を、
 //!   [min,max] にクランプして決める。測定は描画と同じエンジンで行う（D2D パスは DWrite、
 //!   GDI フォールバックは `GetTextExtentPoint32W`）— エンジン差で本文が切れないように。
-//! - すべての画素メトリクスは `GetDeviceCaps(hdc, LOGPIXELSX)` から得た DPI で
-//!   整数丸めスケールする（`MulDiv` は無効フィーチャ依存なので使わない）。
+//! - すべての画素メトリクスは配置先モニタから確定した単一の DPI で整数丸めスケールする
+//!   （`MulDiv` は無効フィーチャ依存なので使わない）。
 //!
 //! ウィンドウクラスは初回だけ `RegisterClassW` し、アトムを `OnceLock` に保持する。
 //! `TextService::new()` 時点では HWND は null（未生成）でよく、最初の `show` で遅延生成する。
@@ -51,9 +51,9 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC,
-    GetDeviceCaps, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, SetBkMode,
-    SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
-    HFONT, LOGPIXELSX, PAINTSTRUCT, TRANSPARENT,
+    GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HFONT, PAINTSTRUCT,
+    TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, ShowWindow, SW_HIDE,
@@ -61,7 +61,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 // ポップアップ共有基盤（popup.rs）の純ヘルパ。旧来この module にあったものを移設した。
-pub(crate) use crate::popup::{effective_dpi, font_size_px, scale};
+pub(crate) use crate::popup::{font_size_px, scale};
 
 /// 候補窓のアンカー。`(x, y)` は窓左上の希望位置（キャレット左下）。`caret_top` は
 /// キャレット矩形の上端で、画面下端はみ出し時にキャレット直上へフリップする基準。
@@ -312,6 +312,9 @@ struct WindowState {
     selection_dirty: Option<Rc<Cell<bool>>>,
     /// 共有描画バックエンド（D2D/GDI・DWrite・GDI フォント・デバイスロストフラグ）。
     backend: Backend,
+    /// 外枠・描画・ヒットテストが共有する、配置先モニタ基準の DPI。
+    /// ホストの thread DPI context は WndProc 呼出時に変わり得るため、HDC から再取得しない。
+    layout_dpi: i32,
 }
 
 impl PopupState for WindowState {
@@ -335,6 +338,13 @@ unsafe fn window_state<'a>(hwnd: HWND) -> Option<&'a mut WindowState> {
     popup::state_mut::<WindowState>(hwnd)
 }
 
+fn clicked_candidate(selected: usize, count: usize, y: i32, dpi: i32) -> Option<(usize, bool)> {
+    let (start, end) = visible_range(selected, count, MAX_VISIBLE_ROWS);
+    let row = row_at_y(y, dpi, end - start)?;
+    let absolute = start + row;
+    Some((absolute, absolute != selected))
+}
+
 /// マウスクリックによる候補選択。クリック行（可視ページ内）を絶対 index へ解決し、
 /// 表示状態と共有の選択真実源（cand_state）の両方へ書き込み、preedit の描き直しを要求する
 /// ＝矢印キー選択（move_candidate）と同じ副作用範囲。
@@ -342,34 +352,34 @@ unsafe fn window_state<'a>(hwnd: HWND) -> Option<&'a mut WindowState> {
 /// だから — 同期 edit session 中にホストが再入すると窓状態の二重可変借用になる。drain 経由なら
 /// 再入は借用未保持の安全点まで保留される。
 unsafe fn on_click(hwnd: HWND, y: i32) {
-    let dpi = popup::window_dpi(hwnd);
-    let (abs, sync_requested) = {
+    let (abs, changed, sync_requested) = {
         let Some(state) = window_state(hwnd) else {
             return;
         };
-        let count = state.candidates.len();
-        let (start, end) = visible_range(state.selected, count, MAX_VISIBLE_ROWS);
-        let Some(row) = row_at_y(y, dpi, end - start) else {
+        let Some((abs, changed)) =
+            clicked_candidate(state.selected, state.candidates.len(), y, state.layout_dpi)
+        else {
             return;
         };
-        let abs = start + row;
-        if abs == state.selected {
-            return;
+        if changed {
+            state.selected = abs;
         }
-        state.selected = abs;
-        if let Some(shared) = &state.shared {
-            shared.borrow_mut().set_selection(abs);
-        }
-        match &state.selection_dirty {
-            Some(dirty) => {
-                dirty.set(true);
-                (abs, true)
+        let sync_requested = match (&state.shared, &state.selection_dirty) {
+            (Some(shared), Some(dirty)) => {
+                crate::candidate_state::request_selection(shared, dirty, abs)
             }
-            None => (abs, false),
-        }
+            (Some(shared), None) => {
+                shared.borrow_mut().set_selection(abs);
+                false
+            }
+            _ => false,
+        };
+        (abs, changed, sync_requested)
     };
     tip_log(&format!("ev=candidate_click sel={abs}"));
-    let _ = InvalidateRect(Some(hwnd), None, true);
+    if changed {
+        let _ = InvalidateRect(Some(hwnd), None, true);
+    }
     if sync_requested {
         crate::text_service::drain_behavior_via_tls();
     }
@@ -466,9 +476,8 @@ fn paint_gdi(hwnd: HWND) {
             }
         };
 
-        // メトリクスもフォントも単一の DPI 軸（横 DPI）で統一する。こうすると異方性 DPI
-        // （LOGPIXELSX != LOGPIXELSY）でも内容幅と chrome の DPI 軸が食い違わない。
-        let dpi = effective_dpi(GetDeviceCaps(Some(hdc), LOGPIXELSX));
+        // ホストの thread DPI context ではなく、外枠計算時に確定した DPI を使う。
+        let dpi = state.layout_dpi;
 
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
@@ -569,10 +578,10 @@ unsafe fn paint_d2d(hwnd: HWND) {
         DWRITE_TEXT_ALIGNMENT_TRAILING,
     };
 
-    // update region の validate（無限 WM_PAINT 防止）。hdc は DPI 取得にだけ使う。
+    // update region の validate（無限 WM_PAINT 防止）。
     // BeginPaint 済みなので、以降のどの early-out でも EndPaint は必須（全経路で対にする）。
     let mut ps = PAINTSTRUCT::default();
-    let hdc = BeginPaint(hwnd, &mut ps);
+    let _hdc = BeginPaint(hwnd, &mut ps);
     let Some(state) = window_state(hwnd) else {
         let _ = EndPaint(hwnd, &ps);
         return;
@@ -582,7 +591,7 @@ unsafe fn paint_d2d(hwnd: HWND) {
         let _ = EndPaint(hwnd, &ps);
         return;
     }
-    let dpi = effective_dpi(GetDeviceCaps(Some(hdc), LOGPIXELSX));
+    let dpi = state.layout_dpi;
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
 
@@ -838,6 +847,7 @@ impl CandidateWindow {
                     shared: self.shared.clone(),
                     selection_dirty: self.selection_dirty.clone(),
                     backend: Backend::new(renderer),
+                    layout_dpi: 96,
                 }),
             );
         }
@@ -938,6 +948,11 @@ impl CandidateWindow {
         // は窓の現位置（前回位置・初回は主モニタ）の DPI を返すため、混合DPI環境の
         // モニタ越え表示で外枠とグリフの縮尺が1フレーム食い違う（UIバグ2）。
         let dpi = popup::dpi_for_anchor(anchor.x, anchor.y);
+        unsafe {
+            if let Some(state) = window_state(self.hwnd) {
+                state.layout_dpi = dpi;
+            }
+        }
 
         let content_w = self.measure_content_width(dpi);
         // 高さはページ単位（最大 MAX_VISIBLE_ROWS 行）で固定する。こうすると move_selection で
@@ -1306,6 +1321,13 @@ mod tests {
     }
 
     #[test]
+    fn clicking_the_selected_row_still_resolves_an_interaction_without_visual_change() {
+        let y = row_top(0, 96);
+        assert_eq!(clicked_candidate(0, 3, y, 96), Some((0, false)));
+        assert_eq!(clicked_candidate(1, 3, y, 96), Some((0, true)));
+    }
+
+    #[test]
     fn geometry_scales_at_192dpi() {
         // 192DPI で scale が恒等でなくなる経路を実値で検証する。
         // scale(28,192)=(28*192+48)/96=5424/96=56.5→56（行高）。
@@ -1324,6 +1346,22 @@ mod tests {
         // テキスト列の幅が負にならない（MIN_W 相当の狭幅でも反転しない）。
         let (_r, _n, t_narrow) = column_rects(0, scale(MIN_W, 192), 192);
         assert!(t_narrow.right >= t_narrow.left);
+    }
+
+    #[test]
+    fn candidate_frame_keeps_layout_dpi_for_paint_and_hit_testing() {
+        let state = WindowState {
+            candidates: Rc::new(Vec::new()),
+            selected: 0,
+            theme: crate::theme::Theme::default(),
+            shared: None,
+            selection_dirty: None,
+            backend: Backend::new(None),
+            layout_dpi: 96,
+        };
+
+        assert_eq!(state.layout_dpi, 96);
+        assert_eq!(scale(ROW_HEIGHT, state.layout_dpi), 28);
     }
 
     #[test]

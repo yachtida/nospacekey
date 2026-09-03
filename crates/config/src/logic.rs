@@ -371,6 +371,7 @@ pub enum EngineStatus {
     Declined,
     Absent,
     Timeout,
+    VersionMismatch,
 }
 
 /// UI 一覧行。ruby/pos は生値を必ず含める(`dict_update`/`dict_delete` の対象特定は

@@ -28,6 +28,26 @@ const CLUIE_FULL: u32 = TF_CLUIE_COUNT
     | TF_CLUIE_PAGEINDEX
     | TF_CLUIE_CURRENTPAGE;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BeginOutcome {
+    NotAttempted,
+    Advertised,
+    Failed,
+}
+
+fn effective_selection_after_begin(
+    state: &RefCell<CandidateState>,
+    candidates: &[String],
+    selected: usize,
+    outcome: BeginOutcome,
+) -> usize {
+    if outcome == BeginOutcome::Failed {
+        state.borrow_mut().set(candidates.to_vec(), selected);
+    }
+    let effective = state.borrow().selected();
+    effective
+}
+
 pub struct CandidatePresenter {
     window: CandidateWindow,
     state: Rc<RefCell<CandidateState>>,
@@ -39,6 +59,7 @@ pub struct CandidatePresenter {
     ui_mgr: Option<ITfUIElementMgr>,
     element: Option<ITfUIElement>, // advertise した UIElement（EndUIElement まで保持）
     element_id: Option<u32>,
+    element_active: Option<Rc<Cell<bool>>>,
     pbshow: bool,
 }
 
@@ -61,6 +82,7 @@ impl CandidatePresenter {
             ui_mgr: None,
             element: None,
             element_id: None,
+            element_active: None,
             pbshow: true,
         }
     }
@@ -68,29 +90,33 @@ impl CandidatePresenter {
     /// Activate 時に ITfUIElementMgr を渡す（None=取得失敗→フォールバック自前描画）。
     pub fn set_ui_mgr(&mut self, mgr: Option<ITfUIElementMgr>) {
         // mgr が変わるなら、古い element_id を新 mgr に持ち越さない（Deactivate→Activate の取り違え防止）。
+        self.invalidate_element();
         self.element = None;
         self.element_id = None;
         self.pbshow = true;
         self.ui_mgr = mgr;
     }
 
-    fn begin_if_needed(&mut self) {
+    fn begin_if_needed(&mut self) -> BeginOutcome {
         if self.element_id.is_some() {
-            return;
+            return BeginOutcome::NotAttempted;
         }
         let Some(mgr) = self.ui_mgr.clone() else {
             // SP6a 診断: ホストが ITfUIElementMgr を出さない＝フォールバックで自前描画。
             tip_log("ev=uielement mgr=none advertise=skip draw=self(fallback)");
-            return;
+            return BeginOutcome::NotAttempted;
         };
         // #[implement(ITfCandidateListUIElementBehavior)] は Behavior 派生の COM
         // オブジェクトを生む。ITfUIElement へは Behavior 経由でアップキャストする。
+        let active = Rc::new(Cell::new(true));
+        self.element_active = Some(active.clone());
         let behavior: ITfCandidateListUIElementBehavior = CandidateListUIElement::new(
             self.state.clone(),
             self.outbox.clone(),
             self.selection_dirty.clone(),
             self.updated_flags.clone(),
             self.notify.clone(),
+            active.clone(),
         )
         .into();
         let element: ITfUIElement = behavior.into();
@@ -113,17 +139,28 @@ impl CandidatePresenter {
                         "host"
                     }
                 ));
+                BeginOutcome::Advertised
             }
             Err(e) => {
+                self.invalidate_element();
                 // SP6a 診断: advertise 失敗＝フォールバックで自前描画。
                 tip_log(&format!(
                     "ev=uielement advertised=false begin_hr=0x{:08X} draw=self(fallback)",
                     e.code().0 as u32
                 ));
+                BeginOutcome::Failed
             }
         }
     }
+    fn invalidate_element(&mut self) {
+        if let Some(active) = self.element_active.take() {
+            active.set(false);
+        }
+        self.outbox.borrow_mut().take();
+        self.selection_dirty.set(false);
+    }
     fn end(&mut self) {
+        self.invalidate_element();
         if let (Some(mgr), Some(id)) = (self.ui_mgr.clone(), self.element_id.take()) {
             unsafe {
                 let _ = mgr.EndUIElement(id);
@@ -162,10 +199,13 @@ impl CandidateUI for CandidatePresenter {
     ) {
         self.state.borrow_mut().set(candidates.to_vec(), selected);
         let first = self.element_id.is_none();
-        self.begin_if_needed();
+        let begin = self.begin_if_needed();
+        let effective_selected =
+            effective_selection_after_begin(&self.state, candidates, selected, begin);
         if should_draw_self(self.advertised(), self.pbshow) {
             // Task 7: 表示ごとに解決し直したテーマを自前窓へそのまま渡す（ホスト描画時は不要）。
-            self.window.show(candidates, selected, anchor, theme);
+            self.window
+                .show(candidates, effective_selected, anchor, theme);
         } else {
             self.window.hide();
             // 初回 BeginUIElement はホストが全項目を取りに来るので update 不要。
@@ -198,11 +238,77 @@ impl CandidateUI for CandidatePresenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::candidate_uielement::{behavior_abort, behavior_finalize, behavior_set_selection};
     #[test]
     fn route_selection() {
         assert!(should_draw_self(true, true)); // デスクトップ: 自前描画
         assert!(!should_draw_self(true, false)); // イマーシブ: 描かない
         assert!(should_draw_self(false, false)); // mgr 無し: フォールバック自前描画
         assert!(should_draw_self(false, true));
+    }
+
+    #[test]
+    fn shared_and_window_selection_match_for_each_begin_outcome() {
+        let requested = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let state = Rc::new(RefCell::new(CandidateState::default()));
+        state.borrow_mut().set(requested.clone(), 0);
+        state.borrow_mut().set_selection(2);
+        let window_selected =
+            effective_selection_after_begin(&state, &requested, 0, BeginOutcome::Failed);
+        assert_eq!(state.borrow().selected(), 0);
+        assert_eq!(window_selected, 0);
+
+        state.borrow_mut().set_selection(2);
+        let window_selected =
+            effective_selection_after_begin(&state, &requested, 0, BeginOutcome::Advertised);
+        assert_eq!(state.borrow().selected(), 2);
+        assert_eq!(window_selected, 2);
+
+        state.borrow_mut().set(requested.clone(), 0);
+        let window_selected =
+            effective_selection_after_begin(&state, &requested, 0, BeginOutcome::NotAttempted);
+        assert_eq!(state.borrow().selected(), 0);
+        assert_eq!(window_selected, 0);
+    }
+
+    #[test]
+    fn invalidation_clears_retired_payload_and_keeps_only_the_successor_payload() {
+        let state = Rc::new(RefCell::new(CandidateState::default()));
+        state
+            .borrow_mut()
+            .set(vec!["a".into(), "b".into(), "c".into()], 0);
+        let outbox = Rc::new(RefCell::new(None));
+        let dirty = Rc::new(Cell::new(false));
+        let mut presenter =
+            CandidatePresenter::new(state, outbox.clone(), dirty.clone(), Rc::new(|| {}));
+        let active = Rc::new(Cell::new(true));
+        presenter.element_active = Some(active.clone());
+        behavior_set_selection(&active, &presenter.state, &dirty, 2);
+        behavior_finalize(&active, &outbox);
+
+        presenter.invalidate_element();
+        assert!(!active.get());
+        assert_eq!(*outbox.borrow(), None);
+        assert!(!dirty.get());
+
+        let successor = Cell::new(true);
+        behavior_abort(&successor, &outbox);
+        assert_eq!(*outbox.borrow(), Some(BehaviorAction::Abort));
+    }
+
+    #[test]
+    fn generic_hide_uses_the_same_element_invalidation_path() {
+        let state = Rc::new(RefCell::new(CandidateState::default()));
+        let outbox = Rc::new(RefCell::new(Some(BehaviorAction::Finalize)));
+        let dirty = Rc::new(Cell::new(true));
+        let mut presenter =
+            CandidatePresenter::new(state, outbox.clone(), dirty.clone(), Rc::new(|| {}));
+        let active = Rc::new(Cell::new(true));
+        presenter.element_active = Some(active.clone());
+
+        presenter.hide();
+        assert!(!active.get());
+        assert_eq!(*outbox.borrow(), None);
+        assert!(!dirty.get());
     }
 }

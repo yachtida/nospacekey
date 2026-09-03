@@ -21,14 +21,9 @@ pub struct InputState {
     /// 「現在の表記の次」に必要なため。
     pub notation_fixed: Option<crate::keymap::Notation>,
     /// Shift英語モード(shift_latin=compose): raw 内で direct 挿入部分が始まるバイト位置。
-    /// Some=英語モード中。bool でなく位置を持つのはセッション喪失リプレイ(split_replay)が
+    /// Some=英語モード中。bool でなく位置を持つのはセッション喪失リプレイが
     /// かな部/英語部の style 分割に必要なため。合成終息(reset/reseed/raw 枯渇)で None。
     pub latin_from: Option<usize>,
-    /// 最後にエンジン応答(または TIP 確定的表示)で表示を更新したときの文字列。
-    /// 劣化(エンジン応答 None)時のフォールバック素材。空 = まだ一度も成功していない。
-    pub last_good_text: String,
-    /// ↑を記録した時点の raw のバイト長。劣化時は raw[この位置..] を追記分として扱う。
-    pub last_good_raw_len: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -38,7 +33,8 @@ pub enum Action {
     RequestConvert, // 候補要求（Space）
     #[allow(dead_code)] // テスト専用: prod は OnKeyDown 内に同等処理をインライン化（テストモデル）
     Commit, // 確定（Enter）
-    Cancel,                       // 取消（Esc）
+    #[cfg(test)]
+    Cancel,       // 取消（Esc）の参照モデル
     #[allow(dead_code)] // テスト専用: prod は start_llm_convert を直接呼ぶ（テストモデル）
     RequestLlmConvert, // 外部LLM変換要求（Tab）
     Pass,                         // IMEは関与しない
@@ -83,6 +79,7 @@ impl InputState {
             Action::Pass
         }
     }
+    #[cfg(test)]
     pub fn on_escape(&mut self) -> Action {
         if self.composing {
             self.reset();
@@ -117,8 +114,6 @@ impl InputState {
         self.phase = Phase::Composing;
         self.notation_fixed = None;
         self.latin_from = None;
-        self.last_good_text.clear();
-        self.last_good_raw_len = 0;
     }
 
     /// 巡10(round10): 空 Backspace の cancel 拒否時に呼ぶ — on_backspace が最終文字削除で
@@ -129,56 +124,21 @@ impl InputState {
         self.composing = true;
     }
 
-    /// 前方一致候補の部分確定後、残り読み `remaining` で composition を継続する状態に整える。
-    /// `raw` を残り読み（かな）で満たすのは on_backspace の composing 判定をエンジン側の残り読みと
+    /// 前方一致候補の部分確定後、残りの canonical text で composition を継続する状態に整える。
+    /// `raw` を残りで満たすのは on_backspace の composing 判定をエンジン側の残りと
     /// **1:1 で同期**させるため（raw が空のままだと最初の Backspace で composing を取りこぼし、
     /// 2かな以上の残り読みが途中で打ち切られる＝データロス再発。defect#1）。raw が前面に出るのは
-    /// エンジン応答失敗時の劣化フォールバックのみで、その場合も正しい残り読みを表示できる。
-    pub fn reseed_after_partial_commit(&mut self, remaining: &str) {
+    /// エンジン応答失敗時の劣化フォールバックのみで、その場合も正しい残りを表示できる。
+    pub fn reseed_after_partial_commit_with_latin(
+        &mut self,
+        remaining: &str,
+        latin_from: Option<usize>,
+    ) {
         self.raw = remaining.to_string();
         self.composing = true;
         self.phase = Phase::Composing;
         self.notation_fixed = None; // 残り読みのライブ変換が再開する（arm_debounce と対）
-        self.latin_from = None; // 残り読みはかな＝英語モードは部分確定で終わる
-                                // 部分確定前(全読み時代)の last_good が残ると、直後の劣化で確定済み
-                                // テキストが二重に前置される。残り読みで記録し直す。
-        self.last_good_text = remaining.to_string();
-        self.last_good_raw_len = self.raw.len();
-    }
-
-    /// エンジン応答または TIP 確定的表示で表示文字列を更新したときに呼ぶ。
-    /// 劣化時フォールバック(degraded_reading)の素材を最新化する。
-    pub fn mark_good(&mut self, text: &str) {
-        self.last_good_text = text.to_string();
-        self.last_good_raw_len = self.raw.len();
-    }
-
-    /// エンジン劣化(応答 None)時の表示/確定文字列。契約: 劣化キーイベント 1 回につき
-    /// 1 回呼び、結果を live_text/last_reading へ保存して再利用する(同期後の再呼び出しは
-    /// 冪等だが契約としては依存しない)。raw 全体へ巻き戻さないのは、直前まで成功していた
-    /// 変換結果が last_good に残っており、捨てると Enter 確定が生ローマ字になるため
-    /// (spec 2026-07-21-engine-crash-degraded-fallback-design.md)。
-    pub fn degraded_reading(&mut self) -> String {
-        if self.raw.len() < self.last_good_raw_len {
-            // 劣化中の Backspace が追記分を食い尽くして変換済み部へ食い込んだ。
-            // 表示 1 文字と raw 1 char は 1:1 でない(日本語↔nihongo)ため厳密対応は
-            // 不可能 — 表示 1 文字 pop の best-effort に留める。
-            self.last_good_text.pop();
-            self.last_good_raw_len = self.raw.len();
-        }
-        // last_good_raw_len は常に「過去のある時点の raw.len()」。raw の変更経路は
-        // 末尾 push / char 単位 pop / 全置換(reset・reseed は記録も同時更新)のみ
-        // なので、記録値 ≤ 現長なら char 境界にあり、このスライスは panic しない。
-        let at = self.last_good_raw_len.min(self.raw.len());
-        let result = format!("{}{}", self.last_good_text, &self.raw[at..]);
-        if result.is_empty() && !self.raw.is_empty() {
-            // 表示を削り尽くしても raw が残る密度差ケース。空を返すと呼び出し側の
-            // reading.is_empty() → do_cancel が composition ごと raw を破棄する
-            // (spec レビュー I-1)ため、生ローマ字表示へ縮退して継続する。
-            self.last_good_raw_len = 0;
-            return self.raw.clone();
-        }
-        result
+        self.latin_from = latin_from;
     }
     /// ライブ変換要求ごとに seq を1つ進めて返す（TIP 採番）。
     pub fn bump_live_seq(&mut self) -> u64 {
@@ -211,17 +171,6 @@ impl InputState {
     }
 }
 
-/// 合成途中にエンジンセッションが失われたか（バグ#2: live_convert タイムアウト等で
-/// drop_engine された後、次打鍵の ensure_session が**空の新セッション**を張るケース）の純判定。
-/// `session==0` かつ `raw` に蓄積があるのは「commit/cancel/放棄/Deactivate の後」では
-/// あり得ない（それらは必ず raw を clear する。Deactivate の reset は 2026-07-07 レビュー
-/// I-1 で追加 — 怠ると取消済みテキストが再活性化後の初打鍵で復活する偽陽性リプレイになる）。
-/// よってこの組合せ＝合成途中の喪失と同値。
-/// true なら新セッションへ raw を一括リプレイしないと、それまでの未確定入力が全損する。
-pub fn needs_session_reseed(session: i64, raw: &str) -> bool {
-    session == 0 && !raw.is_empty()
-}
-
 /// 候補確定の分岐。`FullReset`=従来どおり全確定（composition/セッションを片付ける）、
 /// `PartialReseed`=前方一致候補の部分確定（prefix を確定し remaining でセッションを継続）。
 #[derive(Debug, PartialEq)]
@@ -234,6 +183,7 @@ pub enum CommitPlan {
 /// （成功なら `Some((確定text, 残り読み))`、失敗/未知セッションなら `None`）、
 /// `resolved_text` は TIP 側 cand_state で解決済みの確定文字列。
 /// 残り読みが非空のときだけ部分確定。空（全消費）・失敗はいずれも従来どおりの全確定（バイト等価）。
+#[cfg(test)]
 pub fn plan_commit(outcome: Option<(String, String)>, resolved_text: &str) -> CommitPlan {
     match outcome {
         Some((prefix, remaining)) if !remaining.is_empty() => {
@@ -596,22 +546,6 @@ pub fn clause_target_utf16(segments: &[String], selected: usize) -> (usize, usiz
 pub enum InsertStyle {
     Kana,
     Direct,
-}
-
-/// セッション喪失リプレイ(バグ#2)の分割純関数。raw をかな部(roman2kana)と英語部(direct)へ
-/// 分け、送信順の (text, style) 列を返す。2区間で済むのは latin_from が合成中に一度しか
-/// 立たない(英語モードは合成終息まで解除されない)ため — 任意インターリーブを表せる
-/// Vec<(String, Style)> を raw 側に持たせる案は不要な一般化。境界/範囲外/None は
-/// 1 区間へ縮退(従来ワイヤ等価)。
-pub fn split_replay(raw: &str, latin_from: Option<usize>) -> Vec<(String, InsertStyle)> {
-    match latin_from {
-        Some(i) if i > 0 && i < raw.len() => vec![
-            (raw[..i].to_string(), InsertStyle::Kana),
-            (raw[i..].to_string(), InsertStyle::Direct),
-        ],
-        Some(0) if !raw.is_empty() => vec![(raw.to_string(), InsertStyle::Direct)],
-        _ => vec![(raw.to_string(), InsertStyle::Kana)],
-    }
 }
 
 /// 再変換の対象種別。`None`=対象なし / `Latin`=ローマ字リプレイ / `Surface`=かな表層を
@@ -1049,7 +983,7 @@ mod tests {
         // 部分確定後、残り読み(2かな)で reseed。on_backspace は残り読みと 1:1 で縮み、
         // 最後の1かなを消すまで composing を維持する（defect#1 回帰: composing 早期 false を防ぐ）。
         let mut s = InputState::default();
-        s.reseed_after_partial_commit("ほご"); // 2 かな
+        s.reseed_after_partial_commit_with_latin("ほご", None); // 2 かな
         assert!(s.composing);
         assert_eq!(s.raw, "ほご");
         s.on_backspace(); // 1かな消す
@@ -1061,140 +995,10 @@ mod tests {
     #[test]
     fn reseed_single_kana_drops_composing_on_one_backspace() {
         let mut s = InputState::default();
-        s.reseed_after_partial_commit("ご"); // 1 かな
+        s.reseed_after_partial_commit_with_latin("ご", None); // 1 かな
         assert!(s.composing);
         s.on_backspace();
         assert!(!s.composing);
-    }
-
-    // ---- エンジン劣化時フォールバック: last_good + raw 追記 ----
-    // spec: docs/superpowers/specs/2026-07-21-engine-crash-degraded-fallback-design.md
-
-    #[test]
-    fn degraded_reading_appends_raw_typed_after_last_good() {
-        let mut s = InputState::default();
-        for c in "nihongo".chars() {
-            s.on_char(c);
-        }
-        s.mark_good("日本語");
-        s.on_char('d');
-        assert_eq!(s.degraded_reading(), "日本語d");
-    }
-    #[test]
-    fn degraded_reading_without_last_good_falls_back_to_raw() {
-        let mut s = InputState::default();
-        for c in "abc".chars() {
-            s.on_char(c);
-        }
-        assert_eq!(s.degraded_reading(), "abc");
-    }
-    #[test]
-    fn degraded_backspace_consumes_appended_suffix_first() {
-        let mut s = InputState::default();
-        for c in "nihongo".chars() {
-            s.on_char(c);
-        }
-        s.mark_good("日本語");
-        s.on_char('d');
-        s.on_backspace();
-        assert_eq!(s.degraded_reading(), "日本語");
-    }
-    #[test]
-    fn degraded_backspace_after_suffix_exhausted_trims_last_good_display() {
-        let mut s = InputState::default();
-        for c in "nihongo".chars() {
-            s.on_char(c);
-        }
-        s.mark_good("日本語");
-        s.on_backspace(); // raw="nihong"(6) < 記録7 → 表示1文字pop
-        assert_eq!(s.degraded_reading(), "日本");
-    }
-    #[test]
-    fn degraded_reading_never_returns_empty_while_raw_remains() {
-        // spec レビュー I-1: 表示を削り尽くしても raw が残る限り空を返さない
-        // (空を返すと呼び出し側の cancel 経路が raw ごと破棄する)。
-        let mut s = InputState::default();
-        for c in "nihongo".chars() {
-            s.on_char(c);
-        }
-        s.mark_good("日本語");
-        s.on_backspace();
-        assert_eq!(s.degraded_reading(), "日本");
-        s.on_backspace();
-        assert_eq!(s.degraded_reading(), "日");
-        s.on_backspace(); // 表示枯渇 → raw フォールバック
-        assert_eq!(s.degraded_reading(), "niho");
-        assert!(s.composing);
-        s.on_backspace(); // 以後は raw 縮退で継続
-        assert_eq!(s.degraded_reading(), "nih");
-    }
-    #[test]
-    fn degraded_reading_is_idempotent_after_sync() {
-        // 契約は1イベント1回だが、二重呼び出しが破壊的でないこと(pop は shrink 検知時のみ)
-        let mut s = InputState::default();
-        for c in "nihongo".chars() {
-            s.on_char(c);
-        }
-        s.mark_good("日本語");
-        s.on_backspace();
-        assert_eq!(s.degraded_reading(), "日本");
-        assert_eq!(s.degraded_reading(), "日本");
-    }
-    #[test]
-    fn reset_clears_last_good() {
-        let mut s = InputState::default();
-        s.on_char('a');
-        s.mark_good("あ");
-        s.reset();
-        assert_eq!(s.last_good_text, "");
-        assert_eq!(s.last_good_raw_len, 0);
-    }
-    #[test]
-    fn reseed_after_partial_commit_records_remaining_as_last_good() {
-        let mut s = InputState::default();
-        for c in "kyouhaame".chars() {
-            s.on_char(c);
-        }
-        s.mark_good("今日は雨");
-        s.reseed_after_partial_commit("あめ");
-        assert_eq!(s.last_good_text, "あめ");
-        assert_eq!(s.last_good_raw_len, "あめ".len());
-        s.on_char('d');
-        assert_eq!(s.degraded_reading(), "あめd");
-    }
-    #[test]
-    fn degraded_reading_survives_multibyte_raw_from_partial_commit() {
-        // 部分確定後の raw はかな(マルチバイト)。pop→スライスで境界 panic しないこと。
-        let mut s = InputState::default();
-        s.reseed_after_partial_commit("かな");
-        s.on_backspace(); // raw="か"(3B) < 記録6B
-        assert_eq!(s.degraded_reading(), "か");
-    }
-    #[test]
-    fn degraded_reading_survives_multibyte_append_like_long_vowel_mark() {
-        // spec レビュー M-5: 追記側のマルチバイト('-'→'ー' は raw へ 3 バイト push)も試験。
-        let mut s = InputState::default();
-        for c in "ra".chars() {
-            s.on_char(c);
-        }
-        s.mark_good("ら");
-        s.on_char('ー');
-        assert_eq!(s.degraded_reading(), "らー");
-        s.on_backspace();
-        assert_eq!(s.degraded_reading(), "ら");
-    }
-
-    // ---- バグ#2: 合成途中のセッション喪失 → raw 一括リプレイの純判定 ----
-
-    #[test]
-    fn reseed_needed_only_when_session_lost_mid_composition() {
-        // session==0 かつ raw 蓄積あり = live_convert タイムアウト等の drop 後（バグ#2 の窓）。
-        assert!(needs_session_reseed(0, "watashinonamaeha"));
-        // 生きたセッションでは何もしない（通常打鍵・部分確定の継続セッション）。
-        assert!(!needs_session_reseed(7, "watashinonamaeha"));
-        // raw が空なら新規合成の開始（commit/cancel/放棄の直後）— リプレイ対象なし。
-        assert!(!needs_session_reseed(0, ""));
-        assert!(!needs_session_reseed(7, ""));
     }
 
     // ---- U9: sanitize_left_context ----
@@ -1337,7 +1141,6 @@ mod tests {
         // 全角ON・native・既定確定 → 全角化
         assert!(should_widen_digits(true, false, false, None, "live"));
         assert!(should_widen_digits(true, false, false, None, "live_prefix"));
-        assert!(should_widen_digits(true, false, false, None, "live_auto"));
         // 候補の明示選択は幅を変えない（文節ナビゲーション確定も候補選択の一種）
         assert!(!should_widen_digits(true, false, false, None, "candidate"));
         assert!(!should_widen_digits(
@@ -1388,7 +1191,6 @@ mod tests {
         assert!(!should_widen_digits(
             true, false, /*latin=*/ true, None, "live"
         ));
-        assert!(!should_widen_digits(true, false, true, None, "live_auto"));
         assert!(!should_widen_digits(true, false, true, None, "mode_toggle"));
     }
 
@@ -1464,7 +1266,7 @@ mod tests {
         s.reset();
         assert!(s.notation_fixed.is_none(), "確定/取消の reset で固定解除");
         s.notation_fixed = Some(Notation::Hiragana);
-        s.reseed_after_partial_commit("ご");
+        s.reseed_after_partial_commit_with_latin("ご", None);
         assert!(
             s.notation_fixed.is_none(),
             "部分確定の reseed で固定解除（残り読みはライブ変換再開）"
@@ -1543,28 +1345,7 @@ mod tests {
         s.reset();
         assert!(!s.latin_mode(), "確定/取消の reset で解除");
         s.on_char_latin('A');
-        s.reseed_after_partial_commit("ご");
+        s.reseed_after_partial_commit_with_latin("ご", None);
         assert!(!s.latin_mode(), "部分確定の残り読みはかな=英語モード解除");
-    }
-
-    // ---- セッション喪失リプレイ(バグ#2)の style 分割 ----
-
-    #[test]
-    fn split_replay_partitions_kana_and_direct() {
-        use InsertStyle::*;
-        assert_eq!(
-            split_replay("kyouAb", Some(4)),
-            vec![("kyou".to_string(), Kana), ("Ab".to_string(), Direct)]
-        );
-        assert_eq!(
-            split_replay("Ab", Some(0)),
-            vec![("Ab".to_string(), Direct)]
-        );
-        assert_eq!(split_replay("kyou", None), vec![("kyou".to_string(), Kana)]);
-        // クランプ後(英語部分全消し)は 1 区間かなへ縮退(ワイヤ等価)
-        assert_eq!(
-            split_replay("kyou", Some(4)),
-            vec![("kyou".to_string(), Kana)]
-        );
     }
 }

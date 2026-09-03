@@ -73,13 +73,6 @@ pub(crate) fn display_bound(max_chars: u32) -> usize {
     2 * max_chars as usize
 }
 
-/// 自動確定でエンジンが消費した読み（= full から remaining を末尾サフィックスとして
-/// 剥がした頭）。サフィックス不成立（engine_insert 失敗の raw フォールバック等）は None —
-/// 呼び出し側は追記をスキップして劣化する（欠落は Enter まで恒久だが壊れない）。
-pub(crate) fn consumed_reading<'a>(full: &'a str, remaining: &str) -> Option<&'a str> {
-    full.strip_suffix(remaining)
-}
-
 fn trim_to_tail(buf: &mut String, max_chars: usize) {
     let n = buf.chars().count();
     if n > max_chars {
@@ -87,12 +80,6 @@ fn trim_to_tail(buf: &mut String, max_chars: usize) {
             buf.drain(..cut);
         }
     }
-}
-
-/// 累積バッファへ消費分を追記し末尾 `bound` 文字へ切り詰める（bound は display_bound 由来）。
-pub(crate) fn append_committed(buf: &mut String, consumed: &str, bound: usize) {
-    buf.push_str(consumed);
-    trim_to_tail(buf, bound);
 }
 
 /// モニタ表示文字列（累積+現在読み、末尾優先バウンド）。累積 OFF は committed="" で
@@ -724,34 +711,6 @@ mod tests {
     }
 
     #[test]
-    fn consumed_reading_strips_remaining_as_suffix() {
-        // 自動確定はエンジンが先頭文節の読みを消費する — 残りは全読みの末尾サフィックス。
-        assert_eq!(
-            consumed_reading("きょうはてんき", "てんき"),
-            Some("きょうは")
-        );
-        // 全消費(remaining が空)は全体が消費分。
-        assert_eq!(consumed_reading("きょうは", ""), Some("きょうは"));
-        // 濁点・促音・小書きを含む読みでも文字列サフィックスとして剥がせる。
-        assert_eq!(
-            consumed_reading("がっこうへいった", "へいった"),
-            Some("がっこう")
-        );
-        // サフィックス不成立(raw フォールバック等の不整合)は None — 呼び出し側がスキップ。
-        assert_eq!(consumed_reading("kyouha", "てんき"), None);
-    }
-
-    #[test]
-    fn append_committed_bounds_buffer_to_tail_chars() {
-        let mut buf = "あ".repeat(60);
-        append_committed(&mut buf, &"い".repeat(10), 64);
-        // 末尾 bound(64) にバウンド: 先頭の「あ」が 6 文字落ち、末尾は保たれる。
-        assert_eq!(buf.chars().count(), 64);
-        assert!(buf.ends_with(&"い".repeat(10)));
-        assert!(buf.starts_with("あ"));
-    }
-
-    #[test]
     fn compose_monitor_text_joins_and_trims_tail_priority() {
         // 通常: 連結のみ。
         assert_eq!(
@@ -765,20 +724,6 @@ mod tests {
         let s = compose_monitor_text(&long, "おわり", 64);
         assert_eq!(s.chars().count(), 64);
         assert!(s.ends_with("おわり"));
-    }
-
-    #[test]
-    fn auto_commit_frame_keeps_display_string_unchanged() {
-        // 順序契約(spec 状態C1): 「追記→last_reading 縮小」の後の合成表示が追記前と一致する。
-        // これが破れると自動確定フレームだけ読みが縮んで見える「跳ね」になる。
-        let full = "きょうはてんきがいい";
-        let remaining = "てんきがいい";
-        let mut buf = String::from("わたしの");
-        let before = compose_monitor_text(&buf, full, 64);
-        let consumed = consumed_reading(full, remaining).expect("正常系はサフィックス成立");
-        append_committed(&mut buf, consumed, 64);
-        let after = compose_monitor_text(&buf, remaining, 64);
-        assert_eq!(before, after);
     }
 
     #[test]

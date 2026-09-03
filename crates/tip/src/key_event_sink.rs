@@ -14,10 +14,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState,
 use windows::Win32::UI::TextServices::{ITfContext, ITfKeyEventSink_Impl};
 
 use crate::candidate_window::{visible_range, CandidateUI, MAX_VISIBLE_ROWS};
+use crate::input_module::{
+    BackgroundIntent as ModuleIntent, EngineCommitOutcome as ModuleCommitOutcome,
+    EngineResult as ModuleEngineResult, ImmediateOperation as ModuleOperation,
+    InputEvent as ModuleEvent, InputSegment as ModuleInputSegment, KeyEvent as ModuleKeyEvent,
+    ReplayMode as ModuleReplayMode, RequestId as ModuleRequestId, TextStyle as ModuleTextStyle,
+};
 use crate::input_state::{
-    needs_session_reseed, plan_commit, plan_live_enter, should_widen_digits, to_hankaku_ascii,
-    to_hankaku_kana, to_kana_reading_char, to_katakana, to_zenkaku_ascii, to_zenkaku_digits,
-    CommitPlan, InsertStyle, LiveEnterPlan,
+    plan_live_enter, should_widen_digits, to_hankaku_ascii, to_hankaku_kana, to_kana_reading_char,
+    to_katakana, to_zenkaku_ascii, to_zenkaku_digits, CommitPlan, InsertStyle, LiveEnterPlan,
 };
 use crate::text_service::{
     tip_log, PendingEndKeySignature, PendingEndTestDecision, TextService_Impl,
@@ -38,6 +43,68 @@ const VK_LEFT: u32 = 0x25;
 const VK_UP: u32 = 0x26;
 const VK_RIGHT: u32 = 0x27;
 const VK_DOWN: u32 = 0x28;
+
+fn cancel_explicit_wait_for_actual_keydown(vk: u32, cancel: impl FnOnce()) {
+    if !is_pure_modifier_vk(vk) {
+        cancel();
+    }
+}
+
+fn apply_and_complete_module_operation(
+    operation: &ModuleOperation,
+    apply: impl FnOnce() -> bool,
+    complete: impl FnOnce(&ModuleOperation, bool),
+) -> bool {
+    let applied = apply();
+    complete(operation, applied);
+    applied
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitSessionCleanup {
+    EndMainAndCloseBackground,
+    DropMainOnly,
+}
+
+fn commit_session_cleanup_plan(end_engine_session: bool) -> CommitSessionCleanup {
+    if end_engine_session {
+        CommitSessionCleanup::EndMainAndCloseBackground
+    } else {
+        CommitSessionCleanup::DropMainOnly
+    }
+}
+
+fn resolve_candidate_commit(
+    snapshot_candidate: bool,
+    resolved_text: &str,
+    snapshot_remaining: Option<&str>,
+    engine_commit: impl FnOnce() -> Option<(String, String)>,
+) -> ModuleCommitOutcome {
+    if snapshot_candidate {
+        return ModuleCommitOutcome::Applied {
+            text: resolved_text.to_string(),
+            remaining: snapshot_remaining.unwrap_or_default().to_string(),
+        };
+    }
+    match engine_commit() {
+        Some((text, remaining)) => ModuleCommitOutcome::Applied { text, remaining },
+        None => ModuleCommitOutcome::Fallback {
+            text: resolved_text.to_string(),
+        },
+    }
+}
+
+fn reseed_background(
+    close: impl FnOnce(),
+    snapshot: impl FnOnce() -> ModuleIntent,
+    submit: impl FnOnce(ModuleRequestId, Vec<ModuleInputSegment>) -> bool,
+) -> bool {
+    close();
+    match snapshot() {
+        ModuleIntent::Insert { request, segments } => submit(request, segments),
+        _ => unreachable!("background reseed must produce insert"),
+    }
+}
 const VK_DELETE: u32 = 0x2E;
 const VK_1: u32 = 0x31;
 const VK_9: u32 = 0x39;
@@ -202,9 +269,8 @@ pub(crate) fn current_modifier_mask() -> u8 {
 /// 確定取消（Ctrl+Backspace）: この `source`（remember_last_commit/commit_and_reset に渡る
 /// ev=commit の source ラベル）の確定が undo_armed を武装してよいかを判定する純粋関数。
 /// 対象は「読みを使い切って composition を畳んだ全確定」の candidate/live/clause のみ
-/// （設計ロック⑤）。candidate_prefix/live_prefix は composition が残るためガードで自然に除外され、
-/// live_auto は全消費時のみ commit_and_reset を通るが「iOS 由来の自動確定」を undo 対象にしない
-/// 方針（M-2）で source ゲート側から明示的に除外する。mode_toggle/navigate（settle 系）は
+/// （設計ロック⑤）。candidate_prefix/live_prefix は composition が残るためガードで自然に除外される。
+/// mode_toggle/navigate（settle 系）は
 /// 対象外（C-1: settle は候補確定を経由すると source="candidate"/"clause" になるため、armed を
 /// 残さないよう settle_active_input/on_preserved_key_impl 側で disarm_undo を必ず呼ぶ）。
 /// clause（文節ナビゲーションの Enter 確定）は candidate と同じ「明示選択の全確定」なので武装する。
@@ -769,6 +835,7 @@ impl TextService_Impl {
         let vk = crate::keymap::normalize_vk(raw_vk);
         if !is_pure_modifier_vk(vk) {
             self.cancel_deferred_prediction_preserved_on_input();
+            self.cancel_explicit_snapshot_wait();
         }
         if should_invalidate_hidden_prediction(
             vk,
@@ -897,6 +964,7 @@ impl TextService_Impl {
         if !is_pure_modifier_vk(vk) {
             self.cancel_deferred_prediction_preserved_on_input();
         }
+        cancel_explicit_wait_for_actual_keydown(vk, || self.cancel_explicit_snapshot_wait());
         if should_invalidate_hidden_prediction(
             vk,
             self.prediction_ghost_actionable(),
@@ -1210,47 +1278,38 @@ impl TextService_Impl {
                 // 確定文字列の唯一の真実源は cand_state（drain_behavior と同じ読み元）。
                 // 選択 index も cand_state から読み、空なら先頭へフォールバック（index と文字列は一致）。
                 let cand_pick = if showing {
-                    let st = self.cand_state.borrow();
-                    st.resolve_commit(st.selected())
+                    self.module_candidate_commit(None)
                 } else {
                     None
                 };
-                if let Some((index, text)) = cand_pick {
+                if let Some((request, index, text)) = cand_pick {
                     // 候補確定: 前方一致候補ならエンジンが残り読みを返すので部分確定して継続する。
-                    self.commit_candidate(&ctx, index, &text);
+                    self.commit_candidate(&ctx, request, index, &text);
                 } else {
-                    // 候補非表示: ライブ変換結果（無ければ読み）を確定する。
-                    // Spec2: エンジンが生きていれば Commit(0) に通して学習に乗せる
-                    // （liveConvert が先頭候補をキャッシュ済み）。劣化時は従来どおり文字列直確定
-                    // （学習されないだけで確定は必ず成功）。前方一致候補なら candidate_prefix と
-                    // 同じ部分確定継続（source=live_prefix）— 従来は残り読みが暗黙に捨てられていた。
-                    // ライブ変換 OFF / F6-F10 表記固定中は engine のライブ変換を参照しない
-                    // （None=劣化枝と同じ DirectCommit へ）— 表示中の live_text をそのまま確定する。
-                    let live = if self.should_consult_live_engine() {
-                        let seq = self.state.borrow_mut().bump_live_seq();
-                        // auto_commit=false: この直後の Commit{0} が全読みを確定する前提のため、
-                        // エンジンに読みを消費させてはいけない（protocol.rs の LiveConvert 参照）。
-                        self.engine_live_convert(seq, false).map(|(t, _, _)| t)
-                    } else {
-                        None
+                    let module_output = self
+                        .state
+                        .borrow_mut()
+                        .handle(ModuleEvent::Key(ModuleKeyEvent::Enter));
+                    let local_operation = module_output
+                        .immediate
+                        .expect("composing Enter must produce a local commit operation");
+                    debug_assert!(module_output.background.is_none());
+                    let local_fallback = match &local_operation {
+                        ModuleOperation::Commit { text, .. } => text.clone(),
+                        _ => unreachable!("composing Enter must commit"),
                     };
                     let live_text = self.live_text.borrow().clone();
-                    let last_reading = self.last_reading.borrow().clone();
-                    // Why not(ライブ変換 OFF 専用の source を作る): `arms_undo` は
-                    // `matches!(source, "candidate" | "live")` の**列挙**なので、別名にすると
-                    // Ctrl+Backspace の確定取消が OFF のときだけ静かに武装しなくなる
-                    // （`should_widen_digits` は逆に除外列挙なので別名でも幅は変わらない）。
-                    match plan_live_enter(live, &live_text, &last_reading) {
-                        LiveEnterPlan::EngineCommit { text } => {
-                            let plan = plan_commit(self.engine_commit(0), &text);
-                            self.apply_commit_plan(&ctx, plan, "live", "live_prefix", None);
-                        }
-                        LiveEnterPlan::DirectCommit { text } => {
-                            // 巡5 GLM M-1: 成否を受ける（後続処理は無いが FullReset 枝の
-                            // drop_engine 自己修復と対称に — 直確定はエンジン消費が無いので
-                            // drop 不要、ログのみで再試行に任せる）。
-                            let _ = self.commit_and_reset(&ctx, &text, "live", None);
-                        }
+                    let text = match plan_live_enter(None, &live_text, &local_fallback) {
+                        LiveEnterPlan::EngineCommit { text }
+                        | LiveEnterPlan::DirectCommit { text } => text,
+                    };
+                    let applied = apply_and_complete_module_operation(
+                        &local_operation,
+                        || self.commit_local_and_reset(&ctx, &text, "live"),
+                        |operation, applied| self.state.borrow_mut().complete(operation, applied),
+                    );
+                    if applied {
+                        self.background_input.try_commit_and_close();
                     }
                 }
                 Ok(TRUE)
@@ -1287,13 +1346,13 @@ impl TextService_Impl {
                         let st = self.cand_state.borrow();
                         let digit = (vk - VK_1) as usize; // 0 始まりのページ内行
                         page_candidate_index(st.selected(), st.count(), digit)
-                            .and_then(|abs| st.resolve_commit(abs))
-                    };
+                    }
+                    .and_then(|absolute| self.module_candidate_commit(Some(absolute)));
                     match picked {
-                        Some((index, text)) => {
+                        Some((request, index, text)) => {
                             tip_log(&format!("ev=candidate_move sel={index}"));
                             // 候補確定: 前方一致候補なら部分確定して残り読みを継続する。
-                            self.commit_candidate(&ctx, index, &text);
+                            self.commit_candidate(&ctx, request, index, &text);
                             Ok(TRUE)
                         }
                         // 可視ページの行数を超える数字は no-op（誤った候補を選ばない）。候補表示中は
@@ -1366,16 +1425,24 @@ impl TextService_Impl {
                     Ok(TRUE)
                 } else if self.state.borrow().composing {
                     self.disarm_debounce();
+                    let cancel = self
+                        .state
+                        .borrow_mut()
+                        .handle(ModuleEvent::Key(ModuleKeyEvent::Escape))
+                        .immediate
+                        .expect("composing Escape must produce a cancel operation");
                     // 巡4 T4: セッション拒否時は TIP 側状態を畳まない（composition が文書に
                     // 残るため「Esc が効かなかった」扱いにする）。do_cancel 内の left_context
                     // 清算は実行済み。
                     if !self.do_cancel(&ctx) {
+                        self.state.borrow_mut().complete(&cancel, false);
                         tip_log("ev=cancel_rejected source=escape");
                         return Ok(TRUE);
                     }
+                    self.state.borrow_mut().complete(&cancel, true);
                     self.reading_monitor.borrow_mut().hide();
-                    self.state.borrow_mut().on_escape();
                     self.engine_end_session();
+                    self.background_input.request_close();
                     // ephemeral かな: composition を破棄した以上、開始状態へ戻す＝direct へ復帰する。
                     self.exit_ephemeral_to_direct(Some(&ctx));
                     self.live_text.borrow_mut().clear();
@@ -1416,57 +1483,76 @@ impl TextService_Impl {
                     self.showing.set(false);
                     self.clear_clause_nav();
                 }
-                self.state.borrow_mut().on_backspace();
-                // mark_good は Some アーム内限定 — match 後の共通行に置くと劣化出力まで
-                // 良好素材として記録され「エンジン由来の表示」という前提が崩れる。
-                let reading = match self.engine_backspace() {
-                    Some(r) => {
-                        self.state.borrow_mut().mark_good(&r);
-                        *self.last_reading.borrow_mut() = r.clone();
-                        r
-                    }
-                    None => {
-                        let degraded = self.state.borrow_mut().degraded_reading();
-                        *self.last_reading.borrow_mut() = degraded.clone();
-                        degraded
-                    }
+                let module_output = self
+                    .state
+                    .borrow_mut()
+                    .handle(ModuleEvent::Key(ModuleKeyEvent::Backspace));
+                let local_reading = match module_output.immediate.as_ref() {
+                    Some(ModuleOperation::SetPreedit { text }) => Some(text.clone()),
+                    Some(ModuleOperation::Cancel) => None,
+                    other => unreachable!(
+                        "backspace must produce local preedit or cancel, got {other:?}"
+                    ),
                 };
-                if reading.is_empty() {
-                    self.disarm_debounce();
-                    // 巡4 T4: 拒否時は composition が文書に残るため状態を畳まない（再 Backspace
-                    // の再試行に任せる）。
-                    if !self.do_cancel(&ctx) {
-                        tip_log("ev=cancel_rejected source=backspace_empty");
-                        // 巡10(round10): on_backspace() が最終文字削除で composing=false に
-                        // 済ませているので巻き戻す — このままだと文書に composition が残るのに
-                        // will_handle の composing gate(Esc/BS/Return)を素通りし、composition
-                        // を閉じる手段が消えて次の Backspace が本文を削りかねない。
-                        // 巡11(round11): live_text も空にする — 残したまま戻すと Enter/settle の
-                        // plan_live_enter が残骸を確定素材に選び「cancel は落ちたのに commit は
-                        // 通る」で消したはずの文字が本文に入り得る。空なら Enter は空確定
-                        // （SetText 成功時に限り composition を畳る cancel 代わり — 拒否時は
-                        // cancel と同様に中間状態のまま再試行）、Tab(LLM)/F6-F10 は素材空ガード
-                        // で no-op になり、中間状態は Esc/BS/Enter の再試行に集中する。
-                        // Space(Convert)/Tab(Typo) は空ガード対象外 — 同期 IPC のみで、
-                        // 応答が空配列なら TIP 側の no-op 枝(`Some(cands) if !cands.is_empty()`
-                        // の外)で収まる。非空を返す実測は無いが「契約」として固定しても
-                        // いない(エンジン側に空読みの早期 return は無い)。LLM(awaiting
-                        // ロックで再試行が死ぬ)と Notation(preedit 潰し)は実害ゆえガード済み。
-                        self.state
-                            .borrow_mut()
-                            .resume_composing_after_cancel_reject();
-                        self.live_text.borrow_mut().clear();
-                        return Ok(TRUE);
-                    }
-                    self.reading_monitor.borrow_mut().hide();
-                    self.state.borrow_mut().reset();
-                    self.live_text.borrow_mut().clear();
-                    *self.current_context.borrow_mut() = None;
+                let operation = module_output
+                    .immediate
+                    .clone()
+                    .expect("backspace must produce an immediate operation");
+                let (background_request, background_segments) = match module_output.background {
+                    Some(ModuleIntent::Reseed { request, segments }) => (request, segments),
+                    _ => unreachable!("composing backspace must produce one background intent"),
+                };
+                let local_applied = local_reading.as_ref().is_some_and(|text| {
+                    *self.last_reading.borrow_mut() = text.clone();
+                    *self.live_text.borrow_mut() = text.clone();
+                    self.run_preedit(&ctx, &self.widen_display_text(text))
+                });
+                // A surface deletion can preserve the same text while changing whether its
+                // trailing ASCII is frozen or still composable. A stateful engine Backspace
+                // cannot carry that distinction, so the next worker state starts from the
+                // canonical styled replay instead.
+                if local_reading.is_some() {
+                    reseed_background(
+                        || self.background_input.request_close(),
+                        || ModuleIntent::Insert {
+                            request: background_request,
+                            segments: background_segments,
+                        },
+                        |request, segments| self.background_input.try_reseed(request, segments),
+                    );
                 } else {
-                    *self.current_context.borrow_mut() = Some(ctx.clone());
-                    *self.live_text.borrow_mut() = reading.clone();
-                    self.run_preedit(&ctx, &self.widen_display_text(&reading));
-                    self.arm_debounce();
+                    self.background_input.request_close();
+                }
+                match operation {
+                    operation @ ModuleOperation::Cancel => {
+                        self.disarm_debounce();
+                        let applied = apply_and_complete_module_operation(
+                            &operation,
+                            || self.do_cancel(&ctx),
+                            |operation, applied| {
+                                self.state.borrow_mut().complete(operation, applied)
+                            },
+                        );
+                        if !applied {
+                            tip_log("ev=cancel_rejected source=backspace_empty");
+                            return Ok(TRUE);
+                        }
+                        self.last_reading.borrow_mut().clear();
+                        self.reading_monitor.borrow_mut().hide();
+                        self.live_text.borrow_mut().clear();
+                        *self.current_context.borrow_mut() = None;
+                        self.background_input.request_close();
+                    }
+                    ModuleOperation::SetPreedit { text } => {
+                        *self.current_context.borrow_mut() = Some(ctx.clone());
+                        if !local_applied {
+                            self.run_preedit(&ctx, &self.widen_display_text(&text));
+                        }
+                        self.arm_debounce();
+                    }
+                    other => {
+                        unreachable!("backspace result cannot produce {other:?}");
+                    }
                 }
                 Ok(TRUE)
             }
@@ -1616,13 +1702,9 @@ impl TextService_Impl {
             tip_log("ev=notation_skip_empty_text");
             return Ok(TRUE);
         }
-        {
-            let mut st = self.state.borrow_mut();
-            st.notation_fixed = Some(kind);
-            st.mark_good(&shown);
-        }
-        // 表示だけ全角化する（input_char と同じ規律）。live_text/mark_good を半角 canonical の
-        // まま置くのは、それが劣化確定・リプレイでエンジンへ戻る素材だから。
+        self.state.borrow_mut().set_notation(kind);
+        // 表示だけ全角化する（input_char と同じ規律）。live_text は半角 canonical の
+        // まま置くのは、それが確定・リプレイでエンジンへ戻る素材だから。
         // widen は notation_fixed を書いた**後**で呼ぶ — 先だと F10/半角カナが半角指定として
         // 効かず、機能名と真逆に数字が全角化される。
         *self.live_text.borrow_mut() = shown.clone();
@@ -1914,13 +1996,12 @@ impl TextService_Impl {
         }
         // 候補表示中: 選択中の候補を確定（VK_RETURN の候補枝と同じ読み元・同じ経路）。
         let cand_pick = if self.showing.get() {
-            let st = self.cand_state.borrow();
-            st.resolve_commit(st.selected())
+            self.module_candidate_commit(None)
         } else {
             None
         };
-        if let Some((index, text)) = cand_pick {
-            self.commit_candidate(ctx, index, &text);
+        if let Some((request, index, text)) = cand_pick {
+            self.commit_candidate(ctx, request, index, &text);
         }
         // 候補確定が部分確定だった場合・候補非表示の場合とも、composition が残っていれば
         // VK_RETURN の候補非表示枝と同一の「ライブ変換結果（無ければ読み）」で全確定する。
@@ -1978,32 +2059,37 @@ impl TextService_Impl {
         let composing = self.state.borrow().composing;
         if composing {
             self.disarm_debounce();
-            match self.engine_convert() {
-                Some(cands) if !cands.is_empty() => {
-                    // 確定文字列の唯一の真実源は cand_state（show() が set する）。別途持たない。
-                    self.showing.set(true);
-                    // 候補窓を開いた時点で preedit を選択候補へ揃える（show_reconvert_candidates と
-                    // 同じ形）。候補確定は幅を変えない契約なので、ここは widen を通さない生の候補。
-                    // これが無いと、数字を全角表示した preedit のまま半角候補を確定して
-                    // 「見えている幅と確定の幅が違う」が候補経路で再発する。
-                    self.run_preedit(ctx, &cands[0]);
-                    let anchor = self.caret_point(ctx);
-                    // Task 7: 表示ごとに settings/ダークモードを再評価した Theme を渡す。
-                    let theme = self.appearance.borrow_mut().current_theme();
-                    self.candidate_ui
-                        .borrow_mut()
-                        .show(&cands, 0, anchor, theme);
-                    self.reading_monitor.borrow_mut().hide();
-                    tip_log(&candidates_event(
-                        self.prediction_enabled.get(),
-                        "candidates_shown",
-                        &cands,
-                    ));
-                }
-                // エンジン失敗/空: preedit はそのまま（ハングさせない）。
-                _ => {}
-            }
+            self.begin_explicit_snapshot_wait();
         }
+    }
+
+    pub(crate) fn show_explicit_candidates(
+        &self,
+        ctx: &ITfContext,
+        candidates: &[String],
+        selected: usize,
+    ) {
+        if candidates.is_empty() {
+            return;
+        }
+        let selected = selected.min(candidates.len() - 1);
+        self.hide_explicit_snapshot_status();
+        self.explicit_snapshot_pending.set(false);
+        self.explicit_snapshot_candidates_active.set(true);
+        self.showing.set(true);
+        self.state.borrow_mut().invalidate_live_display();
+        self.run_preedit(ctx, &candidates[selected]);
+        let anchor = self.caret_point(ctx);
+        let theme = self.appearance.borrow_mut().current_theme();
+        self.candidate_ui
+            .borrow_mut()
+            .show(candidates, selected, anchor, theme);
+        self.reading_monitor.borrow_mut().hide();
+        tip_log(&candidates_event(
+            self.prediction_enabled.get(),
+            "candidates_shown",
+            candidates,
+        ));
     }
 
     /// 修正変換（Tab）本体。読みのタイポ修復候補を要求し候補窓に出す。showing 中なら次の候補へ
@@ -2019,7 +2105,8 @@ impl TextService_Impl {
             match self.engine_typo_convert() {
                 Some(cands) if !cands.is_empty() => {
                     self.showing.set(true);
-                    self.run_preedit(ctx, &cands[0]); // trigger_convert と同じ理由（幅の一致）
+                    let first = self.replace_module_candidates(&cands, 0);
+                    self.run_preedit(ctx, &first); // trigger_convert と同じ理由（幅の一致）
                     let anchor = self.caret_point(ctx);
                     let theme = self.appearance.borrow_mut().current_theme();
                     self.candidate_ui
@@ -2130,75 +2217,58 @@ impl TextService_Impl {
             self.showing.set(false);
             self.clear_clause_nav();
         }
-        // 喪失判定は ensure_engine より**前**に行う: drop_engine 後の再接続は
-        // ensure_engine 内の start_and_store が StartSession まで済ませて engine_session を
-        // 非0にするため、ensure_session は「新規作成」を検知できず false を返す
-        // （この経路が fac6315 の盲点 — item24 ヘッドレス再現で崩壊が残ることを実測済み）。
-        // 「session==0 かつ raw 非空」は commit/cancel/放棄/Deactivate 後にはあり得ない
-        // 組合せ（それらは必ず raw を clear する — needs_session_reseed の doc 参照）ので、
-        // 合成途中のエンジン喪失と同値。
-        let lost_mid_composition =
-            needs_session_reseed(self.engine_session.get(), &self.state.borrow().raw);
-        self.ensure_engine();
-        let session_created = self.ensure_session();
-        match style {
-            InsertStyle::Direct => self.state.borrow_mut().on_char_latin(ch),
-            InsertStyle::Kana => self.state.borrow_mut().on_char(ch),
+        if !self.state.borrow().composing {
+            self.background_input.begin_composition();
+        }
+        let background_reseed = self.background_input.needs_reseed();
+        let module_output =
+            self.state
+                .borrow_mut()
+                .handle(ModuleEvent::Key(ModuleKeyEvent::Text {
+                    ch,
+                    style: match style {
+                        InsertStyle::Direct => ModuleTextStyle::Direct,
+                        InsertStyle::Kana => ModuleTextStyle::Kana,
+                    },
+                    replay: if background_reseed {
+                        ModuleReplayMode::Full
+                    } else {
+                        ModuleReplayMode::Delta
+                    },
+                }));
+        let displayed = match module_output.immediate.as_ref() {
+            Some(ModuleOperation::SetPreedit { text }) => text.clone(),
+            other => unreachable!("text input must produce local preedit, got {other:?}"),
+        };
+        let (request, segments) = match module_output.background {
+            Some(ModuleIntent::Insert { request, segments }) => (request, segments),
+            _ => unreachable!("composing text input must produce one insert intent"),
         };
         *self.current_context.borrow_mut() = Some(ctx.clone());
-        // セッションを今作った（＝engine 側の読みが空）なら raw 全体を送り直す。
-        // composition 継続中の drop_engine（ライブ変換タイムアウト等）からの復帰打鍵で、
-        // 新セッションに新規1文字だけを入れると preedit が積み上げた読みごと 1 文字に
-        // 置き換わる（22 文字打鍵→23 文字目で全部消えるデータロス）。raw は打鍵の全履歴
-        // （部分確定後は残り読みのかな）を保持しているので、replay で読みが完全復元される。
-        // 新規 composition では raw == ch 1 文字なので従来とワイヤ等価。
-        // リプレイは raw をかな部/英語部で style 分割して順送する（split_replay）。複数区間の
-        // 途中失敗は最終 Insert の結果だけを見る — 部分成功を巻き戻す経路は無く、None 劣化
-        // （raw 表示）は単発失敗時と同じ挙動に収束するため。
-        let segments: Vec<(String, InsertStyle)> = if session_created || lost_mid_composition {
-            let st = self.state.borrow();
-            if lost_mid_composition {
-                // 実機受入で「復旧が発火した」ことを確認するための診断（NOSPACEKEY_LOG ゲート内）。
-                // len はリプレイ payload の長さ＝喪失していた raw + 今回の打鍵1文字（M-3）。
-                tip_log(&format!("ev=session_reseed len={}", st.raw.chars().count()));
-            }
-            crate::input_state::split_replay(&st.raw, st.latin_from)
-        } else {
-            vec![(ch.to_string(), style)]
-        };
-        let mut inserted = None;
-        for (seg, seg_style) in &segments {
-            inserted = self.engine_insert(seg, *seg_style);
-        }
-        let reading = match inserted {
-            Some(r) => {
-                self.state.borrow_mut().mark_good(&r);
-                *self.last_reading.borrow_mut() = r.clone();
-                r
-            }
-            None => {
-                let degraded = self.state.borrow_mut().degraded_reading();
-                *self.last_reading.borrow_mut() = degraded.clone();
-                degraded
-            }
-        };
-        *self.live_text.borrow_mut() = reading.clone();
-        // 表示だけ全角化する。live_text/last_reading/raw は半角 canonical のまま置く —
-        // これらは劣化フォールバックや確定取消のリプレイでエンジンへ戻る素材だから。
-        if !self.run_preedit(ctx, &self.widen_display_text(&reading)) {
+        // 表示は anchor 継ぎ足し文字列、last_reading は正規読み。SetPreedit text が
+        // 読みと一致しなくなったため、ここで分離する。
+        *self.last_reading.borrow_mut() = self.state.borrow().canonical_reading().to_owned();
+        *self.live_text.borrow_mut() = displayed.clone();
+        let local_applied = self.run_preedit(ctx, &self.widen_display_text(&displayed));
+        if !local_applied {
             // ghost cleanup の一過性競合などで表示だけ拒否されても、打鍵は logical/raw と
-            // engine reading に保存済み。cleanup 後に同じ読みを再描画して入力を失わない。
+            // local composer に保存済み。cleanup 後に同じ読みを再描画して入力を失わない。
             self.partial_preedit_redraw_pending.set(true);
             self.partial_preedit_redraw_retries.set(0);
             self.arm_partial_preedit_redraw_retry();
         }
+        if background_reseed {
+            self.background_input.try_reseed(request, segments)
+        } else {
+            self.background_input.try_insert(request, segments)
+        };
         self.arm_debounce();
         Ok(TRUE)
     }
 
     /// 品質ループ③: 直前確定バッファ（誤変換ワンキー記録の対象）を保存する。commit サイトが
     /// **状態クリア前に** ev=commit と同じ採取材料で呼ぶ。かな変換系の確定
-    /// （commit_and_reset / apply_commit_plan / apply_live_auto_commit）のみが対象で、
+    /// （commit_and_reset / apply_commit_plan）のみが対象で、
     /// shift_latin の直接確定は**意図的に対象外**（読みが無く「誤変換」の概念が成立しない）。
     /// idle 記号は 2026-08-03 の仕様変更（直接確定→合成開始）で通常の commit 経路に乗り、
     /// 対象**内**になった — 「。」だけの確定も undo/feedback の対象になるのは、記号 composition
@@ -2273,6 +2343,22 @@ impl TextService_Impl {
         source: &str,
         sel: Option<usize>,
     ) -> bool {
+        self.commit_and_reset_core(ctx, text, source, sel, true, true)
+    }
+
+    fn commit_local_and_reset(&self, ctx: &ITfContext, text: &str, source: &str) -> bool {
+        self.commit_and_reset_core(ctx, text, source, None, false, false)
+    }
+
+    fn commit_and_reset_core(
+        &self,
+        ctx: &ITfContext,
+        text: &str,
+        source: &str,
+        sel: Option<usize>,
+        reset_module_state: bool,
+        end_engine_session: bool,
+    ) -> bool {
         self.disarm_debounce();
         // ④: 既定確定（候補選択でない）はかなモード全角設定に従い数字を全角化する。
         // 以降のログ/remember/do_commit はすべて widened を使う（shadowing）。
@@ -2304,7 +2390,7 @@ impl TextService_Impl {
             tip_log("ev=commit_rejected source=do_commit");
             return false;
         }
-        // Phase 1 はユーザーが明示した全確定だけを起点にする。settle / live_auto / 部分確定は除外。
+        // Phase 1 はユーザーが明示した全確定だけを起点にする。settle / 部分確定は除外。
         let prediction_source = prediction_commit_source(
             source,
             self.prediction_commit_suppressed.get(),
@@ -2324,13 +2410,21 @@ impl TextService_Impl {
             self.remember_last_commit(&reading, text, source, sel, cand_n);
         }
         // 確定取消: 全消費して composition を畳む確定（candidate/live）だけ武装する。
-        // apply_commit_plan の PartialReseed / apply_live_auto_commit の部分確定枝は
+        // apply_commit_plan の PartialReseed 枝は
         // commit_and_reset を経由しない（=ここを通らないので自然に武装しない）。
         if keep_records && arms_undo(source) {
             self.undo_armed.set(true);
         }
-        self.engine_end_session();
-        self.state.borrow_mut().reset();
+        match commit_session_cleanup_plan(end_engine_session) {
+            CommitSessionCleanup::EndMainAndCloseBackground => {
+                self.engine_end_session();
+                self.background_input.request_close();
+            }
+            CommitSessionCleanup::DropMainOnly => self.drop_engine(),
+        }
+        if reset_module_state {
+            self.state.borrow_mut().reset();
+        }
         self.reconverting.set(false);
         self.live_text.borrow_mut().clear();
         // pending EndComposition の所有 context は専用 slot が保持する。通常の current_context は
@@ -2339,6 +2433,10 @@ impl TextService_Impl {
         self.candidate_ui.borrow_mut().hide();
         self.reading_monitor.borrow_mut().hide();
         self.showing.set(false);
+        self.explicit_snapshot_candidates_active.set(false);
+        self.explicit_snapshot_candidate_remaining
+            .borrow_mut()
+            .clear();
         self.clear_clause_nav();
         // U9: 合成終了 — 次 composition の再捕捉まで前文書の左文脈を残さない（stale 残留防止）。
         *self.left_context.borrow_mut() = None;
@@ -2349,7 +2447,7 @@ impl TextService_Impl {
         // ephemeral かな: composition を物理的にも畳めたときだけ direct へ復帰する。
         // SetText 済みでも EndComposition が pending なら marker/mode を維持し、キー入口の
         // close-only 障壁または OnCompositionTerminated が回収してから復帰する。
-        // PartialReseed/live_auto の部分確定枝はここを通らない＝composition 継続で ephemeral 維持。
+        // PartialReseed の部分確定枝はここを通らない＝composition 継続で ephemeral 維持。
         if self.composition_end_pending.get() {
             tip_log("ev=ephemeral_exit deferred=pending_end");
         } else {
@@ -2362,7 +2460,13 @@ impl TextService_Impl {
     /// 前方一致候補ならエンジンが残り読みを返すので **部分確定**し、残り読みで composition を継続して
     /// エンジンセッションを保持する（前方一致候補のデータロス対策）。全消費・エンジン失敗・再変換中は
     /// 従来どおりの **全確定**（`commit_and_reset`）でバイト等価。
-    pub(crate) fn commit_candidate(&self, ctx: &ITfContext, index: usize, resolved_text: &str) {
+    pub(crate) fn commit_candidate(
+        &self,
+        ctx: &ITfContext,
+        request: ModuleRequestId,
+        index: usize,
+        resolved_text: &str,
+    ) {
         self.disarm_debounce();
         // 再変換中の確定は対象外（g1 リプレイ由来の別セッション）。従来確定へフォールバック。
         if self.reconverting.get() {
@@ -2380,8 +2484,61 @@ impl TextService_Impl {
             }
             return;
         }
-        let plan = plan_commit(self.engine_commit(index), resolved_text);
-        self.apply_commit_plan(ctx, plan, "candidate", "candidate_prefix", Some(index));
+        let snapshot_candidate = self.explicit_snapshot_candidates_active.replace(false);
+        let snapshot_remaining = snapshot_candidate
+            .then(|| {
+                self.explicit_snapshot_candidate_remaining
+                    .borrow()
+                    .get(index)
+                    .cloned()
+            })
+            .flatten();
+        self.explicit_snapshot_candidate_remaining
+            .borrow_mut()
+            .clear();
+        if snapshot_candidate {
+            self.drop_engine();
+        }
+        let outcome = resolve_candidate_commit(
+            snapshot_candidate,
+            resolved_text,
+            snapshot_remaining.as_deref(),
+            || self.engine_commit(index),
+        );
+        let output =
+            self.state
+                .borrow_mut()
+                .handle(ModuleEvent::Engine(ModuleEngineResult::Commit {
+                    request,
+                    candidate: Some(index),
+                    resolved_text: resolved_text.to_string(),
+                    outcome,
+                }));
+        let Some(operation @ ModuleOperation::Commit { .. }) = output.immediate else {
+            tip_log("ev=partial_reseed_rejected source=candidate");
+            self.drop_engine();
+            return;
+        };
+        let plan = match &operation {
+            ModuleOperation::Commit {
+                text,
+                remaining: Some(remaining),
+                ..
+            } if !remaining.is_empty() => CommitPlan::PartialReseed {
+                prefix: text.clone(),
+                remaining: remaining.clone(),
+            },
+            ModuleOperation::Commit { text, .. } => CommitPlan::FullReset { text: text.clone() },
+            _ => unreachable!(),
+        };
+        self.apply_commit_plan(
+            ctx,
+            plan,
+            operation,
+            "candidate",
+            "candidate_prefix",
+            Some(index),
+        );
     }
 
     /// 文節ナビゲーション中の確定（Enter / settle / ホスト Finalize）。エンジンの CommitClauses が
@@ -2412,7 +2569,7 @@ impl TextService_Impl {
         tip_log(&clause_commit_event(self.prediction_enabled.get(), &text));
         // 巡4 T3(a): clauses はエンジンの学習往復(CommitClauses)が済んだ後 — 挿入拒否時に
         // エンジン側だけ文脈が進んだまま残すと次入力とズレるので、接続を作り直して
-        // needs_session_reseed の全リプレイで自己修復させる（partial/live_auto と同じ規律）。
+        // 次の変換でcanonical全量をreanchorして自己修復させる。
         if !self.commit_and_reset(ctx, &text, source, None) {
             self.drop_engine();
         }
@@ -2426,6 +2583,7 @@ impl TextService_Impl {
         &self,
         ctx: &ITfContext,
         plan: CommitPlan,
+        operation: ModuleOperation,
         full_source: &str,
         prefix_source: &str,
         sel: Option<usize>,
@@ -2455,23 +2613,30 @@ impl TextService_Impl {
                 // 巡3 P3: prefix 挿入が拒否されたら reseed しない — 文書へ書かれていない
                 // prefix を確定済み扱いで残り読みへ進むと文字が消失する。composition は
                 // CommitText 未実行で生きており、ユーザの再選択に任せる。
-                if !self.do_commit(ctx, &prefix) {
+                let applied = apply_and_complete_module_operation(
+                    &operation,
+                    || self.do_commit(ctx, &prefix),
+                    |operation, applied| self.state.borrow_mut().complete(operation, applied),
+                );
+                if !applied {
                     self.partial_committing.set(false);
                     tip_log("ev=commit_rejected source=partial");
                     // 巡4 T3(a): エンジン側は既に prefix を消費済み — このまま既存セッションを
-                    // 使い続けると次入力が読み欠落する。drop_engine して次打鍵の
-                    // needs_session_reseed 全リプレイで自己修復させる。
+                    // 使い続けると次入力が読み欠落する。drop_engine し、次の変換とbackground
+                    // intentをcanonical全量replayで自己修復させる。
                     self.drop_engine();
                     return;
                 }
+                reseed_background(
+                    || self.background_input.request_close(),
+                    || self.state.borrow_mut().background_reseed(),
+                    |request, segments| self.background_input.try_reseed(request, segments),
+                );
                 // 巡5 GLM I-4: remember_last_commit は挿入成功後に — 拒否時 return の後ろへ
                 // 移動（文書に存在しない prefix の学習記録混入を防ぐ。commit_and_reset と対称）。
                 // 品質ループ③: 部分確定も直前確定として記録対象（reading は消費前の全読み）。
                 self.remember_last_commit(&reading, &prefix, prefix_source, sel, cand_n);
                 // エンジンセッションは保持（engine_end_session を呼ばない）。残り読みで継続する。
-                self.state
-                    .borrow_mut()
-                    .reseed_after_partial_commit(&remaining);
                 self.reconverting.set(false);
                 *self.last_reading.borrow_mut() = remaining.clone();
                 self.monitor_committed_reading.borrow_mut().clear();
@@ -2496,115 +2661,155 @@ impl TextService_Impl {
             CommitPlan::FullReset { text } => {
                 // 全消費 or エンジン失敗: 従来どおり全確定（engine_end_session も呼ばれる）。
                 // 巡4 T3(a): 挿入拒否時はエンジン側の読み消費済みの可能性（候補経由）—
-                // drop_engine して次打鍵の needs_session_reseed 全リプレイで自己修復させる。
-                if !self.commit_and_reset(ctx, &text, full_source, sel) {
+                // drop_engine し、次の変換でcanonical全量をreanchorして自己修復させる。
+                let applied = apply_and_complete_module_operation(
+                    &operation,
+                    || self.commit_and_reset_core(ctx, &text, full_source, sel, false, true),
+                    |operation, applied| self.state.borrow_mut().complete(operation, applied),
+                );
+                if !applied {
                     self.drop_engine();
                 }
             }
         }
     }
 
-    /// ライブ変換の自動確定（iOS nospacekey の先頭文節自動確定の再現）を composition へ適用する。
-    /// エンジンは LiveConvert{auto_commit:true} の応答時点で既に先頭文節分の読みを消費済み
-    /// （ComposingText.prefixComplete 実行済み）なので、ここでは engine_commit を呼ばず、
-    /// TIP 側の確定挿入と残り読みへの reseed だけを行う（apply_commit_plan::PartialReseed と
-    /// 同じ規律。違いはエンジン側の状態遷移が済んでいることだけ）。
-    /// `prefix` = 確定する先頭文節、`text` = 残り読みのライブ変換結果、`reading` = 残り読み。
-    /// reading が空（全消費 — 稀だが iOS でも起きる正当ケース）なら全確定と同じ片付けに落とす。
-    pub(crate) fn apply_live_auto_commit(
+    pub(crate) fn apply_auto_commit_proposal(
         &self,
         ctx: &ITfContext,
-        prefix: &str,
-        text: &str,
-        reading: &str,
+        operation: ModuleOperation,
+        remainder_display: &str,
     ) {
-        if reading.is_empty() {
-            // 全消費: エンジン側の読みは空。従来の全確定と同じ片付け（セッションも畳む）。
-            // 巡4 T3(a): 挿入拒否時はエンジン側が消費済み — drop_engine で自己修復に落とす。
-            if !self.commit_and_reset(ctx, prefix, "live_auto", None) {
-                self.drop_engine();
-            }
+        let ModuleOperation::Commit {
+            text,
+            remaining: Some(remaining),
+            ..
+        } = &operation
+        else {
             return;
-        }
-        // ④: 部分自動確定の prefix も既定確定なので数字を全角化（source="live_auto"）。
-        let prefix = self.widen_commit_text(prefix, "live_auto");
-        let prefix = prefix.as_str();
-        // 品質ループ②: 自動確定は候補選択でない（sel=-1 cand_n=0）。rlen はこの時点の
-        // last_reading（=消費前の全読み。この後 remaining へ上書きされる）。
-        let full_reading = self.last_reading.borrow().clone();
-        let fields = commit_fields(None, 0, &full_reading, prefix, self.is_direct_mode());
-        tip_log(&commit_event(
-            self.prediction_enabled.get(),
-            prefix,
-            "live_auto",
-            Some(reading),
-            &fields,
-        ));
-        // do_commit の合成終了が（ホスト依存で）OnCompositionTerminated を誘発しても
-        // エンジンセッションを畳まないようガードする（apply_commit_plan と同じ）。
-        self.partial_committing.set(true);
-        // 巡3 P3: 挿入拒否時は reseed しない（エンジン側の読み消費との整合は既に失われるが、
-        // 文書未挿入の prefix を確定扱いで進めると文字消失になる — composition を残す方が救える）。
-        if !self.do_commit(ctx, prefix) {
-            self.partial_committing.set(false);
-            tip_log("ev=commit_rejected source=live_auto");
-            // 巡4 T3(a): エンジン側は消費済み — partial 枝と同じ drop_engine 自己修復。
-            self.drop_engine();
-            return;
-        }
-        // 巡5 GLM I-4: remember_last_commit は挿入成功後に（部分確定枝と対称）。
-        // 品質ループ③: ライブ自動確定も直前確定として記録対象。
-        self.remember_last_commit(&full_reading, prefix, "live_auto", None, 0);
-        // エンジンセッションは保持（読みは消費済みで残り読みと同期している）。
-        self.state.borrow_mut().reseed_after_partial_commit(reading);
-        self.reconverting.set(false); // 部分確定で composition を張り替えた（apply_commit_plan と同じ）
-                                      // 読みキャッシュ: 追記は last_reading を remaining へ縮める行と run_preedit（表示更新）
-                                      // より前が契約 — 後に置くと自動確定フレームだけ表示が consumed ぶん縮んで戻る
-                                      // 「跳ね」になる（spec 順序契約）。サフィックス不成立は追記スキップ（欠落は Enter まで
-                                      // 恒久だが壊れない）。skip ログは発生観測用（通常入力で出ないことが受入条件）。
-        if self.reading_monitor_accumulate.get() {
-            match crate::reading_monitor::consumed_reading(&full_reading, reading) {
-                Some(consumed) => crate::reading_monitor::append_committed(
-                    &mut self.monitor_committed_reading.borrow_mut(),
-                    consumed,
-                    crate::reading_monitor::display_bound(self.reading_monitor_max_chars.get()),
-                ),
-                None => tip_log("ev=reading_monitor accumulate=skip"),
-            }
-        }
-        *self.last_reading.borrow_mut() = reading.to_string();
-        let display = if text.is_empty() { reading } else { text };
-        // 直前の reseed_after_partial_commit が残り読みで記録済みだが、表示は
-        // ライブ変換結果でありうる — より良い表示素材で上書きする。
-        self.state.borrow_mut().mark_good(display);
-        *self.live_text.borrow_mut() = display.to_string();
-        // 残りの読み/ライブ結果で新しい composition を張る。旧 composition の close-only が
-        // 拒否された場合も残り読みを不可視のまま放置せず、PartialReseed と同じ bounded retry
-        // へ送る。mark_good/live_text は半角のまま（degraded_reading の読みを汚染しない）。
-        self.partial_preedit_redraw_pending.set(true);
-        self.partial_preedit_redraw_retries.set(0);
-        let redrawn = self.redraw_partial_preedit_if_needed(ctx);
-        self.partial_committing.set(false); // 張り替え完了。以降の app 都合終了は通常処理。
-        if redrawn {
-            // この関数自体が単発 debounce callback から来るため、成功後も残り読みの
-            // live conversion を継続する次タイマを明示的に張る。
-            self.arm_debounce();
+        };
+        let plan = if remaining.is_empty() {
+            CommitPlan::FullReset { text: text.clone() }
         } else {
-            self.arm_partial_preedit_redraw_retry();
+            CommitPlan::PartialReseed {
+                prefix: text.clone(),
+                remaining: remaining.clone(),
+            }
+        };
+        self.apply_commit_plan(ctx, plan, operation, "live", "live_prefix", None);
+        let receipt = self.state.borrow_mut().take_auto_commit_receipt();
+        let Some(receipt) = receipt else {
+            return;
+        };
+        if !self.background_input.try_auto_commit_receipt(receipt) {
+            tip_log("ev=auto_commit_receipt queued=false");
         }
+        *self.live_text.borrow_mut() = remainder_display.to_owned();
+        self.run_preedit(ctx, &self.widen_display_text(remainder_display));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        backspace_route, commit_keeps_records, ephemeral_idle_abort, is_cmd_modifier,
-        newer_preserved_action_supersedes_deferred, prediction_commit_source,
-        prediction_key_action, should_defer_preserved_until_prediction_cleanup,
+        apply_and_complete_module_operation, backspace_route,
+        cancel_explicit_wait_for_actual_keydown, commit_keeps_records, commit_session_cleanup_plan,
+        ephemeral_idle_abort, is_cmd_modifier, newer_preserved_action_supersedes_deferred,
+        prediction_commit_source, prediction_key_action, reseed_background,
+        resolve_candidate_commit, should_defer_preserved_until_prediction_cleanup,
         should_invalidate_hidden_prediction, will_handle, will_handle_awaiting, will_handle_gated,
-        PredictionKeyAction, PreservedAction, ScopedCellFlag,
+        CommitSessionCleanup, ModuleCommitOutcome, ModuleInputSegment, ModuleIntent,
+        ModuleOperation, ModuleRequestId, ModuleTextStyle, PredictionKeyAction, PreservedAction,
+        ScopedCellFlag,
     };
     use crate::keymap::{resolve_action, ActionInput, KeyAction, Keymap};
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    #[test]
+    fn keydown_only_space_clears_the_old_wait_then_dispatches_one_new_wait() {
+        let pending = Cell::new(true);
+        let visible = Cell::new(true);
+        let deadline = Cell::new(Some(Instant::now()));
+        let dispatches = Cell::new(0);
+
+        cancel_explicit_wait_for_actual_keydown(0x20, || {
+            pending.set(false);
+            visible.set(false);
+            deadline.set(None);
+        });
+        assert!(!pending.get());
+        assert!(!visible.get());
+        assert_eq!(deadline.get(), None);
+
+        dispatches.set(dispatches.get() + 1);
+        pending.set(true);
+        deadline.set(Some(Instant::now()));
+        assert_eq!(dispatches.get(), 1, "the key still reaches Space dispatch");
+        assert!(pending.get(), "Space owns exactly one fresh wait");
+    }
+
+    #[test]
+    fn full_commit_closes_main_and_private_sessions_but_local_enter_defers_private_commit() {
+        assert_eq!(
+            commit_session_cleanup_plan(true),
+            CommitSessionCleanup::EndMainAndCloseBackground
+        );
+        assert_eq!(
+            commit_session_cleanup_plan(false),
+            CommitSessionCleanup::DropMainOnly
+        );
+    }
+
+    #[test]
+    fn snapshot_candidate_commit_uses_the_displayed_text_without_engine_io() {
+        let called = std::cell::Cell::new(false);
+        let outcome = resolve_candidate_commit(true, "日本", Some("ご"), || {
+            called.set(true);
+            Some(("wrong".into(), String::new()))
+        });
+        assert_eq!(
+            outcome,
+            ModuleCommitOutcome::Applied {
+                text: "日本".into(),
+                remaining: "ご".into()
+            }
+        );
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn background_reseed_closes_then_snapshots_and_submits_styled_remaining() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let accepted = reseed_background(
+            || events.borrow_mut().push("close"),
+            || {
+                events.borrow_mut().push("snapshot");
+                ModuleIntent::Insert {
+                    request: ModuleRequestId(9),
+                    segments: vec![
+                        ModuleInputSegment {
+                            text: "かな".to_string(),
+                            style: ModuleTextStyle::Kana,
+                        },
+                        ModuleInputSegment {
+                            text: "A".to_string(),
+                            style: ModuleTextStyle::Direct,
+                        },
+                    ],
+                }
+            },
+            |request, segments| {
+                events.borrow_mut().push("submit");
+                assert_eq!(request, ModuleRequestId(9));
+                assert_eq!(segments[0].style, ModuleTextStyle::Kana);
+                assert_eq!(segments[1].style, ModuleTextStyle::Direct);
+                true
+            },
+        );
+        assert!(accepted);
+        assert_eq!(*events.borrow(), vec!["close", "snapshot", "submit"]);
+    }
 
     // 既存テストは全て native(ひらがな)モード＝第5引数 direct=false。
     // will_handle_gated/awaiting の action 引数は KeyAction を直接渡す（Convert/Typo/Llm/Undo/
@@ -2628,6 +2833,30 @@ mod tests {
                 llm_enabled: true,
             },
         )
+    }
+
+    #[test]
+    fn synchronous_apply_result_is_forwarded_to_module_completion_once() {
+        let apply_calls = std::cell::Cell::new(0);
+        let completion_calls = std::cell::Cell::new(0);
+        let operation = ModuleOperation::Cancel;
+
+        let applied = apply_and_complete_module_operation(
+            &operation,
+            || {
+                apply_calls.set(apply_calls.get() + 1);
+                false
+            },
+            |forwarded, result| {
+                completion_calls.set(completion_calls.get() + 1);
+                assert_eq!(forwarded, &operation);
+                assert!(!result);
+            },
+        );
+
+        assert!(!applied);
+        assert_eq!(apply_calls.get(), 1);
+        assert_eq!(completion_calls.get(), 1);
     }
 
     #[test]
@@ -3816,7 +4045,6 @@ mod tests {
         assert!(arms_undo("live"));
         assert!(!arms_undo("candidate_prefix")); // 部分確定（composition 継続）
         assert!(!arms_undo("live_prefix"));
-        assert!(!arms_undo("live_auto"));
         assert!(!arms_undo("mode_toggle")); // settle 系は対象外（設計ロック）
         assert!(!arms_undo("navigate"));
     }

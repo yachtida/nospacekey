@@ -258,6 +258,11 @@ fn xml_escape(value: &str) -> String {
 }
 
 pub fn register_or_update(checker_path: &Path) -> Result<TaskIdentity, String> {
+    let _transaction = nospacekey_lifetime::TaskTransactionLease::acquire()?;
+    register_or_update_under_gate(checker_path)
+}
+
+fn register_or_update_under_gate(checker_path: &Path) -> Result<TaskIdentity, String> {
     if !checker_path.is_absolute() {
         return Err("checker path must be absolute".into());
     }
@@ -306,6 +311,7 @@ pub fn run_now(identity: &TaskIdentity) -> Result<(), String> {
 }
 
 pub fn delete(identity: &TaskIdentity) -> Result<(), String> {
+    let _transaction = nospacekey_lifetime::TaskTransactionLease::acquire()?;
     delete_with_runner(identity, run_command)
 }
 

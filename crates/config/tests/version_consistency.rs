@@ -83,6 +83,255 @@ fn nospacekey_iss_has_no_hardcoded_version() {
 }
 
 #[test]
+fn installer_keeps_loaded_pairs_in_versioned_directories() {
+    let iss = read("../../installer/nospacekey.iss");
+    let tip_registration = read("../tip/src/register.rs");
+    let versioned = r#"{app}\versions\{#MyAppVersion}"#;
+    assert!(
+        iss.contains(&format!(
+            r#"Source: "..\dist\nospacekey_tip.dll"; DestDir: "{versioned}"; Flags: 64bit onlyifdoesntexist"#
+        )),
+        "TIP must be copied without Inno's non-transactional regserver flag"
+    );
+    assert!(!iss.contains("Flags: regserver"));
+    assert!(
+        iss.contains(&format!(
+            r#"Source: "..\dist\NospacekeyEngineHost.exe"; DestDir: "{versioned}"; Flags: 64bit onlyifdoesntexist"#
+        )),
+        "the matching EngineHost must be beside its TIP"
+    );
+    assert!(
+        !iss.contains("taskkill /F /IM NospacekeyEngineHost.exe"),
+        "upgrade/uninstall must not kill an EngineHost still serving a loaded old TIP"
+    );
+    assert!(
+        !iss.contains("restartreplace") && !iss.contains("uninsrestartdelete"),
+        "versioned binaries must never be overwritten or deleted at reboot"
+    );
+    assert!(!iss.contains("ignoreversion"));
+    assert!(iss.contains("function PrepareToInstall(var NeedsRestart: Boolean): String;"));
+    assert!(iss.contains("if DirExists(ExpandConstant('{app}\\versions\\{#MyAppVersion}')) then"));
+    assert!(iss.contains(
+        "Result := '同じバージョンの製品ファイルがすでに存在するため、安全に上書きできません。"
+    ));
+    assert!(iss.contains("--repair-update-task"));
+    assert!(iss.contains("waituntilterminated runasoriginaluser"));
+    let config_main = read("src/main.rs");
+    let repair_fast_path = config_main
+        .find("LaunchIntent::RepairUpdateTask")
+        .expect("repair fast path must exist");
+    let singleton_setup = config_main
+        .find("tauri::Builder::default()")
+        .expect("normal singleton setup must exist");
+    assert!(
+        repair_fast_path < singleton_setup,
+        "installer task repair must exit before acquiring the Config singleton"
+    );
+    assert!(!iss.contains("CleanupInactiveVersions"));
+    assert!(!iss.contains("DelTree(Candidate"));
+    assert!(iss.contains("reclamation is tracked separately in #45"));
+    assert!(
+        iss.contains("アプリを再起動すると新版に切り替わります")
+            && iss.contains("Windows の再起動は不要です"),
+        "upgrade must explain the application-only restart boundary"
+    );
+    assert!(iss.contains("学習履歴は安全のためバージョンごとに分離"));
+    assert!(iss.contains("function CapturePriorTipPath(): String;"));
+    assert!(
+        iss.contains("SetupMutex=nospacekey-tip-registration,Global\\nospacekey-tip-registration")
+    );
+    assert!(iss.contains("UsePreviousAppDir=no"));
+    assert!(iss.contains("DisableDirPage=yes"));
+    assert!(iss.contains("function IsExpectedInstallPath(): Boolean;"));
+    assert!(iss.contains("function LoadPreviousInstallRoot(): String;"));
+    assert!(iss.contains("'InstallLocation', Candidate"));
+    assert!(iss.contains("Legacy := PreviousInstallRoot + '\\nospacekey_tip.dll';"));
+    assert!(iss.contains("VersionedRoot := PreviousInstallRoot + '\\versions\\';"));
+    assert!(iss.contains("(not PreviousInstall) or (PreviousInstallRoot = '')"));
+    assert!(iss.contains("function QueryOriginalUserClsidOverlay(): Integer;"));
+    assert!(iss.contains("ExecAsOriginalUser("));
+    assert!(iss.contains("[Microsoft.Win32.RegistryView]::Registry64"));
+    assert!(iss.contains("$base.Dispose(); exit 0 } catch { exit 20 }"));
+    assert!(iss.contains("procedure RegisterTipTransaction();"));
+    assert!(iss.contains("procedure RollbackTipRegistration();"));
+    assert!(iss.contains("PriorTipValidationFailed := True;"));
+    assert!(iss.contains("if PriorTipValidationFailed then"));
+    assert!(iss.contains("if NewTipRegistered and (not InstallCompleted) then"));
+    assert!(iss.contains("function TipRegistrationMatches(const ExpectedPath: String): Boolean;"));
+    assert!(iss.contains("ThreadingModel") && iss.contains("Apartment"));
+    assert!(iss.contains(
+        "if RunTrustedTipRestore(PriorTipPath) and TipRegistrationMatches(PriorTipPath) then"
+    ));
+    assert!(iss.contains("(not TipRegistrationMatches(NewTipPath())) then"));
+    assert!(iss.contains("RunTrustedTipRestore(PriorTipPath)"));
+    assert!(!iss.contains("RunTipRegistration(PriorTipPath"));
+    assert!(!iss.contains("Exec(PriorTipPath"));
+    assert!(!iss.contains("Params := '/s \"' + PriorTipPath"));
+    assert!(iss.contains("' \"' + NewTipPath() + '\"'"));
+    assert_eq!(iss.matches("IsRetainedTipPath(").count(), 3);
+    assert!(iss.contains("/n /i:restore-utf16hex="));
+    for restore_case in [
+        r#"D:\custom nospacekey\nospacekey_tip.dll"#,
+        r#"D:\custom nospacekey\versions\1.2.3-beta.4+sha.abc\nospacekey_tip.dll"#,
+        r#"D:\custom nospacekey\versions\v1.2.3\nospacekey_tip.dll"#,
+        r#"D:\custom nospacekey\versions\1.2.3\nospacekey_tip.dll:evil"#,
+        r#"D:\foreign\nospacekey_tip.dll"#,
+    ] {
+        assert!(tip_registration.contains(restore_case), "{restore_case}");
+    }
+    assert!(iss.contains("UninstallTipWasActive := IsCurrentTipActive();"));
+    assert!(iss.contains("function InitializeUninstall(): Boolean;"));
+    assert!(iss.contains("function RecoverInterruptedUninstallClaim(): Boolean;"));
+    assert!(iss.contains("-RecoverUninstallClaim"));
+    assert!(iss.contains("function CommitUninstallTasks(): Boolean;"));
+    assert!(iss.contains("function FinalizeUninstallTasks(): Boolean;"));
+    assert!(iss.contains("(not UninstallResumeDeleting) and (not CommitUninstallTasks())"));
+    assert!(iss.contains("-ValidateDeletingUninstall -UninstallBuild ''{#MyAppVersion}''"));
+    assert!(iss.contains("function ValidateDeletingUninstallResume(): Integer;"));
+    assert_eq!(iss.matches("ValidateDeletingUninstallResume()").count(), 3);
+    let uninstall_step = iss
+        .find("if CurUninstallStep = usUninstall then begin")
+        .expect("uninstall deletion callback must exist");
+    let immediate_resume_validation = iss
+        .find("UninstallResumeDeleting and (ValidateDeletingUninstallResume() <> 0)")
+        .expect("deleting resume must be revalidated immediately before removal");
+    let task_commit = iss
+        .find("(not UninstallResumeDeleting) and (not CommitUninstallTasks())")
+        .expect("normal uninstall task commit must exist");
+    assert!(
+        uninstall_step < immediate_resume_validation && immediate_resume_validation < task_commit
+    );
+    assert!(iss.contains(
+        "#define CleanupScriptSHA256 GetSHA256OfFile(\"..\\scripts\\version-cleanup.ps1\")"
+    ));
+    assert_eq!(iss.matches("RunTrustedCleanupScript(").count(), 10);
+    assert!(!iss.contains("ExecutionPolicy Bypass -File"));
+    assert!(iss.contains("CreateFileW@kernel32.dll"));
+    assert!(iss.contains("CleanupOpenReparsePoint"));
+    assert!(iss.contains("BuildCleanupBootstrapCommand"));
+    assert!(iss.contains("Get-FileHash -InputStream $pin -Algorithm SHA256"));
+    assert!(iss.contains("Test-SemanticallyProtectedDirectory") || iss.contains("function safe($p)"));
+    assert!(iss.contains(
+        "Parameters: \"{code:DeferredCleanupParameters}\"; Flags: runhidden nowait; Check: ValidateCurrentCleanupPayload"
+    ));
+    assert!(iss.contains(
+        "if (CurStep = ssPostInstall) and (not ValidateCurrentCleanupPayload()) then"
+    ));
+    let trusted_runner = iss
+        .find("function RunTrustedCleanupScript(")
+        .expect("trusted cleanup bootstrap must exist");
+    let non_reparse = iss[trusted_runner..]
+        .find("TestNonReparsePath(Root, True)")
+        .expect("trusted cleanup bootstrap must inspect ancestors");
+    let embedded_hash = iss[trusted_runner..]
+        .find("CompareText(GetSHA256OfFile(ScriptPath), '{#CleanupScriptSHA256}')")
+        .expect("trusted cleanup bootstrap must pin script bytes");
+    let script_pin = iss[trusted_runner..]
+        .find("OpenPinnedCleanupScript(ScriptPath)")
+        .expect("trusted cleanup bootstrap must pin the non-reparse script");
+    let elevated_exec = iss[trusted_runner..]
+        .find("Result := Exec(ExpandConstant('{sys}\\WindowsPowerShell")
+        .expect("trusted cleanup bootstrap must own the elevated launch");
+    assert!(
+        non_reparse < script_pin
+            && script_pin < embedded_hash
+            && embedded_hash < elevated_exec
+    );
+    let powershell_hash = iss
+        .find("Get-FileHash -InputStream $pin -Algorithm SHA256")
+        .expect("elevated bootstrap must revalidate the script hash");
+    let powershell_pin = iss
+        .find("[IO.FileShare]::Read")
+        .expect("elevated bootstrap must deny concurrent script writes and deletes");
+    let powershell_script_acl = iss
+        .find("-not (safe $script)")
+        .expect("elevated bootstrap must reject a writable installed script");
+    let powershell_invoke = iss
+        .find("& $script -InstallRoot $root")
+        .expect("elevated bootstrap must invoke the validated script");
+    assert!(
+        powershell_script_acl < powershell_pin
+            && powershell_pin < powershell_hash
+            && powershell_hash < powershell_invoke
+    );
+    assert!(iss.contains("OpenPinnedCleanupScript(ScriptPath)"));
+    assert!(iss.contains("if AllowMissingTree then"));
+    assert!(iss.contains("if ResultCode = 3 then begin"));
+    assert!(iss.contains("InterruptedDeletingDetected := True;"));
+    assert!(iss.contains(
+        "中断した同じバージョンのアンインストーラーを再実行して、アンインストールを完了してください。"
+    ));
+    assert!(iss.contains("UninstallResumeDeleting := True;"));
+    assert!(iss.contains("if IsCurrentTipActive() then begin"));
+    let finalizer = iss
+        .find("if not FinalizeUninstallTasks() then")
+        .expect("usDone finalizer must exist");
+    let finalized = iss
+        .find("UninstallFinalized := True")
+        .expect("successful finalization marker must exist");
+    assert!(finalizer < finalized);
+    assert!(iss.contains("if not UninstallFinalized then"));
+    assert!(iss.contains("-ValidateFinalUninstallArtifacts"));
+    assert!(iss.contains("DeleteFile(RecoveryPath)"));
+    assert!(iss.contains("DeleteFile(ExpandConstant('{app}\\.nospacekey-task-transaction'))"));
+    assert!(iss.contains("RemoveDir(ExpandConstant('{app}\\.nospacekey-uninstall'))"));
+    let recovery_delete = iss
+        .find("DeleteFile(RecoveryPath)")
+        .expect("recovery script cleanup must exist");
+    let dependency_delete = iss
+        .find("RemoveDir(ExpandConstant('{app}\\.nospacekey-uninstall'))")
+        .expect("journal cleanup must exist");
+    assert!(
+        recovery_delete < dependency_delete,
+        "a failed recovery-script deletion must retain its complete dependency set"
+    );
+    assert!(iss.contains(".nospacekey-uninstall-recovery.ps1"));
+    assert!(iss.contains("-RecoverInterruptedUninstalls"));
+    assert!(iss.contains("-FinalizeUninstallTasks"));
+    assert!(iss.contains(".nospacekey-task-transaction"));
+    assert!(iss.contains("uninsneveruninstall"));
+    assert!(!iss.contains(
+        "Type: files; Name: \"{app}\\versions\\{#MyAppVersion}\\.nospacekey-lifetime.uninstalling\""
+    ));
+    assert!(iss.contains("Type: dirifempty; Name: \"{app}\\versions\\{#MyAppVersion}\""));
+    let initialize_uninstall = iss
+        .split("function InitializeUninstall(): Boolean;")
+        .nth(1)
+        .unwrap()
+        .split("function CommitUninstallTasks(): Boolean;")
+        .next()
+        .unwrap();
+    assert!(!initialize_uninstall.contains("-CommitUninstallTasks"));
+    assert!(!initialize_uninstall.contains("Get-ScheduledTask"));
+    assert!(!initialize_uninstall.contains("Unregister-ScheduledTask"));
+    assert!(iss.contains("if UninstallClaimed and (not UninstallStarted) and"));
+    assert!(iss.contains("function RestoreUninstallClaim(): Boolean;"));
+    assert!(iss.contains("not RestoreUninstallClaim()"));
+    assert!(iss.contains("UninstallSentinelRestored: Boolean;"));
+    assert!(iss.contains("(not IsCurrentTipActive())"));
+    assert!(config_main
+        .find("VersionLease::acquire()")
+        .is_some_and(|lease| lease < config_main.find("LaunchIntent::RepairUpdateTask").unwrap()));
+    assert_eq!(
+        iss.matches("'/u /s \"' + ExpandConstant").count(),
+        1,
+        "uninstall must unregister the active TIP once"
+    );
+}
+
+#[test]
+fn rust_and_swift_wire_versions_match() {
+    let swift = read("../../engine-host/Sources/NospacekeyEngineCore/Protocol.swift");
+    assert!(
+        swift.contains(&format!(
+            "static let current: UInt32 = {}",
+            ipc::protocol::PROTO_VERSION
+        )),
+        "Swift wire version must match Rust protocol::PROTO_VERSION"
+    );
+}
+
+#[test]
 fn all_crates_inherit_workspace_version() {
     // env!(CARGO_PKG_VERSION) は config 1 crate の継承しか証明しない。
     // workspace crate 全部の Cargo.toml を読み、[package] 節(次の [ 行まで)に

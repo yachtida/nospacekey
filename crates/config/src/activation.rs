@@ -4,6 +4,7 @@
 pub enum LaunchIntent {
     OpenUpdate,
     StopEngine,
+    RepairUpdateTask,
     ParentHwnd(isize),
     None,
 }
@@ -14,6 +15,7 @@ pub fn parse_argument(value: &str) -> LaunchIntent {
             LaunchIntent::OpenUpdate
         }
         "--stop-engine" => LaunchIntent::StopEngine,
+        "--repair-update-task" => LaunchIntent::RepairUpdateTask,
         _ => value
             .parse::<isize>()
             .map(LaunchIntent::ParentHwnd)
@@ -29,6 +31,7 @@ where
     for argument in args {
         match parse_argument(&argument) {
             LaunchIntent::StopEngine => return LaunchIntent::StopEngine,
+            LaunchIntent::RepairUpdateTask => return LaunchIntent::RepairUpdateTask,
             LaunchIntent::OpenUpdate => return LaunchIntent::OpenUpdate,
             LaunchIntent::ParentHwnd(hwnd) => parent = LaunchIntent::ParentHwnd(hwnd),
             LaunchIntent::None => {}
@@ -90,6 +93,15 @@ mod tests {
         );
         assert_eq!(parse_argument("nospacekey://evil"), LaunchIntent::None);
         assert_eq!(parse_argument("https://example.com"), LaunchIntent::None);
+    }
+
+    #[test]
+    fn installer_repair_task_intent_is_exact() {
+        assert_eq!(
+            parse_argument("--repair-update-task"),
+            LaunchIntent::RepairUpdateTask
+        );
+        assert_eq!(parse_argument("--repair-update-task=x"), LaunchIntent::None);
     }
 
     #[test]

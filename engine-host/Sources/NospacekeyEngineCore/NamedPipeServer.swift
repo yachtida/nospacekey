@@ -436,13 +436,18 @@ func withPersistentOverlapped<T>(
 /// Start one overlapped operation and wait until its absolute deadline. A timeout always calls
 /// CancelIoEx and then reaps the event before returning, so the OVERLAPPED/buffer can safely leave
 /// scope. ERROR_NOT_FOUND is the expected cancel-vs-completion race and is still reaped.
+/// `deadline == nil` waits indefinitely; WAIT_FAILED still follows the shared cancel+reap path.
+/// Only the next-request header wait may pass nil, so body/reply frames stay on finite deadlines
+/// at the type level.
 private func waitForOverlapped(
     _ hPipe: HANDLE,
-    deadline: UInt64,
+    deadline: UInt64?,
     start: (UnsafeMutablePointer<OVERLAPPED>) -> Bool
 ) -> PipeIOResult {
-    guard remainingMilliseconds(until: deadline) > 0 else {
-        return .timedOut
+    if let deadline {
+        guard remainingMilliseconds(until: deadline) > 0 else {
+            return .timedOut
+        }
     }
     guard let event = CreateEventW(nil, true, false, nil) else {
         return .failed(GetLastError())
@@ -462,7 +467,11 @@ private func waitForOverlapped(
             return .failed(startError)
         }
 
-        let waitResult = WaitForSingleObject(event, remainingMilliseconds(until: deadline))
+        // 待機直前に再計算する: event 作成と I/O 開始が予算を消費しても、絶対 deadline が
+        // それらで延長されてはならない(nil は無期限のまま)。
+        let waitResult = WaitForSingleObject(
+            event,
+            deadline.map { remainingMilliseconds(until: $0) } ?? DWORD(INFINITE))
         if waitResult == DWORD(WAIT_OBJECT_0) {
             let completed = completedOverlappedBytes { bytes in
                 GetOverlappedResult(hPipe, overlapped, &bytes, false)
@@ -542,7 +551,20 @@ private func connectOverlapped(_ hPipe: HANDLE, deadline: UInt64) -> PipeConnect
     }
 }
 
+/// 受信フレーム本体のように「フレーム全体で一つの絶対期限」を持つ読み取り。有限 deadline
+/// 専用 — nil を受ける入口は readNextRequestHeader にだけ存在する。
 private func readExactOverlapped(_ hPipe: HANDLE, count: Int, deadline: UInt64) -> Data? {
+    readExactOverlappedCore(hPipe, count: count, deadline: deadline)
+}
+
+/// 次リクエストの header(4 バイト)待ち。deadline == nil は無期限(oneShot GPU ワーカー)。
+/// 5 分アイドルでワーカーが自発終了しないようにする専用入口で、型を分けることで
+/// body 読み取りへ nil が流れるのを防ぐ。
+private func readNextRequestHeader(_ hPipe: HANDLE, deadline: UInt64?) -> Data? {
+    readExactOverlappedCore(hPipe, count: MemoryLayout<UInt32>.size, deadline: deadline)
+}
+
+private func readExactOverlappedCore(_ hPipe: HANDLE, count: Int, deadline: UInt64?) -> Data? {
     if count == 0 { return Data() }
     var data = Data(count: count)
     var offset = 0
@@ -609,11 +631,19 @@ final class NamedPipeServer: @unchecked Sendable {
     /// onListening: persistent では全固定 instance 作成と DACL 縮小の成功後、oneShot では
     /// pipe 作成成功後に1回だけ呼ばれる。呼ばれた時点でクライアントは接続できる＝「接続可能に
     /// なった後」を要求する処理（カスタム辞書の再読 — spec §4.1 の spawn 窓閉塞）の起点。
+    /// requestHeaderIdleTimeoutMs: 接続確立後の「次リクエスト header 待ち」の idle タイムアウト(ms)。
+    /// nil = 無期限(oneShot 専用 — 単一クライアントが接続を保持し続ける GPU ワーカー用)。
+    /// 初回 accept 待ちは常に namedPipeHeaderReadTimeoutMs のまま。
     func run(handler: @escaping @Sendable (Int, Data) -> (reply: Data, exitAfterReply: Bool),
              onDisconnect: @escaping @Sendable (Int) -> Void = { _ in },
              oneShot: Bool = false,
+             requestHeaderIdleTimeoutMs: Int? = namedPipeHeaderReadTimeoutMs,
              exitHook: @escaping @Sendable () -> Void = { exit(0) },
              onListening: @escaping @Sendable () -> Void = {}) {
+        // 無期限 header 待ち(nil)は「単一クライアントが接続を保持する」oneShot 専用。
+        // persistent の quiet-period recycle(タイムアウトで accept へ戻る)と両立しないため。
+        precondition(oneShot || requestHeaderIdleTimeoutMs != nil,
+                     "requestHeaderIdleTimeoutMs = nil is oneShot-only")
         guard let logonSid = currentProcessLogonSid() else {
             engineLog("nospacekey-engine pipe acl: current process logon SID unavailable; refusing pipe\n")
             return
@@ -634,7 +664,8 @@ final class NamedPipeServer: @unchecked Sendable {
                 CloseHandle(hPipe)
                 return
             }
-            serveConnected(hPipe, connId: ids.next(), handler: handler, exitHook: exitHook)
+            serveConnected(hPipe, connId: ids.next(), headerIdleTimeoutMs: requestHeaderIdleTimeoutMs,
+                           handler: handler, exitHook: exitHook)
             DisconnectNamedPipe(hPipe)
             CloseHandle(hPipe)
             return
@@ -649,7 +680,8 @@ final class NamedPipeServer: @unchecked Sendable {
             Thread.detachNewThread { [self] in
                 defer { group.leave() }
                 let hPipe = UnsafeMutableRawPointer(bitPattern: handleInt)!
-                servePersistent(hPipe, ids: ids, handler: handler, onDisconnect: onDisconnect,
+                servePersistent(hPipe, ids: ids, headerIdleTimeoutMs: requestHeaderIdleTimeoutMs,
+                                handler: handler, onDisconnect: onDisconnect,
                                 exitHook: exitHook)
             }
         }
@@ -719,6 +751,7 @@ final class NamedPipeServer: @unchecked Sendable {
     }
 
     private func servePersistent(_ hPipe: HANDLE, ids: ConnectionIDSource,
+                                 headerIdleTimeoutMs: Int?,
                                  handler: @escaping @Sendable (Int, Data) -> (reply: Data, exitAfterReply: Bool),
                                  onDisconnect: @escaping @Sendable (Int) -> Void,
                                  exitHook: @escaping @Sendable () -> Void) {
@@ -743,7 +776,8 @@ final class NamedPipeServer: @unchecked Sendable {
                 return
             }
             let connId = ids.next()
-            _ = serveConnected(hPipe, connId: connId, handler: handler, exitHook: exitHook)
+            _ = serveConnected(hPipe, connId: connId, headerIdleTimeoutMs: headerIdleTimeoutMs,
+                               handler: handler, exitHook: exitHook)
             // serveConnected has returned only after all request/response leases are released.
             onDisconnect(connId)
             DisconnectNamedPipe(hPipe)
@@ -753,11 +787,12 @@ final class NamedPipeServer: @unchecked Sendable {
 
     @discardableResult
     private func serveConnected(_ hPipe: HANDLE, connId: Int,
+                                headerIdleTimeoutMs: Int?,
                                 handler: @escaping @Sendable (Int, Data) -> (reply: Data, exitAfterReply: Bool),
                                 exitHook: @escaping @Sendable () -> Void) -> Bool {
         while true {
-            let headerDeadline = deadlineAfterMilliseconds(namedPipeHeaderReadTimeoutMs)
-            guard let lenData = readExactOverlapped(hPipe, count: 4, deadline: headerDeadline) else {
+            let headerDeadline = headerIdleTimeoutMs.map { deadlineAfterMilliseconds($0) }
+            guard let lenData = readNextRequestHeader(hPipe, deadline: headerDeadline) else {
                 return false
             }
             let n = lenData.withUnsafeBytes { raw -> Int in

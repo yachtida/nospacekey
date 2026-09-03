@@ -1,10 +1,25 @@
 //! SP6a: 候補リストの純データ。候補列・選択 index。COM 非依存・テスト対象。
 //! presenter と UIElement が Rc<RefCell<CandidateState>> で共有する単一の真実源。
 
+use std::cell::{Cell, RefCell};
+
 #[derive(Default)]
 pub struct CandidateState {
     items: Vec<String>,
     selected: usize,
+}
+
+pub(crate) fn request_selection(
+    state: &RefCell<CandidateState>,
+    selection_dirty: &Cell<bool>,
+    index: usize,
+) -> bool {
+    if state.borrow().count() == 0 {
+        return false;
+    }
+    state.borrow_mut().set_selection(index);
+    selection_dirty.set(true);
+    true
 }
 
 impl CandidateState {

@@ -1,5 +1,6 @@
 import {
   clearLearningSuccessMessage,
+  canRetryZenzai,
   dictionaryPage,
   bindDefaultSettingsHandler,
   mergePersistedAutomaticCheckFields,
@@ -8,6 +9,12 @@ import {
   reconcilePromptDismissal,
   resetDictionaryScroll,
   rollbackAutomaticCheckFields,
+  reduceUpdateCancellation,
+  settleUpdatePhase,
+  updateCloseBlockedMessage,
+  updateCancellationPresentation,
+  updatePhasePresentation,
+  zenzaiRuntimeStatusLabel,
 } from "./app-state.mjs";
 
 // nospacekey 設定 UI。state = SettingsDto（snake_case、Rust 側 logic.rs と同名キー）。
@@ -21,6 +28,10 @@ let state = null;    // 編集中の SettingsDto
 let baseline = null; // 最終ロード/適用時点のスナップショット（dirty 判定・鍵クリア検出用）
 let dirty = false;
 let predictionModelReady = false;
+let zenzaiModelReady = false;
+let zenzaiRuntimeStatus = null;
+let zenzaiRuntimeStatusInFlight = false;
+let zenzaiRuntimePollTimer = null;
 // Startup reconciliation runs after setup returns. The event listener is
 // installed before the first get_settings call; an early event is coalesced
 // until the initial state/baseline and DOM exist.
@@ -78,16 +89,19 @@ function markDirty() {
   settingsEditEpoch++;
   dirty = true;
   document.getElementById("dirty-indicator").hidden = false;
+  syncBusyButtons();
 }
 function clearDirty() {
   dirty = false;
   document.getElementById("dirty-indicator").hidden = true;
+  syncBusyButtons();
 }
 // state が baseline と一致するかで dirty を再計算する。markDirty を通さず state/baseline を
 // 書き換えた後（ダウンロード後の zenzai 反映など）に「未適用の変更」表示のズレを正す。
 function recomputeDirty() {
   dirty = JSON.stringify(state) !== JSON.stringify(baseline);
   document.getElementById("dirty-indicator").hidden = !dirty;
+  syncBusyButtons();
 }
 
 // ---- 外観: パレット編集行の生成・タブ切替・custom 注記 ----
@@ -580,8 +594,8 @@ function showFieldErrors(errors) {
 // もう片方を始められると last-writer-wins で相手の成果を黙って上書きしうる（巡2 C1）。
 // 両ハンドラで共有ビジーフラグを立て、ボタン状態は必ずこの同期関数経由で戻す
 // （各ハンドラが finally で disabled=false を書き合うと相手の保護を解除してしまう）。
-// アップデートもこの排他域に参加する: インストーラはプロセスを taskkill するため、
-// DL 中に書かれた設定の運命が不定になる（「適用しました」が taskkill で消えうる）。
+// アップデートもこの排他域に参加する: Setup完了後にこの設定画面を自発終了するため、
+// DL 中に並行した未適用編集を置き去りにしない。
 let applyInFlight = false;
 let dlInFlight = false;
 let predictionDlInFlight = false;
@@ -603,9 +617,14 @@ let invalidateUpdateCandidate = () => {};
 // Protocol intents are queued while an existing settings/update operation owns
 // the UI. The queue is drained by syncBusyButtons after that operation ends.
 let drainQueuedUpdateIntent = () => {};
-// インストーラ起動済みフラグ。bindUpdateCheck と performClose の両方から参照するため
-// モジュールスコープに置く(起動後は destroy 再試行以外の全操作を封じ続ける — 巡2 C3)。
+// インストーラ完了済みフラグ。bindUpdateCheck と performClose の両方から参照するため
+// モジュールスコープに置く(完了後は destroy 再試行以外の全操作を封じ続ける — 巡2 C3)。
 let installerLaunched = false;
+let updatePhase = "idle";
+let updateCommandPending = false;
+let activeUpdateAttemptId = null;
+let cancelRequestedAttemptId = null;
+let updateAttemptSequence = 0;
 
 function settingsOperationBusy() {
   return applyInFlight || dlInFlight || predictionDlInFlight || updateInFlight || clearInFlight ||
@@ -630,6 +649,7 @@ function syncBusyButtons() {
   const promptDismissBtn = document.getElementById("update-prompt-dismiss");
   const defaultsBtn = document.getElementById("about-defaults");
   const paletteResetBtn = document.getElementById("pal-reset");
+  const zenzaiRetryBtn = document.getElementById("zenzai-runtime-retry");
   const automatic = document.querySelector('[data-bind="update_automatic_check"]');
   // installerLaunched 後は updateInFlight が true のまま残る(封止維持)ため busy に数える。
   // これで各ハンドラの finally syncBusyButtons が意図せず封止を解除しない。
@@ -661,6 +681,16 @@ function syncBusyButtons() {
   // registration/removal transaction. Keep it disabled for the whole async
   // operation so a second click cannot race that transaction.
   if (automatic) automatic.disabled = anyBusy;
+  if (zenzaiRetryBtn) {
+    zenzaiRetryBtn.disabled = !canRetryZenzai({
+      anyBusy,
+      dirty,
+      enabled: Boolean(state?.zenzai_enabled),
+      modelReady: zenzaiModelReady,
+      statusInFlight: zenzaiRuntimeStatusInFlight,
+      status: zenzaiRuntimeStatus,
+    });
+  }
   drainQueuedUpdateIntent();
   drainQueuedReconcileRefresh();
 }
@@ -733,8 +763,8 @@ drainQueuedReconcileRefresh = () => {
 };
 
 // アップデートの開始(破棄確認の待機を含む)から DL/インストール中までは、設定を変える全
-// コントロールを凍結する。DL は長引きうる上、インストーラ起動でプロセスが taskkill される
-// ため、この間に新しく作られた未適用編集は確実に失われる — 凍結して作らせない。対象は
+// コントロールを凍結する。DL とSetup完了待ちは長引きうる上、完了後はこの画面を自発終了する
+// ため、この間に新しく作られた未適用編集は失われる — 凍結して作らせない。対象は
 // state/dirty を触る経路のみ（辞書は settings.json と dirty に無関係なので通常操作のまま）。
 // 適用/Zenzai DL ボタンは syncBusyButtons の管轄なのでここに入れない。解除は
 // 凍結前の disabled に戻す — 単純に false を書くと、凍結前に無効だった要素を
@@ -820,7 +850,11 @@ async function applyNow() {
     // 失敗は無害（次回エンジン起動時の enqueue 読み直しで追いつく）ので待たない。
     invoke("dict_sync_engine").then((st) => {
       if (st === "declined") toast("反映には IME の再起動が必要な場合があります");
+      if (st === "version_mismatch") toast("読み込み済みアプリを再起動して新版 IME に切り替えてください");
     }).catch(() => {});
+    // Apply/reload observes the engine; it never clears a failure latch. Only the
+    // explicit GPU retry button sends RetryZenzai.
+    void refreshZenzaiRuntimeStatus();
   } catch (errors) {
     if (Array.isArray(errors)) showFieldErrors(errors);
     else toast(String(errors), true);
@@ -873,6 +907,7 @@ async function refreshZenzaiStatus() {
   const btn = document.getElementById("zenzai-download");
   try {
     const st = await invoke("zenzai_model_status");
+    zenzaiModelReady = Boolean(st.installed);
     if (st.installed) {
       el.textContent = `モデル: 導入済み（${st.path}）`;
       btn.textContent = "モデルを再ダウンロード";
@@ -881,8 +916,72 @@ async function refreshZenzaiStatus() {
       btn.textContent = "モデルをダウンロード（約70MB）";
     }
   } catch (e) {
+    zenzaiModelReady = false;
     el.textContent = "モデル状態を取得できませんでした";
   }
+  syncBusyButtons();
+}
+
+function renderZenzaiRuntimeStatus() {
+  const el = document.getElementById("zenzai-runtime-status");
+  if (!el) return;
+  const label = zenzaiRuntimeStatusLabel(zenzaiRuntimeStatus);
+  if (label === null) {
+    zenzaiRuntimeStatus = null;
+    el.textContent = "GPU runtime状態を取得できません（応答が不正です）";
+  } else {
+    el.textContent = label;
+  }
+}
+
+async function refreshZenzaiRuntimeStatus() {
+  if (zenzaiRuntimeStatusInFlight) return;
+  zenzaiRuntimeStatusInFlight = true;
+  try {
+    zenzaiRuntimeStatus = await invoke("zenzai_runtime_status");
+  } catch (e) {
+    // Engine absence/old protocol/timeout is an unavailable observation, not classic state.
+    zenzaiRuntimeStatus = null;
+  } finally {
+    zenzaiRuntimeStatusInFlight = false;
+    renderZenzaiRuntimeStatus();
+    syncBusyButtons();
+  }
+}
+
+function startZenzaiRuntimePoll() {
+  if (zenzaiRuntimePollTimer !== null) clearInterval(zenzaiRuntimePollTimer);
+  zenzaiRuntimePollTimer = setInterval(() => {
+    void refreshZenzaiRuntimeStatus();
+  }, 2000);
+}
+
+function bindZenzaiRuntime() {
+  const retryBtn = document.getElementById("zenzai-runtime-retry");
+  if (!retryBtn) return;
+  retryBtn.addEventListener("click", async () => {
+    if (settingsOperationBusy() || reconcileRefreshInFlight || dirty ||
+        !state?.zenzai_enabled || !zenzaiModelReady ||
+        zenzaiRuntimeStatus?.state !== "classic") return;
+    zenzaiRuntimeStatusInFlight = true;
+    retryBtn.disabled = true;
+    renderZenzaiRuntimeStatus();
+    try {
+      await invoke("retry_zenzai");
+      // RetryZenzai is an acknowledgement; warm-up continues in the engine.
+      zenzaiRuntimeStatus = { state: "preparing" };
+      renderZenzaiRuntimeStatus();
+      toast("GPU runtimeを再試行しています…");
+    } catch (e) {
+      zenzaiRuntimeStatus = null;
+      renderZenzaiRuntimeStatus();
+      toast(String(e), true);
+    } finally {
+      zenzaiRuntimeStatusInFlight = false;
+      syncBusyButtons();
+      void refreshZenzaiRuntimeStatus();
+    }
+  });
 }
 
 function bindZenzaiDownload() {
@@ -921,6 +1020,7 @@ function bindZenzaiDownload() {
       renderAll();
       recomputeDirty();
       await refreshZenzaiStatus();
+      await refreshZenzaiRuntimeStatus();
       toast("Zenzai モデルを導入しました");
     } catch (e) {
       // 巡4 B2: キャンセルは失敗扱いにしない（アップデータと同じ規律）。
@@ -1043,8 +1143,8 @@ function bindPredictionModelDownload() {
 }
 
 // ---- アップデート確認（情報ページ）----
-// check_for_update → UpToDate / Available。Available ならインストーラをDL→起動。
-// ダウンロード進捗は update-download-progress イベントで受ける（zenzai DL と同型）。
+// check_for_update → UpToDate / Available。Available ならインストーラをDL→完了待機。
+// update-download-progress はattempt id付きで downloading/installing phaseを通知する。
 function bindUpdateCheck() {
   const checkBtn = document.getElementById("about-check-update");
   const status = document.getElementById("update-status");
@@ -1143,8 +1243,56 @@ function bindUpdateCheck() {
   // 場合に、古い確認の応答・catch・finally が新しい確認の pending・表示・ボタンを上書き
   // しないための所有権(dictListGen と同型)。
   let checkGen = 0;
+  let cancelError = null;
+  let lastUpdateProgressPayload = {};
+
+  const currentCancellationState = () => ({
+    activeAttemptId: activeUpdateAttemptId,
+    commandPending: updateCommandPending,
+    phase: updatePhase,
+    cancelRequestedAttemptId,
+    cancelError,
+  });
+
+  function applyCancellationAction(action) {
+    const current = currentCancellationState();
+    const next = reduceUpdateCancellation(current, action);
+    if (next === current) return false;
+    activeUpdateAttemptId = next.activeAttemptId;
+    updateCommandPending = next.commandPending;
+    updatePhase = next.phase;
+    cancelRequestedAttemptId = next.cancelRequestedAttemptId;
+    cancelError = next.cancelError;
+    if (action.type === "phase") lastUpdateProgressPayload = action.payload;
+
+    const view = updateCancellationPresentation(next, lastUpdateProgressPayload);
+    cancelBtn.hidden = view.cancelHidden;
+    cancelBtn.disabled = view.cancelDisabled;
+    progress.hidden = view.progressHidden;
+    dlStatus.textContent = view.status;
+    if (next.phase === "downloading" && lastUpdateProgressPayload.percent != null) {
+      progress.value = lastUpdateProgressPayload.percent;
+    } else {
+      progress.removeAttribute("value");
+    }
+    if (current.cancelError && !next.cancelError) {
+      status.textContent = "";
+      status.className = "hint";
+    }
+    if (next.cancelError) {
+      status.textContent = `キャンセル要求の送信に失敗しました。再試行できます: ${next.cancelError}`;
+      status.className = "hint update-status-err";
+    }
+    return true;
+  }
 
   function resetDl() {
+    updatePhase = "idle";
+    updateCommandPending = false;
+    activeUpdateAttemptId = null;
+    cancelRequestedAttemptId = null;
+    cancelError = null;
+    lastUpdateProgressPayload = {};
     pending = null;
     pendingIncludeBeta = null;
     installBtn.hidden = true;
@@ -1172,7 +1320,7 @@ function bindUpdateCheck() {
   };
 
   checkBtn.addEventListener("click", async () => {
-    // 巡2 C3: インストーラ起動済みなら再確認で Available を引き直し、二重起動経路を
+    // 巡2 C3: インストーラ完了済みなら再確認で Available を引き直し、二重起動経路を
     // 復活させない（destroy 失敗で窓が生き残った場合の迂回路封じ）。
     if (installerLaunched) return;
     // 適用/DL/アップデートの予約中は確認を始めない。開始時と応答時の両側で検査するのは、
@@ -1259,9 +1407,9 @@ function bindUpdateCheck() {
     updateInFlight = true;
     syncBusyButtons();
     freezeSettingsControls();
+    let attemptId = null;
     try {
-      // インストーラはプロセスを taskkill する — 窓を閉じるのと同義なので、未適用編集の
-      // 破棄をここで確認する。
+      // Setup完了後はこの窓を自発終了するため、未適用編集の破棄をここで確認する。
       if (!(await confirmDiscardIfDirty())) return;
       // 確認中に候補が差し替わっていたら今回の起動は行わない — 新しい候補で選び直させる。
       if (pending !== selected || pendingIncludeBeta !== selectedIncludeBeta ||
@@ -1272,11 +1420,20 @@ function bindUpdateCheck() {
       // 承認後の競合防御(確認ダイアログは webview を止めない)。
       if (applyInFlight || dlInFlight || predictionDlInFlight || clearInFlight || defaultsInFlight ||
           promptDismissInFlight || installerLaunched || reconcileRefreshInFlight) return;
+      attemptId = ++updateAttemptSequence;
+      activeUpdateAttemptId = attemptId;
+      cancelRequestedAttemptId = null;
+      cancelError = null;
+      lastUpdateProgressPayload = {};
+      updateCommandPending = true;
+      updatePhase = "downloading";
+      const initialView = updatePhasePresentation(updatePhase);
       installBtn.hidden = true;
-      cancelBtn.hidden = false;
-      progress.hidden = false;
+      cancelBtn.hidden = initialView.cancelHidden;
+      cancelBtn.disabled = false;
+      progress.hidden = initialView.progressHidden;
       progress.removeAttribute("value");
-      dlStatus.textContent = "ダウンロード中…";
+      dlStatus.textContent = initialView.status;
       // 巡5(巡4 B4(b) の真の修正): 再試行の実経路 — 前回の失敗/キャンセル表示を消す。
       // resetDl は checkBtn 経由でしか呼ばれないため、ここで明示的に初期化する。
       status.textContent = "";
@@ -1285,18 +1442,29 @@ function bindUpdateCheck() {
         installerUrl: selected.installer_url,
         expectedSha256: selected.expected_sha256,
         installerSize: selected.installer_size,
+        attemptId,
       });
-      // インストーラ起動成功 = 設定アプリは終了させる（インストーラの taskkill が追い打ち）。
-      dlStatus.textContent = "インストーラを起動しました。このウィンドウは閉じます…";
-      // 起動済みのため再試行・再確認の両方を封じる（巡2 C3）: pending を null にして
+      updateCommandPending = false;
+      activeUpdateAttemptId = null;
+      cancelRequestedAttemptId = null;
+      cancelError = null;
+      updatePhase = settleUpdatePhase(true);
+      // Setup終了コード0まで確認済み。設定アプリを自発終了し、次回起動を新版へ切り替える。
+      dlStatus.textContent = "アップデートが完了しました。このウィンドウは閉じます…";
+      // 完了済みのため再試行・再確認の両方を封じる（巡2 C3）: pending を null にして
       // installBtn を隠し（finally の !pending が true＝非表示を保つ）、installerLaunched で
       // checkBtn も押せなくする — destroy 失敗で窓が残ってもインストーラの二重起動を
       // 許さない。
       pending = null;
       pendingIncludeBeta = null;
       installerLaunched = true;
-      try { await getCurrentWindow().destroy(); } catch (_) { /* インストーラがプロセスを終了させる */ }
+      try { await getCurrentWindow().destroy(); } catch (_) { /* 封止状態を維持して手動終了を待つ */ }
     } catch (e) {
+      if (activeUpdateAttemptId === attemptId) activeUpdateAttemptId = null;
+      if (cancelRequestedAttemptId === attemptId) cancelRequestedAttemptId = null;
+      cancelError = null;
+      updateCommandPending = false;
+      updatePhase = settleUpdatePhase(false);
       dlStatus.textContent = "";
       // 巡4 B2: キャンセル（固定文字列）は失敗扱いにしない — ユーザ操作の中性表示。
       const msg = String(e);
@@ -1309,7 +1477,7 @@ function bindUpdateCheck() {
       }
     } finally {
       // 確認キャンセル・候補差し替え・DL 失敗/キャンセルの全経路で予約・凍結・ボタンを復元。
-      // 成功時（installerLaunched）は taskkill まで凍結と排他を維持する — 再編集も
+      // 成功時（installerLaunched）はウィンドウ終了まで凍結と排他を維持する — 再編集も
       // アップデートの再開も封じたまま。
       // installerLaunched 時の封止維持(下の syncBusyButtons は呼ばないため直接書く)。
       // 確認飛行中のインストール完了でも確認ボタンを再有効化しない。
@@ -1320,6 +1488,11 @@ function bindUpdateCheck() {
       // 成功時（installerLaunched）は installBtn は隠したまま。
       installBtn.hidden = !pending || installerLaunched;
       if (!installerLaunched) {
+        activeUpdateAttemptId = null;
+        cancelRequestedAttemptId = null;
+        cancelError = null;
+        updateCommandPending = false;
+        updatePhase = settleUpdatePhase(false);
         updateInFlight = false;
         unfreezeSettingsControls();
         syncBusyButtons();
@@ -1327,17 +1500,19 @@ function bindUpdateCheck() {
     }
   });
 
-  cancelBtn.addEventListener("click", () => invoke("cancel_update_download"));
+  cancelBtn.addEventListener("click", async () => {
+    const attemptId = activeUpdateAttemptId;
+    if (!applyCancellationAction({ type: "request", attemptId })) return;
+    try {
+      const outcome = await invoke("cancel_update_download", { attemptId });
+      applyCancellationAction({ type: "result", attemptId, outcome });
+    } catch (error) {
+      applyCancellationAction({ type: "rejected", attemptId, error });
+    }
+  });
 
   listen("update-download-progress", (ev) => {
-    const p = ev.payload;
-    if (p.percent != null) {
-      progress.value = p.percent;
-      dlStatus.textContent = `ダウンロード中… ${p.percent}%`;
-    } else {
-      progress.removeAttribute("value");
-      dlStatus.textContent = `ダウンロード中… ${(p.received / 1048576).toFixed(1)} MB`;
-    }
+    applyCancellationAction({ type: "phase", payload: ev.payload });
   });
 
   document.getElementById("update-releases").addEventListener("click", (e) => {
@@ -1567,6 +1742,7 @@ async function saveDictEntry() {
     await loadDictList();
     // MutationReport.engine の declined を無言にしない(spec §4.2 — 全 mutation コマンド共通)。
     if (report.engine === "declined") toast("反映には IME の再起動が必要な場合があります");
+    if (report.engine === "version_mismatch") toast("読み込み済みアプリを再起動して新版 IME に切り替えてください");
   } catch (err) {
     dictSaving = false;
     setDictFormBusy(false);
@@ -1603,6 +1779,7 @@ async function deleteDictEntry(entry) {
     const report = await invoke("dict_delete", { ruby: entry.ruby, word: entry.word });
     await loadDictList();
     if (report.engine === "declined") toast("反映には IME の再起動が必要な場合があります");
+    if (report.engine === "version_mismatch") toast("読み込み済みアプリを再起動して新版 IME に切り替えてください");
   } catch (err) {
     const kind = dictErrorKind(err);
     if (kind === "NotFound") {
@@ -1638,6 +1815,9 @@ async function importDict() {
     // （直後に別トーストを呼ぶと import 結果の文言が上書きされて消える）。
     if (report.engine === "declined") {
       msg += "。反映には IME の再起動が必要な場合があります";
+    }
+    if (report.engine === "version_mismatch") {
+      msg += "。読み込み済みアプリを再起動して新版 IME に切り替えてください";
     }
     toast(msg);
     await loadDictList();
@@ -1748,7 +1928,10 @@ async function init() {
     }
   });
   bindZenzaiDownload();
+  bindZenzaiRuntime();
   refreshZenzaiStatus();
+  refreshZenzaiRuntimeStatus();
+  startZenzaiRuntimePoll();
   bindPredictionModelDownload();
   refreshPredictionModelStatus();
   const info = await invoke("get_app_info");
@@ -1802,7 +1985,7 @@ async function init() {
   document.getElementById("btn-clear-learning").addEventListener("click", async () => {
     if (settingsOperationBusy() || reconcileRefreshInFlight) return;
     // 確認ダイアログの待機中から予約する。背後でモデルDL/更新を開始されると、ClearLearning
-    // の serviceLock と Shutdown、または updater の taskkill が競合するため。
+    // の serviceLock と、更新開始後のウィンドウ終了境界を競合させないため。
     clearInFlight = true;
     syncBusyButtons();
     const el = document.getElementById("clear-learning-result");
@@ -1831,17 +2014,17 @@ async function init() {
   let closing = false;
   async function performClose() {
     if (closing) return;
-    // アップデートの DL/インストーラ起動（UAC 待ちを含む）中は destroy しない — 窓だけ
-    // 消えてアップデートだけが半端に残るのを防ぐ。「キャンセル」で中止して完了を待ってもらう。
+    // DL/Setup完了待ち中は結果報告の窓をdestroyしない。DL中はConfigのキャンセル、
+    // installing中はSetup自身の完了/中止へ案内する。
     // installerLaunched 後は例外: auto destroy の失敗だけ手動再試行させる(凍結・排他は維持)。
     if (updateInFlight && !installerLaunched) {
-      toast("アップデート進行中です。「キャンセル」で中止して完了を待ってから閉じてください");
+      toast(updateCloseBlockedMessage(updatePhase));
       return;
     }
     if (await confirmDiscardIfDirty()) {
       // 破棄確認の待機中にアップデートが始まっていた場合も、承認後に destroy を拒否する。
       if (updateInFlight && !installerLaunched) {
-        toast("アップデート進行中です。「キャンセル」で中止して完了を待ってから閉じてください");
+        toast(updateCloseBlockedMessage(updatePhase));
         return;
       }
       closing = true;

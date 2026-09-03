@@ -188,6 +188,17 @@
             </div>
           </div>
           <div class="row">
+            <label>GPU runtime</label>
+            <div class="grow">
+              <div id="zenzai-runtime-status" class="hint">状態を確認中…</div>
+              <div class="hstack mt-6">
+                <button id="zenzai-runtime-retry" type="button" disabled>GPUを再試行</button>
+              </div>
+              <p class="hint">Zenzai は Vulkan GPU が利用できる場合だけ動作します。GPU が利用できない場合は
+                CPU版Zenzaiへ切り替えず、古典変換を使用します。</p>
+            </div>
+          </div>
+          <div class="row">
             <label for="e-weight">重みパス(GGUF)</label>
             <div class="grow">
               <div class="hstack">
@@ -206,8 +217,8 @@
                 data-bind="inline_prediction_enabled"> 明示確定後に文の続きを薄く表示する</label>
               <div data-error-for="inline_prediction_enabled" class="field-error"></div>
               <p class="hint">アルファ版機能です。動作や仕様は今後変更される可能性があります。
-                既定はオフです。候補はローカルCPUだけで生成され、右矢印または End で受理、
-                Esc で却下します。変更は入力先を切り替えると反映されます。</p>
+                既定はオフです。モデル推論はローカルのVulkan GPUで実行されます。GPUを利用できない
+                場合は予測を無効にし、通常変換を継続します。右矢印または End で受理、Esc で却下します。</p>
             </div>
           </div>
           <div class="row">
@@ -415,6 +426,7 @@
               </div>
               <div id="update-task-status" class="hint update-status-err"></div>
               <div id="update-status" class="hint"></div>
+              <div class="hint">アップデート後に再起動が必要な場合は、インストーラーが案内します。Windows が自動で再起動することはありません。</div>
               <div class="hstack mt-6">
                 <button id="update-install" type="button" class="primary" hidden>アップデート</button>
                 <button id="update-cancel" type="button" hidden>キャンセル</button>

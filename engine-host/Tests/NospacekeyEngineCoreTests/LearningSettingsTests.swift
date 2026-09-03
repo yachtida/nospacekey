@@ -14,7 +14,8 @@ final class LearningSettingsTests: XCTestCase {
             environment: ["NOSPACEKEY_LEARNING": "1", "NOSPACEKEY_MEMORY_DIR": #"C:\tmp\mem"#],
             ensureDir: { _ in true })
         XCTAssertTrue(s.enabled)
-        XCTAssertEqual(s.memoryDir, URL(fileURLWithPath: #"C:\tmp\mem"#))
+        XCTAssertEqual(s.memoryDir, URL(fileURLWithPath: #"C:\tmp\mem"#)
+            .appendingPathComponent(BuildInfo.version))
     }
     func testDefaultsToLocalAppData() {
         let s = LearningSettings.resolve(
@@ -23,7 +24,8 @@ final class LearningSettingsTests: XCTestCase {
         XCTAssertTrue(s.enabled)
         XCTAssertEqual(s.memoryDir,
             URL(fileURLWithPath: #"C:\Users\u\AppData\Local"#)
-                .appendingPathComponent("nospacekey").appendingPathComponent("memory"))
+                .appendingPathComponent("nospacekey").appendingPathComponent("memory")
+                .appendingPathComponent(BuildInfo.version))
     }
     func testEnsureDirFailureDegradesToDisabled() {
         let s = LearningSettings.resolve(
@@ -40,7 +42,8 @@ final class LearningSettingsTests: XCTestCase {
         // 消去用: 学習 OFF でも「置かれる場所」は解決できる。
         XCTAssertEqual(
             LearningSettings.resolveDir(environment: ["LOCALAPPDATA": #"C:\lad"#]),
-            URL(fileURLWithPath: #"C:\lad"#).appendingPathComponent("nospacekey").appendingPathComponent("memory"))
+            URL(fileURLWithPath: #"C:\lad"#).appendingPathComponent("nospacekey")
+                .appendingPathComponent("memory").appendingPathComponent(BuildInfo.version))
         XCTAssertNil(LearningSettings.resolveDir(environment: [:]))
     }
     func testCoordinationNamesMatchRustConfig() {
@@ -52,7 +55,8 @@ final class LearningSettingsTests: XCTestCase {
             LearningSettings.lifecycleMutexName(scope: scope!),
             #"Global\nospacekey-learning-lifecycle-540cb8761d8b7d7f"#)
         XCTAssertEqual(
-            LearningSettings.presenceMutexName(scope: scope!, sessionID: 42),
-            #"Global\nospacekey-learning-presence-540cb8761d8b7d7f-s42"#)
+            LearningSettings.presenceMutexName(
+                scope: scope!, build: BuildInfo.version, sessionID: 42),
+            "Global\\nospacekey-learning-presence-540cb8761d8b7d7f-b\(BuildInfo.version)-s42")
     }
 }

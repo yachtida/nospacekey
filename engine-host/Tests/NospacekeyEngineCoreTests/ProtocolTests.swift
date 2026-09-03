@@ -138,7 +138,7 @@ final class ProtocolTests: XCTestCase {
     func testEncodeResponseNeverEmpty() {
         let cases: [Response] = [
             .pong,
-            .session(7, proto: nil),
+            .session(7, proto: nil, boot: nil),
             .reading(""),                                   // 空読みでもフレーム本体は非空
             .candidates([]),                                // 空候補でもフレーム本体は非空
             .ok,
@@ -148,6 +148,7 @@ final class ProtocolTests: XCTestCase {
             .prediction(seq: 3, text: ""),
             .predictionUnavailable(seq: 4, state: "loading"),
             .committed(text: "", reading: ""),              // 全消費（残り読み空）でもフレーム本体は非空
+            .zenzaiStatus(state: "classic", backend: nil, device: nil, reason: nil),
         ]
         for c in cases {
             XCTAssertFalse(encodeResponse(c).isEmpty, "encodeResponse must never be empty for \(c)")
@@ -208,8 +209,31 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(unavailable["state"] as? String, "loading")
     }
 
-    func testPredictionBumpsProtocolGeneration() {
-        XCTAssertEqual(ProtocolVersion.current, 3)
+    func testSnapshotAutoCommitBumpsProtocolGeneration() {
+        XCTAssertEqual(ProtocolVersion.current, 8)
+    }
+
+    func testSnapshotAutoCommitProposalAndReceiptWireContract() throws {
+        let response = Response.snapshotResult(
+            composition: 8, revision: 13, configurationGeneration: 2,
+            connectionGeneration: 5, text: "語", candidates: nil,
+            candidateRemaining: nil, baseline: 41,
+            autoCommit: AutoCommitProposal(
+                proposal: 17, text: "日本", consumedReading: "にほん", remaining: "ご"))
+        let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(response)) as! [String: Any]
+        let proposal = object["auto_commit"] as! [String: Any]
+        XCTAssertEqual(proposal["proposal"] as? Int, 17)
+        XCTAssertEqual(proposal["consumed_reading"] as? String, "にほん")
+        XCTAssertEqual(proposal["remaining"] as? String, "ご")
+
+        let json = #"{"method":"AutoCommitReceipt","params":{"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"proposal":17}}"#
+        let request = try JSONDecoder().decode(Request.self, from: Data(json.utf8))
+        guard case .autoCommitReceipt(let composition, let revision, _, _, let id) = request else {
+            return XCTFail("not receipt")
+        }
+        XCTAssertEqual(composition, 8)
+        XCTAssertEqual(revision, 13)
+        XCTAssertEqual(id, 17)
     }
 
     // ---- Shift英語モード: Insert style（Rust protocol.rs のテストと wire 形一致）----
@@ -236,6 +260,31 @@ final class ProtocolTests: XCTestCase {
         XCTAssertNil(req.sessionId)
     }
 
+    func testDecodeZenzaiStatusOperationsHaveNoSession() throws {
+        let query = try JSONDecoder().decode(
+            Request.self, from: Data(#"{"method":"QueryZenzaiStatus"}"#.utf8))
+        let retry = try JSONDecoder().decode(
+            Request.self, from: Data(#"{"method":"RetryZenzai"}"#.utf8))
+        guard case .queryZenzaiStatus = query else { return XCTFail("not QueryZenzaiStatus") }
+        guard case .retryZenzai = retry else { return XCTFail("not RetryZenzai") }
+        XCTAssertNil(query.sessionId)
+        XCTAssertNil(retry.sessionId)
+    }
+
+    func testEncodeZenzaiStatusOmitsSensitiveAndOptionalFields() throws {
+        let response = Response.zenzaiStatus(
+            state: "classic", backend: nil, device: nil, reason: "backend_unavailable")
+        let object = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(response)) as! [String: Any]
+        XCTAssertEqual(object["result"] as? String, "ZenzaiStatus")
+        XCTAssertEqual(object["state"] as? String, "classic")
+        XCTAssertEqual(object["reason"] as? String, "backend_unavailable")
+        for key in ["path", "input", "candidates", "generation", "model_load_attempts",
+                    "context_init_attempts", "decode_attempts"] {
+            XCTAssertNil(object[key], "runtime status must not expose \(key)")
+        }
+    }
+
     func testDecodeRecordCorrection() throws {
         // Rust 側 protocol.rs の serialize 出力と一字一句一致(record_correction_request_roundtrips と対)。
         // session を伴わない(確定済み訂正はどのセッションにも属さない — ClearLearning と同じ共有資源扱い)。
@@ -249,19 +298,21 @@ final class ProtocolTests: XCTestCase {
 
     func testEncodeSessionCarriesProto() throws {
         // 新エンジン: Session 応答に proto を載せる。dict 比較（キー順非保証のためバイト一致比較はしない）。
-        let res = Response.session(7, proto: 3)
+        let res = Response.session(7, proto: 5, boot: BuildInfo.version)
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
         XCTAssertEqual(obj["session"] as? Int, 7)
-        XCTAssertEqual(obj["proto"] as? Int, 3)
+        XCTAssertEqual(obj["proto"] as? Int, 5)
+        XCTAssertEqual(obj["boot"] as? String, BuildInfo.version)
     }
 
     func testEncodeSessionWithoutProtoOmitsKey() throws {
         // proto=nil はキー自体を省略＝handshake 導入前と wire 形一致（旧TIP互換。Rust 側 Option と対）。
-        let res = Response.session(7, proto: nil)
+        let res = Response.session(7, proto: nil, boot: nil)
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
         XCTAssertEqual(obj["session"] as? Int, 7)
         XCTAssertNil(obj["proto"])
+        XCTAssertNil(obj["boot"])
     }
 }

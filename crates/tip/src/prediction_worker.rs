@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use crate::prediction_state::{PredictionRequest, Timestamp};
-use ipc::client::EngineClient;
-use ipc::protocol::{Request, Response, PROTO_VERSION};
+use ipc::client::{verify_start_session, EngineClient, EngineIdentityError};
+use ipc::protocol::{Request, Response};
 
 pub(crate) trait Predictor {
     fn predict(&self, context_before: &str) -> Option<String>;
@@ -25,6 +25,10 @@ pub(crate) enum IpcPredictionResult {
     Prediction(String),
     Unavailable(String),
     Failed,
+    VersionMismatch {
+        actual_proto: Option<u32>,
+        actual_boot: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -238,6 +242,12 @@ fn interpret_response(seq: u64, response: Response, duration_ms: u128) -> IpcPre
     }
 }
 
+fn prediction_session(
+    mut send: impl FnMut(&Request) -> std::io::Result<Response>,
+) -> Result<i64, EngineIdentityError> {
+    verify_start_session(|request| send(request).map_err(EngineIdentityError::Io))
+}
+
 /// 通常変換と別の名前付きパイプ接続を開き、1要求だけを低優先度スレッドで実行する。
 /// connection drop は engine-host の onDisconnect を通じて予測用 session を必ず掃除する。
 pub(crate) fn spawn_ipc_prediction_worker(
@@ -292,38 +302,40 @@ pub(crate) fn spawn_ipc_prediction_worker(
         // receives a fresh hard budget; PredictionState still rejects any result that missed
         // the user-visible 400 ms deadline measured from dispatch.
         let deadline = std::time::Instant::now() + timeout;
-        let outcome = (|| -> std::io::Result<IpcPredictionOutcome> {
+        let outcome = (|| -> Result<IpcPredictionOutcome, IpcPredictionResult> {
             let connect_budget = timeout.min(std::time::Duration::from_millis(75));
-            let mut client = EngineClient::connect_to(&pipe_name, connect_budget)?;
-            let session = match client.request_within(&Request::StartSession, deadline)? {
-                Response::Session {
-                    session,
-                    proto: Some(proto),
-                } if proto == PROTO_VERSION => session,
-                _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "prediction handshake failed",
-                    ))
-                }
-            };
-            let response = client.request_within(
-                &Request::Predict {
-                    session,
-                    seq,
-                    token_ids,
-                },
-                deadline,
-            )?;
+            let mut client = EngineClient::connect_to(&pipe_name, connect_budget)
+                .map_err(|_| IpcPredictionResult::Failed)?;
+            let session = prediction_session(|request| client.request_within(request, deadline))
+                .map_err(|error| match error {
+                    EngineIdentityError::Mismatch {
+                        actual_proto,
+                        actual_boot,
+                    } => IpcPredictionResult::VersionMismatch {
+                        actual_proto,
+                        actual_boot,
+                    },
+                    _ => IpcPredictionResult::Failed,
+                })?;
+            let response = client
+                .request_within(
+                    &Request::Predict {
+                        session,
+                        seq,
+                        token_ids,
+                    },
+                    deadline,
+                )
+                .map_err(|_| IpcPredictionResult::Failed)?;
             Ok(interpret_response(
                 seq,
                 response,
                 started.elapsed().as_millis(),
             ))
         })()
-        .unwrap_or(IpcPredictionOutcome {
+        .unwrap_or_else(|result| IpcPredictionOutcome {
             seq,
-            result: IpcPredictionResult::Failed,
+            result,
             duration_ms: started.elapsed().as_millis(),
         });
         slot.complete(outcome);
@@ -490,6 +502,21 @@ mod tests {
             .result,
             IpcPredictionResult::Unavailable("loading".into())
         );
+    }
+
+    #[test]
+    fn prediction_identity_mismatch_sends_no_predict_request() {
+        let mut requests = Vec::new();
+        let result = prediction_session(|request| {
+            requests.push(matches!(request, Request::StartSession));
+            Ok(Response::Session {
+                session: 7,
+                proto: Some(ipc::protocol::PROTO_VERSION),
+                boot: Some("loaded-old-build".into()),
+            })
+        });
+        assert!(matches!(result, Err(EngineIdentityError::Mismatch { .. })));
+        assert_eq!(requests, vec![true]);
     }
 
     #[test]

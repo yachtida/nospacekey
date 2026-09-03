@@ -1,5 +1,6 @@
 import Foundation
 import KanaKanjiConverterModuleWithDefaultDictionary
+import NospacekeyLlamaRuntimeAdapter
 
 #if os(Windows)
 import WinSDK
@@ -111,17 +112,99 @@ struct LearningFileSystem: @unchecked Sendable {
 /// `corrections`/`recordability`（訂正昇格）も同じ規律（読み書きとも converterLock 下）。
 /// `llmClient` は読み(llmConvert/isEcho)/書き(reload) とも handler の serviceLock 下。reload は
 /// serviceLock を握る handler から呼ばれ converterLock を **非ブロックで試す**ので、ロック反転は無い。
-/// （`zenzaiEnabled` は起動時/テストのみ config を無ロックで読むが、その時点で並行 reload は無い。）
+/// `config` の公開状態読み取り（zenzaiEnabled/inferenceLimit）は専用の短いロックで保護し、
+/// reload は converterLock と同じ更新点でそのロックも取得する。status はこの短いスナップショット
+/// を読むため、native warm-up を待たない。
 /// `zenzaiReady`（cold start ③）は専用 `zenzaiReadyLock` で保護。makeOptions（converterLock 下）→
 /// getter の一方向の入れ子しか無く、zenzaiReadyLock 保持中に他のロックは取らない＝反転しない。
 /// `activeConverterSession`（bindConverter/endSession）と `firstConvertLogged`
 /// （logFirstConvertOnceLocked）は読み書きとも converterLock 下（各メソッドの呼出契約）。
 /// カスタム辞書のリロード（spec 2026-08-02-custom-dictionary §4.1）: `desiredDictEnabled` は専用
 /// `dictStateLock`（保持中に他のロックを取らない＝反転しない）、`environment` は immutable。
-/// 実作業は直列 `dictQueue` 上で走り、serviceLock を持たない文脈なので converterLock を
-/// blocking で取ってよい（取るのは import の1箇所だけ）。
+/// 実作業はbounded maintenance lane上で走り、serviceLockを保持しない。
 public final class ConversionService: @unchecked Sendable {
+    static let defaultSnapshotAutoCommitStateLimit = 64
+    struct SnapshotEnhancementKey: Equatable, Sendable {
+        let composition: UInt64
+        let revision: UInt64
+        let configurationGeneration: UInt64
+        let connectionGeneration: UInt64
+    }
+
+    struct SnapshotAutoCommitProposal: Equatable, Sendable {
+        let proposal: UInt64
+        let text: String
+        let consumedReading: String
+        let remaining: String
+    }
+
+    private struct SnapshotAutoCommitState {
+        var live = LiveConversionState()
+        var lastRevision: UInt64?
+        var pending: (key: SnapshotEnhancementKey, value: SnapshotAutoCommitProposal, candidate: Candidate)?
+    }
+
+    private struct SnapshotAutoCommitStream: Hashable {
+        let connection: Int
+        let composition: UInt64
+    }
+
+    enum SnapshotEnhancementPoll: Sendable {
+        case pending
+        case unavailable
+        case ready(text: String, candidates: [String]?, candidateRemaining: [String]?)
+    }
+
+    private struct SnapshotCandidateIdentity: Hashable {
+        let text: String
+        let consumedReading: Int
+    }
+
+    private struct SnapshotEnhancementWork: Sendable {
+        let key: SnapshotEnhancementKey
+        let baseline: UInt64
+        let explicit: Bool
+        let reading: String
+        let classic: ConversionResult
+        let snapshot: GPUWorkerCompositionSnapshot
+        let leftContext: String?
+        let inferenceLimit: Int
+    }
+
+    private struct CompletedSnapshotEnhancement: Sendable {
+        let key: SnapshotEnhancementKey
+        let baseline: UInt64
+        let result: SnapshotEnhancementPoll
+    }
+    /// The production main host owns only the classic converter.  The worker
+    /// role is the sole role allowed to compose Zenzai .on options.  `legacy`
+    /// keeps the existing unit-test initializer semantics while the process
+    /// entry points pass an explicit role.
+    enum ProcessRole: Sendable {
+        case legacy
+        case mainClassicOnly
+        case gpuWorker
+    }
+
+    public struct GPUWorkerEvaluation: Sendable {
+        public let conversion: ConversionResult?
+        public let failure: GPUWorkerFailure?
+
+        public init(conversion: ConversionResult? = nil,
+                    failure: GPUWorkerFailure? = nil) {
+            self.conversion = conversion
+            self.failure = failure
+        }
+    }
+
     private let converter = KanaKanjiConverter.withDefaultDictionary()
+    private var learningConverter = KanaKanjiConverter.withDefaultDictionary()
+    private let recentLearning = RecentLearningOverlay()
+    private let learningStateLock = NSLock()
+    private var learningGeneration: UInt64 = 0
+    private var clearingLearning = false
+    private let learningPersistenceForTesting: (@Sendable (Candidate) -> Void)?
+    private let learningClearStartedForTesting: (@Sendable () -> Void)?
 
     /// 1セッションの全状態（合成テキスト・候補キャッシュ・ライブ変換履歴・所有接続）。
     /// 並列 Dictionary 6本（sessions/cachedCandidates/cachedTarget/typoRepairedIndices/
@@ -258,7 +341,7 @@ public final class ConversionService: @unchecked Sendable {
     /// SessionRecord.connection が持つ（endSession はそれで所有集合から O(1) 除去する）。
     private var connectionSessions: [Int: Set<Int>] = [:]
     private var nextId = 1
-    private let workDir = FileManager.default.temporaryDirectory
+    private let workDir: URL
     private let fileSystem: LearningFileSystem
     /// 学習設定が OFF でも clear の対象 root を失わないための解決済み directory。
     /// reload の overrides は ProcessInfo.environment へ戻せないため、現在値を保持する。
@@ -276,6 +359,37 @@ public final class ConversionService: @unchecked Sendable {
     /// `makeOptions` が convert ごとに読むため、`converterLock` 下で差し替えれば次回変換から効く
     /// （converter オブジェクト自体の再構築は不要＝Zenzai は options の weightURL で切替わる）。
     private var config: ZenzaiConfig
+    /// Public status/configuration reads must not race reload's converterLock
+    /// critical section, and status must remain independent of native work.
+    private let configurationLock = NSLock()
+    private let processRole: ProcessRole
+    private let gpuWorkerSupervisor: GPUWorkerSupervisor?
+    private let snapshotEnhancementLock = NSLock()
+    private var desiredSnapshotEnhancement: SnapshotEnhancementWork?
+    private var latestSnapshotEnhancement: (SnapshotEnhancementKey, UInt64)?
+    private var completedSnapshotEnhancement: CompletedSnapshotEnhancement?
+    private var snapshotEnhancementRunning = false
+    /// Structural evidence for the main process's CPU-Zenzai prohibition.
+    /// Incremented immediately before the sole vendor request seam when its
+    /// effective options carry Zenzai `.on`.
+    private var zenzaiInvocationCounter = ZenzaiInvocationCounter()
+    /// GPU-required runtime client. All calls are made under converterLock so a failed
+    /// request cannot race a retry or a model reload.
+    private let zenzaiRuntime: ZenzaiRuntimeClient
+    /// Typed state is kept separately from the converter's legacy zenzStatus string.
+    private var _zenzaiRuntimeState: ZenzaiRuntimeState
+    private var _zenzaiRuntimeStatus = ZenzaiRuntimeStatus.unconfigured
+    /// Status queries must remain responsive while warm-up holds converterLock. Keep a
+    /// sanitized snapshot behind its own short lock instead of exposing converter state.
+    private let zenzaiRuntimeSnapshotLock = NSLock()
+    private var _zenzaiRuntimeSnapshot: ZenzaiRuntimeSnapshot
+    private var warmupDecodeAttemptsBaseline: UInt64 = 0
+    private var warmUpInFlight = false
+    private let warmUpControlLock = NSLock()
+    private var warmUpActiveForReload = false
+    private var warmUpCancellationRequested = false
+    private var warmUpWeightURL: URL?
+    private var warmUpRuntimeDirectory: URL?
     /// Spec2: 学習設定。読み(makeOptions/commit)/書き(reload) とも `converterLock` 下（config と同じ規律）。
     private var learning: LearningSettings
     /// 訂正昇格テーブル(spec 2026-07-30-correction-promotion)。読み書きとも converterLock 下
@@ -303,6 +417,10 @@ public final class ConversionService: @unchecked Sendable {
     /// 読み長バックストップ（死のループ対策）: 読みがこの長さを超えたら文節安定を待たず
     /// 先頭文節を強制確定する。0 以下で無効。読み(liveConvert)/書き(reload) とも `converterLock` 下。
     private var autoCommitMaxReading: Int
+    private var snapshotAutoCommitStates: [SnapshotAutoCommitStream: SnapshotAutoCommitState] = [:]
+    private var appliedSnapshotAutoCommitReceipts: [SnapshotAutoCommitStream: (SnapshotEnhancementKey, UInt64)] = [:]
+    private var nextSnapshotAutoCommitProposal: UInt64 = 0
+    private let snapshotAutoCommitStateLimit: Int
     /// converter（およびモデル）への全アクセスを直列化する。背景 warm-up（別スレッド）と
     /// convert（リクエストループ）の競合を防ぎ、warm-up がロック保持中に届いた変換はロード完了を
     /// 自然に待つ（ロック取得**前**の要求だけが zenzaiReady ゲート閉で古典に落ちて即応する —
@@ -367,21 +485,32 @@ public final class ConversionService: @unchecked Sendable {
     /// 保持する（immutable なのでロック無しでワーカスレッドから読める）。テストはここに
     /// NOSPACEKEY_USER_DICT / LOCALAPPDATA を注入して辞書ファイルを差し込む。
     private let environment: [String: String]
-    /// カスタム辞書のリロード作業を直列化する専用キュー。ハンドラ（serviceLock 下）は
-    /// ここへ積むだけで即返り、実際の I/O と converterLock 取得はこのキューの上で行う
+    /// カスタム辞書のリロード作業を直列化する専用レーン。ハンドラ（serviceLock 下）は
+    /// ここへ積むだけで即返り、実際の I/O と converterLock 取得はこのレーンの上で行う
     /// （spec §4.1: ハンドラ内 blocking 取得は warm-up 中に全クライアントの打鍵を凍らせる）。
-    private let dictQueue = DispatchQueue(label: "nospacekey.dict.reload")
+    /// Session teardown and persistence are deliberately outside the request handler.  This queue
+    /// is serial so vendor learning state is finalized in commit order without making EndSession
+    /// acknowledgement wait for disk or native cleanup.
+    private let maintenance = BackgroundMaintenance()
     /// desiredDictEnabled 専用のロック。保持中に他のロックは取らない（反転しない）。
     private let dictStateLock = NSLock()
     /// 「望ましい辞書状態」。**書くのは init（env から1回）と ReloadDictionary ハンドラだけ**で、
     /// work item は読むだけ — 起動時 enqueue が env 値で書き戻す実装だと、pipe 開通直後に
     /// 届いた `{enabled:false}` を上書きして辞書が勝手に有効へ戻る競合窓ができる（spec §4.1）。
     private var desiredDictEnabled: Bool
+    private var dictionaryReloadGeneration: UInt64 = 0
+    private let dictionaryRetryDelay: DispatchTimeInterval
 
     /// 本番用: env から「明示 weight → per-user(%LOCALAPPDATA%) → exe 隣」の3段解決表で
     /// Zenzai 設定を解決する（ZenzaiConfig.resolve と同一の表 — UIバグ8）。
     /// テストからは呼ばないこと（exe 隣のモデル有無で挙動が環境依存になる）。テストは `init(config:)` を使う。
     public convenience init() {
+        self.init(productionMain: true)
+    }
+
+    /// Production main entry point.  Its converter is permanently classic;
+    /// GPU ranking is owned by the injected isolated-worker supervisor.
+    convenience init(productionMain: Bool) {
         let exeDir = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
             .deletingLastPathComponent()
         let env = ProcessInfo.processInfo.environment
@@ -395,7 +524,13 @@ public final class ConversionService: @unchecked Sendable {
                   autoCommit: AutoCommitStrength.resolve(environment: env),
                   autoCommitMaxReading: AutoCommitLengthBackstop.resolve(environment: env),
                   typoLearn: env["NOSPACEKEY_TYPO_LEARN"] != "0",
-                  environment: env)
+                  environment: env,
+                  processRole: productionMain ? .mainClassicOnly : .legacy,
+                  gpuWorkerSupervisor: productionMain
+                    ? GPUWorkerSupervisor(
+                        transport: NativeGPUWorkerTransport(),
+                        runtimeConfiguration: GPUWorkerRuntimeConfiguration(config: cfg),
+                        allowsLazyStart: false) : nil)
         // Plan4: ユーザ辞書(ワンショット移行 JSON)+組み込み日付テンプレートの起動時ロード。
         // ここは runEngineHost の service.startWarmUp() より前(EngineHost.swift:128→136)＝
         // warm-up スレッド起動前の初期化時点なので競合しない(メソッド側でも lock は取る)。
@@ -407,17 +542,29 @@ public final class ConversionService: @unchecked Sendable {
     /// autoCommit の既定 `.weak` は本番既定（AutoCommitStrength.resolve の未設定時）と同値。
     /// autoCommitMaxReading の既定 25 は本番既定（AutoCommitLengthBackstop.resolve の未設定時）と同値。
     /// environment は辞書リロードの解決に使う env（既定 `[:]` ＝ resolve が nil＝辞書なし）。
-    public convenience init(config: ZenzaiConfig,
+    convenience init(config: ZenzaiConfig,
                             learning: LearningSettings = .disabled,
                             llmClient: LLMClient = LLMClient(config: LLMConfig.resolve(environment: [:])),
                             autoCommit: AutoCommitStrength = .weak,
                             autoCommitMaxReading: Int = 25,
                             typoLearn: Bool = true,
-                            environment: [String: String] = [:]) {
+                            environment: [String: String] = [:],
+                            runtimeClient: ZenzaiRuntimeClient = NativeZenzaiRuntimeClient(),
+                            processRole: ProcessRole = .legacy,
+                            gpuWorkerSupervisor: GPUWorkerSupervisor? = nil,
+                            privateTemporaryDirectory: URL? = nil,
+                            snapshotAutoCommitStateLimit: Int = defaultSnapshotAutoCommitStateLimit,
+                            dictionaryRetryDelay: DispatchTimeInterval = .milliseconds(100)) {
         self.init(config: config, learning: learning, llmClient: llmClient,
                   autoCommit: autoCommit, autoCommitMaxReading: autoCommitMaxReading,
                   typoLearn: typoLearn, environment: environment,
-                  fileSystem: .live)
+                  runtimeClient: runtimeClient,
+                  fileSystem: .live,
+                  processRole: processRole,
+                  gpuWorkerSupervisor: gpuWorkerSupervisor,
+                  privateTemporaryDirectory: privateTemporaryDirectory,
+                  snapshotAutoCommitStateLimit: snapshotAutoCommitStateLimit,
+                  dictionaryRetryDelay: dictionaryRetryDelay)
     }
 
     /// テスト用のファイル操作注入。公開 initializer は本番 seam を露出しない。
@@ -428,25 +575,313 @@ public final class ConversionService: @unchecked Sendable {
          autoCommitMaxReading: Int = 25,
          typoLearn: Bool = true,
          environment: [String: String] = [:],
-         fileSystem: LearningFileSystem) {
+         runtimeClient: ZenzaiRuntimeClient = NativeZenzaiRuntimeClient(),
+         fileSystem: LearningFileSystem,
+         processRole: ProcessRole = .legacy,
+         gpuWorkerSupervisor: GPUWorkerSupervisor? = nil,
+         privateTemporaryDirectory: URL? = nil,
+         snapshotAutoCommitStateLimit: Int = defaultSnapshotAutoCommitStateLimit,
+         learningPersistenceForTesting: (@Sendable (Candidate) -> Void)? = nil,
+         learningClearStartedForTesting: (@Sendable () -> Void)? = nil,
+         dictionaryRetryDelay: DispatchTimeInterval = .milliseconds(100)) {
         self.config = config
+        self.processRole = processRole
+        self.gpuWorkerSupervisor = gpuWorkerSupervisor
+        self.zenzaiRuntime = runtimeClient
+        let initialRuntimeState: ZenzaiRuntimeState = config.weightURL == nil
+            ? .classic(reason: Self.classicReason(for: config))
+            : .classic(reason: .notStarted)
+        self._zenzaiRuntimeState = initialRuntimeState
+        self._zenzaiRuntimeSnapshot = Self.runtimeSnapshot(
+            state: initialRuntimeState,
+            status: .unconfigured,
+            zenzaiEnabled: config.weightURL != nil)
         self.learning = learning
         self.corrections = CorrectionStore(directory: learning.memoryDir)
         self.llmClient = llmClient
         self.autoCommit = autoCommit
         self.autoCommitMaxReading = autoCommitMaxReading
+        self.snapshotAutoCommitStateLimit = max(1, snapshotAutoCommitStateLimit)
+        self.learningPersistenceForTesting = learningPersistenceForTesting
+        self.learningClearStartedForTesting = learningClearStartedForTesting
+        self.dictionaryRetryDelay = dictionaryRetryDelay
         self.typoLearn = typoLearn
         self.environment = environment
         self.desiredDictEnabled = UserDictionary.enabled(environment: environment)
         self.fileSystem = fileSystem
+        self.workDir = privateTemporaryDirectory ?? FileManager.default.temporaryDirectory
         self.learningDirectory = learning.memoryDir ?? LearningSettings.resolveDir(environment: environment)
     }
 
     /// Zenzai が有効か（重みが解決できたか）。
-    public var zenzaiEnabled: Bool { config.weightURL != nil }
+    public var zenzaiEnabled: Bool {
+        configurationLock.lock()
+        defer { configurationLock.unlock() }
+        return config.weightURL != nil
+    }
+
+    /// Current engine state. The value is sanitized and contains no model path or input.
+    public var zenzaiRuntimeState: ZenzaiRuntimeState {
+        if processRole == .mainClassicOnly, zenzaiEnabled, let supervisor = gpuWorkerSupervisor {
+            let worker = supervisor.snapshot
+            switch worker.state {
+            case .preparing: return .warming
+            case .gpuActive:
+                return .gpuActive(device: worker.device ?? "unknown")
+            case .classic:
+                return .classic(reason: Self.classicReason(fromWorkerReason: worker.reason))
+            case .disabled: return .classic(reason: .userDisabled)
+            case .stopped: return .classic(reason: .notStarted)
+            }
+        }
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        return _zenzaiRuntimeState
+    }
+
+    /// Non-blocking sanitized state for the settings UI. The snapshot lock is independent
+    /// from converterLock because warm-up may hold the latter for native model work.
+    public var zenzaiRuntimeSnapshot: ZenzaiRuntimeSnapshot {
+        if processRole == .mainClassicOnly, zenzaiEnabled, let supervisor = gpuWorkerSupervisor {
+            let worker = supervisor.snapshot
+            let state: ZenzaiRuntimeSnapshot.DisplayState
+            switch worker.state {
+            case .stopped, .preparing: state = .preparing
+            case .gpuActive: state = .gpuActive
+            case .classic: state = .classic
+            case .disabled: state = .disabled
+            }
+            return ZenzaiRuntimeSnapshot(
+                state: state, backend: worker.backend, device: worker.device,
+                reason: worker.reason)
+        }
+        zenzaiRuntimeSnapshotLock.lock()
+        defer { zenzaiRuntimeSnapshotLock.unlock() }
+        return _zenzaiRuntimeSnapshot
+    }
+
+    /// Sanitized worker-only state for host integrations that need to
+    /// distinguish child lifecycle from the legacy runtime status.
+    public var gpuWorkerRuntimeSnapshot: GPUWorkerSupervisorSnapshot? {
+        gpuWorkerSupervisor?.snapshot
+    }
+
+    /// Worker-only handshake/evaluation seam.  It exposes typed native state
+    /// but never serializes candidate or composing text data.
+    public func gpuWorkerHandshake(generation: UInt64) -> GPUWorkerHandshakeResponse {
+        guard processRole == .gpuWorker else {
+            return GPUWorkerHandshakeResponse(
+                generation: generation, ready: false, failure: .unknown)
+        }
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        let status = zenzaiRuntime.status()
+        setRuntimeStatusLocked(status)
+        guard case .gpuActive = _zenzaiRuntimeState,
+              status.state == .gpuActive,
+              status.failure == .none,
+              status.decodeAttempts > warmupDecodeAttemptsBaseline,
+              Self.hasTrustedGPUIdentity(status) else {
+            return GPUWorkerHandshakeResponse(
+                generation: generation, ready: false,
+                backend: status.backend.isEmpty ? nil : status.backend,
+                device: status.device.isEmpty ? nil : status.device,
+                failure: Self.workerRuntimeFailure(
+                    status, requireTrustedGPUIdentity: true))
+        }
+        return GPUWorkerHandshakeResponse(
+            generation: generation, ready: true,
+            backend: status.backend.isEmpty ? nil : status.backend,
+            device: status.device.isEmpty ? nil : status.device)
+    }
+
+    /// Evaluate exactly one worker request after warm-up.  The returned
+    /// ConversionResult is local to the child; host wire code copies the
+    /// public candidate structure needed for safe display and commit.
+    public func evaluateGPUWorker(
+        snapshot: GPUWorkerCompositionSnapshot,
+        leftContext: String?,
+        nBest: Int,
+        inferenceLimit: Int
+    ) -> GPUWorkerEvaluation {
+        guard processRole == .gpuWorker else {
+            return GPUWorkerEvaluation(failure: .unavailable)
+        }
+        guard snapshot.supportsGPUWorker,
+              let composing = try? snapshot.makeComposingText(),
+              !composing.convertTarget.isEmpty else {
+            return GPUWorkerEvaluation(failure: .unsupportedInput)
+        }
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        guard inferenceLimit == config.inferenceLimit else {
+            return GPUWorkerEvaluation(failure: .protocolMismatch)
+        }
+        let before = zenzaiRuntime.status()
+        setRuntimeStatusLocked(before)
+        guard case .gpuActive = _zenzaiRuntimeState,
+              before.state == .gpuActive, before.failure == .none,
+              before.decodeAttempts >= warmupDecodeAttemptsBaseline,
+              Self.hasTrustedGPUIdentity(before) else {
+            return GPUWorkerEvaluation(
+                failure: Self.workerFailure(before, requireTrustedGPUIdentity: true))
+        }
+        let options = makeOptions(
+            nBest: max(10, nBest), leftSideContext: leftContext,
+            forceZenzai: true, noLearning: true)
+        let conversion = requestCandidatesLocked(composing, options: options)
+        let after = zenzaiRuntime.status()
+        setRuntimeStatusLocked(after)
+        guard after.state == .gpuActive, after.failure == .none,
+              Self.hasTrustedGPUIdentity(after) else {
+            return GPUWorkerEvaluation(
+                failure: Self.workerFailure(after, requireTrustedGPUIdentity: true))
+        }
+        guard after.decodeAttempts > before.decodeAttempts else {
+            return GPUWorkerEvaluation(failure: .decode)
+        }
+        return GPUWorkerEvaluation(conversion: conversion)
+    }
+
+    /// Alias used by diagnostics and tests at the public boundary.
+    public var runtimeState: ZenzaiRuntimeState { zenzaiRuntimeState }
+
+    /// Last status observed from the native seam.
+    public var zenzaiRuntimeStatus: ZenzaiRuntimeStatus {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        return _zenzaiRuntimeStatus
+    }
 
     /// 実効の Zenzai 推論上限（観測/テスト用。config は private のため読み取り口を公開する）。
-    public var zenzaiInferenceLimit: Int { config.inferenceLimit }
+    public var zenzaiInferenceLimit: Int {
+        configurationLock.lock()
+        defer { configurationLock.unlock() }
+        return config.inferenceLimit
+    }
+
+    private static func runtimeSnapshot(
+        state: ZenzaiRuntimeState,
+        status: ZenzaiRuntimeStatus,
+        zenzaiEnabled: Bool
+    ) -> ZenzaiRuntimeSnapshot {
+        let backend = status.backend.isEmpty ? nil : status.backend
+        let device = status.device.isEmpty ? nil : status.device
+        switch state {
+        case .probing, .warming:
+            return ZenzaiRuntimeSnapshot(
+                state: .preparing, backend: backend, device: device)
+        case .gpuActive:
+            return ZenzaiRuntimeSnapshot(
+                state: .gpuActive, backend: backend, device: device)
+        case .classic(let reason):
+            let displayState: ZenzaiRuntimeSnapshot.DisplayState
+            if reason == .userDisabled || reason == .cpuUnsupported {
+                displayState = .disabled
+            } else if reason == .notStarted && zenzaiEnabled {
+                displayState = .preparing
+            } else {
+                displayState = .classic
+            }
+            return ZenzaiRuntimeSnapshot(
+                state: displayState, backend: backend, device: device,
+                reason: reason.description)
+        }
+    }
+
+    private static func classicReason(fromWorkerReason reason: String?) -> ZenzaiClassicReason {
+        switch reason {
+        case ZenzaiClassicReason.invalidRuntimeDirectory.description: return .invalidRuntimeDirectory
+        case ZenzaiClassicReason.backendPathRejected.description: return .backendPathRejected
+        case ZenzaiClassicReason.backendUnavailable.description: return .backendUnavailable
+        case ZenzaiClassicReason.gpuUnavailable.description: return .gpuUnavailable
+        case ZenzaiClassicReason.modelLoadFailed.description: return .modelLoadFailed
+        case ZenzaiClassicReason.contextLoadFailed.description: return .contextLoadFailed
+        case ZenzaiClassicReason.decodeFailed.description: return .decodeFailed
+        case ZenzaiClassicReason.warmupFailed.description: return .warmupFailed
+        case ZenzaiClassicReason.tooSlow.description: return .tooSlow
+        default: return .unknownRuntimeFailure
+        }
+    }
+
+    private static func hasTrustedGPUIdentity(_ status: ZenzaiRuntimeStatus) -> Bool {
+        let backend = status.backend.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let device = status.device.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The shipped runtime is Vulkan-only.  The device name is evidence (and
+        // may vary by driver), so require it to be present without hard-coding
+        // one Radeon marketing string.
+        return backend.contains("vulkan") && !device.isEmpty
+    }
+
+    private static func workerRuntimeFailure(
+        _ status: ZenzaiRuntimeStatus,
+        requireTrustedGPUIdentity: Bool = false
+    ) -> GPUWorkerRuntimeFailure {
+        if requireTrustedGPUIdentity,
+           status.state == .gpuActive,
+           status.failure == .none,
+           !hasTrustedGPUIdentity(status) {
+            return .gpuUnavailable
+        }
+        switch status.failure {
+        case .invalidRuntimeDirectory: return .invalidRuntimeDirectory
+        case .backendPathRejected: return .backendPathRejected
+        case .backendUnavailable: return .backendUnavailable
+        case .gpuUnavailable: return .gpuUnavailable
+        case .modelLoad: return .modelLoad
+        case .contextLoad: return .contextLoad
+        case .decode: return .decode
+        case .unknown: return .unknown
+        case .none:
+            switch status.state {
+            case .unconfigured: return .invalidRuntimeDirectory
+            case .gpuActive: return .none
+            case .failed: return .unknown
+            }
+        }
+    }
+
+    private static func workerFailure(
+        _ status: ZenzaiRuntimeStatus,
+        requireTrustedGPUIdentity: Bool = false
+    ) -> GPUWorkerFailure {
+        switch workerRuntimeFailure(
+            status, requireTrustedGPUIdentity: requireTrustedGPUIdentity) {
+        case .invalidRuntimeDirectory: return .invalidRuntimeDirectory
+        case .backendPathRejected: return .backendPathRejected
+        case .backendUnavailable: return .backendUnavailable
+        case .gpuUnavailable: return .gpuUnavailable
+        case .modelLoad: return .modelLoad
+        case .contextLoad: return .contextLoad
+        case .decode: return .decode
+        case .none, .unknown: return .warmup
+        }
+    }
+
+    /// **converterLock 保持中に呼ぶこと**。UI snapshot は native status の内部 counter を
+    /// 越境させず、state/status の更新を同じ観測点へ反映する。
+    private func updateRuntimeSnapshotLocked() {
+        let snapshot = Self.runtimeSnapshot(
+            state: _zenzaiRuntimeState,
+            status: _zenzaiRuntimeStatus,
+            zenzaiEnabled: config.weightURL != nil)
+        zenzaiRuntimeSnapshotLock.lock()
+        _zenzaiRuntimeSnapshot = snapshot
+        zenzaiRuntimeSnapshotLock.unlock()
+    }
+
+    /// **converterLock 保持中に呼ぶこと**。
+    private func setRuntimeStateLocked(_ state: ZenzaiRuntimeState) {
+        _zenzaiRuntimeState = state
+        updateRuntimeSnapshotLocked()
+    }
+
+    /// **converterLock 保持中に呼ぶこと**。
+    private func setRuntimeStatusLocked(_ status: ZenzaiRuntimeStatus) {
+        _zenzaiRuntimeStatus = status
+        updateRuntimeSnapshotLocked()
+    }
 
     /// Plan4: ユーザ辞書(ワンショット移行 JSON)+組み込み日付テンプレートを converter へ載せる。
     /// `importDynamicUserDictionary` は**丸ごと置換**（DicdataStoreState が配列を代入するだけ）
@@ -479,20 +914,59 @@ public final class ConversionService: @unchecked Sendable {
     public func requestDictionaryReload(enabled: Bool) {
         dictStateLock.lock()
         desiredDictEnabled = enabled
+        dictionaryReloadGeneration &+= 1
+        let generation = dictionaryReloadGeneration
         dictStateLock.unlock()
-        enqueueDictionaryReload()
+        enqueueDictionaryReload(generation: generation, attempt: 0)
     }
 
     /// desired を変えずに再読だけを積む。pipe 作成直後（`NamedPipeServer.onListening`）から呼び、
     /// 「エンジン init の辞書ロード後〜pipe 作成前」に落ちた保存（接続失敗＝不達）を拾い直す。
     /// 各作業がファイルと desired を読み直すので冪等（二重読みは無害）。
     public func enqueueDictionaryReload() {
-        dictQueue.async { [weak self] in self?.dictionaryReloadWork() }
+        dictStateLock.lock()
+        dictionaryReloadGeneration &+= 1
+        let generation = dictionaryReloadGeneration
+        dictStateLock.unlock()
+        enqueueDictionaryReload(generation: generation, attempt: 0)
+    }
+
+    private func enqueueDictionaryReload(generation: UInt64, attempt: Int) {
+        maintenance.submitLatest(label: "dictionary_reload") { [weak self] in
+            try self?.runDictionaryReload(generation: generation, attempt: attempt)
+        }
+    }
+
+    private func runDictionaryReload(generation: UInt64, attempt: Int) throws {
+        dictStateLock.lock()
+        let current = dictionaryReloadGeneration == generation
+        dictStateLock.unlock()
+        guard current else { return }
+        if dictionaryReloadWork() { return }
+
+        dictStateLock.lock()
+        let stillCurrent = dictionaryReloadGeneration == generation
+        dictStateLock.unlock()
+        guard stillCurrent else { return }
+        guard attempt < 2 else {
+            engineLog("ev=user_dict retry_giveup generation=\(generation) attempt=\(attempt + 1)\n")
+            throw DictionaryReloadError.failed
+        }
+
+        engineLog("ev=user_dict retry_scheduled generation=\(generation) attempt=\(attempt + 2) deadline_ms=100\n")
+        let accepted = maintenance.submitLatestAfter(
+            label: "dictionary_reload", delay: dictionaryRetryDelay
+        ) { [weak self] in
+            try self?.runDictionaryReload(generation: generation, attempt: attempt + 1)
+        }
+        if !accepted {
+            engineLog("ev=user_dict retry_superseded generation=\(generation) attempt=\(attempt + 2)\n")
+        }
     }
 
     /// 直列キュー上のリロード作業。I/O はロック外、converterLock 内は import だけ
     /// （ロック内でファイル読み＋JSON デコードを行うと数万語辞書で全クライアントの変換が止まる）。
-    private func dictionaryReloadWork() {
+    private func dictionaryReloadWork() -> Bool {
         dictStateLock.lock()
         let enabled = desiredDictEnabled
         dictStateLock.unlock()
@@ -509,7 +983,7 @@ public final class ConversionService: @unchecked Sendable {
             case .failed:
                 // 一過性の読み失敗で「動いていた辞書の全消滅」を起こさないため import 自体を行わない。
                 engineLog("ev=user_dict reload_failed\n")
-                return
+                return false
             }
         }
         converterLock.lock()
@@ -523,11 +997,19 @@ public final class ConversionService: @unchecked Sendable {
         // activeConverterSession には触れないこと（nil を置くと bindConverter のリセットが
         // スキップされ、終了セッションの文脈が次セッションへ漏れる — endSession の注記）。
         if !isZenzaiOperationalLocked { stopCompositionLocked() }
+        return true
     }
 
     /// テスト専用: 直列キューに積まれたリロードの完了を待つ（キューは serial なので sync で足りる）。
     func flushDictionaryQueueForTesting() {
-        dictQueue.sync {}
+        maintenance.barrier()
+    }
+
+    @discardableResult
+    func releaseDictionaryRetryForTesting() -> Bool {
+        let released = maintenance.releaseDelayedForTesting()
+        maintenance.barrier()
+        return released
     }
 
     /// テスト専用: **背景スレッドで** converterLock を保持し、解放クロージャを返す。
@@ -587,8 +1069,14 @@ public final class ConversionService: @unchecked Sendable {
             exeDir: exeDir, environment: env, cpuMeetsLlamaBaseline: cpuMeetsLlamaBaseline)
         let newLLM = LLMConfig.resolve(environment: env)
         let newLearning = LearningSettings.resolve(environment: env)
-        // 非ブロック取得（NSLock.lock(before: 現在時刻) は空いていれば true / 埋まっていれば即 false）。
-        if converterLock.lock(before: Date()) {
+        var scheduleZenzaiWarmUp = false
+        // 通常は非ブロック取得。warm-up中にZenzaiをOFFへ切る場合だけ、warm-upを
+        // キャンセルして短時間待ち、OFF設定を取りこぼさない。
+        let cancelWarmUp = requestWarmUpCancellationIfConfigurationChanged(
+            weightURL: newZenzai.weightURL,
+            runtimeDirectory: newZenzai.runtimeDirectory)
+        let lockDeadline = cancelWarmUp ? Date().addingTimeInterval(2) : Date()
+        if converterLock.lock(before: lockDeadline) {
             defer { converterLock.unlock() }
             // OFF では LearningSettings.memoryDir が nil になるため、明示 directory を失わない。
             // env に新しい directory があればそれを採用し、無ければ直前の clear root を保持する。
@@ -607,14 +1095,13 @@ public final class ConversionService: @unchecked Sendable {
             // ＝保留分が「凍結」され、後で ON に戻すと古い保留分が書かれうる。先に保存して空にしておく。
             // 注: ライブラリの updateConfig(.nothing) は一時トライをクリアしない — LearningMemory.swift:645-650）。
             if self.learning.enabled && !newLearning.enabled {
-                flushLearningLocked()
-                corrections.flush()   // 学習と同じ穴: OFF 凍結前に保留分を保存
-                // commitUpdateLearningData は vendor 内で失敗を握り、成功時だけ temporary trie を
-                // 空にする。結果を観測できないまま OFF にすると resetMemory は stale root を
-                // 指し得るため、次の OFF request/再起動まで clear を fail-closed にする。
-                if vendorTemporaryState == .mayContainData {
-                    vendorTemporaryState = .unobservableAfterFlush
+                if processRole != .mainClassicOnly {
+                    flushLearningLocked()
+                    if vendorTemporaryState == .mayContainData {
+                        vendorTemporaryState = .unobservableAfterFlush
+                    }
                 }
+                enqueueCorrectionPersistenceLocked()
             }
             // audit H2: Zenzai 有効→無効の切替時は一度だけフルリセットする。稼働中に bindConverter が
             // （切替スパイク排除のため）温存してきた classic 分岐の文脈（completedData 等）と zenz の
@@ -628,11 +1115,18 @@ public final class ConversionService: @unchecked Sendable {
             // shouldRestoreSkipOnReload の「無効化時は復活させない」意味論との矛盾）。
             let weightSwapped = self.config.weightURL != nil && newZenzai.weightURL != nil
                 && self.config.weightURL != newZenzai.weightURL
+            let runtimeDirectoryChanged = self.config.weightURL != nil && newZenzai.weightURL != nil &&
+                self.config.runtimeDirectory != newZenzai.runtimeDirectory
+            let inferenceLimitChanged = self.config.inferenceLimit != newZenzai.inferenceLimit
+            let disabledReasonChanged = self.config.weightURL == nil &&
+                self.config.disabledReason != newZenzai.disabledReason
+            let modelConfigurationChanged = self.config.weightURL != newZenzai.weightURL ||
+                runtimeDirectoryChanged || inferenceLimitChanged || disabledReasonChanged
             if self.config.weightURL != nil && newZenzai.weightURL == nil { stopCompositionLocked() }
             if weightSwapped { stopCompositionLocked() }
             // 訂正昇格テーブルは学習 directory と運命共同体: dir が変わったら flush して作り直す。
             if self.learningDirectory != newLearningDirectory {
-                corrections.flush()
+                enqueueCorrectionPersistenceLocked()
                 corrections = CorrectionStore(directory: newLearningDirectory)
             }
             // self.config の差し替え前に、旧 weightURL をキャプチャ（新規有効化判定で self.config が
@@ -640,19 +1134,42 @@ public final class ConversionService: @unchecked Sendable {
             let oldWeightURL = self.config.weightURL
             self.learning = newLearning
             self.learningDirectory = newLearningDirectory
+            configurationLock.lock()
             self.config = newZenzai
+            configurationLock.unlock()
             self.llmClient = LLMClient(config: newLLM)
             self.autoCommit = AutoCommitStrength.resolve(environment: env)
             self.autoCommitMaxReading = AutoCommitLengthBackstop.resolve(environment: env)
             self.typoLearn = env["NOSPACEKEY_TYPO_LEARN"] != "0"
-            // slow-inference フォールバックをリセット: reload は常にユーザー明示操作（設定アプリの適用）
-            // 経由なので、「重い」と判定された後でもユーザーが再試行できる。Zenzai 有効のまま他設定変更
-            // した時もリセットする — 環境が改善した（別GPUプロセス終了等）可能性があるため。
-            if self.zenzaiTooSlow {
+            // A model/runtime change starts a new native generation. Ordinary settings
+            // reloads preserve a failure latch so a broken backend is not retried in a loop.
+            if modelConfigurationChanged {
                 // 遅延フォールバック予約を残したまま Zenzai を再有効化しない。上のモデル無効化/
                 // 差し替えで既にリセット済みなら stopCompositionLocked が予約を消しているため二重実行しない。
                 if self.needsClassicReset { self.stopCompositionLocked() }
                 self.zenzaiTooSlow = false
+                self.setRuntimeStatusLocked(.unconfigured)
+                if newZenzai.weightURL == nil {
+                    if processRole == .mainClassicOnly {
+                        gpuWorkerSupervisor?.disable()
+                    }
+                    self.setClassicLocked(Self.classicReason(for: newZenzai))
+                } else {
+                    if processRole == .mainClassicOnly {
+                        gpuWorkerSupervisor?.modelOrRuntimeChanged(
+                            configuration: GPUWorkerRuntimeConfiguration(config: newZenzai))
+                    }
+                    self.setRuntimeStateLocked(.classic(reason: .notStarted))
+                    self.zenzaiReady = false
+                    scheduleZenzaiWarmUp = true
+                }
+                engineLog("ev=zenzai_reset reason=model_or_runtime_change\n")
+            } else if self.zenzaiTooSlow {
+                // Slow inference is an independent, user-tunable fallback latch. It is
+                // reset by the existing reload contract, while native failure latches above
+                // remain unchanged unless the model/runtime generation changes.
+                self.zenzaiTooSlow = false
+                if self.needsClassicReset { self.stopCompositionLocked() }
                 engineLog("ev=zenzai_reset reason=reload\n")
             }
             // 初回スキップ: モデルが既にホット（Zenzai 継続/無効→無効/無効化）なら 0 で即監視。
@@ -664,6 +1181,18 @@ public final class ConversionService: @unchecked Sendable {
             let newlyEnabledZenzai = ConversionService.shouldRestoreSkipOnReload(
                 old: oldWeightURL, new: newZenzai.weightURL) || weightSwapped
             self.slowWatchSkipsRemaining = newlyEnabledZenzai ? self.slowWatchSkipInitial : self.slowWatchSkipAfterReload
+            if scheduleZenzaiWarmUp {
+                if processRole == .mainClassicOnly {
+                    // The main converter has no native Zenzai lifecycle.  A model/runtime
+                    // generation change warms the isolated child instead of reopening the
+                    // legacy in-process probe path.
+                    Thread.detachNewThread { [weak self] in
+                        self?.gpuWorkerSupervisor?.startWarmUp()
+                    }
+                } else {
+                    Thread.detachNewThread { [weak self] in self?.startWarmUp(explicitRetry: true) }
+                }
+            }
             engineLog("ev=reload_config zenzai=\(newZenzai.weightURL != nil) inference_limit=\(newZenzai.inferenceLimit) llm=\(newLLM.enabled) learning=\(newLearning.enabled) auto_commit=\(self.autoCommit.rawValue) auto_commit_max_reading=\(self.autoCommitMaxReading) typo_learn=\(self.typoLearn)\n")
             return true
         } else {
@@ -717,6 +1246,14 @@ public final class ConversionService: @unchecked Sendable {
         return rec.composing.convertTarget
     }
 
+    private static func classicReason(for config: ZenzaiConfig) -> ZenzaiClassicReason {
+        switch config.disabledReason {
+        case .userDisabled: return .userDisabled
+        case .cpuUnsupported: return .cpuUnsupported
+        case .modelMissing, .none: return .modelMissing
+        }
+    }
+
     /// isZenzaiOperationalLocked の判定表（純粋関数 — converter/実モデルを参照しないため
     /// truth table として直接検証できる）。実稼働 = ready × !tooSlow × weightURL あり ×
     /// zenzStatus が成功形（"load <url>" ちょうど）の全て。tooSlow を含める理由:
@@ -739,7 +1276,8 @@ public final class ConversionService: @unchecked Sendable {
     /// 旧辞書の previousInputData/lattice/completedData が残置される。reload で Zenzai を新規有効化
     /// した直後も、初回の Zenzai 変換が成功するまでは false（安全側）。
     private var isZenzaiOperationalLocked: Bool {
-        ConversionService.isZenzaiOperational(
+        guard case .gpuActive = _zenzaiRuntimeState else { return false }
+        return ConversionService.isZenzaiOperational(
             ready: zenzaiReady, tooSlow: zenzaiTooSlow,
             weightURL: config.weightURL, zenzStatus: converter.zenzStatus)
     }
@@ -771,12 +1309,14 @@ public final class ConversionService: @unchecked Sendable {
     private func setCompletedDataLocked(_ candidate: Candidate, session: Int) {
         converter.setCompletedData(candidate)
         completedDataSession = session
+        refreshDeferredClassicResetLocked()
     }
 
     /// updateLearningData は vendor の `lastData` も更新するため、その所有者も追跡する。
     private func updateLearningDataLocked(_ candidate: Candidate, session: Int) {
         converter.updateLearningData(candidate)
         learningDataSession = session
+        refreshDeferredClassicResetLocked()
         vendorTemporaryState = .mayContainData
     }
 
@@ -793,28 +1333,194 @@ public final class ConversionService: @unchecked Sendable {
         // と扱わず、mayContainData / unobservableAfterFlush をそのまま保持する。
     }
 
+    private func setClassicLocked(_ reason: ZenzaiClassicReason) {
+        setRuntimeStateLocked(.classic(reason: reason))
+        zenzaiReady = true
+        engineLog("ev=zenzai_classic reason=\(reason.description)\n")
+    }
+
+    /// Start a new probe. No native status/configure call is made for disabled or missing
+    /// models, which keeps the classic-only path independent of runtime DLLs.
+    @discardableResult
+    private func beginRuntimeProbeLocked(explicitRetry: Bool) -> Bool {
+        guard let weightURL = config.weightURL else {
+            setClassicLocked(Self.classicReason(for: config))
+            return false
+        }
+        var isDirectory = ObjCBool(false)
+        guard weightURL.isFileURL,
+              FileManager.default.fileExists(atPath: weightURL.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else {
+            setClassicLocked(.modelMissing)
+            return false
+        }
+        guard let runtimeDirectory = config.runtimeDirectory else {
+            setClassicLocked(.invalidRuntimeDirectory)
+            return false
+        }
+        setRuntimeStateLocked(.probing)
+        let status = zenzaiRuntime.configure(
+            trustedRuntimeDirectory: runtimeDirectory,
+            explicitRetry: explicitRetry)
+        setRuntimeStatusLocked(status)
+        guard status.state == .gpuActive, status.failure == .none else {
+            setClassicLocked(status.classicReason ?? .backendUnavailable)
+            return false
+        }
+        warmupDecodeAttemptsBaseline = status.decodeAttempts
+        setRuntimeStateLocked(.warming)
+        engineLog("ev=zenzai_probe backend=\(status.backend)\n")
+        return true
+    }
+
+    private func refreshRuntimeAfterRequestLocked() -> ZenzaiClassicReason? {
+        guard config.weightURL != nil else { return nil }
+        guard case .classic = _zenzaiRuntimeState else {
+            let status = zenzaiRuntime.status()
+            setRuntimeStatusLocked(status)
+            if let reason = status.classicReason {
+                setClassicLocked(reason)
+                return reason
+            }
+            return nil
+        }
+        return nil
+    }
+
+    /// A native failure invalidates the result that requested Zenzai. Re-run the exact
+    /// composing input with classic options so the caller still receives a result.
+    private func requestCandidatesWithRuntimeFallbackLocked(
+        _ input: ComposingText,
+        options: ConvertRequestOptions,
+        requestedZenzai: Bool,
+        classicOptions: ConvertRequestOptions,
+        leftContext: String? = nil,
+        deadline: GPUWorkerDeadlineTier = .convert
+    ) -> ConversionResult {
+        if processRole == .mainClassicOnly {
+            return requestClassicAndRerankLocked(
+                input, leftContext: leftContext, nBest: max(options.N_best, 10), deadline: deadline)
+        }
+        let result = requestCandidatesLocked(input, options: options)
+        guard requestedZenzai, refreshRuntimeAfterRequestLocked() != nil else { return result }
+        consumePendingClassicResetLocked()
+        return requestCandidatesLocked(input, options: classicOptions)
+    }
+
     /// 全ての requestCandidates をここへ集約し、vendor learning root の観測窓を漏らさない。
     /// **converterLock 保持中に呼ぶこと**。
     private func requestCandidatesLocked(_ input: ComposingText,
                                          options: ConvertRequestOptions) -> ConversionResult {
-        let result = converter.requestCandidates(input, options: options)
-        noteVendorLearningConfigurationLocked(options, input: input)
+        var effectiveOptions = options
+        if processRole == .mainClassicOnly {
+            // The main process never enters the vendor Zenzai path.  This is
+            // a second guard in addition to the call-site classic options.
+            effectiveOptions.zenzaiMode = .off
+        }
+        if effectiveOptions.zenzaiMode != .off {
+            zenzaiInvocationCounter.recordInvocation()
+        }
+        let result = converter.requestCandidates(input, options: effectiveOptions)
+        if processRole == .mainClassicOnly,
+           ProcessInfo.processInfo.environment["NOSPACEKEY_GPU_WORKER_E2E"] == "1" {
+            engineLog(
+                "ev=zenzai_main_vendor_invocations count=\(zenzaiInvocationCounter.value)\n")
+        }
+        noteVendorLearningConfigurationLocked(effectiveOptions, input: input)
         return result
     }
 
-    /// Zenzai 遅延フォールバック後の最初の converter 操作だけをリセット境界にする。
+    /// Main-process conversion seam: generate the complete classic candidate
+    /// pool first, then ask the isolated worker for GPU candidates.  Exact
+    /// text matches reuse the classic objects; GPU-only candidates retain
+    /// commit structure but are made ineligible for persistent learning.
+    private func requestClassicAndRerankLocked(
+        _ input: ComposingText,
+        leftContext: String?,
+        nBest: Int,
+        deadline: GPUWorkerDeadlineTier = .convert
+    ) -> ConversionResult {
+        let poolSize = max(10, nBest)
+        let classicOptions = makeOptions(
+            nBest: poolSize, leftSideContext: leftContext, forceClassic: true)
+        let classic = requestCandidatesLocked(input, options: classicOptions)
+        guard processRole == .mainClassicOnly,
+              let gpuWorkerSupervisor,
+              !input.convertTarget.isEmpty else {
+            return classic
+        }
+        let decision = gpuWorkerSupervisor.rerank(
+            classic: classic,
+            snapshot: GPUWorkerCompositionSnapshot(input),
+            leftContext: leftContext,
+            nBest: poolSize,
+            inferenceLimit: config.inferenceLimit,
+            deadline: deadline.workerBudget)
+        if let failure = decision.failure {
+            // Only the sanitized category is logged; no input/candidate text.
+            engineLog("ev=zenzai_worker_fallback reason=\(failure.rawValue)\n")
+        }
+        return decision.conversion
+    }
+
+    private func requestWarmUpCancellationIfConfigurationChanged(
+        weightURL: URL?, runtimeDirectory: URL?
+    ) -> Bool {
+        warmUpControlLock.lock()
+        defer { warmUpControlLock.unlock() }
+        guard warmUpActiveForReload,
+              warmUpWeightURL != weightURL ||
+                (weightURL != nil && warmUpRuntimeDirectory != runtimeDirectory) else { return false }
+        warmUpCancellationRequested = true
+        return true
+    }
+
+    private func takeWarmUpCancellationRequest() -> Bool {
+        warmUpControlLock.lock()
+        defer { warmUpControlLock.unlock() }
+        let requested = warmUpCancellationRequested
+        warmUpCancellationRequested = false
+        return requested
+    }
+
+    private func markWarmUpStarted() {
+        warmUpControlLock.lock()
+        warmUpActiveForReload = true
+        warmUpCancellationRequested = false
+        warmUpWeightURL = config.weightURL
+        warmUpRuntimeDirectory = config.runtimeDirectory
+        warmUpControlLock.unlock()
+    }
+
+    private func markWarmUpFinished() {
+        warmUpControlLock.lock()
+        warmUpActiveForReload = false
+        warmUpCancellationRequested = false
+        warmUpWeightURL = nil
+        warmUpRuntimeDirectory = nil
+        warmUpControlLock.unlock()
+    }
+
+    /// GPU稼働中に温存したclassic文脈は、classicへ入る境界でだけ破棄する。
     /// **converterLock 保持中に呼ぶこと**。
     private func consumePendingClassicResetLocked() {
         guard needsClassicReset else { return }
         stopCompositionLocked()
     }
 
-    /// 共有 converter を `session` 用に束ねる。直前に別セッションが使っていたら、その完了文脈
-    /// （completedData/previousInputData/lattice）をリセットしてからにする（セッション間の漏れ防止）。
+    private func refreshDeferredClassicResetLocked() {
+        guard isZenzaiOperationalLocked else { return }
+        needsClassicReset = Self.requiresClassicReset(
+            activeSession: activeConverterSession,
+            completedDataSession: completedDataSession,
+            learningDataSession: learningDataSession)
+    }
+
+    /// 共有 converter を `session` 用に束ねる。classic稼働中は別セッションの文脈を即時破棄する。
     /// **converterLock 保持中に呼ぶこと**（stopComposition/zenzStatus が converter を触るため）。
     ///
-    /// audit H2 (2026-07-18): Zenzai 実稼働中（!tooSlow — isZenzaiOperationalLocked）は、別セッション由来の
-    /// classic 文脈がない限りこのリセットを **スキップ**する。stopComposition は
+    /// audit H2 (2026-07-18): Zenzai 実稼働中（!tooSlow — isZenzaiOperationalLocked）は、このリセットを
+    /// **遅延**する。stopComposition は
     /// zenz.endSession()→reset_context()（llama_free＋llama_init_from_model）を誘発し、prevInput が
     /// 空に戻るため、アプリ切替直後の 1 変換に KV 全再プリフィル分のレイテンシが上乗せされていた
     /// （頻度はアプリ切替に比例）。スキップが安全な根拠（upstream 0.11.2 精読）:
@@ -826,18 +1532,14 @@ public final class ConversionService: @unchecked Sendable {
     /// - zenzaiCache（prefix 制約ヒント）は getNewConstraint が新しい読みに対し自己検証し、採用された
     ///   制約も all_zenzai のループが現在の左文脈で zenz 再評価・自己修正する（stale ヒントの最悪影響は
     ///   初回推論の反復増、次の入力でキャッシュは現セッションのものに置き換わる）。
-    /// classic 文脈の所有者が切替先と異なる場合は correctness を優先してリセットする。これを残すと
-    /// 遅延フォールバック後の部分確定入口で予約リセットが切替先の current lattice を破棄し、
-    /// kana2lattice_afterComplete を使えなくなる。
+    /// classic 文脈の所有者が切替先と異なる場合はresetを予約し、native失敗またはslow判定でclassicへ
+    /// 入る直前に一度だけ消費する。GPU成功中に即時resetするとアプリ切替ごとにcontext再生成が入り、
+    /// CPU競合下でLiveConvertの400ms期限を超える。
     /// Zenzai 有効→無効の reload 切替時は reload 側が一度フルリセットして残置状態を一掃する。
     private func bindConverter(to session: Int) {
+        let zenzaiOperational = isZenzaiOperationalLocked
         if let active = activeConverterSession, active != session {
-            if !Self.shouldResetForSessionSwitch(
-                isZenzaiOperational: isZenzaiOperationalLocked,
-                targetSession: session,
-                completedDataSession: completedDataSession,
-                learningDataSession: learningDataSession
-            ) {
+            if !Self.shouldResetForSessionSwitch(isZenzaiOperational: zenzaiOperational) {
                 // スキップの観測用（従来の ev=llama_reset reason=session_switch 計数と対になる）。
                 engineLog("ev=llama_reset_skipped reason=session_switch\n")
             } else {
@@ -851,7 +1553,11 @@ public final class ConversionService: @unchecked Sendable {
             }
         }
         activeConverterSession = session
-        consumePendingClassicResetLocked()
+        if zenzaiOperational {
+            refreshDeferredClassicResetLocked()
+        } else {
+            consumePendingClassicResetLocked()
+        }
     }
 
     /// 現在の読みを変換し、変換候補のテキスト配列を返す。
@@ -864,8 +1570,11 @@ public final class ConversionService: @unchecked Sendable {
         defer { converterLock.unlock() }
         bindConverter(to: session)
         let (options, requestedZenzai) = makeOptionsWithZenzaiUsage(leftSideContext: leftContext)
+        let classicOptions = makeOptions(leftSideContext: leftContext, forceClassic: true)
         let t0 = DispatchTime.now()
-        let rawResults = requestCandidatesLocked(rec.composing, options: options).mainResults
+        let rawResults = requestCandidatesWithRuntimeFallbackLocked(
+            rec.composing, options: options, requestedZenzai: requestedZenzai,
+            classicOptions: classicOptions, leftContext: leftContext).mainResults
         // 監視に渡すのは requestCandidates の推論時間のみ。実稼働判定はこの直後で確定させる —
         // 要求（requestedZenzai）だけでは足りず、invalid/nonexistent weight の silent fallback 中は
         // 実推論が走っていない（zenzaiInferenceUsedLocked の注記）。
@@ -932,8 +1641,11 @@ public final class ConversionService: @unchecked Sendable {
         // 後段処理なので、どちらも時間を数えず skip も消費させない。全区間を数える旧実装は
         // 仮説数と辞書引きの遅さ次第で Zenzai 未実行のまま閾値を超え得た（High）。
         let (literalOptions, literalRequestedZenzai) = makeOptionsWithZenzaiUsage(leftSideContext: leftContext)
+        let literalClassicOptions = makeOptions(leftSideContext: leftContext, forceClassic: true)
         let literalT0 = DispatchTime.now()
-        let literalResults = requestCandidatesLocked(rec.composing, options: literalOptions).mainResults
+        let literalResults = requestCandidatesWithRuntimeFallbackLocked(
+            rec.composing, options: literalOptions, requestedZenzai: literalRequestedZenzai,
+            classicOptions: literalClassicOptions, leftContext: leftContext).mainResults
         // 実稼働判定は literal の requestCandidates 直後に確定（convert と同じ規律 — 後続の
         // forceClassic 仮説変換が converter を触る前に zenzStatus を読む）。
         let literalUsedZenzai = zenzaiInferenceUsedLocked(requestedZenzai: literalRequestedZenzai,
@@ -995,8 +1707,11 @@ public final class ConversionService: @unchecked Sendable {
         defer { converterLock.unlock() }
         bindConverter(to: session)
         let (options, requestedZenzai) = makeOptionsWithZenzaiUsage(leftSideContext: leftContext)
+        let classicOptions = makeOptions(leftSideContext: leftContext, forceClassic: true)
         let t0 = DispatchTime.now()
-        let mainCands = requestCandidatesLocked(c, options: options).mainResults
+        let mainCands = requestCandidatesWithRuntimeFallbackLocked(
+            c, options: options, requestedZenzai: requestedZenzai,
+            classicOptions: classicOptions, leftContext: leftContext).mainResults
         // 監視は推論時間のみ — 昇格（promoted）の lookup/合成は後段処理（convert と同型）。
         // 実稼働判定は requestCandidates 直後に確定（silent fallback 除外 — surface が空なら
         // 対象入力も空で推論は走らない）。
@@ -1044,8 +1759,11 @@ public final class ConversionService: @unchecked Sendable {
         defer { converterLock.unlock() }
         bindConverter(to: session)
         let (options, requestedZenzai) = makeOptionsWithZenzaiUsage(nBest: 1, leftSideContext: leftContext)
+        let classicOptions = makeOptions(nBest: 1, leftSideContext: leftContext, forceClassic: true)
         let t0 = DispatchTime.now()
-        let conversion = requestCandidatesLocked(rec.composing, options: options)
+        let conversion = requestCandidatesWithRuntimeFallbackLocked(
+            rec.composing, options: options, requestedZenzai: requestedZenzai,
+            classicOptions: classicOptions, leftContext: leftContext, deadline: .live)
         let results = conversion.mainResults
         // 監視は推論時間のみ: 自動確定（setCompletedData/学習）・昇格・キャッシュの後段は
         // Zenzai の重さではない（convert と同型 — 旧実装はこれら込みで数えていた）。
@@ -1285,12 +2003,12 @@ public final class ConversionService: @unchecked Sendable {
             engineLog("ev=correction_record_reject reason=surface reading_chars=\(reading.count)\n")
         case .recordable:
             corrections.record(reading: reading, surface: surface)
-            corrections.flush()
+            enqueueCorrectionPersistenceLocked()
             engineLog("ev=correction_record source=reconvert\n")
         }
     }
 
-    // ---- テスト専用の観測窓(既存 typoRepairedIndices と同じ流儀: 無ロック・直接検査。
+    // ---- テスト専用の観測窓(既存 typoRepairedIndices と同じ流儀。
     // 間接観測は辞書データ依存・学習効果との混同で再現性が無いため) ----
 
     /// テスト専用: 記録可否マップを迂回して直接 record する(昇格側の単体検証用)。
@@ -1299,7 +2017,9 @@ public final class ConversionService: @unchecked Sendable {
     }
     /// テスト専用: CorrectionStore の中身を直接引く(記録の陰性/陽性検証用)。
     func correctionLookupForTesting(reading: String) -> String? {
-        corrections.lookup(reading: reading)
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        return corrections.lookup(reading: reading)
     }
     /// テスト専用: 昇格テーブルだけ消す(学習効果と昇格効果の分離観測用。学習には触れない)。
     func clearCorrectionsForTesting() {
@@ -1441,7 +2161,7 @@ public final class ConversionService: @unchecked Sendable {
         if learning.enabled && index != 0 && candidate.text != modelTop
             && remaining.isEmpty && candidate.isLearningTarget {
             corrections.record(reading: wholeReading, surface: candidate.text)
-            corrections.flush()   // 小さな JSON なので record 直後に無条件(spec §4 契機1)
+            enqueueCorrectionPersistenceLocked()
             engineLog("ev=correction_record source=candidate\n")
         }
         // 昇格が押し下げたモデル1位の明示選択は「昇格の拒否」= un-learn。記録除外だけに
@@ -1455,7 +2175,7 @@ public final class ConversionService: @unchecked Sendable {
         if learning.enabled && promotedWindow && index != 0 && candidate.text == modelTop
             && remaining.isEmpty && candidate.isLearningTarget {
             if corrections.remove(reading: wholeReading) {
-                corrections.flush()
+                enqueueCorrectionPersistenceLocked()
                 engineLog("ev=correction_unlearn source=candidate\n")
             }
         }
@@ -1541,8 +2261,11 @@ public final class ConversionService: @unchecked Sendable {
         let preceding = state.clauses[..<state.selected].map { $0.text }.joined()
         let ctx = (leftContext ?? "") + preceding
         let (options, requestedZenzai) = makeOptionsWithZenzaiUsage(leftSideContext: ctx.isEmpty ? nil : ctx)
+        let classicOptions = makeOptions(leftSideContext: ctx.isEmpty ? nil : ctx, forceClassic: true)
         let ct0 = DispatchTime.now()
-        let results = requestCandidatesLocked(c, options: options).mainResults
+        let results = requestCandidatesWithRuntimeFallbackLocked(
+            c, options: options, requestedZenzai: requestedZenzai,
+            classicOptions: classicOptions, leftContext: ctx.isEmpty ? nil : ctx).mainResults
         // 実稼働判定は requestCandidates 直後に確定（convert と同じ規律 — silent fallback 除外）。
         let usedZenzai = zenzaiInferenceUsedLocked(requestedZenzai: requestedZenzai,
                                                    input: c.convertTarget)
@@ -1759,7 +2482,7 @@ public final class ConversionService: @unchecked Sendable {
             recorded = true
             engineLog("ev=correction_unlearn source=clause_seed\n")
         }
-        if recorded { corrections.flush() }
+        if recorded { enqueueCorrectionPersistenceLocked() }
         rec.composing = ComposingText()
         rec.invalidateCandidateCache()   // clauseState もここで消える
         rec.liveState = nil
@@ -1800,17 +2523,22 @@ public final class ConversionService: @unchecked Sendable {
         // （例: nihongo→日本語 を全確定→次に go を打つと afterComplete 経路で日本語が左文脈に混ざる）。
         // 部分確定はセッションを保持し endSession を呼ばないので、残り読みの変換では completedData が
         // 正しく左文脈として効く（リセットされない）。
-        if sessions.isEmpty {
-            converterLock.lock()
-            defer { converterLock.unlock() }
-            flushLearningLocked()          // Spec2: 全確定・切断の終息点でディスクへ保存
-            corrections.flush()            // 訂正昇格の保険 flush(record 直後の無条件 flush が主)
-            // バグ#3 実測用: 全セッション空時の stopComposition も llama の reset_context を誘発する
-            // （bindConverter の session_switch と対）。計数のみ — 修正は別トラック。
-            // M-2: Zenzai 無効（zenz 不在で reset は no-op）では出さない。config 読みは converterLock 下。
-            if config.weightURL != nil { engineLog("ev=llama_reset reason=all_end\n") }
-            stopCompositionLocked()
-            activeConverterSession = nil
+        guard sessions.isEmpty else { return }
+        let endedSession = session
+        maintenance.submit(label: "end_session") { [weak self] in
+            guard let self else { return }
+            self.converterLock.lock()
+            defer { self.converterLock.unlock() }
+            // A newer session may have used the shared converter before this deferred job ran.
+            // Its bind already performed the required old-session reset; resetting again here
+            // would erase the new composition.
+            guard self.activeConverterSession == endedSession else { return }
+            // Legacy mutable-session callers have no apply-receipt persistence lane. Preserve
+            // their durability in the background; production snapshots use learningConverter.
+            if self.processRole != .mainClassicOnly { self.flushLearningLocked() }
+            if self.config.weightURL != nil { engineLog("ev=llama_reset reason=all_end\n") }
+            self.stopCompositionLocked()
+            self.activeConverterSession = nil
         }
     }
 
@@ -1822,11 +2550,18 @@ public final class ConversionService: @unchecked Sendable {
     /// 放棄された合成の completedData/previousInputData が後続の別セッションへ左文脈として漏れるのを防ぐ。
     /// 他接続のセッションは触らない（複数クライアント常駐でも当該接続分だけを掃除する）。
     public func cleanupConnection(_ connection: Int) {
-        guard let ids = connectionSessions[connection] else { return }
-        // ids は Set の値コピー（値意味論）。endSession が内部で connectionSessions[connection] を
-        // 変更しても、このループ対象は不変。
-        for id in ids { endSession(session: id) }
-        connectionSessions[connection] = nil   // 念のため（通常は最後の endSession が nil 済み）
+        if let ids = connectionSessions[connection] {
+            // ids は Set の値コピー（値意味論）。endSession が内部で connectionSessions[connection] を
+            // 変更しても、このループ対象は不変。
+            for id in ids { endSession(session: id) }
+            connectionSessions[connection] = nil   // 念のため（通常は最後の endSession が nil 済み）
+        }
+        converterLock.lock()
+        snapshotAutoCommitStates = snapshotAutoCommitStates.filter { $0.key.connection != connection }
+        appliedSnapshotAutoCommitReceipts = appliedSnapshotAutoCommitReceipts.filter {
+            $0.key.connection != connection
+        }
+        converterLock.unlock()
     }
 
     /// cold start ③: 背景スレッドで converterLock を握ってダミー変換し、llama モデルを先読みする。
@@ -1844,27 +2579,462 @@ public final class ConversionService: @unchecked Sendable {
     /// 競合する（data race）。完全な古典即応には upstream の public preload API（ロック外ロード）か
     /// 「busy 応答」プロトコルが必要（follow-up）。
     public func startWarmUp() {
-        guard zenzaiEnabled else {
-            zenzaiReady = true
+        if processRole == .mainClassicOnly {
+            guard zenzaiEnabled else { return }
+            gpuWorkerSupervisor?.startWarmUp()
             return
         }
+        startWarmUp(explicitRetry: false)
+    }
+
+    func flushMaintenanceForTesting() {
+        maintenance.flushForTesting()
+    }
+
+    func beginMaintenanceHoldForTesting() -> @Sendable () -> Void {
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        maintenance.submit(label: "test_hold") {
+            started.signal()
+            release.wait()
+        }
+        started.wait()
+        return { release.signal() }
+    }
+
+    var recentLearningCountForTesting: Int { recentLearning.count }
+
+    var snapshotReceiptLedgerCountsForTesting: (pending: Int, applied: Int) {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        return (snapshotAutoCommitStates.count, appliedSnapshotAutoCommitReceipts.count)
+    }
+
+    static func makeSnapshotComposing(_ segments: [SnapshotSegment]) -> ComposingText {
+        var composing = ComposingText()
+        for segment in segments {
+            composing.insertAtCursorPosition(
+                segment.text,
+                inputStyle: segment.style == "direct" ? .direct : .roman2kana)
+        }
+        return composing
+    }
+
+    func snapshot(_ segments: [SnapshotSegment], explicit: Bool, leftContext: String? = nil,
+                  enhancementKey: SnapshotEnhancementKey? = nil, snapshotConnection: Int = 0)
+        -> (text: String, reading: String, candidates: [String]?, candidateRemaining: [String]?, baseline: UInt64,
+            autoCommit: SnapshotAutoCommitProposal?)
+    {
+        let composing = Self.makeSnapshotComposing(segments)
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        stopCompositionLocked()
+        let options = makeOptions(nBest: explicit ? 10 : 1, leftSideContext: leftContext, forceClassic: true)
+        var classic = requestCandidatesLocked(composing, options: options)
+        let reading = composing.convertTarget
+        let ranked = recentLearning.rank(
+            mainResults: classic.mainResults, firstClauseResults: classic.firstClauseResults,
+            composing: composing)
+        classic.mainResults = ranked.main
+        classic.firstClauseResults = ranked.firstClause
+        let results = classic.mainResults
+        let baseline = Self.snapshotBaselineDigest(explicit: explicit, reading: reading, candidates: results)
+        let whole = results.filter {
+            $0.data.reduce(0) { $0 + $1.ruby.count } == reading.count
+        }.map(\.text)
+        let display = whole.first ?? reading
+        engineLog("ev=infer kind=\(explicit ? "explicit" : "live")_snapshot target_chars=\(reading.count)\n")
+        guard explicit else {
+            let liveCandidate = results.first(where: {
+                $0.data.reduce(0) { $0 + $1.ruby.count } == reading.count
+            }) ?? Candidate(
+                text: reading, value: 0,
+                composingCount: .inputCount(composing.input.count),
+                lastMid: MIDData.一般.mid,
+                data: [DicdataElement(
+                    ruby: Self.toKatakana(reading), cid: CIDData.一般名詞.cid,
+                    mid: MIDData.一般.mid, value: 0)])
+            let proposal = snapshotAutoCommitProposalLocked(
+                key: enhancementKey, connection: snapshotConnection,
+                composing: composing, candidate: liveCandidate,
+                firstClauseCandidates: classic.firstClauseResults, reading: reading)
+            if let enhancementKey {
+                enqueueSnapshotEnhancement(SnapshotEnhancementWork(
+                    key: enhancementKey, baseline: baseline, explicit: false, reading: reading,
+                    classic: classic, snapshot: GPUWorkerCompositionSnapshot(composing),
+                    leftContext: leftContext, inferenceLimit: config.inferenceLimit))
+            }
+            let proposalDisplay: String
+            if let proposal {
+                let remainder = display.hasPrefix(proposal.text)
+                    ? String(display.dropFirst(proposal.text.count)) : proposal.remaining
+                proposalDisplay = remainder.isEmpty ? proposal.remaining : remainder
+            } else {
+                proposalDisplay = display.isEmpty ? reading : display
+            }
+            return (proposalDisplay, reading, nil, nil, baseline, proposal)
+        }
+        let candidates = results.map(\.text)
+        let remaining = results.map { candidate in
+            let consumed = min(reading.count, candidate.data.reduce(0) { $0 + $1.ruby.count })
+            return String(reading.dropFirst(consumed))
+        }
+        if let enhancementKey {
+            enqueueSnapshotEnhancement(SnapshotEnhancementWork(
+                key: enhancementKey, baseline: baseline, explicit: true, reading: reading,
+                classic: classic, snapshot: GPUWorkerCompositionSnapshot(composing),
+                leftContext: leftContext, inferenceLimit: config.inferenceLimit))
+        }
+        return (display.isEmpty ? reading : display, reading, candidates, remaining, baseline, nil)
+    }
+
+    private func snapshotAutoCommitProposalLocked(
+        key: SnapshotEnhancementKey?, connection: Int, composing: ComposingText, candidate: Candidate,
+        firstClauseCandidates: [Candidate], reading: String
+    ) -> SnapshotAutoCommitProposal? {
+        guard let key, let threshold = autoCommit.threshold, !reading.isEmpty else { return nil }
+        let stream = SnapshotAutoCommitStream(connection: connection, composition: key.composition)
+        if snapshotAutoCommitStates[stream] == nil {
+            let replaced = snapshotAutoCommitStates.keys.filter {
+                $0.connection == connection && $0 != stream
+            }
+            for key in replaced {
+                snapshotAutoCommitStates[key] = nil
+                appliedSnapshotAutoCommitReceipts[key] = nil
+            }
+            if snapshotAutoCommitStates.count >= snapshotAutoCommitStateLimit,
+               let oldest = snapshotAutoCommitStates.keys.min(by: {
+                   ($0.connection, $0.composition) < ($1.connection, $1.composition)
+               }) {
+                snapshotAutoCommitStates[oldest] = nil
+                appliedSnapshotAutoCommitReceipts[oldest] = nil
+            }
+        }
+        var state = snapshotAutoCommitStates[stream] ?? SnapshotAutoCommitState()
+        if let last = state.lastRevision, key.revision < last { return nil }
+        if let pending = state.pending {
+            if pending.key == key { return pending.value }
+            if key.revision <= pending.key.revision { return nil }
+            state.pending = nil
+        }
+        if state.lastRevision == key.revision {
+            return nil
+        }
+        state.lastRevision = key.revision
+        state.live.update(candidate: candidate, firstClauseCandidates: firstClauseCandidates)
+        var prefix = state.live.candidateForCompleteFirstClause(threshold: threshold)
+        if prefix == nil, autoCommitMaxReading > 0, reading.count > autoCommitMaxReading {
+            prefix = firstClauseCandidates.first
+        }
+        guard let prefix else {
+            snapshotAutoCommitStates[stream] = state
+            return nil
+        }
+        var remainder = composing
+        remainder.prefixComplete(composingCount: prefix.composingCount)
+        let remaining = remainder.convertTarget
+        guard !remaining.isEmpty, remaining.count < reading.count else {
+            snapshotAutoCommitStates[stream] = state
+            return nil
+        }
+        let consumed = String(reading.dropLast(remaining.count))
+        nextSnapshotAutoCommitProposal &+= 1
+        let proposal = SnapshotAutoCommitProposal(
+            proposal: nextSnapshotAutoCommitProposal, text: prefix.text,
+            consumedReading: consumed, remaining: remaining)
+        state.pending = (key, proposal, prefix)
+        snapshotAutoCommitStates[stream] = state
+        return proposal
+    }
+
+    func applySnapshotAutoCommitReceipt(connection: Int, key: SnapshotEnhancementKey,
+                                        proposal: UInt64) -> Bool {
+        converterLock.lock()
+        let stream = SnapshotAutoCommitStream(connection: connection, composition: key.composition)
+        if let applied = appliedSnapshotAutoCommitReceipts[stream], applied.0 == key,
+           applied.1 == proposal {
+            converterLock.unlock()
+            return true
+        }
+        guard var state = snapshotAutoCommitStates[stream],
+              state.pending?.key == key,
+              state.pending?.value.proposal == proposal else {
+            converterLock.unlock()
+            return false
+        }
+        let candidate = state.pending!.candidate
+        state.live.didCompleteFirstClause()
+        state.pending = nil
+        snapshotAutoCommitStates[stream] = state
+        appliedSnapshotAutoCommitReceipts[stream] = (key, proposal)
+        if learning.enabled && candidate.isLearningTarget {
+            recentLearning.record(candidate)
+            enqueueLearningPersistence(candidate: candidate,
+                                       options: makeOptions(nBest: 1, forceClassic: true))
+        }
+        converterLock.unlock()
+        return true
+    }
+
+    private func enqueueLearningPersistence(candidate: Candidate, options: ConvertRequestOptions) {
+        learningStateLock.lock()
+        guard !clearingLearning else {
+            learningStateLock.unlock()
+            return
+        }
+        let generation = learningGeneration
+        learningStateLock.unlock()
+        maintenance.submit(label: "learning") { [weak self] in
+            guard let self else { return }
+            self.learningStateLock.lock()
+            let current = !self.clearingLearning && self.learningGeneration == generation
+            self.learningStateLock.unlock()
+            guard current else { return }
+            if let hook = self.learningPersistenceForTesting {
+                hook(candidate)
+                return
+            }
+            var composing = ComposingText()
+            let reading = candidate.data.map(\.ruby).joined()
+            guard !reading.isEmpty else { return }
+            composing.insertAtCursorPosition(reading, inputStyle: .direct)
+            // Snapshot conversion deliberately has no cross-request composition context. Reset
+            // the persistence converter too, or receipts from different apps could form a bigram.
+            self.learningConverter.stopComposition()
+            _ = self.learningConverter.requestCandidates(composing, options: options)
+            self.learningConverter.updateLearningData(candidate)
+            self.learningConverter.commitUpdateLearningData()
+        }
+    }
+
+    /// Capture immutable bytes while holding converterLock, then perform filesystem I/O on the
+    /// bounded maintenance lane. A later mutation advances the generation, so completion of an
+    /// older write cannot incorrectly clear the newer dirty state.
+    private func enqueueCorrectionPersistenceLocked() {
+        maintenance.submitLatest(label: "correction") { [weak self] in
+            guard let self else { return }
+            for _ in 0..<3 {
+                self.converterLock.lock()
+                let store = self.corrections
+                let snapshot = store.persistenceSnapshot()
+                self.converterLock.unlock()
+                guard let snapshot else { return }
+                guard CorrectionStore.persist(snapshot) else { continue }
+                self.converterLock.lock()
+                store.acknowledgePersistence(snapshot)
+                self.converterLock.unlock()
+                return
+            }
+            throw CorrectionPersistenceError.failed
+        }
+    }
+
+    private enum CorrectionPersistenceError: Error { case failed }
+    private enum DictionaryReloadError: Error { case failed }
+
+    func pollSnapshotEnhancement(key: SnapshotEnhancementKey, baseline: UInt64)
+        -> SnapshotEnhancementPoll
+    {
+        snapshotEnhancementLock.lock()
+        defer { snapshotEnhancementLock.unlock() }
+        guard latestSnapshotEnhancement?.0 == key,
+              latestSnapshotEnhancement?.1 == baseline else { return .unavailable }
+        guard let completed = completedSnapshotEnhancement,
+              completed.key == key, completed.baseline == baseline else { return .pending }
+        completedSnapshotEnhancement = nil
+        return completed.result
+    }
+
+    private func enqueueSnapshotEnhancement(_ work: SnapshotEnhancementWork) {
+        guard processRole == .mainClassicOnly, zenzaiEnabled,
+              gpuWorkerSupervisor != nil else { return }
+        snapshotEnhancementLock.lock()
+        latestSnapshotEnhancement = (work.key, work.baseline)
+        completedSnapshotEnhancement = nil
+        desiredSnapshotEnhancement = work
+        guard !snapshotEnhancementRunning else {
+            snapshotEnhancementLock.unlock()
+            return
+        }
+        snapshotEnhancementRunning = true
+        snapshotEnhancementLock.unlock()
+        Thread.detachNewThread { [weak self] in self?.runSnapshotEnhancements() }
+    }
+
+    private func runSnapshotEnhancements() {
+        while true {
+            snapshotEnhancementLock.lock()
+            guard let work = desiredSnapshotEnhancement else {
+                snapshotEnhancementRunning = false
+                snapshotEnhancementLock.unlock()
+                return
+            }
+            desiredSnapshotEnhancement = nil
+            snapshotEnhancementLock.unlock()
+
+            let result = evaluateSnapshotEnhancement(work)
+            snapshotEnhancementLock.lock()
+            if latestSnapshotEnhancement?.0 == work.key,
+               latestSnapshotEnhancement?.1 == work.baseline {
+                completedSnapshotEnhancement = CompletedSnapshotEnhancement(
+                    key: work.key, baseline: work.baseline, result: result)
+            }
+            snapshotEnhancementLock.unlock()
+        }
+    }
+
+    private func evaluateSnapshotEnhancement(_ work: SnapshotEnhancementWork)
+        -> SnapshotEnhancementPoll
+    {
+        guard let gpuWorkerSupervisor else { return .unavailable }
+        let decision = gpuWorkerSupervisor.rerank(
+            classic: work.classic, snapshot: work.snapshot, leftContext: work.leftContext,
+            nBest: work.explicit ? 10 : 1, inferenceLimit: work.inferenceLimit,
+            deadline: work.explicit ? GPUWorkerDeadlineTier.convert.workerBudget
+                                    : GPUWorkerDeadlineTier.live.workerBudget)
+        guard decision.usedWorker, decision.failure == nil,
+              Self.isSnapshotEnhancement(decision.conversion.mainResults,
+                                         of: work.classic.mainResults) else {
+            return .unavailable
+        }
+        let enhanced = decision.conversion.mainResults
+        let whole = enhanced.filter { Self.consumedReading(of: $0) == work.reading.count }
+        let display = whole.first?.text ?? work.reading
+        guard work.explicit else {
+            return .ready(text: display.isEmpty ? work.reading : display,
+                          candidates: nil, candidateRemaining: nil)
+        }
+        return .ready(
+            text: display.isEmpty ? work.reading : display,
+            candidates: enhanced.map(\.text),
+            candidateRemaining: enhanced.map {
+                String(work.reading.dropFirst(min(work.reading.count, Self.consumedReading(of: $0))))
+            })
+    }
+
+    static func isSnapshotEnhancement(_ enhanced: [Candidate], of classic: [Candidate]) -> Bool {
+        guard !enhanced.isEmpty, enhanced.count == classic.count else { return false }
+        var remaining: [SnapshotCandidateIdentity: Int] = [:]
+        for candidate in classic {
+            let identity = SnapshotCandidateIdentity(
+                text: candidate.text, consumedReading: consumedReading(of: candidate))
+            remaining[identity, default: 0] += 1
+        }
+        for candidate in enhanced {
+            let identity = SnapshotCandidateIdentity(
+                text: candidate.text, consumedReading: consumedReading(of: candidate))
+            guard let count = remaining[identity], count > 0 else { return false }
+            remaining[identity] = count - 1
+        }
+        return true
+    }
+
+    private static func consumedReading(of candidate: Candidate) -> Int {
+        candidate.data.reduce(0) { $0 + $1.ruby.count }
+    }
+
+    static func snapshotBaselineDigest(explicit: Bool, reading: String,
+                                       candidates: [Candidate]) -> UInt64 {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        func append(_ bytes: some Sequence<UInt8>) {
+            for byte in bytes { hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211 }
+        }
+        append([explicit ? 1 : 0])
+        for field in [reading] + candidates.flatMap({ [$0.text, String(consumedReading(of: $0))] }) {
+            var length = UInt64(field.utf8.count).littleEndian
+            withUnsafeBytes(of: &length) { append($0) }
+            append(field.utf8)
+        }
+        return hash
+    }
+
+    /// Explicit retry is the only non-model-change operation that clears a runtime latch.
+    public func retryZenzai() {
+        if processRole == .mainClassicOnly {
+            guard zenzaiEnabled else { return }
+            gpuWorkerSupervisor?.explicitRetry()
+            gpuWorkerSupervisor?.startWarmUp()
+            return
+        }
+        startWarmUp(explicitRetry: true)
+    }
+
+    private func startWarmUp(explicitRetry: Bool) {
+        converterLock.lock()
+        guard !warmUpInFlight else {
+            converterLock.unlock()
+            return
+        }
+        if explicitRetry {
+            zenzaiTooSlow = false
+            setRuntimeStatusLocked(.unconfigured)
+            if config.weightURL != nil {
+                setRuntimeStateLocked(.classic(reason: .notStarted))
+                zenzaiReady = false
+            }
+        }
+        guard zenzaiEnabled else {
+            setClassicLocked(Self.classicReason(for: config))
+            converterLock.unlock()
+            return
+        }
+        if !explicitRetry,
+           case .classic(let reason) = _zenzaiRuntimeState,
+           reason != .notStarted {
+            converterLock.unlock()
+            return
+        }
+        warmUpInFlight = true
+        markWarmUpStarted()
+        guard beginRuntimeProbeLocked(explicitRetry: explicitRetry) else {
+            warmUpInFlight = false
+            markWarmUpFinished()
+            converterLock.unlock()
+            return
+        }
+        converterLock.unlock()
         Thread.detachNewThread { [weak self] in self?.warmUp() }
     }
 
     private func warmUp() {
         let t0 = DispatchTime.now()
-        do {
-            converterLock.lock()
-            defer { converterLock.unlock() }
-            var dummy = ComposingText()
-            dummy.insertAtCursorPosition("tesuto", inputStyle: .roman2kana)
-            // ゲート（zenzaiReady）はまだ閉なので、forceZenzai で Zenzai ON の options を組んで
-            // モデルロードを誘発する（これが warm-up の眼目 — ゲート越しだと古典に落ちてしまう）。
-            _ = self.requestCandidatesLocked(dummy, options: self.makeOptions(forceZenzai: true))
-            // ロックを放す前にゲートを開ける: このロックを待っていた変換要求は、起きた時点で必ず
-            // Zenzai になる（converterLock 保持中の zenzaiReadyLock 取得は makeOptions と同順＝反転しない）。
-            zenzaiReady = true
+        converterLock.lock()
+        if takeWarmUpCancellationRequest() {
+            warmUpInFlight = false
+            markWarmUpFinished()
+            converterLock.unlock()
+            return
         }
+        defer {
+            warmUpInFlight = false
+            markWarmUpFinished()
+            converterLock.unlock()
+        }
+        var dummy = ComposingText()
+        dummy.insertAtCursorPosition("tesuto", inputStyle: .roman2kana)
+        let options = makeOptions(forceZenzai: true)
+        let classicOptions = makeOptions(forceClassic: true)
+        _ = requestCandidatesWithRuntimeFallbackLocked(
+            dummy, options: options, requestedZenzai: true,
+            classicOptions: classicOptions)
+        let status = zenzaiRuntime.status()
+        setRuntimeStatusLocked(status)
+        guard status.state == .gpuActive, status.failure == .none,
+              status.decodeAttempts > warmupDecodeAttemptsBaseline,
+              case .warming = _zenzaiRuntimeState else {
+            if case .classic = _zenzaiRuntimeState {
+                zenzaiReady = true
+            } else {
+                setClassicLocked(status.classicReason ?? .warmupFailed)
+            }
+            let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
+            engineLog("ev=coldstart stage=warmup_failed ms=\(String(format: "%.1f", ms))\n")
+            return
+        }
+        let device = status.device.isEmpty ? "unknown" : status.device
+        setRuntimeStateLocked(.gpuActive(device: device))
+        zenzaiReady = true
+        engineLog("ev=zenzai_gpu_active device=\(device) decode_attempts=\(status.decodeAttempts)\n")
         // M-1: stage=warmup は実所要（モデルロード込み）をスレッド内で測って完了時に出す
         // （呼び出し側で startWarmUp を測ると detach の即 return で常に ~0ms になる）。
         let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
@@ -1927,12 +3097,8 @@ public final class ConversionService: @unchecked Sendable {
         }
     }
 
-    static func shouldResetForSessionSwitch(isZenzaiOperational: Bool, targetSession: Int,
-                                            completedDataSession: Int?, learningDataSession: Int?) -> Bool {
-        !isZenzaiOperational || requiresClassicReset(
-            activeSession: targetSession,
-            completedDataSession: completedDataSession,
-            learningDataSession: learningDataSession)
+    static func shouldResetForSessionSwitch(isZenzaiOperational: Bool) -> Bool {
+        !isZenzaiOperational
     }
 
     /// reload 時に初回スキップを復活させるべきか（Zenzai 新規有効化）を判定する純関数。
@@ -1969,6 +3135,12 @@ public final class ConversionService: @unchecked Sendable {
         learningDataSession = learning
     }
 
+    func setClassicResetPendingForTesting() {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        needsClassicReset = true
+    }
+
     /// テスト専用: converterLock を取った上で checkZenzaiTooSlowLocked を呼ぶ（本番の convert/liveConvert
     /// が converterLock 内で呼ぶのと同じ規律を再現）。private(set) の zenzaiTooSlow をテストから操作するための口。
     /// usedZenzai に既定値を付けないのは意図的 — 呼び出しごとに「Zenzai 推論の計測」か
@@ -1984,7 +3156,14 @@ public final class ConversionService: @unchecked Sendable {
     /// zenzaiReady が true にならないため、結合テストで makeOptions の zenzaiTooSlow 分岐を
     /// 分離検証するには直接ゲートを開ける必要がある。
     func setZenzaiReadyForTesting(_ value: Bool) {
+        converterLock.lock()
         zenzaiReady = value
+        if value, config.weightURL != nil {
+            setRuntimeStateLocked(.gpuActive(device: "test-device"))
+        } else if !value, config.weightURL != nil {
+            setRuntimeStateLocked(.classic(reason: .notStarted))
+        }
+        converterLock.unlock()
     }
 
     /// テスト専用: makeOptionsWithZenzaiUsage の実際の決定を呼び、**同一の結果から**
@@ -2014,16 +3193,32 @@ public final class ConversionService: @unchecked Sendable {
 
     /// テスト専用（巡2 D9）: 現在解決済みの weightURL。reload のモデル差し替え
     /// （非 nil→別の非 nil）を zenzaiEnabled の真偽だけでは観測できないための読み出し口。
-    var zenzaiWeightURLForTesting: URL? { config.weightURL }
+    var zenzaiWeightURLForTesting: URL? {
+        configurationLock.lock()
+        defer { configurationLock.unlock() }
+        return config.weightURL
+    }
+
+    /// Structural observation of the vendor Zenzai call seam. Unlike a log
+    /// declaration, this value is incremented only when the effective options
+    /// passed to `requestCandidates` are actually `.on`.
+    var zenzaiVendorInvocationCountForTesting: UInt64 {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        return zenzaiInvocationCounter.value
+    }
 
     /// graceful 停止（Shutdown IPC → 応答後 exit）の前段: 保留中の学習をディスクへフラッシュする。
     /// flushLearningLocked は private かつ「converterLock 保持中に呼ぶこと」契約なので、ここで
     /// converterLock を取ってから呼ぶ公開ラッパ。呼び出し元 handler は serviceLock を保持しており、
     /// converterLock をその内側で取るのは既存の順序（clearLearning と同型）に従う。
     public func prepareForShutdown() {
+        maintenance.barrier()
         converterLock.lock()
         defer { converterLock.unlock() }
-        flushLearningLocked()
+        // Snapshot receipts are persisted by the isolated learning converter. Flushing the
+        // classic converter as well would replay the same candidate into long-term memory.
+        if processRole != .mainClassicOnly { flushLearningLocked() }
         corrections.flush()
     }
 
@@ -2164,13 +3359,51 @@ public final class ConversionService: @unchecked Sendable {
         }
     }
 
+    enum LearningClearOutcome {
+        case cleared
+        case failed
+        case inProgress
+    }
+
+    func clearLearningForIPC() -> LearningClearOutcome {
+        learningStateLock.lock()
+        guard !clearingLearning else {
+            learningStateLock.unlock()
+            return .inProgress
+        }
+        clearingLearning = true
+        learningGeneration &+= 1
+        learningStateLock.unlock()
+        learningClearStartedForTesting?()
+        defer {
+            learningStateLock.lock()
+            clearingLearning = false
+            learningStateLock.unlock()
+        }
+        return clearLearningAccepted() ? .cleared : .failed
+    }
+
     public func clearLearning() -> Bool {
+        if case .cleared = clearLearningForIPC() { return true }
+        return false
+    }
+
+    private func clearLearningAccepted() -> Bool {
+        // Establish a generation boundary and drain already-accepted work before deletion. New
+        // receipts observe clearingLearning and cannot enqueue into either learning state.
+        maintenance.barrier()
         converterLock.lock()
         defer { converterLock.unlock() }
 
         // RAM の訂正テーブルは disk preflight が失敗しても消す（既存の false/error 契約）。
         // corrections.json 自体は下の allowlist preflight 後に seam 経由で削除する。
         corrections.clearMemory()
+        recentLearning.clear()
+        snapshotAutoCommitStates.removeAll()
+        appliedSnapshotAutoCommitReceipts.removeAll()
+        // Dropping the dedicated converter is the only observable way to discard vendor
+        // temporary learning after a failed commit; its API does not report commit success.
+        learningConverter = KanaKanjiConverter.withDefaultDictionary()
 
         let dir = learningDirectory
         guard let dir else {
@@ -2330,17 +3563,19 @@ public final class ConversionService: @unchecked Sendable {
     /// requestCandidates 直後に zenzaiInferenceUsedLocked（要求 × 入力非空 × 実ロード成功）で行う。
     private func makeOptionsWithZenzaiUsage(nBest: Int = 10, leftSideContext: String? = nil, forceZenzai: Bool = false, forceClassic: Bool = false, noLearning: Bool = false)
         -> (options: ConvertRequestOptions, requestedZenzai: Bool) {
+        let classicOnly = forceClassic || processRole == .mainClassicOnly
         // cold start ③: ゲートが開く（zenzaiReady）まで Zenzai を options に載せない＝古典（辞書）変換で即応。
         // forceZenzai は warmUp 専用（ゲートを開ける前のモデル先読みロードに Zenzai ON が要る）。
         // zenzaiTooSlow: 推論が恒常的に重い環境では古典固定（drop_engine 自己増幅ループ＝Space ハング防止）。
         //   forceZenzai（warmUp）は zenzaiTooSlow で止めない — warmUp は起動時1回のモデル先読みで、
         //   ユーザーが Zenzai を意図した以上はロードを尊重し、ロード完了後の convert で重さを判定する。
         let zenzai: ConvertRequestOptions.ZenzaiMode
-        if forceClassic {
+        if classicOnly {
             zenzai = .off
-        } else if forceZenzai {
+        } else if forceZenzai, case .warming = _zenzaiRuntimeState {
             zenzai = ConversionService.makeZenzaiMode(config: config, leftSideContext: leftSideContext)
-        } else if zenzaiReady && !zenzaiTooSlow {
+        } else if zenzaiReady && !zenzaiTooSlow,
+                  case .gpuActive = _zenzaiRuntimeState {
             zenzai = ConversionService.makeZenzaiMode(config: config, leftSideContext: leftSideContext)
         } else {
             zenzai = .off

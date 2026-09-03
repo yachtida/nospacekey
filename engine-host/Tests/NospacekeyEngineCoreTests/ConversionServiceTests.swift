@@ -1,6 +1,23 @@
 import XCTest
 @testable import NospacekeyEngineCore
 
+private final class ConfigurationReadFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var marked = false
+
+    func set() {
+        lock.lock()
+        marked = true
+        lock.unlock()
+    }
+
+    var value: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return marked
+    }
+}
+
 final class ConversionServiceTests: XCTestCase {
     func testInsertReturnsHiraganaReading() {
         let svc = ConversionService()
@@ -89,6 +106,53 @@ final class ConversionServiceTests: XCTestCase {
         XCTAssertTrue(svc.zenzaiEnabled, "reload で weight が解決でき有効化されるはず")
         svc.reload(overrides: ["NOSPACEKEY_ZENZAI": "off"], cpuMeetsLlamaBaseline: true)
         XCTAssertFalse(svc.zenzaiEnabled, "off で無効化されるはず")
+    }
+
+    func testConfigurationAndStatusReadsAreSafeDuringReload() throws {
+        let model = FileManager.default.temporaryDirectory
+            .appendingPathComponent("config-race-\(UUID().uuidString).gguf")
+        try Data("model".utf8).write(to: model)
+        defer { try? FileManager.default.removeItem(at: model) }
+        let service = ConversionService(
+            config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1))
+        let invalid = ConfigurationReadFlag()
+        let group = DispatchGroup()
+
+        group.enter()
+        Thread.detachNewThread {
+            for _ in 0..<100 {
+                _ = service.reload(
+                    overrides: [
+                        "NOSPACEKEY_ZENZAI": "on",
+                        "NOSPACEKEY_ZENZAI_WEIGHT": model.path,
+                        "NOSPACEKEY_ZENZAI_INFERENCE_LIMIT": "3"
+                    ], cpuMeetsLlamaBaseline: true)
+                _ = service.reload(
+                    overrides: [
+                        "NOSPACEKEY_ZENZAI": "off",
+                        "NOSPACEKEY_ZENZAI_INFERENCE_LIMIT": "2"
+                    ], cpuMeetsLlamaBaseline: true)
+            }
+            group.leave()
+        }
+
+        DispatchQueue.concurrentPerform(iterations: 4) { _ in
+            for _ in 0..<1_000 {
+                let enabled = service.zenzaiEnabled
+                let limit = service.zenzaiInferenceLimit
+                let weight = service.zenzaiWeightURLForTesting
+                _ = service.zenzaiRuntimeState
+                _ = service.zenzaiRuntimeSnapshot
+                guard limit == 1 || limit == 2 || limit == 3,
+                      weight == nil || weight == model else {
+                    invalid.set()
+                    break
+                }
+                _ = enabled
+            }
+        }
+        group.wait()
+        XCTAssertFalse(invalid.value, "configuration reads must remain valid while reload publishes")
     }
 
     /// 巡2 D9: G1-B（非 nil→別の非 nil のモデル差し替え）の reload 実経路を検証する。

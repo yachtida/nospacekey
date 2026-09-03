@@ -1,13 +1,28 @@
 use serde::{Deserialize, Serialize};
 
-/// IPC プロトコルの互換世代。TIP は StartSession 応答の `proto` と本定数を突合し、
-/// 不一致（None=handshake 以前の旧エンジンを含む）を検出したら graceful に世代交代する。
-/// **wire 互換でも、その版が依存する op を追加したら bump する** — handshake は更新後に
-/// 居残る旧 persist エンジンを回収する唯一の手段で、「互換が壊れた時だけ bump」だと
+/// IPC プロトコルの互換世代。TIP は StartSession 応答の `proto` とbuild identityを突合し、
+/// 不一致（欠落を含む）を検出した接続へ後続要求を送らない。
+/// **wire 互換でも、その版が依存する op を追加したら bump する** — 「互換が壊れた時だけ bump」だと
 /// 新 op が再起動まで無言で decline / no-op になる（v1.2.0 の辞書即時反映・文節ナビ・
-/// 訂正昇格で顕在化）。optional フィールドの追加（skip_serializing_if で旧形とバイト一致）
-/// では bump しない。Swift 側 `ProtocolVersion.current` とミラー（一字一句一致規約）。
-pub const PROTO_VERSION: u32 = 3;
+/// 訂正昇格で顕在化）。読み手が依存しない optional フィールドの追加
+/// （skip_serializing_if で旧形とバイト一致）では bump しない。Swift 側
+/// `ProtocolVersion.current` とミラー（一字一句一致規約）。
+pub const PROTO_VERSION: u32 = 8;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotSegment {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AutoCommitProposal {
+    pub proposal: u64,
+    pub text: String,
+    pub consumed_reading: String,
+    pub remaining: String,
+}
 
 /// `#[serde(skip_serializing_if)]` 用: false のときフィールド自体を省略する
 /// （旧エンジン/旧TIP と wire 形をバイト一致させるため）。
@@ -73,7 +88,7 @@ pub enum Request {
     /// ライブ変換要求。現在の読みを N_best=1 で変換し先頭1候補を返す。seq は TIP 採番（A2 の古い応答破棄用）。
     /// `auto_commit`: iOS nospacekey の「自動確定」（先頭文節が一定回数安定したら prefix を確定して
     /// 残り読みで合成を継続する — LiveConversionManager.candidateForCompleteFirstClause 相当）を
-    /// エンジン側で実行してよいか。TIP はデバウンス経路（on_debounce_convert）でのみ true を送る。
+    /// エンジン側で実行してよいか。TIP の非同期デバウンス経路は revision 適用契約を持つまで false。
     /// Enter のライブ確定経路は直後に Commit{index:0} を送るため false（エンジンが勝手に読みを
     /// 消費すると確定文字列から prefix が欠ける）。false のとき wire 形は従来と同一（旧エンジン互換）。
     LiveConvert {
@@ -83,6 +98,31 @@ pub enum Request {
         left_context: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         auto_commit: bool,
+    },
+    LiveSnapshot {
+        composition: u64,
+        revision: u64,
+        configuration_generation: u64,
+        connection_generation: u64,
+        segments: Vec<SnapshotSegment>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        explicit: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        left_context: Option<String>,
+    },
+    PollSnapshotEnhancement {
+        composition: u64,
+        revision: u64,
+        configuration_generation: u64,
+        connection_generation: u64,
+        baseline: u64,
+    },
+    AutoCommitReceipt {
+        composition: u64,
+        revision: u64,
+        configuration_generation: u64,
+        connection_generation: u64,
+        proposal: u64,
     },
     /// 外部LLM変換要求。現在の読み(convertTarget)をLLMへ。seq は TIP 採番（世代ガード）。
     /// left_context は第三者 API へ出る（spec §4 で文書化済みトレードオフ）。
@@ -139,10 +179,13 @@ pub enum Request {
         enabled: bool,
     },
     /// persist エンジンの graceful 停止（学習 flush → 応答後 exit）。session を伴わない
-    /// プロセス全体操作。アンインストーラ/更新（NospacekeyConfig.exe --stop-engine）と
-    /// version handshake（proto 不一致時の世代交代）から送る。TIP はエンジンを kill しない
-    /// 不変条件を保ったまま、エンジン自身に flush して終了させるための唯一の停止手段。
+    /// プロセス全体操作。アンインストーラのNospacekeyConfig.exe --stop-engineから送る。
     Shutdown,
+    /// Zenzai の GPU runtime 状態を問い合わせる。モデル導入状況とは別の観測で、引数を持たない。
+    QueryZenzaiStatus,
+    /// 失敗 latch を明示的に解除して GPU runtime の再試行を受け付ける。応答は受理のみで、
+    /// warm-up 自体は engine の背景スレッドで進める。
+    RetryZenzai,
     /// 再変換で選び直された訂正の通知(記録のみ・確定は既に TIP 側で完了している)。
     /// 確定契約(再変換は Commit IPC を迂回して直接挿入)を変えずに訂正シグナルだけを運ぶ。
     /// Swift 側 Protocol.swift / EngineHost.swift と対(一字一句一致規約)。応答は既存 Ok。
@@ -182,13 +225,13 @@ pub enum Request {
 #[serde(tag = "result")]
 pub enum Response {
     Pong,
-    /// StartSession 応答。`proto` は version handshake 用の互換世代（PROTO_VERSION）。
-    /// None なら wire 形は handshake 導入前とバイト一致（旧TIP互換）＝旧エンジンは None を返す。
-    /// 新エンジンは常に Some(PROTO_VERSION) を載せ、TIP は不一致を検出して世代交代する。
+    /// StartSession 応答。wire世代とEngineHost buildの完全一致だけをTIPが採用する。
     Session {
         session: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proto: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot: Option<String>,
     },
     Reading {
         reading: String,
@@ -218,6 +261,34 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         committed: Option<String>,
     },
+    SnapshotResult {
+        composition: u64,
+        revision: u64,
+        configuration_generation: u64,
+        connection_generation: u64,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidates: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidate_remaining: Option<Vec<String>>,
+        baseline: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_commit: Option<AutoCommitProposal>,
+    },
+    SnapshotEnhancement {
+        composition: u64,
+        revision: u64,
+        configuration_generation: u64,
+        connection_generation: u64,
+        baseline: u64,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidates: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidate_remaining: Option<Vec<String>>,
+    },
+    SnapshotEnhancementPending,
+    SnapshotEnhancementUnavailable,
     /// 外部LLM変換結果。seq は要求エコー、text は補正済み文（preedit 全置換）。
     LlmResult {
         seq: u64,
@@ -242,11 +313,151 @@ pub enum Response {
         candidates: Vec<String>,
         candidate_index: u32,
     },
+    /// Zenzai の sanitized runtime 状態。path/input/candidates/generation/counters は載せない。
+    ZenzaiStatus {
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_snapshot_identity_and_styled_input_roundtrip() {
+        let request = Request::LiveSnapshot {
+            composition: 8,
+            revision: 13,
+            configuration_generation: 2,
+            connection_generation: 5,
+            segments: vec![
+                SnapshotSegment {
+                    text: "nihon".into(),
+                    style: None,
+                },
+                SnapshotSegment {
+                    text: "GPU".into(),
+                    style: Some("direct".into()),
+                },
+            ],
+            explicit: false,
+            left_context: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+
+        let response = Response::SnapshotResult {
+            composition: 8,
+            revision: 13,
+            configuration_generation: 2,
+            connection_generation: 5,
+            text: "日本GPU".into(),
+            candidates: None,
+            candidate_remaining: None,
+            baseline: 41,
+            auto_commit: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), response);
+    }
+
+    #[test]
+    fn explicit_snapshot_candidates_roundtrip_and_require_protocol_eight() {
+        let request = Request::LiveSnapshot {
+            composition: 8,
+            revision: 13,
+            configuration_generation: 2,
+            connection_generation: 5,
+            segments: vec![SnapshotSegment {
+                text: "nihongo".into(),
+                style: None,
+            }],
+            explicit: true,
+            left_context: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""explicit":true"#));
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+
+        let response = Response::SnapshotResult {
+            composition: 8,
+            revision: 13,
+            configuration_generation: 2,
+            connection_generation: 5,
+            text: "日本語".into(),
+            candidates: Some(vec!["日本語".into(), "二本語".into()]),
+            candidate_remaining: Some(vec![String::new(), String::new()]),
+            baseline: 42,
+            auto_commit: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), response);
+        assert_eq!(PROTO_VERSION, 8);
+    }
+
+    #[test]
+    fn snapshot_auto_commit_proposal_and_receipt_roundtrip() {
+        let proposal = AutoCommitProposal {
+            proposal: 17,
+            text: "日本".into(),
+            consumed_reading: "にほん".into(),
+            remaining: "ご".into(),
+        };
+        let response = Response::SnapshotResult {
+            composition: 8,
+            revision: 13,
+            configuration_generation: 2,
+            connection_generation: 5,
+            text: "日本語".into(),
+            candidates: None,
+            candidate_remaining: None,
+            baseline: 41,
+            auto_commit: Some(proposal.clone()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), response);
+
+        let receipt = Request::AutoCommitReceipt {
+            composition: 8,
+            revision: 13,
+            configuration_generation: 2,
+            connection_generation: 5,
+            proposal: proposal.proposal,
+        };
+        let json = serde_json::to_string(&receipt).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), receipt);
+    }
+
+    #[test]
+    fn snapshot_enhancement_poll_binds_identity_and_classic_baseline() {
+        let request = Request::PollSnapshotEnhancement {
+            composition: 8,
+            revision: 13,
+            configuration_generation: 2,
+            connection_generation: 5,
+            baseline: 42,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+        let response = Response::SnapshotEnhancement {
+            composition: 8,
+            revision: 13,
+            configuration_generation: 2,
+            connection_generation: 5,
+            baseline: 42,
+            text: "日本語".into(),
+            candidates: None,
+            candidate_remaining: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), response);
+    }
 
     #[test]
     fn live_convert_request_roundtrips() {
@@ -622,6 +833,39 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
     }
 
+    #[test]
+    fn zenzai_status_requests_roundtrip_without_params() {
+        for request in [Request::QueryZenzaiStatus, Request::RetryZenzai] {
+            let js = serde_json::to_string(&request).unwrap();
+            assert!(
+                js == r#"{"method":"QueryZenzaiStatus"}"# || js == r#"{"method":"RetryZenzai"}"#
+            );
+            assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn zenzai_status_response_omits_unavailable_details() {
+        let response = Response::ZenzaiStatus {
+            state: "classic".into(),
+            backend: None,
+            device: None,
+            reason: Some("backend_unavailable".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"result":"ZenzaiStatus","state":"classic","reason":"backend_unavailable"}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(
+            r#"{"result":"ZenzaiStatus","state":"gpu_active","backend":"Vulkan","device":"Radeon 890M"}"#
+        ).unwrap(), Response::ZenzaiStatus {
+            state: "gpu_active".into(),
+            backend: Some("Vulkan".into()),
+            device: Some("Radeon 890M".into()),
+            reason: None,
+        });
+    }
+
     // ---- version handshake: Session.proto ----
 
     #[test]
@@ -632,7 +876,8 @@ mod tests {
             r,
             Response::Session {
                 session: 7,
-                proto: None
+                proto: None,
+                boot: None
             }
         );
     }
@@ -643,15 +888,20 @@ mod tests {
         let r = Response::Session {
             session: 7,
             proto: Some(PROTO_VERSION),
+            boot: Some(env!("CARGO_PKG_VERSION").into()),
         };
         assert_eq!(
             serde_json::to_string(&r).unwrap(),
-            r#"{"result":"Session","session":7,"proto":3}"#
+            format!(
+                r#"{{"result":"Session","session":7,"proto":8,"boot":"{}"}}"#,
+                env!("CARGO_PKG_VERSION")
+            )
         );
         assert_eq!(
-            serde_json::from_str::<Response>(
-                &r#"{"result":"Session","session":7,"proto":3}"#.to_string()
-            )
+            serde_json::from_str::<Response>(&format!(
+                r#"{{"result":"Session","session":7,"proto":8,"boot":"{}"}}"#,
+                env!("CARGO_PKG_VERSION")
+            ))
             .unwrap(),
             r
         );
@@ -661,7 +911,7 @@ mod tests {
     fn old_tip_shape_decodes_new_engine_session() {
         // 旧TIP ↔ 新エンジン象限（更新後〜再起動前に本番で必ず走る）: 旧 TIP の Response 形を
         // テスト内ミラー enum（Session { session } のみ・proto フィールド無し）で再現し、新エンジンの
-        // 応答 {"result":"Session","session":7,"proto":3} が余剰フィールドを無視して decode できることを固定。
+        // 応答 {"result":"Session","session":7,"proto":5} が余剰フィールドを無視して decode できることを固定。
         // committed 先例は auto_commit:true 要求時のみ載るため実績にならない（設計ロック(d)）。
         #[derive(serde::Deserialize, Debug, PartialEq)]
         #[serde(tag = "result")]
@@ -669,7 +919,7 @@ mod tests {
             Session { session: i64 },
         }
         let r: OldTipResponse =
-            serde_json::from_str(r#"{"result":"Session","session":7,"proto":3}"#).unwrap();
+            serde_json::from_str(r#"{"result":"Session","session":7,"proto":5}"#).unwrap();
         assert_eq!(r, OldTipResponse::Session { session: 7 });
     }
 
@@ -866,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn prediction_bumps_protocol_generation() {
-        assert_eq!(PROTO_VERSION, 3);
+    fn explicit_snapshot_candidates_bump_protocol_generation() {
+        assert_eq!(PROTO_VERSION, 8);
     }
 }

@@ -114,7 +114,8 @@ final class ConversionServiceLearningTests: XCTestCase {
         let learned = cands[target]
         let committed = try XCTUnwrap(svc.commit(session: sid, index: target))
         XCTAssertEqual(committed.text, learned)
-        svc.endSession(session: sid) // sessions 空 → フラッシュ
+        svc.endSession(session: sid) // sessions 空 → backgroundフラッシュ
+        svc.flushMaintenanceForTesting()
         let files = try FileManager.default.contentsOfDirectory(atPath: dir.path)
         XCTAssertTrue(files.contains("memory.louds"), "endSession フラッシュで学習ファイル生成: \(files)")
         // 学習反映: 同読みを再変換すると確定した候補が先頭に来る（temporal memory の強い直近ブースト）。
@@ -134,7 +135,8 @@ final class ConversionServiceLearningTests: XCTestCase {
         _ = svc.insert(session: sid, text: "kisha")
         _ = svc.convert(session: sid)
         _ = svc.commit(session: sid, index: 1)
-        svc.endSession(session: sid) // フラッシュしてファイルを作る
+        svc.endSession(session: sid) // backgroundフラッシュしてファイルを作る
+        svc.flushMaintenanceForTesting()
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).contains("memory.louds"))
         XCTAssertTrue(svc.clearLearning(), "temp dir の学習ファイルは消し切れるはず")
         let after = try FileManager.default.contentsOfDirectory(atPath: dir.path)
@@ -421,7 +423,11 @@ final class ConversionServiceLearningTests: XCTestCase {
     func testReloadBeforeFirstRequestNeverResetsWorkDir() throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let tracker = LearningFileSystemTracker(root: dir, names: ["memory.louds"])
+        // NOSPACEKEY_MEMORY_DIR は base dir: reload 後の clear root は base + BuildInfo.version
+        // （ビルド毎の学習状態分離）。tracker の root も同じ versioned dir を指すため、
+        // 直書きでなく BuildInfo.version から組み立てる（bump で壊れない）。
+        let tracker = LearningFileSystemTracker(
+            root: dir.appendingPathComponent(BuildInfo.version), names: ["memory.louds"])
         let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
                                     learning: LearningSettings(enabled: true, memoryDir: dir),
                                     fileSystem: tracker.fileSystem)

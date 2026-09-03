@@ -23,6 +23,25 @@ struct PredictionRuntimeConfig: Equatable {
     static let modelSHA256 = "191f2fdf41a6f64f00ec6b4fcc39ec6164bb13b41d3609ac8f5b2b6149a23a6d"
     static let modelRevision = "b112feef602fff752e4dac4c30af6a2c2fa41c7a"
     static let llamaRevision = "c060ca974c773c7c3d17fd1b66dc9d312bc292c0"
+    static let runtimeRequiredFilenames = [
+        "llama-server.exe", "llama-server-impl.dll", "llama-common.dll",
+        "llama.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll",
+        "ggml-vulkan.dll", "mtmd.dll", "REVISION", "BUILD-RECEIPT.txt",
+    ]
+    static let runtimeOptionalFilenames = [
+        "vcomp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll",
+    ]
+    static let buildReceiptFilename = "BUILD-RECEIPT.txt"
+    static let buildReceipt = "schema=nospacekey-inline-prediction-vulkan-v1\n"
+        + "llama_revision=c060ca974c773c7c3d17fd1b66dc9d312bc292c0\n"
+        + "build_shared_libs=ON\n"
+        + "ggml_backend_dl=ON\n"
+        + "ggml_vulkan=ON\n"
+        + "ggml_native=OFF\n"
+        + "ggml_avx2=ON\n"
+        + "backend=Vulkan\n"
+        + "device=Vulkan0\n"
+        + "gpu_layers=all\n"
     static let verifiedReceipt = "schema=1\n"
         + "model_sha256=191f2fdf41a6f64f00ec6b4fcc39ec6164bb13b41d3609ac8f5b2b6149a23a6d\n"
         + "tokenizer_sha256=955dc1fa623fab38cc92a3f4ee172423ae6d73201c4207569bfdf5626bc733f0\n"
@@ -39,18 +58,26 @@ struct PredictionRuntimeConfig: Equatable {
         let modelFolder = environment["NOSPACEKEY_PREDICTION_MODEL_DIR"].map(URL.init(fileURLWithPath:))
             ?? local.appending(path: "Nospacekey/models/inline-prediction")
         let exe = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
-        let runtimeFolder = environment["NOSPACEKEY_PREDICTION_RUNTIME_DIR"].map(URL.init(fileURLWithPath:))
-            ?? exe.deletingLastPathComponent().appending(path: "prediction-runtime")
+        let runtimeFolder = exe.deletingLastPathComponent().appending(path: "prediction-runtime")
         return Self(enabled: enabled, modelFolder: modelFolder, runtimeFolder: runtimeFolder)
     }
 
     var modelURL: URL { modelFolder.appending(path: Self.modelFilename) }
-    var serverURL: URL { runtimeFolder.appending(path: "llama-server.exe") }
-    var runtimeRevisionURL: URL { runtimeFolder.appending(path: "REVISION") }
+    var canonicalRuntimeFolder: URL {
+        runtimeFolder.resolvingSymlinksInPath().standardizedFileURL
+    }
+    var serverURL: URL { canonicalRuntimeFolder.appending(path: "llama-server.exe") }
+    var runtimeRevisionURL: URL { canonicalRuntimeFolder.appending(path: "REVISION") }
+    var vulkanBackendURL: URL { canonicalRuntimeFolder.appending(path: "ggml-vulkan.dll") }
+    var buildReceiptURL: URL {
+        canonicalRuntimeFolder.appending(path: Self.buildReceiptFilename)
+    }
     var verifiedReceiptURL: URL { modelFolder.appending(path: "VERIFIED") }
+    var runtimeRevision: String { Self.llamaRevision }
 
     var filesArePresent: Bool {
-        [modelURL, serverURL, runtimeRevisionURL, verifiedReceiptURL]
+        [modelURL, serverURL, runtimeRevisionURL, verifiedReceiptURL,
+         vulkanBackendURL, buildReceiptURL]
             .allSatisfy { FileManager.default.fileExists(atPath: $0.path) }
     }
 
@@ -62,9 +89,141 @@ struct PredictionRuntimeConfig: Equatable {
     var verifiedReceiptMatches: Bool {
         (try? String(contentsOf: verifiedReceiptURL, encoding: .utf8)) == Self.verifiedReceipt
     }
+
+    var buildReceiptMatches: Bool {
+        guard let receipt = try? String(contentsOf: buildReceiptURL, encoding: .utf8) else {
+            return false
+        }
+        return receipt.replacingOccurrences(of: "\r\n", with: "\n") == Self.buildReceipt
+    }
+
+    var runtimeBundleIsValid: Bool {
+        let standardized = runtimeFolder.standardizedFileURL
+        guard let rootValues = try? standardized.resourceValues(forKeys: [.isSymbolicLinkKey]),
+              rootValues.isSymbolicLink != true,
+              let entries = try? FileManager.default.contentsOfDirectory(
+                  at: standardized,
+                  includingPropertiesForKeys: [.isSymbolicLinkKey],
+                  options: []
+              ) else { return false }
+        let allowed = Set(Self.runtimeRequiredFilenames + Self.runtimeOptionalFilenames)
+        let present = Set(entries.map(\.lastPathComponent))
+        guard present.isSubset(of: allowed),
+              Set(Self.runtimeRequiredFilenames).isSubset(of: present) else { return false }
+        let entriesByName = Dictionary(uniqueKeysWithValues: entries.map { ($0.lastPathComponent, $0) })
+        return present.allSatisfy { name in
+            guard let url = entriesByName[name],
+                  let values = try? url.resourceValues(forKeys: [.isSymbolicLinkKey]),
+                  values.isSymbolicLink != true,
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  attributes[.type] as? FileAttributeType == .typeRegular,
+                  let size = attributes[.size] as? NSNumber else { return false }
+            return size.intValue > 0
+        }
+    }
 }
 
-let predictionProcessCreationFlags = DWORD(CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT)
+struct PredictionGPUEvidence: Equatable {
+    let hasVulkanDevice: Bool
+    let offloadedLayers: Int?
+    let totalLayers: Int?
+
+    var isValid: Bool {
+        guard hasVulkanDevice, let offloadedLayers, let totalLayers else { return false }
+        return offloadedLayers > 0 && totalLayers > 0 && offloadedLayers == totalLayers
+    }
+}
+
+enum PredictionRuntimeFailureDisposition: Equatable {
+    case retryNextPort
+    case terminal
+}
+
+func classifyPredictionRuntimeFailure(_ log: String) -> PredictionRuntimeFailureDisposition {
+    let lowered = log.lowercased()
+    let bindFailure = lowered.contains("couldn't bind http server socket")
+        || lowered.contains("failed to bind")
+        || lowered.contains("bind failed")
+    let addressInUse = lowered.contains("address already in use")
+        || lowered.contains("address is already in use")
+        || lowered.contains("wsaeaddrinuse")
+        || lowered.contains("eaddrinuse")
+        || lowered.contains("only one usage of each socket address")
+    return bindFailure || addressInUse ? .retryNextPort : .terminal
+}
+
+func parsePredictionGPUEvidence(_ log: String) -> PredictionGPUEvidence {
+    var hasVulkanDevice = false
+    var offloadedLayers: Int?
+    var totalLayers: Int?
+
+    for line in log.split(whereSeparator: \.isNewline) {
+        let lowered = line.lowercased()
+        if lowered.contains("using device vulkan0") {
+            hasVulkanDevice = true
+        }
+        guard let marker = lowered.range(of: "offloaded") else { continue }
+        let fields = lowered[marker.upperBound...].split { $0 == " " || $0 == "\t" }
+        guard fields.count >= 4,
+              fields[1] == "layers", fields[2] == "to", fields[3] == "gpu" else { continue }
+        let counts = fields[0].split(separator: "/")
+        guard counts.count == 2,
+              let offloaded = Int(counts[0]), let total = Int(counts[1]) else { continue }
+        offloadedLayers = offloaded
+        totalLayers = total
+    }
+
+    return PredictionGPUEvidence(hasVulkanDevice: hasVulkanDevice,
+                                 offloadedLayers: offloadedLayers,
+                                 totalLayers: totalLayers)
+}
+
+func predictionProcessEnvironment(from environment: [String: String]) -> [String: String] {
+    environment.filter { key, _ in
+        let normalized = key.uppercased()
+        return normalized != "GGML_BACKEND_PATH"
+            && !normalized.hasPrefix("LLAMA_ARG_")
+            && !normalized.hasPrefix("GGML_VK_")
+            && !normalized.hasPrefix("GGML_VULKAN_")
+            && !normalized.hasPrefix("VK_")
+    }
+}
+
+private func windowsEnvironmentBlock(_ environment: [String: String]) -> [UInt16] {
+    let entries = environment.keys.sorted { lhs, rhs in
+        lhs.uppercased() == rhs.uppercased() ? lhs < rhs : lhs.uppercased() < rhs.uppercased()
+    }.compactMap { key -> [UInt16]? in
+        guard let value = environment[key] else { return nil }
+        return Array("\(key)=\(value)\0".utf16)
+    }
+    return entries.flatMap { $0 } + [0]
+}
+
+func predictionProcessWorkingDirectory(config: PredictionRuntimeConfig) -> URL {
+    config.canonicalRuntimeFolder
+}
+
+func predictionServerArguments(config: PredictionRuntimeConfig, port: Int,
+                               apiKey: String) -> [String] {
+    [
+        "-m", config.modelURL.path,
+        "-t", String(max(1, min(12, ProcessInfo.processInfo.activeProcessorCount))),
+        "-c", "512", "-np", "1", "--host", "127.0.0.1",
+        "--port", String(port), "--no-webui", "--api-key", apiKey,
+        "--device", "Vulkan0", "--n-gpu-layers", "all",
+        "--log-verbosity", "4",
+    ]
+}
+
+private let predictionProcessHandleListAttribute = DWORD_PTR(0x0002_0002)
+
+// CreateProcess snapshots inheritable handles, so clearing a temporary handle after launch must
+// not race another child launch that still uses bInheritHandles.
+let engineInheritableHandleProcessCreationLock = NSLock()
+
+let predictionProcessCreationFlags = DWORD(CREATE_NO_WINDOW)
+    | DWORD(CREATE_UNICODE_ENVIRONMENT)
+    | DWORD(EXTENDED_STARTUPINFO_PRESENT)
 
 private func quoteWindowsProcessArgument(_ argument: String) -> String {
     guard argument.isEmpty || argument.contains(where: { $0 == " " || $0 == "\t" || $0 == "\"" })
@@ -91,9 +250,12 @@ private func quoteWindowsProcessArgument(_ argument: String) -> String {
 
 private final class HiddenProcess: @unchecked Sendable {
     private let handle: HANDLE
+    private let outputLogHandle: HANDLE
+    let outputLogURL: URL
     let processIdentifier: Int32
 
-    init(executableURL: URL, arguments: [String]) throws {
+    init(executableURL: URL, arguments: [String], environment: [String: String] =
+         predictionProcessEnvironment(from: ProcessInfo.processInfo.environment)) throws {
         var security = SECURITY_ATTRIBUTES()
         security.nLength = DWORD(MemoryLayout<SECURITY_ATTRIBUTES>.size)
         security.bInheritHandle = true
@@ -104,42 +266,113 @@ private final class HiddenProcess: @unchecked Sendable {
                 DWORD(OPEN_EXISTING), DWORD(FILE_ATTRIBUTE_NORMAL), nil
             )
         }
-        guard nullHandle != INVALID_HANDLE_VALUE else {
+        guard let nullHandle, nullHandle != INVALID_HANDLE_VALUE else {
             throw LLMError(message: "cannot open null device for prediction process")
         }
         defer { CloseHandle(nullHandle) }
 
+        let logURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nospacekey-prediction-\(UUID().uuidString).log")
+        let logHandle = logURL.path.withCString(encodedAs: UTF16.self) { path in
+            CreateFileW(
+                path, DWORD(GENERIC_READ) | DWORD(GENERIC_WRITE),
+                DWORD(FILE_SHARE_READ) | DWORD(FILE_SHARE_WRITE), &security,
+                DWORD(CREATE_ALWAYS), DWORD(FILE_ATTRIBUTE_NORMAL), nil
+            )
+        }
+        guard let logHandle, logHandle != INVALID_HANDLE_VALUE else {
+            throw LLMError(message: "cannot open prediction process log")
+        }
+        var keepLog = false
+        defer {
+            if !keepLog {
+                CloseHandle(logHandle)
+                try? FileManager.default.removeItem(at: logURL)
+            }
+        }
+
         var startup = STARTUPINFOW()
-        startup.cb = DWORD(MemoryLayout<STARTUPINFOW>.size)
+        startup.cb = DWORD(MemoryLayout<STARTUPINFOEXW>.size)
         startup.dwFlags = DWORD(STARTF_USESTDHANDLES) | DWORD(STARTF_USESHOWWINDOW)
         startup.wShowWindow = WORD(SW_HIDE)
         startup.hStdInput = nullHandle
-        startup.hStdOutput = nullHandle
-        startup.hStdError = nullHandle
+        startup.hStdOutput = logHandle
+        startup.hStdError = logHandle
+
+        var attributeListSize = SIZE_T(0)
+        _ = InitializeProcThreadAttributeList(nil, 1, 0, &attributeListSize)
+        guard attributeListSize > 0 else {
+            throw LLMError(message: "cannot size prediction process attributes")
+        }
+        let attributeStorage = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(attributeListSize),
+            alignment: MemoryLayout<UnsafeMutableRawPointer>.alignment
+        )
+        defer { attributeStorage.deallocate() }
+        let attributeList = OpaquePointer(attributeStorage)
+        guard InitializeProcThreadAttributeList(attributeList, 1, 0, &attributeListSize) else {
+            throw LLMError(message: "cannot initialize prediction process attributes")
+        }
+        defer { DeleteProcThreadAttributeList(attributeList) }
+        var inheritedHandles = [nullHandle, logHandle]
+        let handlesUpdated = inheritedHandles.withUnsafeMutableBytes { handles in
+            UpdateProcThreadAttribute(
+                attributeList, 0, predictionProcessHandleListAttribute,
+                handles.baseAddress, SIZE_T(handles.count), nil, nil
+            )
+        }
+        guard handlesUpdated else {
+            throw LLMError(message: "cannot restrict prediction process handles")
+        }
+        var startupExtended = STARTUPINFOEXW()
+        startupExtended.StartupInfo = startup
+        startupExtended.lpAttributeList = attributeList
 
         let commandLine = ([executableURL.path] + arguments)
             .map(quoteWindowsProcessArgument)
             .joined(separator: " ")
         var commandBuffer = Array(commandLine.utf16) + [0]
+        var environmentBuffer = windowsEnvironmentBlock(environment)
         var processInfo = PROCESS_INFORMATION()
-        let workingDirectory = executableURL.deletingLastPathComponent().path
+        let workingDirectory = executableURL.deletingLastPathComponent()
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        engineInheritableHandleProcessCreationLock.lock()
         let created = executableURL.path.withCString(encodedAs: UTF16.self) { executable in
             workingDirectory.withCString(encodedAs: UTF16.self) { directory in
-                commandBuffer.withUnsafeMutableBufferPointer { command in
-                    CreateProcessW(
-                        executable, command.baseAddress, nil, nil, true,
-                        predictionProcessCreationFlags, nil, directory,
-                        &startup, &processInfo
-                    )
+                environmentBuffer.withUnsafeMutableBufferPointer { environment in
+                    commandBuffer.withUnsafeMutableBufferPointer { command in
+                        withUnsafeMutablePointer(to: &startupExtended) { startupPointer in
+                            let startupInfo = UnsafeMutableRawPointer(startupPointer)
+                                .assumingMemoryBound(to: STARTUPINFOW.self)
+                            return CreateProcessW(
+                                executable, command.baseAddress, nil, nil, true,
+                                predictionProcessCreationFlags,
+                                UnsafeMutableRawPointer(environment.baseAddress), directory,
+                                startupInfo, &processInfo
+                            )
+                        }
+                    }
                 }
             }
         }
         guard created else {
+            engineInheritableHandleProcessCreationLock.unlock()
             throw LLMError(message: "cannot start prediction process (win32=\(GetLastError()))")
+        }
+        let logHandleSealed = SetHandleInformation(logHandle, DWORD(HANDLE_FLAG_INHERIT), 0)
+        engineInheritableHandleProcessCreationLock.unlock()
+        guard logHandleSealed else {
+            _ = TerminateProcess(processInfo.hProcess, 1)
+            CloseHandle(processInfo.hThread)
+            CloseHandle(processInfo.hProcess)
+            throw LLMError(message: "cannot seal prediction process log handle")
         }
         CloseHandle(processInfo.hThread)
         handle = processInfo.hProcess
+        outputLogHandle = logHandle
+        outputLogURL = logURL
         processIdentifier = Int32(bitPattern: GetProcessId(processInfo.hProcess))
+        keepLog = true
     }
 
     var isRunning: Bool {
@@ -154,7 +387,16 @@ private final class HiddenProcess: @unchecked Sendable {
         }
     }
 
-    deinit { CloseHandle(handle) }
+    func readOutputLog() -> String {
+        _ = FlushFileBuffers(outputLogHandle)
+        return (try? String(contentsOf: outputLogURL, encoding: .utf8)) ?? ""
+    }
+
+    deinit {
+        CloseHandle(handle)
+        CloseHandle(outputLogHandle)
+        try? FileManager.default.removeItem(at: outputLogURL)
+    }
 }
 
 private final class KillOnCloseJob: @unchecked Sendable {
@@ -216,12 +458,7 @@ private final class LlamaPredictionRuntime: @unchecked Sendable {
             let port = portBase + offset
             let apiKey = UUID().uuidString
             var process: HiddenProcess?
-            let arguments = [
-                "-m", config.modelURL.path,
-                "-t", String(max(1, min(12, ProcessInfo.processInfo.activeProcessorCount))),
-                "-c", "512", "-np", "1", "--host", "127.0.0.1",
-                "--port", String(port), "--no-webui", "--api-key", apiKey,
-            ]
+            let arguments = predictionServerArguments(config: config, port: port, apiKey: apiKey)
             do {
                 let launched = try HiddenProcess(executableURL: config.serverURL,
                                                  arguments: arguments)
@@ -239,13 +476,36 @@ private final class LlamaPredictionRuntime: @unchecked Sendable {
                                        timeout: 10, isCancelled: isCancelled) != nil else {
                     throw LLMError(message: "prediction runtime warm-up failed")
                 }
+                try waitForGPUEvidence(process: launched, isCancelled: isCancelled)
                 return runtime
             } catch {
-                lastError = error
+                let logBeforeTermination = process?.readOutputLog() ?? ""
                 process?.terminate()
+                let logAfterTermination = process?.readOutputLog() ?? ""
+                let failureLog = logBeforeTermination + "\n" + logAfterTermination
+                guard classifyPredictionRuntimeFailure(failureLog) == .retryNextPort else {
+                    throw error
+                }
+                lastError = error
+                predictionDiagnostic("prediction runtime port unavailable; trying next port")
             }
         }
         throw lastError
+    }
+
+    private static func waitForGPUEvidence(process: HiddenProcess,
+                                           isCancelled: @Sendable () -> Bool) throws {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if isCancelled() { throw CancellationError() }
+            let evidence = parsePredictionGPUEvidence(process.readOutputLog())
+            if evidence.isValid { return }
+            guard process.isRunning else {
+                throw LLMError(message: "prediction runtime exited before GPU evidence")
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        throw LLMError(message: "prediction runtime GPU evidence missing")
     }
 
     func shutdown() {
@@ -358,7 +618,7 @@ private final class LlamaPredictionRuntime: @unchecked Sendable {
 
 func shouldSkipPredictionReload(current: PredictionRuntimeConfig?, next: PredictionRuntimeConfig,
                                 availability: PredictionAvailability) -> Bool {
-    current == next && availability != .failed
+    current == next
 }
 
 func sanitizePrediction(_ raw: String) -> String? {
@@ -414,8 +674,12 @@ final class PredictionService: @unchecked Sendable {
     }
 
     static func configured(environment: [String: String] = ProcessInfo.processInfo.environment) -> PredictionService {
+        configured(config: .resolve(environment: environment))
+    }
+
+    static func configured(config: PredictionRuntimeConfig) -> PredictionService {
         let service = PredictionService()
-        service.reload(config: .resolve(environment: environment))
+        service.reload(config: config)
         return service
     }
 
@@ -439,7 +703,7 @@ final class PredictionService: @unchecked Sendable {
             ?? runtime?.generate(tokenIDs: tokenIDs, isCancelled: cancelled)
         guard let text else {
             if generator == nil, let runtime, !runtime.isRunning {
-                restartAfterRuntimeExit(runtime)
+                markRuntimeFailed(runtime)
             }
             return .predictionUnavailable(seq: seq, state: "failed")
         }
@@ -493,7 +757,8 @@ final class PredictionService: @unchecked Sendable {
             oldRuntime?.shutdown()
             return
         }
-        guard config.runtimeRevisionMatches, config.verifiedReceiptMatches else {
+        guard config.runtimeBundleIsValid, config.runtimeRevisionMatches,
+              config.verifiedReceiptMatches, config.buildReceiptMatches else {
             availability = .failed
             lock.unlock()
             oldRuntime?.shutdown()
@@ -520,17 +785,16 @@ final class PredictionService: @unchecked Sendable {
         }
     }
 
-    /// A crashed llama-server must not leave the setting permanently enabled-but-silent. Mark the
-    /// exact dead runtime failed, then reuse the normal generation-guarded reload path to restart it.
-    private func restartAfterRuntimeExit(_ exitedRuntime: LlamaPredictionRuntime) {
+    private func markRuntimeFailed(_ exitedRuntime: LlamaPredictionRuntime) {
         lock.lock()
-        guard runtime === exitedRuntime, !exitedRuntime.isRunning, let config = currentConfig else {
+        guard runtime === exitedRuntime, !exitedRuntime.isRunning else {
             lock.unlock()
             return
         }
+        runtime = nil
         availability = .failed
+        requestGeneration &+= 1
         lock.unlock()
-        reload(config: config)
     }
 
     private func install(loaded: LlamaPredictionRuntime, generation: UInt64) {

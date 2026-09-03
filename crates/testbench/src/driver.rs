@@ -771,6 +771,19 @@ fn tip_log_has(needle: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn tip_log_count(needle: &str) -> usize {
+    let path =
+        std::path::Path::new(&std::env::var("TEMP").unwrap_or_default()).join("nospacekey-tip.log");
+    let pid_tag = format!("[pid {}]", std::process::id());
+    std::fs::read_to_string(path)
+        .map(|s| {
+            s.lines()
+                .filter(|l| l.contains(&pid_tag) && l.contains(needle))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 /// item18: 別ウィンドウへのフォーカス喪失でエンジンセッションの読みが居残らない
 /// （フォーカス喪失データ残留の回帰ガード）。
 ///
@@ -792,9 +805,11 @@ pub fn run_item18(host: &TsfHost) -> Item18Result {
     host.store.reset();
 
     // 1) ライブ変換中まで打つ（engine セッション＋合成が生きている＝放棄対象がある）。
+    let live_convert_before = tip_log_count("ev=live_convert_ok");
     let _ = run_keys(host, &crate::scenarios::typed("nihongo"));
     host.settle_debounce();
     let before = host.store.preedit();
+    let engine_converted = tip_log_count("ev=live_convert_ok") > live_convert_before;
 
     // 2) 別ウィンドウへフォーカスが移って戻る（実機の別窓クリック相当）。OnSetFocus が発火するはず。
     let focus_ok = host.lose_and_regain_focus().is_ok();
@@ -805,11 +820,8 @@ pub fn run_item18(host: &TsfHost) -> Item18Result {
     let after = host.store.preedit();
     let full = host.store.full();
 
-    // engine が実際に動いて変換した証拠: before が raw reading から変化している＝engine セッションが
-    // 生きていた。engine 不起動だと TIP が raw preedit(にほんご)へ劣化し、focus_abandon も no_stale も
-    // 真になって本来検証すべき「engine セッションの読み居残り」経路を踏まずに偽 PASS する（Codex P2）。
-    // 候補順位はモデル/学習状態に依存するので、特定の漢字ではなく raw reading との差で判定する。
-    let engine_converted = !before.is_empty() && before != "にほんご";
+    // engine が実際に LiveConvert を完了した証拠を IPC 成功イベントで直接見る。学習状態によっては
+    // 正常な最上位候補が raw reading と同一になるため、preedit の文字列差は稼働証明にならない。
     // OnSetFocus（doc フォーカス変化）が放棄リセットを焚いたか＝ITfThreadMgrEventSink 経路の配線ガード。
     let abandoned = tip_log_has("ev=focus_abandon");
     // ITfThreadFocusSink（クロスプロセス前面喪失の OnKillThreadFocus）の advise 配線が生きているか。

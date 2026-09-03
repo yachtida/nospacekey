@@ -3,10 +3,10 @@
 //! GitHub の public repo (yachtida/nospacekey) のリリース一覧を API で問い合わせ、
 //! 現在ビルドの CARGO_PKG_VERSION と比較する。新版本があればインストーラ(setup exe)を
 //! %TEMP% 直下に試行ごと OS 乱数で一意に作る専用 staging ディレクトリへダウンロードし
-//! SHA256 で検証、ShellExecuteExW の runas で昇格起動する。
+//! SHA256 で検証し、呼び出し元ユーザーのまま Setup loader を起動する。
 //! SHA256 検証は二段 — 受信ストリームの照合に加え、昇格実行の前に（コマンド実行境界で）
 //! ディスク上の実ファイルを再ハッシュし、検証後の置換・破損を昇格実行に持ち込まない。
-//! 境界再検証〜起動成立までは staging directory と InstallerGuard の両ハンドルを保持する。
+//! 境界再検証〜起動成立までは InstallerGuard、SetupLdr終了までは staging directory を保持する。
 //! staging は削除共有なしで開いて親の rename/junction 差替えを拒否し、dest の最終親パスが
 //! その directory handle 由来の最終パスと一致することも確認する。InstallerGuard は dest を
 //! FILE_FLAG_OPEN_REPARSE_POINT で開いて reparse point なら即拒否、read 専用 +
@@ -21,14 +21,14 @@
 //! (`https://github.com/yachtida/nospacekey/releases/download/{tag}/{file}`) に厳密一致し、
 //! かつ canonical な新しい setup asset として tag/file が一致するものだけを許す
 //! （validate_installer_asset_url）。改竄応答も直叩き引数もダウンロード前に失敗させる。
-//! インストーラ(Inno Setup・per-machine)の PrepareToInstall が config/engine を taskkill し
-//! restartreplace で使用中 DLL を置換するため、アプリ側は起動後ただ終了すればよい。
+//! インストーラは新しいversion directoryへ完全なTIP/Engine pairを配置し、ロード済み旧pairを
+//! kill・上書きしない。設定画面はSetup終了コード0を確認後に自発終了し、次回起動から新版へ切り替わる。
 //!
 //! `include_beta` で pre-release(beta) を通知に含めるか制御する（既定=false=安定版のみ）。
 //! 自動確認は行わない（プライバシ: ユーザの明示操作時のみネットワークへ出る）。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use tauri::Emitter;
 
 /// 進捗イベント名（フロントの listen と一致させる）。download.rs とは別系列。
@@ -41,22 +41,132 @@ const STAGING_DIR_PREFIX: &str = "nospacekey-update-";
 /// 他試行・他プロセスと衝突しない。完成前は `.part` を付けて隠し、rename で本名へ出す。
 const INSTALLER_FILENAME: &str = "nospacekey-update-setup.exe";
 
+const INSTALLER_PARAMETERS: &str = "/NORESTART /RESTARTEXITCODE=3010";
+
 /// Metadata-provided installer size is untrusted. Keep a conservative hard cap
 /// so a direct/mutated invoke cannot turn this command into an unbounded writer.
 pub const MAX_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
 
-/// 同時実行の排他フラグ。
-static DOWNLOADING: AtomicBool = AtomicBool::new(false);
-/// キャンセル要求フラグ（`cancel_update_download` が立て、DL 処理の各チェックポイントが
-/// 見る — 受信ループの各チャンク・send()/受信の Err 到達時・rename/UAC 起動前の再判定）。
-static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateAttemptPhase {
+    Downloading,
+    Installing,
+}
 
-/// `DOWNLOADING` を必ず戻すガード（download.rs の DownloadGuard と同型）。early return /
-/// `?` / panic のいずれでも解除する（さもないと一度失敗すると以後ずっと締め出される）。
-struct UpdateGuard;
-impl Drop for UpdateGuard {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelUpdateOutcome {
+    Accepted,
+    TooLate,
+    Inactive,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveUpdateAttempt {
+    id: u64,
+    phase: UpdateAttemptPhase,
+    cancel_requested: bool,
+}
+
+struct ActiveUpdateAttempts {
+    inner: Mutex<Option<ActiveUpdateAttempt>>,
+}
+
+impl ActiveUpdateAttempts {
+    const fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<ActiveUpdateAttempt>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn begin(&self, id: u64) -> Result<UpdateGuard<'_>, String> {
+        let mut active = self.lock();
+        if active.is_some() {
+            return Err("既にアップデート処理中です。".into());
+        }
+        *active = Some(ActiveUpdateAttempt {
+            id,
+            phase: UpdateAttemptPhase::Downloading,
+            cancel_requested: false,
+        });
+        Ok(UpdateGuard { attempts: self, id })
+    }
+
+    fn request_cancel(&self, id: u64) -> CancelUpdateOutcome {
+        let mut active = self.lock();
+        let Some(attempt) = active.as_mut() else {
+            return CancelUpdateOutcome::Inactive;
+        };
+        if attempt.id != id {
+            return CancelUpdateOutcome::Inactive;
+        }
+        if attempt.phase != UpdateAttemptPhase::Downloading {
+            return CancelUpdateOutcome::TooLate;
+        }
+        attempt.cancel_requested = true;
+        CancelUpdateOutcome::Accepted
+    }
+
+    fn is_cancelled(&self, id: u64) -> bool {
+        match *self.lock() {
+            Some(attempt) if attempt.id == id => attempt.cancel_requested,
+            _ => true,
+        }
+    }
+
+    fn begin_installing(&self, id: u64) -> Result<(), String> {
+        let mut active = self.lock();
+        let Some(attempt) = active.as_mut() else {
+            return Err("アップデート試行が無効になりました。再試行してください。".into());
+        };
+        if attempt.id != id || attempt.phase != UpdateAttemptPhase::Downloading {
+            return Err("アップデート試行が無効になりました。再試行してください。".into());
+        }
+        if attempt.cancel_requested {
+            return Err("キャンセルしました。".into());
+        }
+        attempt.phase = UpdateAttemptPhase::Installing;
+        Ok(())
+    }
+
+    fn clear_if_matching(&self, id: u64) {
+        let mut active = self.lock();
+        if active.as_ref().is_some_and(|attempt| attempt.id == id) {
+            *active = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn phase(&self, id: u64) -> Option<UpdateAttemptPhase> {
+        self.lock()
+            .as_ref()
+            .filter(|attempt| attempt.id == id)
+            .map(|attempt| attempt.phase)
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> Option<(u64, UpdateAttemptPhase, bool)> {
+        self.lock()
+            .map(|attempt| (attempt.id, attempt.phase, attempt.cancel_requested))
+    }
+}
+
+static ACTIVE_UPDATE_ATTEMPTS: ActiveUpdateAttempts = ActiveUpdateAttempts::new();
+
+struct UpdateGuard<'a> {
+    attempts: &'a ActiveUpdateAttempts,
+    id: u64,
+}
+
+impl Drop for UpdateGuard<'_> {
     fn drop(&mut self) {
-        DOWNLOADING.store(false, Ordering::SeqCst);
+        self.attempts.clear_if_matching(self.id);
     }
 }
 
@@ -153,12 +263,19 @@ pub enum UpdateStatus {
     },
 }
 
-/// 進捗イベントのペイロード（download.rs の Progress と同形）。
+/// ダウンロードからSetup完了待ちへの明示的なphase遷移。
 #[derive(Clone, serde::Serialize)]
-struct Progress {
-    received: u64,
-    total: Option<u64>,
-    percent: Option<u8>,
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum UpdateProgress {
+    Downloading {
+        attempt_id: u64,
+        received: u64,
+        total: Option<u64>,
+        percent: Option<u8>,
+    },
+    Installing {
+        attempt_id: u64,
+    },
 }
 
 /// HTTP クライアント組み立て（download.rs と同設定: native-tls/schannel・UA・timeout）。
@@ -316,22 +433,22 @@ async fn fetch_expected_sha256(
     parse_sha256sums(&text, installer_name)
 }
 
-/// 進行中アップデートのキャンセル要求（DL 処理の各チェックポイント — 次チャンク、
-/// read_timeout 発の send()/受信 Err、受信ループ後・rename 前の再判定、境界再検証後〜
-/// UAC 起動前の再判定 — で気づいて中断・掃除する）。
+/// 試行IDが現在のダウンロードと一致するときだけキャンセルを受理する。遅延したIPCが
+/// 後続試行を止めること、およびSetup起動後にConfigから中断することは許さない。
 #[tauri::command]
-pub fn cancel_update_download() {
-    CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+pub fn cancel_update_download(attempt_id: u64) -> CancelUpdateOutcome {
+    ACTIVE_UPDATE_ATTEMPTS.request_cancel(attempt_id)
 }
 
 /// インストーラをダウンロード → SHA256 検証 → 昇格起動。進捗は PROGRESS_EVENT で通知。
-/// 成功したら（インストーラが config を taskkill するので）呼び出し側(JS)でウィンドウを閉じる。
+/// 成功したら呼び出し側(JS)が自発的にウィンドウを閉じ、次回起動を新版へ切り替える。
 #[tauri::command]
 pub async fn download_and_install_update(
     app: tauri::AppHandle,
     installer_url: String,
     expected_sha256: Option<String>,
     installer_size: u64,
+    attempt_id: u64,
 ) -> Result<(), String> {
     use futures_util::StreamExt;
     use sha2::{Digest, Sha256};
@@ -348,19 +465,18 @@ pub async fn download_and_install_update(
     // staging 作成、HTTP 通信より前に拒否して不要な帯域・ディスク消費を起こさない。
     let expected_sha256 = validate_expected_sha256(expected_sha256.as_deref())?.to_owned();
     validate_installer_size(installer_size)?;
-
-    // 排他: 既に走っていれば弾く。ガードで DOWNLOADING を必ず戻す。
-    if DOWNLOADING.swap(true, Ordering::SeqCst) {
-        return Err("既にアップデート処理中です。".into());
+    if attempt_id == 0 {
+        return Err("アップデート試行IDが不正です。".to_string());
     }
-    let _guard = UpdateGuard;
-    CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+    ensure_update_launch_context(current_process_is_elevated()?)?;
+
+    let _guard = ACTIVE_UPDATE_ATTEMPTS.begin(attempt_id)?;
 
     // staging: 試行ごとに OS 乱数で一意な専用ディレクトリ。従来の固定パス
     // （%TEMP% 直下の本名/.part）は同一ユーザーの別プロセスが事前に .part やその
     // symlink を置いて待ち構えられ — pre-open writer・reparse 差替えの起点に
     // になるため廃止した。以後の全エラー/キャンセル経路の掃除は TempDir の RAII が
-    // ディレクトリごと担う（成功経路だけ keep() で残留に切り替える）。
+    // ディレクトリごと担い、SetupLdr終了後に成功・失敗とも掃除する。
     let staging = create_staging_dir()?;
     // 完成前のファイルを本名で観測させない（中断された半端ファイルを実行させない）。
     let part = staging.path().join(format!("{INSTALLER_FILENAME}.part"));
@@ -373,7 +489,7 @@ pub async fn download_and_install_update(
             // 巡6(同型拡張): ヘッダ待ちのストールも read_timeout の Err として現れる —
             // 受信ループ(巡5 M-2)と同じく、キャンセルが立っているならキャンセル扱いにする。
             // この時点では .part 未作成なので掃除は不要。
-            if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            if ACTIVE_UPDATE_ATTEMPTS.is_cancelled(attempt_id) {
                 return Err("キャンセルしました。".into());
             }
             return Err(format!(
@@ -403,7 +519,7 @@ pub async fn download_and_install_update(
 
     // 中断経路の scrub は不要 — staging の RAII が .part ごとディレクトリを消す。
     while let Some(item) = stream.next().await {
-        if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        if ACTIVE_UPDATE_ATTEMPTS.is_cancelled(attempt_id) {
             return Err("キャンセルしました。".into());
         }
         let chunk = match item {
@@ -411,7 +527,7 @@ pub async fn download_and_install_update(
             Err(e) => {
                 // 巡5 M-2: ストール中のキャンセルは read_timeout の Err として現れる —
                 // キャンセルが立っているなら「失敗」でなくキャンセル扱いにする。
-                if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+                if ACTIVE_UPDATE_ATTEMPTS.is_cancelled(attempt_id) {
                     return Err("キャンセルしました。".into());
                 }
                 return Err(format!("受信中にエラーが発生しました: {e}"));
@@ -435,7 +551,8 @@ pub async fn download_and_install_update(
             last_emit_bytes = received;
             let _ = app.emit(
                 PROGRESS_EVENT,
-                Progress {
+                UpdateProgress::Downloading {
+                    attempt_id,
                     received,
                     total,
                     percent: pct,
@@ -452,7 +569,7 @@ pub async fn download_and_install_update(
 
     // 巡3 Q9: 受信ループ後（ハッシュ検証・rename・起動の前）にキャンセルを再判定する —
     // この窓でキャンセルが無視されると、キャンセルしたはずなのに UAC プロンプトが出る。
-    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+    if ACTIVE_UPDATE_ATTEMPTS.is_cancelled(attempt_id) {
         return Err("キャンセルしました。".into());
     }
 
@@ -484,16 +601,6 @@ pub async fn download_and_install_update(
     };
     verify_installer_hash(&on_disk, Some(&expected_sha256))?;
 
-    // 巡4 B2: 昇格起動の直前にもう一度キャンセルを再判定 — この窓でキャンセルが
-    // 無視されると「キャンセルしたのに UAC プロンプトが出る」。
-    // 判定は runas に一番近い位置に置く — 直前の境界再ハッシュ中に立ったキャンセルも
-    // ここで拾わないと、再検証の導入が逆にキャンセル不能の窓を開くことになる。
-    // ガードは判定中も閉じない — 閉じた瞬間に置換が通り、掃除が別プロセスのファイルを
-    // 消すだけに変わる窓が開く。
-    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
-        return Err("キャンセルしました。".into());
-    }
-
     // lpFile は guard ハンドル由来の最終正規パス（GetFinalPathNameByHandleW）— dest を
     // パス指定で再解決させると symlink/junction 経由の別実体を指させる余地が残る。
     let exec_path = match guard.execute_path() {
@@ -501,16 +608,27 @@ pub async fn download_and_install_update(
         Err(e) => return Err(e),
     };
 
-    // 昇格起動（runas → UAC）。インストーラが config/engine を taskkill し使用中 DLL を置換する。
-    run_installer_elevated(&exec_path)?;
+    // キャンセル受理と起動権取得を同じ短いlockで直列化してからSetup loaderを起動する。
+    // 有効handleを得た直後にinstallingを一度だけ通知し、以後Configから中断する経路は持たない。
+    let process = launch_installer_and_announce(
+        &ACTIVE_UPDATE_ATTEMPTS,
+        attempt_id,
+        || run_installer_as_caller(&exec_path),
+        || {
+            let _ = app.emit(PROGRESS_EVENT, UpdateProgress::Installing { attempt_id });
+        },
+    )?;
 
-    // 起動成立（有効 hProcess 返却済み）— ここで初めてガードを解放（unlock → close）する。
-    // イメージはロード済みで以後の実行中置換は OS が拒否するため閉じてよい。staging は
-    // 削除しない: Inno Setup は自己 EXE 末尾の overlay を起動後に読むことがあるため、
-    // 成功時は実ファイルを残す（%TEMP% 内なので OS・手動の一時掃除対象になるのみ）。
+    // 起動成立後はイメージ置換をOSが拒否するため、ファイルguardだけ先に解放できる。
+    // staging本体はSetupLdrがoverlayを読み終えて終了するまでこのasync frameに保持する。
     drop(guard);
-    staging.keep();
-    Ok(())
+    let exit_code = tauri::async_runtime::spawn_blocking(move || process.wait())
+        .await
+        .map_err(|error| {
+            format!("インストーラの完了を確認できませんでした。再試行してください: {error}")
+        })??;
+    drop(staging);
+    map_installer_exit_code(exit_code)
 }
 
 /// 試行ごとに OS 乱数で一意になる staging ディレクトリを %TEMP% 直下に作り、直後に
@@ -572,15 +690,6 @@ impl StagingDir {
 
     fn final_path(&self) -> &Path {
         &self.final_path
-    }
-
-    fn keep(mut self) {
-        // 成功後は Inno Setup の overlay 読み取り用に実体を残す。directory handle を先に
-        // 閉じてから TempDir を keep へ移す。
-        drop(self.directory.take());
-        if let Some(temp) = self.temp.take() {
-            let _ = temp.keep();
-        }
     }
 }
 
@@ -824,6 +933,10 @@ fn shell_compatible_path(s: &str) -> String {
     }
 }
 
+fn installer_parameters_utf16() -> Vec<u16> {
+    INSTALLER_PARAMETERS.encode_utf16().chain([0]).collect()
+}
+
 /// 開いたガードハンドルの全文を SHA256 hex 化（InstallerGuard::sha256 の本体）。
 fn sha256_handle(file: &mut std::fs::File) -> Result<String, String> {
     use sha2::{Digest, Sha256};
@@ -850,34 +963,78 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     guard.sha256()
 }
 
-/// インストーラを UAC 昇格付きで起動する。lpFile は呼び出し側が guard ハンドル由来の
+/// Setup loader を現在の対話ユーザーとして起動する。lpFile は呼び出し側が guard ハンドル由来の
 /// 最終正規パス（InstallerGuard::execute_path — GetFinalPathNameByHandleW）を渡す。
-/// SEE_MASK_NOCLOSEPROCESS で呼び、TRUE かつ有効な hProcess が返った時点でのみ成功とする
+/// SEE_MASK_NOCLOSEPROCESS で呼び、TRUE かつ有効な hProcess を所有権付きで返す
 /// （旧 ShellExecuteW の >32 疑似ハンドル判定は「起動に失敗しても成功と区別できない」ため
-/// 廃止）。hProcess は実行完了を待たず CloseHandle する — ハンドルが返る時点でイメージは
-/// ロード済みであり、以後の実行中イメージ置換は OS が拒否するため、呼び出し側の読み取り
-/// ガードは不要になる。呼び出し側はプロセス作成の成立（この関数の Ok）までガードを保持
-/// すること。
-fn run_installer_elevated(path: &Path) -> Result<(), String> {
+/// 廃止）。呼び出し側はプロセス作成成立までファイルguardを保持し、返されたhandleで
+/// SetupLdrの完了を待つ。
+fn ensure_update_launch_context(is_elevated: bool) -> Result<(), String> {
+    if is_elevated {
+        Err("アップデートを続けるには、設定画面を通常権限で開き直してください。".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn current_process_is_elevated() -> Result<bool, String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(|e| {
+            format!(
+                "権限状態を確認できませんでした（code {:#010x}）。",
+                e.code().0 as u32
+            )
+        })?;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0;
+        let result = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        let _ = CloseHandle(token);
+        result.map_err(|e| {
+            format!(
+                "権限状態を確認できませんでした（code {:#010x}）。",
+                e.code().0 as u32
+            )
+        })?;
+        if returned < std::mem::size_of::<TOKEN_ELEVATION>() as u32 {
+            return Err("権限状態を確認できませんでした。".to_string());
+        }
+        Ok(elevation.TokenIsElevated != 0)
+    }
+}
+
+fn run_installer_as_caller(path: &Path) -> Result<InstallerProcess, String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let file: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    let verb: Vec<u16> = "runas".encode_utf16().chain([0]).collect();
+    let parameters = installer_parameters_utf16();
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS,
-        lpVerb: PCWSTR(verb.as_ptr()),
+        lpVerb: PCWSTR::null(),
         lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
     unsafe {
-        // 失敗は Err（GetLastError 由来の HRESULT 化。UAC 拒否は ERROR_CANCELLED(1223)
-        // の 0x8007_04b3、起動不能は FILE_NOT_FOUND/ACCESS_DENIED 等の HRESULT 化）。
+        // 失敗は Err（GetLastError 由来の HRESULT 化）。UAC は Inno loader が起動した後に
+        // 自身で要求するため、ここで観測できるのは loader の起動失敗まで。
         if let Err(e) = ShellExecuteExW(&mut info) {
             return Err(format!(
                 "インストーラの起動に失敗しました（code {:#010x}）。",
@@ -891,9 +1048,93 @@ fn run_installer_elevated(path: &Path) -> Result<(), String> {
                     .to_string(),
             );
         }
-        let _ = CloseHandle(info.hProcess);
+        Ok(InstallerProcess {
+            handle: info.hProcess,
+        })
     }
-    Ok(())
+}
+
+fn launch_installer_and_announce<P>(
+    attempts: &ActiveUpdateAttempts,
+    attempt_id: u64,
+    launch: impl FnOnce() -> Result<P, String>,
+    announce_installing: impl FnOnce(),
+) -> Result<P, String> {
+    attempts.begin_installing(attempt_id)?;
+    let process = launch()?;
+    announce_installing();
+    Ok(process)
+}
+
+struct InstallerProcess {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+// Windows process handles have no thread affinity. Ownership moves into the blocking worker,
+// and Drop remains the sole CloseHandle site.
+unsafe impl Send for InstallerProcess {}
+
+impl InstallerProcess {
+    fn wait(self) -> Result<u32, String> {
+        use windows::core::Error;
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, WaitForSingleObject, INFINITE,
+        };
+
+        wait_for_installer_with(
+            || {
+                let status = unsafe { WaitForSingleObject(self.handle, INFINITE) };
+                if status == WAIT_OBJECT_0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "インストーラの終了待機に失敗しました。再試行してください（code {:#010x}）。",
+                        Error::from_thread().code().0 as u32
+                    ))
+                }
+            },
+            || {
+                let mut exit_code = 0;
+                unsafe { GetExitCodeProcess(self.handle, &mut exit_code) }.map_err(|error| {
+                    format!(
+                        "インストーラの終了状態を確認できませんでした。再試行してください（code {:#010x}）。",
+                        error.code().0 as u32
+                    )
+                })?;
+                Ok(exit_code)
+            },
+        )
+    }
+}
+
+impl Drop for InstallerProcess {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+fn wait_for_installer_with(
+    wait: impl FnOnce() -> Result<(), String>,
+    read_exit_code: impl FnOnce() -> Result<u32, String>,
+) -> Result<u32, String> {
+    wait()?;
+    read_exit_code()
+}
+
+fn map_installer_exit_code(exit_code: u32) -> Result<(), String> {
+    match exit_code {
+        0 => Ok(()),
+        3010 => Err(
+            "インストーラが予期しない再起動要求（code 3010）を返しました。Windowsを再起動せず、再試行してください。"
+                .to_string(),
+        ),
+        code => Err(format!(
+            "インストールが完了しませんでした（code {code}）。内容を確認して再試行してください。"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1612,6 +1853,208 @@ mod tests {
             Some(INSTALLER_FILENAME)
         );
         assert!(exec.metadata().is_ok());
+    }
+
+    #[test]
+    fn installer_parameters_disable_automatic_restart_and_report_restart_required() {
+        let actual = installer_parameters_utf16();
+        let expected: Vec<u16> = "/NORESTART /RESTARTEXITCODE=3010"
+            .encode_utf16()
+            .chain([0])
+            .collect();
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.last(), Some(&0));
+        assert!(!actual[..actual.len() - 1].contains(&0));
+    }
+
+    #[test]
+    fn update_launch_requires_a_normal_unelevated_config_process() {
+        assert!(ensure_update_launch_context(false).is_ok());
+        let error = ensure_update_launch_context(true).unwrap_err();
+        assert!(error.contains("通常権限"));
+        assert!(error.contains("開き直"));
+    }
+
+    #[test]
+    fn installer_exit_code_mapping_distinguishes_success_restart_and_retry() {
+        assert!(map_installer_exit_code(0).is_ok());
+        let restart = map_installer_exit_code(3010).unwrap_err();
+        assert!(restart.contains("再起動"));
+        assert!(restart.contains("3010"));
+        for code in [1, 2, 1223, u32::MAX] {
+            let retry = map_installer_exit_code(code).unwrap_err();
+            assert!(retry.contains("再試行"), "code={code}: {retry}");
+        }
+    }
+
+    #[test]
+    fn process_wait_reads_exit_only_after_successful_wait() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let code = wait_for_installer_with(
+            || {
+                events.borrow_mut().push("wait");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("exit");
+                Ok(0)
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(events.into_inner(), ["wait", "exit"]);
+
+        let exit_called = std::cell::Cell::new(false);
+        assert!(wait_for_installer_with(
+            || Err("wait failed".to_string()),
+            || {
+                exit_called.set(true);
+                Ok(0)
+            }
+        )
+        .is_err());
+        assert!(!exit_called.get());
+
+        let exit_error =
+            wait_for_installer_with(|| Ok(()), || Err("exit read failed".to_string())).unwrap_err();
+        assert_eq!(exit_error, "exit read failed");
+    }
+
+    #[test]
+    fn installing_phase_is_announced_once_only_after_a_valid_launch() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let attempts = ActiveUpdateAttempts::new();
+        let _guard = attempts.begin(1).unwrap();
+        let process = launch_installer_and_announce(
+            &attempts,
+            1,
+            || {
+                events.borrow_mut().push("launch");
+                Ok("owned-process")
+            },
+            || events.borrow_mut().push("installing"),
+        )
+        .unwrap();
+        events.borrow_mut().push("wait");
+        assert_eq!(process, "owned-process");
+        assert_eq!(events.into_inner(), ["launch", "installing", "wait"]);
+
+        let announced = std::cell::Cell::new(0);
+        let failed_attempts = ActiveUpdateAttempts::new();
+        let _failed_guard = failed_attempts.begin(2).unwrap();
+        assert!(launch_installer_and_announce::<()>(
+            &failed_attempts,
+            2,
+            || Err("launch failed".to_string()),
+            || announced.set(announced.get() + 1),
+        )
+        .is_err());
+        assert_eq!(announced.get(), 0);
+
+        let launched = std::cell::Cell::new(0);
+        let cancelled_attempts = ActiveUpdateAttempts::new();
+        let _cancelled_guard = cancelled_attempts.begin(3).unwrap();
+        assert_eq!(
+            cancelled_attempts.request_cancel(3),
+            CancelUpdateOutcome::Accepted
+        );
+        assert!(launch_installer_and_announce(
+            &cancelled_attempts,
+            3,
+            || {
+                launched.set(launched.get() + 1);
+                Ok(())
+            },
+            || announced.set(announced.get() + 1),
+        )
+        .is_err());
+        assert_eq!(launched.get(), 0);
+        assert_eq!(announced.get(), 0);
+    }
+
+    #[test]
+    fn update_attempt_state_rejects_stale_cancel_and_accepts_current_download_cancel() {
+        let attempts = ActiveUpdateAttempts::new();
+        let guard_a = attempts.begin(41).unwrap();
+        assert!(attempts.begin(42).is_err());
+        attempts.clear_if_matching(41);
+        let _guard_b = attempts.begin(42).unwrap();
+
+        assert_eq!(attempts.request_cancel(41), CancelUpdateOutcome::Inactive);
+        assert_eq!(attempts.request_cancel(42), CancelUpdateOutcome::Accepted);
+        assert!(attempts.is_cancelled(42));
+
+        drop(guard_a);
+        assert_eq!(
+            attempts.snapshot(),
+            Some((42, UpdateAttemptPhase::Downloading, true))
+        );
+    }
+
+    #[test]
+    fn update_attempt_cancel_is_ignored_without_a_download_or_after_installing() {
+        let attempts = ActiveUpdateAttempts::new();
+        assert_eq!(attempts.request_cancel(7), CancelUpdateOutcome::Inactive);
+
+        let _guard = attempts.begin(7).unwrap();
+        assert_eq!(attempts.request_cancel(8), CancelUpdateOutcome::Inactive);
+        assert_eq!(attempts.begin_installing(7), Ok(()));
+        assert_eq!(attempts.request_cancel(7), CancelUpdateOutcome::TooLate);
+        assert!(!attempts.is_cancelled(7));
+    }
+
+    #[test]
+    fn cancel_update_outcomes_have_a_stable_typed_wire_shape() {
+        assert_eq!(
+            serde_json::to_string(&CancelUpdateOutcome::Accepted).unwrap(),
+            "\"accepted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CancelUpdateOutcome::TooLate).unwrap(),
+            "\"too_late\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CancelUpdateOutcome::Inactive).unwrap(),
+            "\"inactive\""
+        );
+    }
+
+    #[test]
+    fn update_attempt_cancel_and_launch_boundary_have_a_serialized_outcome() {
+        let cancelled_first = ActiveUpdateAttempts::new();
+        let _guard = cancelled_first.begin(10).unwrap();
+        assert_eq!(
+            cancelled_first.request_cancel(10),
+            CancelUpdateOutcome::Accepted
+        );
+        assert!(cancelled_first.begin_installing(10).is_err());
+        assert_eq!(
+            cancelled_first.phase(10),
+            Some(UpdateAttemptPhase::Downloading)
+        );
+
+        let launch_first = ActiveUpdateAttempts::new();
+        let _guard = launch_first.begin(11).unwrap();
+        assert_eq!(launch_first.begin_installing(11), Ok(()));
+        assert_eq!(
+            launch_first.request_cancel(11),
+            CancelUpdateOutcome::TooLate
+        );
+        assert_eq!(launch_first.phase(11), Some(UpdateAttemptPhase::Installing));
+    }
+
+    #[test]
+    fn update_attempt_state_recovers_from_mutex_poison_without_activating_cancel() {
+        let attempts = ActiveUpdateAttempts::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lock = attempts.inner.lock().unwrap();
+            panic!("poison test mutex");
+        }));
+
+        assert_eq!(attempts.request_cancel(99), CancelUpdateOutcome::Inactive);
+        let _guard = attempts.begin(99).unwrap();
+        assert!(!attempts.is_cancelled(99));
     }
 
     #[test]

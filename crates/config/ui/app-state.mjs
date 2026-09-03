@@ -19,6 +19,114 @@ function copyAutomaticCheckFields(target, source) {
   }
 }
 
+export function updatePhasePresentation(phase, payload = {}) {
+  if (phase === "installing") {
+    return {
+      cancelHidden: true,
+      progressHidden: true,
+      status: "インストーラの完了を待っています…",
+    };
+  }
+  if (phase === "downloading") {
+    const status = payload.percent != null
+      ? `ダウンロード中… ${payload.percent}%`
+      : payload.received != null
+        ? `ダウンロード中… ${(payload.received / 1048576).toFixed(1)} MB`
+        : "ダウンロード中…";
+    return { cancelHidden: false, progressHidden: false, status };
+  }
+  return { cancelHidden: true, progressHidden: true, status: "" };
+}
+
+export function acceptUpdatePhaseEvent(activeAttemptId, commandPending, payload) {
+  if (!commandPending || !Number.isSafeInteger(activeAttemptId) ||
+      payload?.attempt_id !== activeAttemptId ||
+      (payload.phase !== "downloading" && payload.phase !== "installing")) {
+    return null;
+  }
+  return payload;
+}
+
+const UPDATE_PHASE_RANK = Object.freeze({ downloading: 0, installing: 1 });
+
+export function reduceUpdateCancellation(state, action) {
+  if (action?.type === "request") {
+    if (!state.commandPending || state.phase !== "downloading" ||
+        state.activeAttemptId !== action.attemptId ||
+        state.cancelRequestedAttemptId != null) return state;
+    return { ...state, cancelRequestedAttemptId: action.attemptId, cancelError: null };
+  }
+
+  if (action?.type === "phase") {
+    const payload = acceptUpdatePhaseEvent(
+      state.activeAttemptId, state.commandPending, action.payload,
+    );
+    if (!payload) return state;
+    const currentRank = UPDATE_PHASE_RANK[state.phase];
+    const incomingRank = UPDATE_PHASE_RANK[payload.phase];
+    if (currentRank == null || incomingRank < currentRank) return state;
+    return {
+      ...state,
+      phase: payload.phase,
+      cancelRequestedAttemptId: payload.phase === "installing" &&
+        state.cancelRequestedAttemptId === payload.attempt_id
+        ? null : state.cancelRequestedAttemptId,
+      cancelError: payload.phase === "installing" ? null : state.cancelError,
+    };
+  }
+
+  if ((action?.type !== "result" && action?.type !== "rejected") ||
+      !state.commandPending || state.activeAttemptId !== action.attemptId ||
+      state.cancelRequestedAttemptId !== action.attemptId) return state;
+
+  if (action.type === "result" && action.outcome === "accepted") return state;
+  if (action.type === "result" && action.outcome === "too_late") {
+    return {
+      ...state,
+      phase: "installing",
+      cancelRequestedAttemptId: null,
+      cancelError: null,
+    };
+  }
+  if (state.phase !== "downloading") return state;
+  if (action.type === "result" && action.outcome === "inactive") {
+    return { ...state, cancelRequestedAttemptId: null, cancelError: null };
+  }
+  return {
+    ...state,
+    cancelRequestedAttemptId: null,
+    cancelError: action.type === "rejected"
+      ? String(action.error)
+      : "キャンセル要求の応答を確認できませんでした。",
+  };
+}
+
+export function updateCancellationPresentation(state, payload = {}) {
+  const view = updatePhasePresentation(state.phase, payload);
+  const cancellationPending = state.phase === "downloading" &&
+    state.cancelRequestedAttemptId === state.activeAttemptId;
+  return {
+    cancelHidden: view.cancelHidden || cancellationPending,
+    cancelDisabled: view.cancelHidden || cancellationPending,
+    progressHidden: view.progressHidden,
+    status: cancellationPending ? "キャンセルしています…" : view.status,
+  };
+}
+
+export function settleUpdatePhase(succeeded) {
+  return succeeded ? "completed" : "idle";
+}
+
+export function updateCloseBlockedMessage(phase) {
+  if (phase === "installing") {
+    return "アップデート進行中です。インストーラ側で完了またはキャンセルしてから閉じてください";
+  }
+  if (phase === "downloading") {
+    return "アップデート進行中です。「キャンセル」で中止して完了を待ってから閉じてください";
+  }
+  return "アップデート操作を完了してから閉じてください";
+}
+
 export function dictionaryPage(entries, filter, pageIndex, pageSize) {
   const query = filter.trim();
   const matching = query
@@ -40,6 +148,52 @@ export function dictionaryPage(entries, filter, pageIndex, pageSize) {
 
 export function resetDictionaryScroll(container) {
   container.scrollTop = 0;
+}
+
+const ZENZAI_RUNTIME_REASON_LABELS = Object.freeze({
+  user_disabled: "設定で無効",
+  cpu_unsupported: "CPU要件未達",
+  model_missing: "モデル未導入",
+  invalid_runtime_directory: "runtimeフォルダ不正",
+  backend_path_rejected: "backend探索先拒否",
+  backend_unavailable: "Vulkan backendなし",
+  gpu_unavailable: "GPU/driverなし",
+  model_load: "モデル読み込み失敗",
+  context_load: "context作成失敗",
+  decode: "GPU推論失敗",
+  warmup: "warm-up失敗",
+  slow_inference: "推論が重いため停止",
+  runtime_failure: "runtime失敗",
+  not_started: "未開始",
+});
+
+export function zenzaiRuntimeStatusLabel(status) {
+  if (!status) return "GPU runtime状態を取得できません（エンジン未起動・旧版・応答なし）";
+  const reason = status.reason
+    ? `（${ZENZAI_RUNTIME_REASON_LABELS[status.reason] ?? status.reason}）`
+    : "";
+  switch (status.state) {
+    case "disabled": return `GPU runtime: 無効${reason}`;
+    case "preparing": return "GPU runtime: 準備中…";
+    case "gpu_active": {
+      const details = [status.device, status.backend].filter(Boolean).join(" / ");
+      return `GPU runtime: ${details || "GPU"} で稼働中`;
+    }
+    case "classic": return `GPU runtime: 古典変換中${reason}`;
+    default: return null;
+  }
+}
+
+export function canRetryZenzai({
+  anyBusy,
+  dirty,
+  enabled,
+  modelReady,
+  statusInFlight,
+  status,
+}) {
+  return !anyBusy && !dirty && enabled && modelReady && !statusInFlight &&
+    status?.state === "classic";
 }
 
 /**

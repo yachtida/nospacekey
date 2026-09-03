@@ -1,7 +1,7 @@
 //! SP6a: 候補リストを TSF UI Element として公開する COM オブジェクト。
 //! 候補データは Rc<RefCell<CandidateState>> を presenter と共有して読む。
 //! Behavior(マウス/タッチ発)は outbox に要求を書き、notify で text_service へ知らせる。
-use crate::candidate_state::CandidateState;
+use crate::candidate_state::{request_selection, CandidateState};
 use crate::globals::{ComObjectGuard, GUID_UIELEMENT_CANDIDATELIST};
 use crate::text_service::tip_log;
 use std::cell::{Cell, RefCell};
@@ -27,17 +27,26 @@ pub enum BehaviorAction {
 /// 選択要求は outbox ではなく専用フラグに立てる — outbox は Option 1 枠しか無く、
 /// 保留中の Finalize を上書きするとホスト発の確定が黙って消える。
 pub(crate) fn behavior_set_selection(
+    active: &Cell<bool>,
     state: &Rc<RefCell<CandidateState>>,
     selection_dirty: &Rc<Cell<bool>>,
     index: u32,
 ) {
-    state.borrow_mut().set_selection(index as usize);
-    selection_dirty.set(true);
+    if !active.get() {
+        return;
+    }
+    request_selection(state, selection_dirty, index as usize);
 }
-pub(crate) fn behavior_finalize(outbox: &Rc<RefCell<Option<BehaviorAction>>>) {
+pub(crate) fn behavior_finalize(active: &Cell<bool>, outbox: &Rc<RefCell<Option<BehaviorAction>>>) {
+    if !active.get() {
+        return;
+    }
     *outbox.borrow_mut() = Some(BehaviorAction::Finalize);
 }
-pub(crate) fn behavior_abort(outbox: &Rc<RefCell<Option<BehaviorAction>>>) {
+pub(crate) fn behavior_abort(active: &Cell<bool>, outbox: &Rc<RefCell<Option<BehaviorAction>>>) {
+    if !active.get() {
+        return;
+    }
     *outbox.borrow_mut() = Some(BehaviorAction::Abort);
 }
 
@@ -54,6 +63,7 @@ pub struct CandidateListUIElement {
     /// ホストの GetUpdatedFlags で read-and-clear する。
     updated_flags: Rc<Cell<u32>>,
     notify: Rc<dyn Fn()>,
+    active: Rc<Cell<bool>>,
     shown: Cell<bool>,
     // C-1: DLL_REF で生存数を数える。ホストが UIElement を保持中に DLL がアンロード
     // されると Behavior 呼び出しで UAF になるため、生存中はアンロードを防ぐ。
@@ -67,6 +77,7 @@ impl CandidateListUIElement {
         selection_dirty: Rc<Cell<bool>>,
         updated_flags: Rc<Cell<u32>>,
         notify: Rc<dyn Fn()>,
+        active: Rc<Cell<bool>>,
     ) -> Self {
         Self {
             state,
@@ -74,6 +85,7 @@ impl CandidateListUIElement {
             selection_dirty,
             updated_flags,
             notify,
+            active,
             shown: Cell::new(false),
             _guard: ComObjectGuard::new(),
         }
@@ -142,17 +154,26 @@ impl ITfCandidateListUIElement_Impl for CandidateListUIElement_Impl {
 
 impl ITfCandidateListUIElementBehavior_Impl for CandidateListUIElement_Impl {
     fn SetSelection(&self, nindex: u32) -> Result<()> {
-        behavior_set_selection(&self.state, &self.selection_dirty, nindex);
+        behavior_set_selection(&self.active, &self.state, &self.selection_dirty, nindex);
+        if !self.active.get() {
+            return Ok(());
+        }
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.notify)()));
         Ok(())
     }
     fn Finalize(&self) -> Result<()> {
-        behavior_finalize(&self.outbox);
+        behavior_finalize(&self.active, &self.outbox);
+        if !self.active.get() {
+            return Ok(());
+        }
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.notify)()));
         Ok(())
     }
     fn Abort(&self) -> Result<()> {
-        behavior_abort(&self.outbox);
+        behavior_abort(&self.active, &self.outbox);
+        if !self.active.get() {
+            return Ok(());
+        }
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.notify)()));
         Ok(())
     }
@@ -186,7 +207,10 @@ impl ITfIntegratableCandidateListUIElement_Impl for CandidateListUIElement_Impl 
     /// 既存 Finalize 経路へ委譲（現在選択を確定）。
     fn FinalizeExactCompositionString(&self) -> Result<()> {
         tip_log("ev=integ_finalize");
-        behavior_finalize(&self.outbox);
+        behavior_finalize(&self.active, &self.outbox);
+        if !self.active.get() {
+            return Ok(());
+        }
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.notify)()));
         Ok(())
     }
@@ -209,7 +233,7 @@ mod tests {
     #[test]
     fn set_selection_updates_state_and_requests_preedit_sync_without_touching_outbox() {
         let (st, ob, dirty) = fixture();
-        behavior_set_selection(&st, &dirty, 2);
+        behavior_set_selection(&Cell::new(true), &st, &dirty, 2);
         assert_eq!(st.borrow().selected(), 2);
         assert!(dirty.get(), "選択移動は preedit 同期を要求する");
         assert_eq!(
@@ -221,8 +245,9 @@ mod tests {
     #[test]
     fn set_selection_does_not_displace_a_pending_finalize() {
         let (st, ob, dirty) = fixture();
-        behavior_finalize(&ob);
-        behavior_set_selection(&st, &dirty, 1);
+        let active = Cell::new(true);
+        behavior_finalize(&active, &ob);
+        behavior_set_selection(&active, &st, &dirty, 1);
         assert_eq!(
             *ob.borrow(),
             Some(BehaviorAction::Finalize),
@@ -233,9 +258,30 @@ mod tests {
     #[test]
     fn finalize_and_abort_post_outbox() {
         let (_st, ob, _dirty) = fixture();
-        behavior_finalize(&ob);
+        let active = Cell::new(true);
+        behavior_finalize(&active, &ob);
         assert_eq!(*ob.borrow(), Some(BehaviorAction::Finalize));
-        behavior_abort(&ob);
+        behavior_abort(&active, &ob);
         assert_eq!(*ob.borrow(), Some(BehaviorAction::Abort));
+    }
+
+    #[test]
+    fn invalidated_element_cannot_mutate_the_shared_state_used_by_its_successor() {
+        let (state, outbox, dirty) = fixture();
+        let old = Cell::new(false);
+        let current = Cell::new(true);
+
+        behavior_set_selection(&old, &state, &dirty, 2);
+        behavior_finalize(&old, &outbox);
+        behavior_abort(&old, &outbox);
+        assert_eq!(state.borrow().selected(), 0);
+        assert!(!dirty.get());
+        assert_eq!(*outbox.borrow(), None);
+
+        behavior_set_selection(&current, &state, &dirty, 2);
+        behavior_finalize(&current, &outbox);
+        assert_eq!(state.borrow().selected(), 2);
+        assert!(dirty.get());
+        assert_eq!(*outbox.borrow(), Some(BehaviorAction::Finalize));
     }
 }

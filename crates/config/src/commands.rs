@@ -684,6 +684,16 @@ fn checker_path() -> std::path::PathBuf {
     nospacekey_update::scheduler::checker_path_from_config(&config)
 }
 
+pub fn repair_update_task_after_install() -> i32 {
+    let (current, outcome) = settings::load_reporting();
+    if !startup_reconcile_load_is_usable(outcome) || !current.update.automatic_check {
+        return 0;
+    }
+    nospacekey_update::scheduler::register_or_update(&checker_path())
+        .map(|_| 0)
+        .unwrap_or(1)
+}
+
 fn current_task_identity() -> Result<nospacekey_update::scheduler::TaskIdentity, String> {
     nospacekey_update::scheduler::current_user_sid()
         .map(nospacekey_update::scheduler::task_identity)
@@ -1042,7 +1052,7 @@ fn learning_coordination_scope(raw: &str) -> String {
     format!("{hash:016x}")
 }
 
-fn learning_memory_dir_from_env() -> Result<PathBuf, String> {
+fn learning_memory_base_dir_from_env() -> Result<PathBuf, String> {
     match std::env::var_os("NOSPACEKEY_MEMORY_DIR").filter(|v| !v.is_empty()) {
         Some(path) => Ok(PathBuf::from(path)),
         None => {
@@ -1054,28 +1064,23 @@ fn learning_memory_dir_from_env() -> Result<PathBuf, String> {
     }
 }
 
-fn learning_coordination_scope_from_env() -> Result<String, String> {
-    let path = learning_memory_dir_from_env()?;
-    Ok(learning_coordination_scope(&path.to_string_lossy()))
-}
-
 fn learning_lifecycle_mutex_name(scope: &str) -> String {
     format!(r"Global\nospacekey-learning-lifecycle-{scope}")
 }
 
-fn learning_presence_mutex_name(scope: &str, session_id: u32) -> String {
-    format!(r"Global\nospacekey-learning-presence-{scope}-s{session_id}")
+fn learning_presence_mutex_name(scope: &str, build: &str, session_id: u32) -> String {
+    format!(r"Global\nospacekey-learning-presence-{scope}-b{build}-s{session_id}")
 }
 
 /// EngineHost が process lifetime 中保持する presence object の存在を調べる。
 /// lifecycle gate の ownership 中にだけ呼ぶため、「不在確認直後に別 session Engine が起動」する
 /// TOCTOU は EngineHost 起動側の同じ gate 待ちで閉じる。
-fn learning_presence_exists(scope: &str, session_id: u32) -> Result<bool, String> {
+fn learning_presence_exists(scope: &str, build: &str, session_id: u32) -> Result<bool, String> {
     use windows::core::HSTRING;
     use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
 
-    let name = HSTRING::from(learning_presence_mutex_name(scope, session_id));
+    let name = HSTRING::from(learning_presence_mutex_name(scope, build, session_id));
     unsafe {
         let created = CreateMutexW(None, false, &name);
         let last_error = GetLastError();
@@ -1090,6 +1095,170 @@ fn learning_presence_exists(scope: &str, session_id: u32) -> Result<bool, String
             )),
         }
     }
+}
+
+fn legacy_learning_presence_exists(scope: &str, session_id: u32) -> Result<bool, String> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    let name = HSTRING::from(format!(
+        r"Global\nospacekey-learning-presence-{scope}-s{session_id}"
+    ));
+    unsafe {
+        let created = CreateMutexW(None, false, &name);
+        let last_error = GetLastError();
+        match created {
+            Ok(handle) => {
+                let exists = last_error == ERROR_ALREADY_EXISTS;
+                let _ = CloseHandle(handle);
+                Ok(exists)
+            }
+            Err(error) => Err(format!(
+                "session {session_id} の旧エンジン状態を確認できませんでした: {error}"
+            )),
+        }
+    }
+}
+
+fn is_safe_build_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 80
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+}
+
+fn installed_versions_root_for_exe(exe: &Path, current_version: &str) -> Option<PathBuf> {
+    let file_name = exe.file_name()?.to_str()?;
+    if !file_name.eq_ignore_ascii_case("NospacekeyConfig.exe") {
+        return None;
+    }
+    let version_dir = exe.parent()?;
+    if !version_dir
+        .file_name()?
+        .to_str()?
+        .eq_ignore_ascii_case(current_version)
+    {
+        return None;
+    }
+    let versions_dir = version_dir.parent()?;
+    if !versions_dir
+        .file_name()?
+        .to_str()?
+        .eq_ignore_ascii_case("versions")
+    {
+        return None;
+    }
+    versions_dir.parent()?;
+    Some(versions_dir.to_path_buf())
+}
+
+fn strict_installed_build_name(name: &str) -> bool {
+    semver::Version::parse(name).is_ok()
+}
+
+fn known_learning_builds(exe: &Path) -> Result<Vec<String>, String> {
+    let mut builds = vec![env!("CARGO_PKG_VERSION").to_string()];
+    if let Some(root) = installed_versions_root_for_exe(exe, env!("CARGO_PKG_VERSION")) {
+        for entry in std::fs::read_dir(&root)
+            .map_err(|error| format!("製品の版一覧を確認できませんでした: {error}"))?
+        {
+            let entry =
+                entry.map_err(|error| format!("学習履歴の版を確認できませんでした: {error}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("学習履歴の版種別を確認できませんでした: {error}"))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if file_type.is_dir() && !file_type.is_symlink() && strict_installed_build_name(&name) {
+                builds.push(name);
+            }
+        }
+    }
+    builds.sort();
+    builds.dedup();
+    Ok(builds)
+}
+
+struct HeldLearningDirectory {
+    build: String,
+    path: PathBuf,
+    _handle: std::fs::File,
+}
+
+fn open_existing_learning_directory(path: &Path) -> Result<Option<std::fs::File>, String> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "学習履歴フォルダを確認できないため削除しません: {error}"
+            ))
+        }
+    };
+    if metadata_is_reparse(&metadata) || !metadata.is_dir() {
+        return Err("学習履歴フォルダが通常の directory ではないため削除しません。".into());
+    }
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(path)
+        .map_err(|error| format!("学習履歴フォルダを固定できないため削除しません: {error}"))?;
+    let held_metadata = handle
+        .metadata()
+        .map_err(|error| format!("固定した学習履歴フォルダを確認できません: {error}"))?;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    if held_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !held_metadata.is_dir()
+    {
+        return Err("固定した学習履歴フォルダが通常の directory ではありません。".into());
+    }
+    Ok(Some(handle))
+}
+
+fn collect_existing_learning_roots_with<T>(
+    base: &Path,
+    builds: &[String],
+    base_handle: Option<T>,
+    mut open: impl FnMut(&Path) -> Result<Option<T>, String>,
+) -> Result<(Option<T>, Vec<(String, PathBuf, T)>), String> {
+    let Some(base_handle) = base_handle else {
+        return Ok((None, Vec::new()));
+    };
+    let mut roots = Vec::new();
+    for build in builds {
+        if !is_safe_build_name(build) {
+            return Err("学習履歴の版名が安全な形式ではありません。".into());
+        }
+        let path = base.join(build);
+        if let Some(handle) = open(&path)? {
+            roots.push((build.clone(), path, handle));
+        }
+    }
+    Ok((Some(base_handle), roots))
+}
+
+fn selected_learning_root_paths(
+    base: &Path,
+    base_held: bool,
+    roots: &[(String, PathBuf)],
+    keep_current: bool,
+) -> Vec<PathBuf> {
+    let mut selected = roots
+        .iter()
+        .filter(|(build, _)| !(keep_current && build == env!("CARGO_PKG_VERSION")))
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    if base_held {
+        selected.push(base.to_path_buf());
+    }
+    selected
 }
 
 fn logon_session_ids() -> Result<Vec<u32>, String> {
@@ -1245,6 +1414,10 @@ struct LearningClearLease {
     handle: windows::Win32::Foundation::HANDLE,
     scope: String,
     current: u32,
+    builds: Vec<String>,
+    base: PathBuf,
+    _base_handle: Option<std::fs::File>,
+    roots: Vec<HeldLearningDirectory>,
 }
 
 impl LearningClearLease {
@@ -1253,7 +1426,8 @@ impl LearningClearLease {
         use windows::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
         use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 
-        let scope = learning_coordination_scope_from_env()?;
+        let base = learning_memory_base_dir_from_env()?;
+        let scope = learning_coordination_scope(&base.to_string_lossy());
         let name = HSTRING::from(learning_lifecycle_mutex_name(&scope));
         let handle = unsafe { CreateMutexW(None, false, &name) }
             .map_err(|e| format!("学習消去 gate を作成できませんでした: {e}"))?;
@@ -1265,11 +1439,36 @@ impl LearningClearLease {
             return Err("別のエンジンが起動処理中です。少し待って再試行してください。".into());
         }
         let current = ipc::client::current_session_id();
-        let lease = Self {
+        let mut lease = Self {
             handle,
             scope,
             current,
+            builds: Vec::new(),
+            base: PathBuf::new(),
+            _base_handle: None,
+            roots: Vec::new(),
         };
+        validate_no_reparse_ancestors(&base)?;
+        let base_handle = open_existing_learning_directory(&base)?;
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("設定アプリの配置を確認できませんでした: {error}"))?;
+        lease.builds = known_learning_builds(&exe)?;
+        let (base_handle, roots) = collect_existing_learning_roots_with(
+            &base,
+            &lease.builds,
+            base_handle,
+            open_existing_learning_directory,
+        )?;
+        lease.base = base;
+        lease._base_handle = base_handle;
+        lease.roots = roots
+            .into_iter()
+            .map(|(build, path, handle)| HeldLearningDirectory {
+                build,
+                path,
+                _handle: handle,
+            })
+            .collect();
         // The current session may have no EngineHost at all.  We still
         // perform the full session/presence audit here, but expose that one
         // fact to the caller so only the proven-absent path can use the
@@ -1288,6 +1487,23 @@ impl LearningClearLease {
         self.revalidate_with_current_presence(false)
     }
 
+    fn clear_held_roots(&self, keep_current: bool) -> Result<(), String> {
+        let roots = self
+            .roots
+            .iter()
+            .map(|root| (root.build.clone(), root.path.clone()))
+            .collect::<Vec<_>>();
+        for path in selected_learning_root_paths(
+            &self.base,
+            self._base_handle.is_some(),
+            &roots,
+            keep_current,
+        ) {
+            clear_learning_files(&path)?;
+        }
+        Ok(())
+    }
+
     fn revalidate_with_current_presence(&self, require_current: bool) -> Result<bool, String> {
         let sessions = logon_session_ids()?;
         let current = self.current;
@@ -1295,7 +1511,25 @@ impl LearningClearLease {
             return Err("現在の Windows session を確認できないため、安全に消去できません。".into());
         }
         ensure_no_other_same_user_session(current, &sessions)?;
-        let current_present = learning_presence_exists(&self.scope, current)?;
+        if legacy_learning_presence_exists(&self.scope, current)? {
+            return Err(
+                "旧エンジンが動作中のため、学習履歴を安全に消去できません。読み込み済みのアプリを再起動してください。"
+                    .into(),
+            );
+        }
+        let current_build = env!("CARGO_PKG_VERSION");
+        let current_present = learning_presence_exists(&self.scope, current_build, current)?;
+        for build in self
+            .builds
+            .iter()
+            .filter(|build| build.as_str() != current_build)
+        {
+            if learning_presence_exists(&self.scope, build, current)? {
+                return Err(format!(
+                    "別バージョン ({build}) のエンジンが動作中のため、学習履歴を安全に消去できません。読み込み済みのアプリを再起動してください。"
+                ));
+            }
+        }
         if require_current && !current_present {
             return Err(
                 "現在のエンジンが学習消去の session 協調に対応していません。IME を再起動して再試行してください。"
@@ -1303,7 +1537,15 @@ impl LearningClearLease {
             );
         }
         for session_id in sessions.into_iter().filter(|id| *id != current) {
-            if learning_presence_exists(&self.scope, session_id)? {
+            if legacy_learning_presence_exists(&self.scope, session_id)?
+                || self.builds.iter().try_fold(false, |found, build| {
+                    if found {
+                        Ok(true)
+                    } else {
+                        learning_presence_exists(&self.scope, build, session_id)
+                    }
+                })?
+            {
                 return Err(
                     "別の Windows session で nospacekey エンジンが動作中のため、学習履歴を消去できません。そちらの session をサインアウトしてから再試行してください。"
                         .into(),
@@ -1392,6 +1634,35 @@ fn metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
     {
         metadata.file_type().is_symlink()
     }
+}
+
+fn validate_no_reparse_ancestors_with(
+    path: &Path,
+    mut inspect: impl FnMut(&Path) -> Result<Option<bool>, String>,
+) -> Result<(), String> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if inspect(&current)?.is_some_and(|reparse| reparse) {
+            return Err(format!(
+                "学習履歴のパスに reparse point が含まれるため削除しません: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_no_reparse_ancestors(path: &Path) -> Result<(), String> {
+    validate_no_reparse_ancestors_with(path, |component| {
+        match std::fs::symlink_metadata(component) {
+            Ok(metadata) => Ok(Some(metadata_is_reparse(&metadata))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!(
+                "学習履歴のパスを確認できないため削除しません: {error}"
+            )),
+        }
+    })
 }
 
 fn scan_learning_directory(path: &Path) -> Result<Vec<LearningEntry>, LearningScanError> {
@@ -1552,7 +1823,11 @@ pub fn clear_learning_history() -> Result<String, String> {
     let (cross_session_lease, current_engine_present) = LearningClearLease::acquire()?;
     let pipe = ipc::client::stable_pipe_name();
     if current_engine_present {
-        return match ipc::client::EngineClient::connect_to(&pipe, Duration::from_millis(250)) {
+        return match ipc::client::EngineClient::connect_verified_to(
+            &pipe,
+            Duration::from_millis(250),
+            std::time::Instant::now() + Duration::from_millis(2000),
+        ) {
             Ok(mut c) => {
                 request_clear_learning_once(&mut c)?;
                 // 最初の消去中に同一ユーザー session が現れた場合は成功を返さない。検証までに
@@ -1560,8 +1835,12 @@ pub fn clear_learning_history() -> Result<String, String> {
                 // 最終的に空へ戻す。検証後に現れる Engine は一度目の空ディスクからしか読めない。
                 cross_session_lease.revalidate()?;
                 request_clear_learning_once(&mut c)?;
+                cross_session_lease.clear_held_roots(true)?;
                 Ok("engine".into())
             }
+            Err(ipc::client::EngineIdentityError::Mismatch { .. }) => Err(
+                "エンジンのバージョンが一致しないため、学習履歴を安全に消去できませんでした。読み込み済みのアプリを再起動してください。".into(),
+            ),
             Err(e) => Err(format!(
                 "エンジンに接続できないため、学習履歴を安全に消去できませんでした。IME を有効にして少し待ってから再試行してください: {e}"
             )),
@@ -1575,9 +1854,110 @@ pub fn clear_learning_history() -> Result<String, String> {
     if cross_session_lease.revalidate_allow_absent()? {
         return Err("エンジンが起動したため、学習履歴を安全に削除できませんでした。".into());
     }
-    let memory_dir = learning_memory_dir_from_env()?;
-    clear_learning_files(&memory_dir)?;
+    cross_session_lease.clear_held_roots(false)?;
     Ok("files".into())
+}
+
+/// Settings-facing projection of the engine's GPU-required Zenzai state. Model
+/// installation is queried separately by `zenzai_model_status`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ZenzaiRuntimeStatusDto {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+const ZENZAI_STATUS_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+const ZENZAI_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_millis(300);
+
+fn zenzai_runtime_client() -> Result<ipc::client::VerifiedEngineClient, String> {
+    ipc::client::EngineClient::connect_verified_to(
+        &ipc::client::stable_pipe_name(),
+        ZENZAI_STATUS_CONNECT_TIMEOUT,
+        std::time::Instant::now() + ZENZAI_STATUS_REQUEST_TIMEOUT,
+    )
+    .map_err(|error| match error {
+        ipc::client::EngineIdentityError::Mismatch { .. } => {
+            "Zenzai runtime の状態を取得できません（エンジンのバージョン不一致）".to_string()
+        }
+        _ => "Zenzai runtime の状態を取得できません（エンジン不在）".to_string(),
+    })
+}
+
+fn zenzai_status_from_response(
+    state: String,
+    backend: Option<String>,
+    device: Option<String>,
+    reason: Option<String>,
+) -> Result<ZenzaiRuntimeStatusDto, String> {
+    if !matches!(
+        state.as_str(),
+        "disabled" | "preparing" | "gpu_active" | "classic"
+    ) {
+        return Err("Zenzai runtime の状態を取得できません（応答が不正です）".into());
+    }
+    Ok(ZenzaiRuntimeStatusDto {
+        state,
+        backend,
+        device,
+        reason,
+    })
+}
+
+fn query_zenzai_status() -> Result<ZenzaiRuntimeStatusDto, String> {
+    use std::time::Instant;
+
+    let mut client = zenzai_runtime_client()?;
+    let deadline = Instant::now() + ZENZAI_STATUS_REQUEST_TIMEOUT;
+    match client.request_within(&ipc::protocol::Request::QueryZenzaiStatus, deadline) {
+        Ok(ipc::protocol::Response::ZenzaiStatus {
+            state,
+            backend,
+            device,
+            reason,
+        }) => zenzai_status_from_response(state, backend, device, reason),
+        // An explicit engine error is not a classic state: status availability is separate.
+        Ok(ipc::protocol::Response::Error { .. }) => {
+            Err("Zenzai runtime の状態を取得できません（エンジンが要求を拒否）".into())
+        }
+        Ok(_) => Err("Zenzai runtime の状態を取得できません（応答が不正です）".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            Err("Zenzai runtime の状態を取得できません（応答 timeout）".into())
+        }
+        Err(_) => Err("Zenzai runtime の状態を取得できません（エンジン応答なし）".into()),
+    }
+}
+
+/// Return a non-sensitive runtime snapshot. The bounded request is executed on
+/// Tauri's async worker and never on the WebView thread.
+#[tauri::command(async)]
+pub fn zenzai_runtime_status() -> Result<ZenzaiRuntimeStatusDto, String> {
+    query_zenzai_status()
+}
+
+/// Accept an explicit GPU retry. The engine acknowledges before starting native
+/// warm-up, so the UI command deadline is independent of model loading.
+#[tauri::command(async)]
+pub fn retry_zenzai() -> Result<(), String> {
+    use std::time::Instant;
+
+    let mut client = zenzai_runtime_client()?;
+    let deadline = Instant::now() + ZENZAI_STATUS_REQUEST_TIMEOUT;
+    match client.request_within(&ipc::protocol::Request::RetryZenzai, deadline) {
+        Ok(ipc::protocol::Response::Ok) => Ok(()),
+        Ok(ipc::protocol::Response::Error { .. }) => {
+            Err("Zenzai GPU の再試行を受け付けられません（エンジンが要求を拒否）".into())
+        }
+        Ok(_) => Err("Zenzai GPU の再試行を受け付けられません（応答が不正です）".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            Err("Zenzai GPU の再試行を受け付けられません（応答 timeout）".into())
+        }
+        Err(_) => Err("Zenzai GPU の再試行を受け付けられません（エンジン応答なし）".into()),
+    }
 }
 
 #[tauri::command]
@@ -1592,8 +1972,8 @@ pub fn open_settings_dir() {
 }
 
 /// `--stop-engine` の終了コード判定（純関数）。sent=接続できて Shutdown を送った、
-/// gone=その後 pipe が消えた（＝停止確認）。exit code は診断用（.iss は code に依らず taskkill へ
-/// 進む）: 0 = 停止完了 or 元々不在 / 1 = 送ったが 3s 以内に消えない。
+/// gone=その後 pipe が消えた（＝停止確認）。exit code は診断用:
+/// 0 = 停止完了 or 元々不在 / 1 = 送ったが 3s 以内に消えない。
 fn stop_engine_exit_code(sent: bool, gone: bool) -> i32 {
     if !sent || gone {
         0
@@ -1606,13 +1986,21 @@ fn stop_engine_exit_code(sent: bool, gone: bool) -> i32 {
 /// 常駐エンジンへ Request::Shutdown を送り（エンジンは学習 flush→応答後 exit）、pipe の消滅を
 /// 最大 3s ポーリングして停止を確認する。GUI は出さない（main は Tauri init 前にこれを呼ぶ）。
 /// パイプ名は TIP と同じ per-logon-session 名（stable_pipe_name）＝現セッション分のみ止まる。
-/// 他ユーザセッションのエンジンや graceful 失敗分は .iss の elevated taskkill が掃討する。
+/// 他version/sessionのEngineはロード済みTIPとのpairを維持するため停止対象にしない。
 pub fn stop_engine() -> i32 {
     use std::time::{Duration, Instant};
     let pipe = ipc::client::stable_pipe_name();
-    let Ok(mut c) = ipc::client::EngineClient::connect_to(&pipe, Duration::from_millis(250)) else {
-        // エンジン不在（接続失敗）＝止めるものが無い＝成功。
-        return stop_engine_exit_code(false, false);
+    let mut c = match ipc::client::EngineClient::connect_verified_to(
+        &pipe,
+        Duration::from_millis(250),
+        Instant::now() + Duration::from_millis(1000),
+    ) {
+        Ok(client) => client,
+        Err(ipc::client::EngineIdentityError::Mismatch { .. }) => return 2,
+        Err(_) => {
+            // エンジン不在（接続失敗）＝止めるものが無い＝成功。
+            return stop_engine_exit_code(false, false);
+        }
     };
     // engine は応答を書いてから exit するので、応答（Ok / 読取り時 broken pipe）は問わない —
     // 真の停止判定は下の pipe 消滅ポーリング。deadline は 1s（flush 込みでも余裕）。
@@ -1689,8 +2077,16 @@ const DICT_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_mil
 fn send_reload_over_pipe(enabled: bool) -> EngineStatus {
     use std::time::Instant;
     let pipe = ipc::client::stable_pipe_name();
-    let Ok(mut c) = ipc::client::EngineClient::connect_to(&pipe, DICT_CONNECT_TIMEOUT) else {
-        return EngineStatus::Absent;
+    let mut c = match ipc::client::EngineClient::connect_verified_to(
+        &pipe,
+        DICT_CONNECT_TIMEOUT,
+        Instant::now() + DICT_REQUEST_DEADLINE,
+    ) {
+        Ok(client) => client,
+        Err(ipc::client::EngineIdentityError::Mismatch { .. }) => {
+            return EngineStatus::VersionMismatch
+        }
+        Err(_) => return EngineStatus::Absent,
     };
     let deadline = Instant::now() + DICT_REQUEST_DEADLINE;
     match c.request_within(
@@ -1699,7 +2095,7 @@ fn send_reload_over_pipe(enabled: bool) -> EngineStatus {
     ) {
         Ok(ipc::protocol::Response::Ok) => EngineStatus::Applied,
         Ok(ipc::protocol::Response::Error { .. }) => EngineStatus::Declined,
-        Ok(_) => EngineStatus::Declined, // 未知応答は旧エンジンの拒否と同型に畳む
+        Ok(_) => EngineStatus::Declined,
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => EngineStatus::Timeout,
         Err(_) => EngineStatus::Absent, // 送信後の切断等も「反映されなかった」で無害に畳む
     }
@@ -1882,7 +2278,7 @@ pub fn dict_sync_engine(lock: tauri::State<'_, crate::logic::SettingsLock>) -> E
     EngineStatus::Absent
 }
 
-fn request_clear_learning_once(c: &mut ipc::client::EngineClient) -> Result<(), String> {
+fn request_clear_learning_once(c: &mut ipc::client::VerifiedEngineClient) -> Result<(), String> {
     use std::time::{Duration, Instant};
 
     let deadline = Instant::now() + Duration::from_millis(2000);
@@ -1902,15 +2298,19 @@ fn request_clear_learning_once(c: &mut ipc::client::EngineClient) -> Result<(), 
 mod tests {
     use super::{
         apply_automatic_check_transaction, apply_automatic_check_transaction_with_lease,
-        can_enable_inline_prediction, clear_learning_files_with, corrupt_recovered,
-        engine_singleton_mutex_name, get_settings_with_timeout, get_symbol_catalog,
-        has_other_same_user_session, is_allowed_external_url, learning_coordination_scope,
-        learning_lifecycle_mutex_name, learning_presence_mutex_name, persist_reconcile_off,
+        can_enable_inline_prediction, clear_learning_files_with,
+        collect_existing_learning_roots_with, corrupt_recovered, engine_singleton_mutex_name,
+        get_settings_with_timeout, get_symbol_catalog, has_other_same_user_session,
+        installed_versions_root_for_exe, is_allowed_external_url, is_safe_build_name,
+        known_learning_builds, learning_coordination_scope, learning_lifecycle_mutex_name,
+        learning_presence_mutex_name, open_existing_learning_directory, persist_reconcile_off,
         persist_reconcile_off_with_status, reconcile_automatic_check_task_with_lease, releases_url,
-        run_now_succeeded, run_reconcile_worker_with, should_register_task,
-        startup_reconcile_load_is_usable, startup_reconcile_load_warning, stop_engine_exit_code,
-        AutomaticCheckReconcileState, EngineAbsenceLease, LearningEntry, LearningEntryKind,
-        LearningScanError, ReconcileCompletion, WindowsSessionUser,
+        run_now_succeeded, run_reconcile_worker_with, selected_learning_root_paths,
+        should_register_task, startup_reconcile_load_is_usable, startup_reconcile_load_warning,
+        stop_engine_exit_code, strict_installed_build_name, validate_no_reparse_ancestors_with,
+        zenzai_status_from_response, AutomaticCheckReconcileState, EngineAbsenceLease,
+        LearningEntry, LearningEntryKind, LearningScanError, ReconcileCompletion,
+        WindowsSessionUser, ZenzaiRuntimeStatusDto,
     };
     use std::cell::{Cell, RefCell};
     use std::ffi::OsString;
@@ -2283,7 +2683,7 @@ mod tests {
         assert_eq!(stop_engine_exit_code(false, true), 0);
         // 送って pipe が消えた＝停止確認＝成功。
         assert_eq!(stop_engine_exit_code(true, true), 0);
-        // 送ったが 3s 以内に pipe が消えない＝診断用の失敗（呼び出し元 .iss は taskkill へ進む）。
+        // 送ったが 3s 以内に pipe が消えない＝診断用の失敗。
         assert_eq!(stop_engine_exit_code(true, false), 1);
     }
 
@@ -2475,9 +2875,166 @@ mod tests {
             r"Global\nospacekey-learning-lifecycle-540cb8761d8b7d7f"
         );
         assert_eq!(
-            learning_presence_mutex_name(&scope, 42),
-            r"Global\nospacekey-learning-presence-540cb8761d8b7d7f-s42"
+            learning_presence_mutex_name(&scope, env!("CARGO_PKG_VERSION"), 42),
+            format!(
+                r"Global\nospacekey-learning-presence-540cb8761d8b7d7f-b{}-s42",
+                env!("CARGO_PKG_VERSION")
+            )
         );
+        assert!(is_safe_build_name("1.2.3-beta.4"));
+        assert!(!is_safe_build_name("..\\loaded"));
+    }
+
+    #[test]
+    fn installed_build_discovery_requires_the_exact_product_layout() {
+        assert!(installed_versions_root_for_exe(
+            std::path::Path::new(r"D:\dev\target\debug\NospacekeyConfig.exe"),
+            env!("CARGO_PKG_VERSION")
+        )
+        .is_none());
+        assert!(installed_versions_root_for_exe(
+            std::path::Path::new(r"C:\app\releases\1.2.2-beta.9\NospacekeyConfig.exe"),
+            env!("CARGO_PKG_VERSION")
+        )
+        .is_none());
+        let uppercased_current = env!("CARGO_PKG_VERSION").to_uppercase();
+        assert_eq!(
+            installed_versions_root_for_exe(
+                std::path::PathBuf::from(format!(
+                    r"C:\Program Files\nospacekey\VeRsIoNs\{}\NOSPACEKEYCONFIG.EXE",
+                    uppercased_current
+                ))
+                .as_path(),
+                env!("CARGO_PKG_VERSION")
+            ),
+            Some(std::path::PathBuf::from(
+                r"C:\Program Files\nospacekey\VeRsIoNs"
+            ))
+        );
+    }
+
+    #[test]
+    fn installed_build_discovery_uses_only_strict_unprefixed_semver_children() {
+        assert!(strict_installed_build_name("1.2.3+sha.abc"));
+        assert!(strict_installed_build_name("1.2.3-beta.1+sha.abc"));
+        for invalid in ["v1.2.3", "backup", "debug", "1.2", "01.2.3"] {
+            assert!(!strict_installed_build_name(invalid), "{invalid}");
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let versions = temp.path().join("versions");
+        let current = versions.join(env!("CARGO_PKG_VERSION"));
+        std::fs::create_dir_all(&current).unwrap();
+        for name in ["1.0.0", "1.2.3+sha.abc", "v2.0.0", "backup", "debug"] {
+            std::fs::create_dir(versions.join(name)).unwrap();
+        }
+        let foreign_version = if env!("CARGO_PKG_VERSION") == "99.98.97+foreign" {
+            "99.98.96+foreign"
+        } else {
+            "99.98.97+foreign"
+        };
+        let memory = temp.path().join("memory");
+        std::fs::create_dir_all(memory.join(foreign_version)).unwrap();
+        std::fs::create_dir_all(memory.join("backup")).unwrap();
+        std::fs::create_dir_all(memory.join("debug")).unwrap();
+        let exe = current.join("NospacekeyConfig.exe");
+        let builds = known_learning_builds(&exe).unwrap();
+        assert!(builds.contains(&"1.0.0".to_string()));
+        assert!(builds.contains(&"1.2.3+sha.abc".to_string()));
+        assert!(!builds.iter().any(|build| build == "v2.0.0"));
+        assert!(!builds
+            .iter()
+            .any(|build| build == "backup" || build == "debug"));
+        assert!(!builds.iter().any(|build| build == foreign_version));
+        let held = builds
+            .iter()
+            .map(|build| (build.clone(), memory.join(build)))
+            .collect::<Vec<_>>();
+        let selected = selected_learning_root_paths(&memory, true, &held, false);
+        for foreign in [foreign_version, "backup", "debug"] {
+            assert!(!selected.contains(&memory.join(foreign)), "{foreign}");
+        }
+    }
+
+    #[test]
+    fn learning_clear_rejects_a_reparse_point_in_any_existing_ancestor() {
+        let target = std::path::Path::new(r"C:\Users\u\AppData\Local\nospacekey\memory");
+        let mut inspected = Vec::new();
+        let result = validate_no_reparse_ancestors_with(target, |component| {
+            inspected.push(component.to_path_buf());
+            Ok(Some(component.ends_with("AppData")))
+        });
+        assert!(result.unwrap_err().contains("reparse point"));
+        assert!(inspected.iter().any(|path| path.ends_with("AppData")));
+        assert!(!inspected.iter().any(|path| path.ends_with("memory")));
+    }
+
+    #[test]
+    fn learning_root_plan_uses_the_validated_base_and_ignores_late_roots() {
+        let base = std::path::PathBuf::from(r"C:\validated\memory");
+        let builds = vec!["1.0.0".to_string(), "2.0.0".to_string()];
+        let mut opened = Vec::new();
+        let (base_handle, roots) =
+            collect_existing_learning_roots_with(&base, &builds, Some("held-base"), |path| {
+                opened.push(path.to_path_buf());
+                Ok(path.ends_with("1.0.0").then_some("held-root"))
+            })
+            .unwrap();
+        assert_eq!(base_handle, Some("held-base"));
+        assert_eq!(opened, vec![base.join("1.0.0"), base.join("2.0.0")]);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].1, base.join("1.0.0"));
+
+        let late_open_attempts = Cell::new(0);
+        let (missing_base, late_roots) =
+            collect_existing_learning_roots_with(&base, &builds, None::<&str>, |_| {
+                late_open_attempts.set(late_open_attempts.get() + 1);
+                Ok(Some("late-root"))
+            })
+            .unwrap();
+        assert!(missing_base.is_none());
+        assert!(late_roots.is_empty());
+        assert_eq!(late_open_attempts.get(), 0);
+    }
+
+    #[test]
+    fn held_learning_directory_blocks_path_rename_until_lease_drop() {
+        let base = std::env::temp_dir().join(format!(
+            "nospacekey-learning-lease-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let moved = base.with_extension("moved");
+        std::fs::create_dir(&base).unwrap();
+        let handle = open_existing_learning_directory(&base)
+            .unwrap()
+            .expect("existing directory must be held");
+        assert!(std::fs::rename(&base, &moved).is_err());
+        drop(handle);
+        std::fs::rename(&base, &moved).unwrap();
+        std::fs::remove_dir(&moved).unwrap();
+    }
+
+    #[test]
+    fn learning_clear_selects_only_roots_held_by_the_lease() {
+        let base = std::path::PathBuf::from(r"C:\validated\memory");
+        let held = vec![
+            (
+                env!("CARGO_PKG_VERSION").to_string(),
+                base.join(env!("CARGO_PKG_VERSION")),
+            ),
+            ("1.0.0".to_string(), base.join("1.0.0")),
+        ];
+        assert_eq!(
+            selected_learning_root_paths(&base, true, &held, true),
+            vec![base.join("1.0.0"), base.clone()]
+        );
+        assert!(!selected_learning_root_paths(&base, false, &[], false)
+            .iter()
+            .any(|path| path == &base));
     }
 
     #[test]
@@ -3409,5 +3966,24 @@ mod tests {
         assert_eq!(saved.len(), 1);
         assert!(!saved[0].update.automatic_check);
         assert!(saved[0].update.automatic_check_prompt_dismissed);
+    }
+
+    #[test]
+    fn zenzai_status_projection_accepts_only_sanitized_states() {
+        assert_eq!(
+            zenzai_status_from_response(
+                "gpu_active".into(),
+                Some("Vulkan".into()),
+                Some("Radeon 890M".into()),
+                None,
+            ),
+            Ok(ZenzaiRuntimeStatusDto {
+                state: "gpu_active".into(),
+                backend: Some("Vulkan".into()),
+                device: Some("Radeon 890M".into()),
+                reason: None,
+            })
+        );
+        assert!(zenzai_status_from_response("model_path".into(), None, None, None).is_err());
     }
 }

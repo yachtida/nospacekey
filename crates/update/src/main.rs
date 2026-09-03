@@ -34,6 +34,10 @@ type FetchResult = Result<
 >;
 
 fn main() {
+    let _version_lease = match nospacekey_lifetime::VersionLease::acquire() {
+        Ok(lease) => lease,
+        Err(_) => std::process::exit(EXIT_STATE),
+    };
     let code = std::panic::catch_unwind(run).unwrap_or_else(|_| {
         diagnostic_log(None, "checker panic");
         EXIT_PANIC

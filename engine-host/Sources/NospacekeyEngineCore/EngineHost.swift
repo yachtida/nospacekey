@@ -25,6 +25,55 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
             return (encodeResponse(.error("\(error)")), false)
         }
 
+        // Runtime status reads a short sanitized snapshot instead of waiting for converterLock.
+        // The snapshot excludes model/input data and is updated independently of converterLock.
+        if case .queryZenzaiStatus = req {
+            let status = service.zenzaiRuntimeSnapshot
+            return (encodeResponse(.zenzaiStatus(
+                state: status.state.rawValue,
+                backend: status.backend,
+                device: status.device,
+                reason: status.reason)), false)
+        }
+
+        // Explicit retry is accepted immediately; native probe/warm-up runs after the
+        // response so a UI deadline never becomes a native model-load deadline.
+        if case .retryZenzai = req {
+            let retryService = service
+            Thread.detachNewThread {
+                retryService.retryZenzai()
+            }
+            return (encodeResponse(.ok), false)
+        }
+
+        // Link supervision must distinguish a dead host from a busy converter. Ping is process
+        // liveness only, so it must not queue behind serviceLock or a long GPU conversion.
+        if case .ping = req {
+            return (encodeResponse(.pong), false)
+        }
+
+        if case .pollSnapshotEnhancement(let composition, let revision,
+                                         let configurationGeneration, let connectionGeneration,
+                                         let baseline) = req {
+            let key = ConversionService.SnapshotEnhancementKey(
+                composition: composition, revision: revision,
+                configurationGeneration: configurationGeneration,
+                connectionGeneration: connectionGeneration)
+            let response: Response = switch service.pollSnapshotEnhancement(
+                key: key, baseline: baseline)
+            {
+            case .pending: .snapshotEnhancementPending
+            case .unavailable: .snapshotEnhancementUnavailable
+            case .ready(let text, let candidates, let candidateRemaining):
+                .snapshotEnhancement(
+                    composition: composition, revision: revision,
+                    configurationGeneration: configurationGeneration,
+                    connectionGeneration: connectionGeneration, baseline: baseline,
+                    text: text, candidates: candidates, candidateRemaining: candidateRemaining)
+            }
+            return (encodeResponse(response), false)
+        }
+
         // 予測はモデル待ちの間も通常変換の serviceLock を保持しない。所有権だけ短く確認する。
         if case .predict(let session, let seq, let tokenIDs) = req {
             serviceLock.lock()
@@ -38,8 +87,19 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
             return (encodeResponse(predictionService.predict(seq: seq, tokenIDs: tokenIDs)), false)
         }
 
-        // Ping は観測なので予測を壊さない。それ以外の操作は古い予測を表示不能にする。
-        if case .ping = req {} else { predictionService.cancel() }
+        // Clear may wait for already accepted persistence, so it cannot hold the global request
+        // lock. Admission is single-flight to keep the fixed pipe worker pool available.
+        if case .clearLearning = req {
+            let response: Response = switch service.clearLearningForIPC() {
+            case .cleared: .ok
+            case .failed: .error("learning files still locked; retry after engine restart")
+            case .inProgress: .error("learning clear already in progress; retry")
+            }
+            return (encodeResponse(response), false)
+        }
+
+        // All operations below can change the visible conversion context.
+        predictionService.cancel()
         serviceLock.lock(); defer { serviceLock.unlock() }
         let response: Response
         var exitAfterReply = false
@@ -53,12 +113,20 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
             // insert/backspace/convert/liveConvert は未知セッションのとき nil を返す（空の正当な
             // 結果と区別する）。nil は一律 .error("no session") にして TIP 側で degrade させる。
             switch req {
+            case .queryZenzaiStatus, .retryZenzai:
+                // Routed before serviceLock is acquired above. This arm is unreachable but
+                // keeps the exhaustive dispatch table explicit when protocol cases change.
+                response = .error("runtime status routing error")
             case .predict:
                 // 上のロック外レーンで必ず処理済み。網羅性のためだけの防御分岐。
                 response = .error("prediction routing error")
-            case .ping: response = .pong
+            case .ping: response = .error("ping routing error")
             // 接続id を渡してセッションの所有者を記録する（切断時に cleanupConnection で掃除するため）。
-            case .startSession: response = .session(Int64(service.startSession(connection: connId)), proto: ProtocolVersion.current)
+            case .startSession:
+                response = .session(
+                    Int64(service.startSession(connection: connId)),
+                    proto: ProtocolVersion.current,
+                    boot: BuildInfo.version)
             case .insert(let s, let t, let style):
                 response = service.insert(session: Int(s), text: t, style: style).map(Response.reading) ?? .error("no session")
             case .backspace(let s):
@@ -82,6 +150,41 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                 } else {
                     response = .error("no session")
                 }
+            case .liveSnapshot(let composition, let revision, let configurationGeneration,
+                               let connectionGeneration, let segments, let explicit, let context):
+                let key = ConversionService.SnapshotEnhancementKey(
+                    composition: composition, revision: revision,
+                    configurationGeneration: configurationGeneration,
+                    connectionGeneration: connectionGeneration)
+                let result = service.snapshot(
+                    segments, explicit: explicit, leftContext: context, enhancementKey: key,
+                    snapshotConnection: connId)
+                response = .snapshotResult(
+                    composition: composition, revision: revision,
+                    configurationGeneration: configurationGeneration,
+                    connectionGeneration: connectionGeneration,
+                    text: result.text, candidates: result.candidates,
+                    candidateRemaining: result.candidateRemaining, baseline: result.baseline,
+                    autoCommit: result.autoCommit.map {
+                        AutoCommitProposal(
+                            proposal: $0.proposal, text: $0.text,
+                            consumedReading: $0.consumedReading, remaining: $0.remaining)
+                    })
+            case .autoCommitReceipt(let composition, let revision,
+                                    let configurationGeneration, let connectionGeneration,
+                                    let proposal):
+                let key = ConversionService.SnapshotEnhancementKey(
+                    composition: composition, revision: revision,
+                    configurationGeneration: configurationGeneration,
+                    connectionGeneration: connectionGeneration)
+                response = service.applySnapshotAutoCommitReceipt(
+                    connection: connId, key: key, proposal: proposal)
+                    ? .ok : .error("stale auto commit receipt")
+            case .pollSnapshotEnhancement(let composition, let revision,
+                                          let configurationGeneration, let connectionGeneration,
+                                          let baseline):
+                _ = (composition, revision, configurationGeneration, connectionGeneration, baseline)
+                response = .error("snapshot enhancement routing error")
             case .llmConvert(let s, let seq, let ctx):
                 switch service.llmConvert(session: Int(s), leftContext: ctx) {
                 case .success(let text): response = .llmResult(seq: seq, text: text)
@@ -147,12 +250,7 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                     ? .ok
                     : .error("reload busy (warm-up or conversion in progress); TIP will retry on this connection")
             case .clearLearning:
-                // Spec2: 学習メモリは全クライアント共有の単一資源（所有の概念がない）。
-                // serviceLock 下で直列化されるので変換と競合しない。消し切れなかった場合は
-                // Error（Ok なのに学習が復活する事故を防ぐ — I-4。設定アプリが UI 表示する）。
-                response = service.clearLearning()
-                    ? .ok
-                    : .error("learning files still locked; retry after engine restart")
+                response = .error("learning clear routing error")
             case .recordCorrection(let reading, let surface):
                 service.recordCorrection(reading: reading, surface: surface)
                 response = .ok
@@ -265,6 +363,14 @@ private func createLearningPresence(name: String) -> HANDLE? {
 /// ConversionService を名前付きパイプに配線して常駐する。main.swift から呼ぶ唯一の公開関数。
 /// oneShot=true なら1接続を捌いて切断したら終了する（TIP のプロセス毎一意エンジン向け）。
 public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, oneShot: Bool = false) {
+    guard let versionLease = createVersionLifetimeLease() else {
+        engineLog("ev=engine_start_blocked reason=version_lifetime_unavailable\n")
+        return
+    }
+    defer {
+        CloseHandle(versionLease.tree)
+        CloseHandle(versionLease.named)
+    }
     let environment = ProcessInfo.processInfo.environment
     let learningScope = LearningSettings.coordinationScope(environment: environment)
     var lifecycleGate: LearningLifecycleGate?
@@ -280,7 +386,7 @@ public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, one
         lifecycleGate = gate
 
         let presenceName = LearningSettings.presenceMutexName(
-            scope: learningScope, sessionID: sessionID)
+            scope: learningScope, build: BuildInfo.version, sessionID: sessionID)
         guard let presence = createLearningPresence(name: presenceName) else {
             engineLog("ev=engine_start_blocked reason=learning_presence_unavailable\n")
             return
@@ -321,7 +427,7 @@ public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, one
 
     // cold start ①: 起動区間の分解計測。engineLog は NOSPACEKEY_LOG ゲート済み（計測の既定 OFF）。
     let t0 = Date()
-    let service = ConversionService()               // 辞書ロード含む(init が eager)
+    let service = ConversionService(productionMain: true) // main owns classic; worker is isolated
     engineLog("ev=coldstart stage=service_init ms=\(Int(Date().timeIntervalSince(t0) * 1000))\n")
     // service init が共有学習ファイルを読み得る区間まで Clear と直列化する。presence は gate を
     // 放す前に公開済みなので、以後 Config はこの Engine を必ず検出して fail-closed にできる。
@@ -381,4 +487,61 @@ public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, one
     }
     NamedPipeServer(pipeName: pipeName).run(handler: handle, onDisconnect: onDisconnect, oneShot: oneShot,
                                             exitHook: exitHook, onListening: onListening)
+}
+
+private struct VersionLifetimeLease {
+    let named: HANDLE
+    let tree: HANDLE
+}
+
+public func runVersionLifetimeFixture(readyPath: String, continuePath: String) -> Int32 {
+    guard let lease = createVersionLifetimeLease() else { return 2 }
+    defer {
+        CloseHandle(lease.tree)
+        CloseHandle(lease.named)
+    }
+    do {
+        try "pid=\(GetCurrentProcessId()) path=\(CommandLine.arguments[0])".write(
+            toFile: readyPath, atomically: true, encoding: .utf8)
+    } catch { return 2 }
+    let deadline = Date().addingTimeInterval(60)
+    while !FileManager.default.fileExists(atPath: continuePath) && Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.02)
+    }
+    return FileManager.default.fileExists(atPath: continuePath) ? 0 : 2
+}
+
+private func createVersionLifetimeLease() -> VersionLifetimeLease? {
+    var sessionID: DWORD = 0
+    guard ProcessIdToSessionId(GetCurrentProcessId(), &sessionID) else { return nil }
+    let leaseName = "Global\\nospacekey-version-lease-" + BuildInfo.version + "-s" + String(sessionID)
+    guard let named = leaseName.withCString(encodedAs: UTF16.self, {
+        CreateMutexW(nil, false, $0)
+    }) else { return nil }
+    var modulePath = [WCHAR](repeating: 0, count: 1024)
+    let length = modulePath.withUnsafeMutableBufferPointer {
+        GetModuleFileNameW(nil, $0.baseAddress, DWORD($0.count))
+    }
+    guard length > 0, length < modulePath.count else {
+        CloseHandle(named)
+        return nil
+    }
+    let executable = String(decoding: modulePath.prefix(Int(length)), as: UTF16.self)
+    let sentinel = ((executable as NSString).deletingLastPathComponent as NSString)
+        .appendingPathComponent(".nospacekey-lifetime")
+    let tree = sentinel.withCString(encodedAs: UTF16.self) {
+        CreateFileW($0, DWORD(GENERIC_READ), DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE), nil,
+                    DWORD(OPEN_EXISTING), DWORD(FILE_ATTRIBUTE_NORMAL), nil)
+    }
+    guard let tree, tree != INVALID_HANDLE_VALUE else {
+        CloseHandle(named)
+        return nil
+    }
+    var overlapped = OVERLAPPED()
+    guard LockFileEx(tree, DWORD(LOCKFILE_FAIL_IMMEDIATELY), 0, 1, 0, &overlapped) else {
+        CloseHandle(tree)
+        CloseHandle(named)
+        return nil
+    }
+    return VersionLifetimeLease(named: named, tree: tree)
 }

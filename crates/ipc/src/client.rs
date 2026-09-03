@@ -7,6 +7,98 @@ use crate::framing::MAX_RESPONSE_FRAME_LEN;
 use crate::framing::{read_frame, write_request_frame};
 use crate::protocol::{Request, Response};
 
+#[derive(Debug)]
+pub enum EngineIdentityError {
+    Io(io::Error),
+    Mismatch {
+        actual_proto: Option<u32>,
+        actual_boot: Option<String>,
+    },
+    UnexpectedResponse(Response),
+}
+
+impl std::fmt::Display for EngineIdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "engine connection failed: {error}"),
+            Self::Mismatch {
+                actual_proto,
+                actual_boot,
+            } => write!(
+                f,
+                "engine identity mismatch: expected proto={} boot={}, actual proto={actual_proto:?} boot={actual_boot:?}",
+                crate::protocol::PROTO_VERSION,
+                env!("CARGO_PKG_VERSION")
+            ),
+            Self::UnexpectedResponse(response) => {
+                write!(f, "unexpected StartSession response: {response:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EngineIdentityError {}
+
+impl From<io::Error> for EngineIdentityError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+pub fn verify_session_identity(response: Response) -> Result<i64, EngineIdentityError> {
+    match response {
+        Response::Session {
+            session,
+            proto,
+            boot,
+        } if proto == Some(crate::protocol::PROTO_VERSION)
+            && boot.as_deref() == Some(env!("CARGO_PKG_VERSION")) =>
+        {
+            Ok(session)
+        }
+        Response::Session { proto, boot, .. } => Err(EngineIdentityError::Mismatch {
+            actual_proto: proto,
+            actual_boot: boot,
+        }),
+        response => Err(EngineIdentityError::UnexpectedResponse(response)),
+    }
+}
+
+pub fn verify_start_session(
+    mut send: impl FnMut(&Request) -> Result<Response, EngineIdentityError>,
+) -> Result<i64, EngineIdentityError> {
+    verify_session_identity(send(&Request::StartSession)?)
+}
+
+pub struct VerifiedEngineClient {
+    client: EngineClient,
+    session: i64,
+}
+
+impl VerifiedEngineClient {
+    pub fn session(&self) -> i64 {
+        self.session
+    }
+
+    pub fn request_within(&mut self, request: &Request, deadline: Instant) -> io::Result<Response> {
+        self.client.request_within(request, deadline)
+    }
+
+    #[cfg(windows)]
+    pub fn request_within_keep(
+        &mut self,
+        request: &Request,
+        deadline: Instant,
+    ) -> io::Result<Response> {
+        self.client.request_within_keep(request, deadline)
+    }
+
+    #[cfg(windows)]
+    pub fn drain_pending(&mut self, deadline: Instant) -> io::Result<Option<Response>> {
+        self.client.drain_pending(deadline)
+    }
+}
+
 /// フレーム到達をポーリングするための最小抽象（実パイプ Win32 からロジックを分離しテスト可能にする）。
 #[allow(dead_code)]
 pub(crate) trait FramePeek {
@@ -121,7 +213,11 @@ fn open_named_pipe(pipe_path: &str) -> io::Result<File> {
 /// 同じ名を算出する（Spec2 で crates/tip/src/engine_link.rs から移設 — 設定アプリの
 /// ClearLearning が同じ engine へ届くための唯一の算出点）。
 pub fn pipe_name_for_session(session_id: u32) -> String {
-    format!(r"\\.\pipe\nospacekey-engine.s{session_id}")
+    format!(
+        r"\\.\pipe\nospacekey-engine.v{}.b{}.s{session_id}",
+        crate::protocol::PROTO_VERSION,
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// 現プロセスの logon session id。取得失敗時は 0。
@@ -184,6 +280,20 @@ impl EngineClient {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    pub fn connect_verified_to(
+        pipe_path: &str,
+        connect_timeout: Duration,
+        start_deadline: Instant,
+    ) -> Result<VerifiedEngineClient, EngineIdentityError> {
+        let mut client = Self::connect_to(pipe_path, connect_timeout)?;
+        let session = verify_start_session(|request| {
+            client
+                .request_within(request, start_deadline)
+                .map_err(EngineIdentityError::Io)
+        })?;
+        Ok(VerifiedEngineClient { client, session })
     }
 
     /// 1要求を送り、1応答を受け取る。フレーミング（4byte長さ前置）は内部で処理する。
@@ -999,6 +1109,7 @@ mod win_pipe_tests {
             Response::Session {
                 session: 42,
                 proto: None,
+                boot: None,
             },
         );
         let mut client =
@@ -1027,7 +1138,8 @@ mod win_pipe_tests {
             response,
             Response::Session {
                 session: 42,
-                proto: None
+                proto: None,
+                boot: None,
             }
         );
         assert!(!client.is_pending());
@@ -1203,8 +1315,63 @@ mod pipe_name_tests {
 
     #[test]
     fn pipe_name_is_stable_and_session_scoped() {
-        assert_eq!(pipe_name_for_session(1), r"\\.\pipe\nospacekey-engine.s1");
+        assert_eq!(
+            pipe_name_for_session(1),
+            concat!(
+                r"\\.\pipe\nospacekey-engine.v8.b",
+                env!("CARGO_PKG_VERSION"),
+                ".s1"
+            )
+        );
         assert_eq!(pipe_name_for_session(7), pipe_name_for_session(7));
         assert_ne!(pipe_name_for_session(1), pipe_name_for_session(2));
+    }
+
+    #[test]
+    fn session_identity_requires_exact_wire_and_boot_match() {
+        let matching = Response::Session {
+            session: 41,
+            proto: Some(crate::protocol::PROTO_VERSION),
+            boot: Some(env!("CARGO_PKG_VERSION").into()),
+        };
+        assert_eq!(verify_session_identity(matching).unwrap(), 41);
+
+        for response in [
+            Response::Session {
+                session: 41,
+                proto: Some(crate::protocol::PROTO_VERSION + 1),
+                boot: Some(env!("CARGO_PKG_VERSION").into()),
+            },
+            Response::Session {
+                session: 41,
+                proto: Some(crate::protocol::PROTO_VERSION),
+                boot: Some("different-build".into()),
+            },
+            Response::Session {
+                session: 41,
+                proto: None,
+                boot: None,
+            },
+        ] {
+            assert!(matches!(
+                verify_session_identity(response),
+                Err(EngineIdentityError::Mismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn mismatch_handshake_sends_only_start_session() {
+        let mut sent = Vec::new();
+        let result = verify_start_session(|request| {
+            sent.push(matches!(request, Request::StartSession));
+            Ok(Response::Session {
+                session: 9,
+                proto: Some(crate::protocol::PROTO_VERSION),
+                boot: Some("loaded-old-build".into()),
+            })
+        });
+        assert!(matches!(result, Err(EngineIdentityError::Mismatch { .. })));
+        assert_eq!(sent, vec![true]);
     }
 }

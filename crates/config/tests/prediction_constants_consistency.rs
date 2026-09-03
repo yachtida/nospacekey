@@ -21,6 +21,7 @@ fn fixed_artifact_values_reach_each_independent_consumer() {
     let engine = read("../../engine-host/Sources/NospacekeyEngineCore/PredictionService.swift");
     let run_gate = read("../../scripts/run-gate.ps1");
     let stage_dist = read("../../scripts/stage-dist.ps1");
+    let runtime_contract = read("../../scripts/prediction-runtime-contract.ps1");
     let receipt_values = [
         "llm-jp-3-150m-q8_0-c060ca9.gguf",
         "191f2fdf41a6f64f00ec6b4fcc39ec6164bb13b41d3609ac8f5b2b6149a23a6d",
@@ -46,8 +47,17 @@ fn fixed_artifact_values_reach_each_independent_consumer() {
 
     let llama_revision = "c060ca974c773c7c3d17fd1b66dc9d312bc292c0";
     assert_contains_all("engine host", &engine, &[llama_revision]);
-    assert_contains_all("Sandbox gate", &run_gate, &[llama_revision]);
-    assert_contains_all("distribution staging", &stage_dist, &[llama_revision]);
+    assert_contains_all("runtime contract", &runtime_contract, &[llama_revision]);
+    assert_contains_all(
+        "Sandbox gate",
+        &run_gate,
+        &["prediction-runtime-contract.ps1", "Get-PredictionRuntimeContract"],
+    );
+    assert_contains_all(
+        "distribution staging",
+        &stage_dist,
+        &["prediction-runtime-contract.ps1", "Get-PredictionRuntimeContract"],
+    );
 }
 
 #[test]
