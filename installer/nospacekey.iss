@@ -302,14 +302,14 @@ begin
     'if($trusted -notcontains $s -and ([int64]$r.FileSystemRights -band $bad)){return $false}};' +
     'return $true}catch{return $false}};' +
     Paths + 'foreach($p in @($paths)){$i=Get-Item -LiteralPath $p -Force -ErrorAction Stop;' +
-    'if(-not $i.PSIsContainer -or ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not (safe $p)){exit 2}};' +
+    'if(-not $i.PSIsContainer -or ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not (safe $p)){exit 21}};' +
     '$si=Get-Item -LiteralPath $script -Force -ErrorAction Stop;' +
-    'if($si.PSIsContainer -or ($si.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not (safe $script)){exit 2};' +
-    '$pin=$null;$code=2;try{' +
+    'if($si.PSIsContainer -or ($si.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not (safe $script)){exit 22};' +
+    '$pin=$null;$code=24;try{' +
     '$pin=[IO.FileStream]::new($script,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read);' +
-    'if((Get-FileHash -InputStream $pin -Algorithm SHA256).Hash -cne ''{#CleanupScriptSHA256}''){exit 2};' +
+    'if((Get-FileHash -InputStream $pin -Algorithm SHA256).Hash -ine ''{#CleanupScriptSHA256}''){exit 23};' +
     '& $script -InstallRoot $root ' + Operation + ';$code=$LASTEXITCODE' +
-    '}finally{if($null -ne $pin){$pin.Dispose()}};exit $code';
+    '}catch{$code=24}finally{if($null -ne $pin){$pin.Dispose()}};exit $code';
 end;
 
 function RunTrustedCleanupScript(const ScriptPath, Tree, Operation: String;
@@ -324,32 +324,50 @@ begin
   Result := False;
   Root := ExpandConstant('{app}');
   Versions := Root + '\versions';
-  if not TestNonReparsePath(Root, True) then
+  if not TestNonReparsePath(Root, True) then begin
+    Log('Trusted cleanup rejected the install root path');
     Exit;
+  end;
   TreeExists := (Tree <> '') and DirExists(Tree);
   if DirExists(Versions) then begin
-    if not TestNonReparsePath(Versions, True) then
+    if not TestNonReparsePath(Versions, True) then begin
+      Log('Trusted cleanup rejected the versions path');
       Exit;
-  end else if not (AllowMissingTree and (not TreeExists)) then
+    end;
+  end else if not (AllowMissingTree and (not TreeExists)) then begin
+    Log('Trusted cleanup requires the versions path');
     Exit;
+  end;
   if Tree <> '' then begin
     if TreeExists then begin
-      if not TestNonReparsePath(Tree, True) then
+      if not TestNonReparsePath(Tree, True) then begin
+        Log('Trusted cleanup rejected the version tree path');
         Exit;
-    end else if not AllowMissingTree then
+      end;
+    end else if not AllowMissingTree then begin
+      Log('Trusted cleanup requires the version tree path');
       Exit;
+    end;
   end;
   ScriptHandle := OpenPinnedCleanupScript(ScriptPath);
-  if ScriptHandle = CleanupInvalidHandle then
+  if ScriptHandle = CleanupInvalidHandle then begin
+    Log('Trusted cleanup could not pin the script');
     Exit;
+  end;
   try
-    if CompareText(GetSHA256OfFile(ScriptPath), '{#CleanupScriptSHA256}') <> 0 then
+    if CompareText(GetSHA256OfFile(ScriptPath), '{#CleanupScriptSHA256}') <> 0 then begin
+      Log('Trusted cleanup rejected the script SHA256');
       Exit;
+    end;
     Command := BuildCleanupBootstrapCommand(Root, Tree, ScriptPath, Operation,
       AllowMissingTree);
     Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
       '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Command + '"',
       '', SW_HIDE, Wait, ResultCode);
+    if not Result then
+      Log('Trusted cleanup could not start Windows PowerShell')
+    else
+      Log(Format('Trusted cleanup operation finished with exit code %d', [ResultCode]));
   finally
     CleanupCloseHandle(ScriptHandle);
   end;
