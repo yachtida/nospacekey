@@ -106,8 +106,8 @@ Name: "zenzaimodel"; Description: "Zenzai（ニューラル変換）を使用す
 
 [Files]
 ; These root coordination artifacts survive a partial version-tree deletion.
-; The gate is immutable under the inherited Program Files ACL; products only
-; take a byte-range lock on its validated read handle.
+; The gate keeps its file identity across upgrades; the trusted initializer
+; migrates only the known beta.10 CRLF bytes while holding its byte-range lock.
 Source: "task-transaction-gate"; DestDir: "{app}"; DestName: ".nospacekey-task-transaction"; Flags: onlyifdoesntexist uninsneveruninstall
 Source: "..\scripts\version-cleanup.ps1"; DestDir: "{app}"; DestName: ".nospacekey-uninstall-recovery.ps1"; Flags: uninsneveruninstall
 
