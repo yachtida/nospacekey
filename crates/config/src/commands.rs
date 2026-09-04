@@ -281,6 +281,10 @@ fn settings_mutation_error(outcome: settings::LoadOutcome) -> String {
         settings::LoadOutcome::CorruptQuarantineFailed => {
             "設定ファイルが壊れており、原本を退避できないため変更を保存できません。".into()
         }
+        settings::LoadOutcome::UnsupportedVersion => {
+            "設定ファイルはこの設定画面より新しい形式です。最新版の設定画面から変更してください。"
+                .into()
+        }
         outcome => format!(
             "設定ファイルの読み込み状態が mutation に適さないため、変更を保存できません（{outcome:?}）。"
         ),
@@ -2437,6 +2441,7 @@ mod tests {
             settings::LoadOutcome::IoError,
             settings::LoadOutcome::NoPath,
             settings::LoadOutcome::CorruptQuarantineFailed,
+            settings::LoadOutcome::UnsupportedVersion,
         ] {
             assert!(!startup_reconcile_load_is_usable(outcome));
             let state = AutomaticCheckReconcileState::default();
@@ -2453,6 +2458,35 @@ mod tests {
         ] {
             assert!(startup_reconcile_load_is_usable(outcome));
         }
+    }
+
+    #[test]
+    fn newer_settings_schema_tells_the_user_to_open_the_latest_config() {
+        let message = super::settings_mutation_error(settings::LoadOutcome::UnsupportedVersion);
+        assert!(message.contains("新しい形式"));
+        assert!(message.contains("最新版の設定画面"));
+    }
+
+    #[test]
+    fn config_mutation_refuses_newer_schema_without_changing_the_file() {
+        let _lock = localappdata_test_lock();
+        let base = std::env::temp_dir().join(format!(
+            "nospacekey-config-future-schema-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let _env = LocalAppDataGuard::set(&base);
+        let path = settings::settings_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let future = r#"{"version":3,"future_setting":true}"#;
+        std::fs::write(&path, future).unwrap();
+
+        let errors = super::load_settings_for_mutation().unwrap_err();
+        assert!(errors.iter().any(|error| {
+            error.field == "_io" && error.message.contains("最新版の設定画面")
+        }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), future);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

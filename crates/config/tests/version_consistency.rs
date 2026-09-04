@@ -83,6 +83,25 @@ fn nospacekey_iss_has_no_hardcoded_version() {
 }
 
 #[test]
+fn installer_removes_only_known_legacy_shortcuts() {
+    let iss = read("../../installer/nospacekey.iss");
+    for shortcut in [
+        "nospacekey Settings.lnk",
+        "Third-Party Notices.lnk",
+        "Uninstall nospacekey.lnk",
+    ] {
+        assert!(
+            iss.contains(&format!(r#"Type: files; Name: "{{group}}\{shortcut}""#)),
+            "legacy shortcut must be removed during upgrade: {shortcut}"
+        );
+    }
+    assert!(
+        !iss.contains(r#"Type: files; Name: "{group}\*.lnk""#),
+        "installer must not delete shortcuts it does not own"
+    );
+}
+
+#[test]
 fn installer_keeps_loaded_pairs_in_versioned_directories() {
     let iss = read("../../installer/nospacekey.iss");
     let tip_registration = read("../tip/src/register.rs");

@@ -139,13 +139,11 @@ impl ModeLangBarItem_Impl {
     fn handle_menu_command(&self, wid: u32) {
         match wid {
             MENU_ID_SETTINGS => {
-                // DLL と同ディレクトリの NospacekeyConfig.exe を起動する。パス解決/起動いずれの
+                // 現在登録されている TIP と同じ版の設定を起動する。パス解決/起動いずれの
                 // 失敗も無視（メニュー選択で panic させない）。
-                if let Some(dll_path) = crate::globals::module_file_path() {
-                    if let Some(exe) = crate::config_launch::config_exe_path(&dll_path) {
-                        unsafe {
-                            let _ = crate::config_launch::launch_config_app(&exe);
-                        }
+                if let Some(exe) = crate::config_launch::active_config_exe_path() {
+                    unsafe {
+                        let _ = crate::config_launch::launch_config_app(&exe);
                     }
                 }
             }

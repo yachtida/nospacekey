@@ -40,6 +40,17 @@ fn guid_braced(g: &GUID) -> String {
     )
 }
 
+/// インストーラが最後に commit した TIP のパス。HKCR は per-user overlay を混ぜるため、
+/// machine-wide 登録を書き込むのと同じ HKLM view だけを読む。
+pub(crate) fn active_tip_path() -> Option<String> {
+    let clsid = guid_braced(&CLSID_NOSPACEKEY);
+    windows_registry::LOCAL_MACHINE
+        .open(format!("SOFTWARE\\Classes\\CLSID\\{clsid}\\InprocServer32"))
+        .ok()?
+        .get_string("")
+        .ok()
+}
+
 fn registry_not_found(error: &Error) -> bool {
     error.code() == ERROR_FILE_NOT_FOUND.to_hresult()
         || error.code() == ERROR_PATH_NOT_FOUND.to_hresult()

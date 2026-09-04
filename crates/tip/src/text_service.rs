@@ -2663,7 +2663,7 @@ impl ITfFnConfigure_Impl for TextService_Impl {
     ) -> Result<()> {
         // GUI を in-proc DLL に持ち込まない: 別 exe を起動して閉じるまで待つ（D3 隔離, engine と同じ思想）。
         // 失敗は no-op 劣化（host を巻き込まない）。
-        match config_exe_path() {
+        match crate::config_launch::active_config_exe_path() {
             Some(exe) => {
                 let mut cmd = std::process::Command::new(exe);
                 cmd.arg(format!("{}", hwndparent.0 as isize)); // 親HWND（config 側で owner 化に使える）
@@ -7783,11 +7783,6 @@ fn sibling_exe(name: &str) -> Option<std::path::PathBuf> {
 /// この DLL と同じディレクトリにある `NospacekeyEngineHost.exe` のパスを解決する。
 pub(crate) fn engine_exe_path() -> Option<std::path::PathBuf> {
     sibling_exe("NospacekeyEngineHost.exe")
-}
-
-/// SP6b: この DLL と同じディレクトリにある `NospacekeyConfig.exe`（設定 GUI）のパスを解決する。
-fn config_exe_path() -> Option<std::path::PathBuf> {
-    sibling_exe("NospacekeyConfig.exe")
 }
 
 #[cfg(test)]

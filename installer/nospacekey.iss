@@ -140,6 +140,13 @@ Name: "{group}\nospacekey 設定"; Filename: "{app}\versions\{#MyAppVersion}\Nos
 Name: "{group}\第三者ソフトウェアに関する通知"; Filename: "{app}\versions\{#MyAppVersion}\THIRD-PARTY-NOTICES.md"
 Name: "{group}\nospacekey のアンインストール"; Filename: "{uninstallexe}"
 
+[InstallDelete]
+; 64e2845 renamed these shortcuts without removing their old names. Delete only
+; the three product-owned legacy entries; a wildcard could remove user shortcuts.
+Type: files; Name: "{group}\nospacekey Settings.lnk"
+Type: files; Name: "{group}\Third-Party Notices.lnk"
+Type: files; Name: "{group}\Uninstall nospacekey.lnk"
+
 [Registry]
 ; Minimal protocol activation: only the fixed update intent reaches Config's exact
 ; parser; arbitrary schemes/paths are ignored by the application.

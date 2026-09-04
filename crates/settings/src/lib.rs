@@ -302,6 +302,8 @@ pub struct UpdateSettings {
     pub automatic_check_prompt_dismissed: bool,
 }
 
+const SETTINGS_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub version: u32,
@@ -369,7 +371,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: SETTINGS_SCHEMA_VERSION,
             llm: Default::default(),
             zenzai: Default::default(),
             live_conversion: Default::default(),
@@ -484,14 +486,14 @@ fn legacy_v1_dark_palette() -> Palette {
 /// 旧内蔵既定と 7 色完全一致のパレットだけを「カスタマイズしていない」とみなして
 /// 引き上げる（1 色でも違えば意図的カスタム＝丸ごと温存）。
 fn migrate(mut s: Settings) -> Settings {
-    if s.version < 2 {
+    if s.version < SETTINGS_SCHEMA_VERSION {
         if s.appearance.palette_light == legacy_v1_light_palette() {
             s.appearance.palette_light = default_light_palette();
         }
         if s.appearance.palette_dark == legacy_v1_dark_palette() {
             s.appearance.palette_dark = default_dark_palette();
         }
-        s.version = 2;
+        s.version = SETTINGS_SCHEMA_VERSION;
     }
     s
 }
@@ -792,6 +794,9 @@ pub enum LoadOutcome {
     /// JSON 破損を検出したが rename/copy のどちらでも原本を退避できなかった。
     /// 原本を既定値で上書きしないため、mutation は拒否する。
     CorruptQuarantineFailed,
+    /// この実行ファイルより新しいスキーマ。既知フィールドは読み取れるが、未知フィールドを
+    /// 失う全体保存を防ぐため mutation は拒否する。
+    UnsupportedVersion,
 }
 
 /// UU-7: `std::fs` の read エラー種別を `LoadOutcome` へ分類する純関数（テスト可能）。
@@ -912,9 +917,49 @@ where
     (Settings::default(), LoadOutcome::CorruptQuarantineFailed)
 }
 
+fn read_compatible_future_settings(text: &str) -> Settings {
+    let Ok(serde_json::Value::Object(future)) = serde_json::from_str::<serde_json::Value>(text)
+    else {
+        return Settings::default();
+    };
+    let Ok(serde_json::Value::Object(mut accepted)) = serde_json::to_value(Settings::default())
+    else {
+        return Settings::default();
+    };
+    for (field, value) in future {
+        if !accepted.contains_key(&field) {
+            continue;
+        }
+        let mut candidate = accepted.clone();
+        candidate.insert(field, value);
+        if serde_json::from_value::<Settings>(serde_json::Value::Object(candidate.clone())).is_ok()
+        {
+            accepted = candidate;
+        }
+    }
+    serde_json::from_value::<Settings>(serde_json::Value::Object(accepted))
+        .map(|settings| normalize_loaded(migrate(settings)))
+        .unwrap_or_default()
+}
+
 fn parse_settings_text(text: &str) -> (Settings, LoadOutcome) {
     if text.trim().is_empty() {
         return (Settings::default(), LoadOutcome::Empty);
+    }
+    #[derive(Deserialize)]
+    struct VersionProbe {
+        version: u64,
+    }
+    // A future schema may legitimately change the type of a field known to this binary.
+    // Detect its version before typed deserialization so that incompatibility cannot be
+    // mistaken for corruption and trigger quarantine.
+    if serde_json::from_str::<VersionProbe>(text)
+        .is_ok_and(|probe| probe.version > u64::from(SETTINGS_SCHEMA_VERSION))
+    {
+        return (
+            read_compatible_future_settings(text),
+            LoadOutcome::UnsupportedVersion,
+        );
     }
     match serde_json::from_str::<Settings>(text) {
         Ok(s) => (normalize_loaded(migrate(s)), LoadOutcome::Loaded),
@@ -1686,6 +1731,66 @@ mod tests {
         assert!(!result.0.llm.enabled);
         assert!(!rename_called.get());
         assert!(!copy_called.get());
+    }
+
+    #[test]
+    fn newer_schema_is_readable_but_never_opened_for_mutation() {
+        let future = r#"{"version":3,"live_conversion":{"enabled":false},"future_setting":true}"#;
+        let (read_only, outcome) = parse_settings_text(future);
+        assert_eq!(outcome, LoadOutcome::UnsupportedVersion);
+        assert!(!read_only.live_conversion.enabled);
+
+        let path = PathBuf::from(r"C:\settings.json");
+        let mutation = load_for_mutation_from_with(
+            &path,
+            |_| Ok(future.to_string()),
+            |_from, _to| panic!("a newer schema is not corrupt and must not be quarantined"),
+            |_from, _to| panic!("a newer schema is not corrupt and must not be copied"),
+        );
+        assert_eq!(mutation.1, LoadOutcome::UnsupportedVersion);
+        assert!(!mutation.0.live_conversion.enabled);
+
+        let _lock = localappdata_test_lock();
+        let base = std::env::temp_dir().join(format!(
+            "nospacekey-settings-future-schema-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let _env = LocalAppDataGuard::set(&base);
+        let settings_path = settings_path().unwrap();
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(&settings_path, future).unwrap();
+        assert!(matches!(
+            load_for_mutation(),
+            Err(LoadOutcome::UnsupportedVersion)
+        ));
+        assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), future);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn newer_schema_with_changed_known_shape_is_not_quarantined() {
+        let future = r#"{"version":3,"default_direct":true,"live_conversion":"future-shape"}"#;
+        let (readable, outcome) = parse_settings_text(future);
+        assert_eq!(outcome, LoadOutcome::UnsupportedVersion);
+        assert!(readable.default_direct);
+
+        let _lock = localappdata_test_lock();
+        let base = std::env::temp_dir().join(format!(
+            "nospacekey-settings-future-shape-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let _env = LocalAppDataGuard::set(&base);
+        let settings_path = settings_path().unwrap();
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(&settings_path, future).unwrap();
+        assert!(matches!(
+            load_for_mutation(),
+            Err(LoadOutcome::UnsupportedVersion)
+        ));
+        assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), future);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
