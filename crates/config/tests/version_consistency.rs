@@ -181,7 +181,15 @@ fn installer_keeps_loaded_pairs_in_versioned_directories() {
     }
     assert!(iss.contains("UninstallTipWasActive := IsCurrentTipActive();"));
     assert!(iss.contains("function InitializeUninstall(): Boolean;"));
-    assert!(iss.contains("function RecoverInterruptedUninstallClaim(): Boolean;"));
+    assert!(iss.contains(
+        "function RecoverInterruptedUninstallClaim(const RecoveryPath: String): Boolean;"
+    ));
+    assert!(iss.contains(
+        "#define PreinstallRecoveryScriptName \"nospacekey-preinstall-recovery.ps1\""
+    ));
+    assert!(iss.contains("Flags: dontcopy noencryption"));
+    assert!(iss.contains("ExtractTemporaryFile('{#PreinstallRecoveryScriptName}')"));
+    assert_eq!(iss.matches("RunEmbeddedCleanupScript(").count(), 3);
     assert!(iss.contains("-RecoverUninstallClaim"));
     assert!(iss.contains("function CommitUninstallTasks(): Boolean;"));
     assert!(iss.contains("function FinalizeUninstallTasks(): Boolean;"));
@@ -204,7 +212,7 @@ fn installer_keeps_loaded_pairs_in_versioned_directories() {
     assert!(iss.contains(
         "#define CleanupScriptSHA256 GetSHA256OfFile(\"..\\scripts\\version-cleanup.ps1\")"
     ));
-    assert_eq!(iss.matches("RunTrustedCleanupScript(").count(), 10);
+    assert_eq!(iss.matches("RunTrustedCleanupScript(").count(), 9);
     assert!(!iss.contains("ExecutionPolicy Bypass -File"));
     assert!(iss.contains("CreateFileW@kernel32.dll"));
     assert!(iss.contains("CleanupOpenReparsePoint"));
@@ -218,8 +226,8 @@ fn installer_keeps_loaded_pairs_in_versioned_directories() {
         "if (CurStep = ssPostInstall) and (not ValidateCurrentCleanupPayload()) then"
     ));
     let trusted_runner = iss
-        .find("function RunTrustedCleanupScript(")
-        .expect("trusted cleanup bootstrap must exist");
+        .find("function RunCleanupScript(")
+        .expect("cleanup bootstrap must exist");
     let non_reparse = iss[trusted_runner..]
         .find("TestNonReparsePath(Root, True)")
         .expect("trusted cleanup bootstrap must inspect ancestors");

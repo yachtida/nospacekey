@@ -59,6 +59,7 @@
 #define ModelDownloadURL "https://huggingface.co/Miwa-Keita/zenz-v3.1-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf"
 #define ModelSHA256 "4de930c06bef8c263aa1aa40684af206db4ce1b96375b3b8ed0ea508e0b14f6c"
 #define CleanupScriptSHA256 GetSHA256OfFile("..\scripts\version-cleanup.ps1")
+#define PreinstallRecoveryScriptName "nospacekey-preinstall-recovery.ps1"
 
 [Setup]
 ; Fix the update identity. The current script has NO AppId (== AppName default),
@@ -105,6 +106,11 @@ Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 Name: "zenzaimodel"; Description: "Zenzai（ニューラル変換）を使用する — 約70MBのモデルをダウンロード（推奨）"
 
 [Files]
+; Preflight must not depend on a possibly older recovery worker left by an
+; interrupted install. Setup verifies this embedded copy while holding a handle
+; that denies replacement, then uses it only before the normal file-copy phase.
+Source: "..\scripts\version-cleanup.ps1"; DestName: "{#PreinstallRecoveryScriptName}"; Flags: dontcopy noencryption
+
 ; These root coordination artifacts survive a partial version-tree deletion.
 ; The gate keeps its file identity across upgrades; the trusted initializer
 ; migrates only the known beta.10 CRLF bytes while holding its byte-range lock.
@@ -273,9 +279,10 @@ begin
 end;
 
 function BuildCleanupBootstrapCommand(const Root, Tree, ScriptPath,
-  Operation: String; AllowMissingTree: Boolean): String;
+  Operation: String; AllowMissingTree, RequireSafeScriptAcl: Boolean): String;
 var
   Paths: String;
+  ScriptAclCheck: String;
 begin
   Paths := '$paths=@($root);';
   if AllowMissingTree then
@@ -284,6 +291,10 @@ begin
     Paths := Paths + '$paths+=,$versions;';
   if Tree <> '' then
     Paths := Paths + 'if(Test-Path -LiteralPath $tree){$paths+=,$tree};';
+  if RequireSafeScriptAcl then
+    ScriptAclCheck := ' -or -not (safe $script)'
+  else
+    ScriptAclCheck := '';
   Result :=
     '$ErrorActionPreference=''Stop'';' +
     '$root=' + PowerShellLiteral(Root) + ';$versions=Join-Path $root ''versions'';' +
@@ -304,7 +315,7 @@ begin
     Paths + 'foreach($p in @($paths)){$i=Get-Item -LiteralPath $p -Force -ErrorAction Stop;' +
     'if(-not $i.PSIsContainer -or ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not (safe $p)){exit 21}};' +
     '$si=Get-Item -LiteralPath $script -Force -ErrorAction Stop;' +
-    'if($si.PSIsContainer -or ($si.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not (safe $script)){exit 22};' +
+    'if($si.PSIsContainer -or ($si.Attributes -band [IO.FileAttributes]::ReparsePoint)' + ScriptAclCheck + '){exit 22};' +
     '$pin=$null;$code=24;try{' +
     '$pin=[IO.FileStream]::new($script,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read);' +
     'if((Get-FileHash -InputStream $pin -Algorithm SHA256).Hash -ine ''{#CleanupScriptSHA256}''){exit 23};' +
@@ -312,8 +323,9 @@ begin
     '}catch{$code=24}finally{if($null -ne $pin){$pin.Dispose()}};exit $code';
 end;
 
-function RunTrustedCleanupScript(const ScriptPath, Tree, Operation: String;
-  AllowMissingTree: Boolean; Wait: TExecWait; var ResultCode: Integer): Boolean;
+function RunCleanupScript(const ScriptPath, Tree, Operation: String;
+  AllowMissingTree, RequireSafeScriptAcl: Boolean; Wait: TExecWait;
+  var ResultCode: Integer): Boolean;
 var
   Root: String;
   Versions: String;
@@ -360,7 +372,7 @@ begin
       Exit;
     end;
     Command := BuildCleanupBootstrapCommand(Root, Tree, ScriptPath, Operation,
-      AllowMissingTree);
+      AllowMissingTree, RequireSafeScriptAcl);
     Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
       '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Command + '"',
       '', SW_HIDE, Wait, ResultCode);
@@ -373,6 +385,20 @@ begin
   end;
 end;
 
+function RunTrustedCleanupScript(const ScriptPath, Tree, Operation: String;
+  AllowMissingTree: Boolean; Wait: TExecWait; var ResultCode: Integer): Boolean;
+begin
+  Result := RunCleanupScript(ScriptPath, Tree, Operation, AllowMissingTree,
+    True, Wait, ResultCode);
+end;
+
+function RunEmbeddedCleanupScript(const ScriptPath, Tree, Operation: String;
+  AllowMissingTree: Boolean; Wait: TExecWait; var ResultCode: Integer): Boolean;
+begin
+  Result := RunCleanupScript(ScriptPath, Tree, Operation, AllowMissingTree,
+    False, Wait, ResultCode);
+end;
+
 function DeferredCleanupParameters(Param: String): String;
 var
   Root: String;
@@ -383,7 +409,7 @@ begin
   Tree := Root + '\versions\{#MyAppVersion}';
   ScriptPath := Tree + '\version-cleanup.ps1';
   Result := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
-    BuildCleanupBootstrapCommand(Root, Tree, ScriptPath, '', False) + '"';
+    BuildCleanupBootstrapCommand(Root, Tree, ScriptPath, '', False, True) + '"';
 end;
 
 function ValidateCurrentCleanupPayload(): Boolean;
@@ -832,7 +858,7 @@ begin
       (ResultCode = 0);
 end;
 
-function RecoverInterruptedUninstallClaim(): Boolean;
+function RecoverInterruptedUninstallClaim(const RecoveryPath: String): Boolean;
 var
   ResultCode: Integer;
   ActivePath: String;
@@ -841,8 +867,11 @@ begin
   Result := False;
   InterruptedDeletingDetected := False;
   if FileExists(ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1')) then begin
-    if not RunTrustedCleanupScript(
-        ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1'), '',
+    if not RunEmbeddedCleanupScript(RecoveryPath, '',
+        '-InitializeTaskTransactionArtifacts', False,
+        ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+      Exit;
+    if not RunEmbeddedCleanupScript(RecoveryPath, '',
         '-RecoverInterruptedUninstalls', False, ewWaitUntilTerminated, ResultCode) then
       Exit;
     if ResultCode = 3 then begin
@@ -876,6 +905,7 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   OverlayStatus: Integer;
+  RecoveryPath: String;
 begin
   Result := '';
   if not IsExpectedInstallPath() then begin
@@ -886,7 +916,15 @@ begin
     Result := '旧版のインストール場所を安全に確認できないため、インストールを中止しました。';
     Exit;
   end;
-  if not RecoverInterruptedUninstallClaim() then begin
+  try
+    ExtractTemporaryFile('{#PreinstallRecoveryScriptName}');
+  except
+    Log('Failed to extract the embedded preinstall recovery worker: ' + GetExceptionMessage);
+    Result := 'セットアップ内の復旧処理を安全に展開できないため、インストールを中止しました。';
+    Exit;
+  end;
+  RecoveryPath := ExpandConstant('{tmp}\{#PreinstallRecoveryScriptName}');
+  if not RecoverInterruptedUninstallClaim(RecoveryPath) then begin
     if InterruptedDeletingDetected then
       Result := '中断した同じバージョンのアンインストーラーを再実行して、アンインストールを完了してください。'
     else

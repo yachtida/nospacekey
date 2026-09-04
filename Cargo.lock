@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "1.2.2-beta.10"
+version = "1.2.2-beta.11"
 dependencies = [
  "futures-util",
  "hex",
@@ -1884,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "ids"
-version = "1.2.2-beta.10"
+version = "1.2.2-beta.11"
 dependencies = [
  "windows-core 0.62.2",
 ]
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "ipc"
-version = "1.2.2-beta.10"
+version = "1.2.2-beta.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -2324,14 +2324,14 @@ dependencies = [
 
 [[package]]
 name = "nospacekey-lifetime"
-version = "1.2.2-beta.10"
+version = "1.2.2-beta.11"
 dependencies = [
  "windows 0.62.2",
 ]
 
 [[package]]
 name = "nospacekey-update"
-version = "1.2.2-beta.10"
+version = "1.2.2-beta.11"
 dependencies = [
  "chrono",
  "futures-util",
@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "nospacekey_tip"
-version = "1.2.2-beta.10"
+version = "1.2.2-beta.11"
 dependencies = [
  "crossbeam-queue",
  "ids",
@@ -3540,7 +3540,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "1.2.2-beta.10"
+version = "1.2.2-beta.11"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -4157,7 +4157,7 @@ dependencies = [
 
 [[package]]
 name = "testbench"
-version = "1.2.2-beta.10"
+version = "1.2.2-beta.11"
 dependencies = [
  "ids",
  "ipc",
