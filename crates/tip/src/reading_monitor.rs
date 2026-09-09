@@ -2,7 +2,7 @@
 //!
 //! ライブ変換は preedit を変換結果（漢字かな交じり）へ全置換するため、「今何を打ったか」が
 //! 画面から消える。読みを候補窓/HUD と同じ popup 基盤の小窓で並走表示する
-//! （spec: docs/superpowers/specs/2026-07-21-reading-monitor-design.md）。
+//! （spec: docs/design/2026-07-21-reading-monitor-design.md）。
 //!
 //! mode_hud との差分は 2 点だけ: 自動消去タイマを持たない（明示 hide まで表示）、
 //! テキストが打鍵ごとに更新され幅が文字列に追従する。mode_hud を汎用化せず同型の

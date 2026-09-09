@@ -43,7 +43,7 @@ final class LocalKanaParityFixtureTests: XCTestCase {
 
     /// TIP は MS IME 準拠で Backspace 後の n を再結合可能にするため、この軌道だけ
     /// 仕様が両者で異なる(共有 fixture から外した経緯は fixtures/local-kana-parity.tsv の
-    /// コメントと docs/plans/2026-09-01-alive-n-after-backspace-msime.md 参照)。
+    /// コメントと docs/design/2026-09-01-alive-n-after-backspace-msime.md 参照)。
     /// ここでは上流 AzooKey (KanaKanjiConverter) の凍結挙動を固定して、
     /// 依存パッケージ更新時に意図せず変わっていないかを検出する。
     func testEngineFreezesBackspacedNForAzooKeyParityWhileTipDiverges() {

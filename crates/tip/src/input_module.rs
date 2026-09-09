@@ -5,6 +5,8 @@ pub struct RequestId(pub u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotIdentity {
+    /// Local issuance identity; navigation can change replay without changing reading.
+    pub request: u64,
     pub composition: u64,
     pub revision: u64,
     pub configuration_generation: u64,
@@ -55,6 +57,10 @@ pub enum KeyEvent {
         replay: ReplayMode,
     },
     Backspace,
+    Delete,
+    MoveReading(i32),
+    ReadingHome,
+    ReadingEnd,
     Space,
     MoveCandidate(i32),
     SelectCandidate(usize),
@@ -221,7 +227,7 @@ struct LiveDisplayAnchor {
     text: String,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct InputModule {
     state: crate::input_state::InputState,
     local_kana: crate::local_kana_composer::LocalKanaComposer,
@@ -233,13 +239,16 @@ pub struct InputModule {
     expected_candidates: Option<(RequestId, u64, u64)>,
     pending_candidate_commit: Option<(RequestId, CandidateResultIdentity)>,
     next_request: u64,
+    next_snapshot_request: u64,
     composition: u64,
     revision: u64,
     expected_snapshot: Option<(SnapshotIdentity, SnapshotPurpose)>,
     pending_auto_commit: Option<AutoCommitReceipt>,
     auto_commit_receipt: Option<AutoCommitReceipt>,
     replay_from_canonical: bool,
+    cursor_replay_pending: bool,
     live_display_anchor: Option<LiveDisplayAnchor>,
+    pending_live_display: Option<(String, Option<LiveDisplayAnchor>)>,
 }
 
 impl std::ops::Deref for InputModule {
@@ -267,10 +276,12 @@ impl InputModule {
         connection_generation: u64,
         left_context: Option<String>,
     ) -> Option<BackgroundIntent> {
-        if !self.state.composing {
+        if !self.state.composing || !self.local_kana.cursor_at_end() {
             return None;
         }
+        self.next_snapshot_request = self.next_snapshot_request.checked_add(1)?;
         let identity = SnapshotIdentity {
+            request: self.next_snapshot_request,
             composition: self.composition,
             revision: self.revision,
             configuration_generation,
@@ -296,7 +307,9 @@ impl InputModule {
         if !self.state.composing {
             return None;
         }
+        self.next_snapshot_request = self.next_snapshot_request.checked_add(1)?;
         let identity = SnapshotIdentity {
+            request: self.next_snapshot_request,
             composition: self.composition,
             revision: self.revision,
             configuration_generation,
@@ -340,6 +353,13 @@ impl InputModule {
     }
 
     pub fn complete(&mut self, operation: &ImmediateOperation, applied: bool) {
+        if let ImmediateOperation::SetPreedit { text } = operation {
+            if let Some((pending_text, anchor)) = self.pending_live_display.take() {
+                if applied && *text == pending_text {
+                    self.live_display_anchor = anchor;
+                }
+            }
+        }
         if !applied {
             self.pending_auto_commit = None;
             if matches!(operation, ImmediateOperation::Cancel) {
@@ -399,7 +419,17 @@ impl InputModule {
         self.invalidate_live_display();
     }
 
+    pub(crate) fn set_awaiting_llm(&mut self, awaiting: bool) {
+        if awaiting {
+            // A reply calculated before correction must not overwrite the LLM result,
+            // even if it arrives after the awaiting flag has been cleared.
+            self.invalidate_live_snapshot();
+        }
+        self.state.set_awaiting_llm(awaiting);
+    }
+
     pub(crate) fn invalidate_live_snapshot(&mut self) {
+        self.pending_live_display = None;
         self.expected_snapshot = None;
         self.pending_auto_commit = None;
     }
@@ -409,12 +439,17 @@ impl InputModule {
     /// but the anchor must survive plain typing and die only on non-extension
     /// events (candidates, notation, partial commit, disconnect, ...).
     pub(crate) fn invalidate_live_display(&mut self) {
+        self.pending_live_display = None;
         self.live_display_anchor = None;
     }
 
     /// Immediate preedit text for a key press: the anchor text plus the local
     /// kana that extends it, so the converted part never flashes back to kana.
     fn immediate_display(&mut self) -> String {
+        if !self.local_kana.cursor_at_end() {
+            self.invalidate_live_display();
+            return self.canonical_reading().to_owned();
+        }
         let (stable, pending) = self.local_kana.reading_parts();
         if let Some(anchor) = &self.live_display_anchor {
             if let Some(suffix) = stable.strip_prefix(&anchor.reading) {
@@ -478,6 +513,7 @@ impl InputModule {
     fn handle_key(&mut self, key: KeyEvent) -> ModuleOutput {
         match key {
             KeyEvent::Text { ch, style, replay } => {
+                let cursor_edit = self.cursor_replay_pending || !self.local_kana.cursor_at_end();
                 if !self.state.composing {
                     self.composition = self.composition.wrapping_add(1);
                     self.revision = 0;
@@ -501,6 +537,8 @@ impl InputModule {
                         self.replay_from_canonical = true;
                     }
                 };
+                if cursor_edit { self.reanchor_after_surface_edit(self.state.latin_mode()); }
+                self.cursor_replay_pending = false;
                 self.revision = self.revision.wrapping_add(1);
                 self.invalidate_live_snapshot();
                 let request = self.request_id();
@@ -514,15 +552,44 @@ impl InputModule {
                 ModuleOutput {
                     eaten: true,
                     immediate: Some(Self::display_operation(self.immediate_display())),
-                    background: Some(BackgroundIntent::Insert { request, segments }),
+                    background: Some(if cursor_edit {
+                        BackgroundIntent::Reseed { request, segments: self.canonical_segments() }
+                    } else { BackgroundIntent::Insert { request, segments } }),
+                }
+            }
+            KeyEvent::MoveReading(direction) if self.state.composing => {
+                let moved = self.local_kana.move_cursor(direction);
+                self.reading_navigation_output(moved)
+            }
+            KeyEvent::ReadingHome | KeyEvent::ReadingEnd if self.state.composing => {
+                let position = if key == KeyEvent::ReadingHome { 0 } else { u32::MAX };
+                let moved = self.local_kana.set_cursor(ipc::clause::ReadingPosition(position));
+                self.reading_navigation_output(moved)
+            }
+            KeyEvent::Delete if self.state.composing => {
+                if !self.local_kana.delete_forward() { return ModuleOutput { eaten: true, ..ModuleOutput::default() }; }
+                self.clear_candidates();
+                self.invalidate_live_display();
+                self.reanchor_after_surface_edit(self.state.latin_mode());
+                self.revision = self.revision.wrapping_add(1);
+                self.invalidate_live_snapshot();
+                let request = self.request_id();
+                ModuleOutput {
+                    eaten: true,
+                    immediate: Some(if self.local_kana.reading().is_empty() { ImmediateOperation::Cancel }
+                        else { Self::display_operation(self.local_kana.reading().to_owned()) }),
+                    background: Some(BackgroundIntent::Reseed { request, segments: self.canonical_segments() }),
                 }
             }
             KeyEvent::Backspace if self.state.composing => {
+                if self.local_kana.cursor().0 == 0 && !self.canonical_reading().is_empty() {
+                    return ModuleOutput { eaten: true, ..ModuleOutput::default() };
+                }
                 self.clear_candidates();
                 self.invalidate_live_display();
                 let keep_latin_mode = self.state.latin_mode();
                 self.state.on_backspace();
-                self.local_kana.backspace();
+                self.local_kana.backspace_at_cursor();
                 self.reanchor_after_surface_edit(keep_latin_mode);
                 self.revision = self.revision.wrapping_add(1);
                 self.invalidate_live_snapshot();
@@ -679,16 +746,17 @@ impl InputModule {
                     return ModuleOutput::default();
                 }
                 let (stable, pending) = self.local_kana.reading_parts();
-                if text.is_empty() {
-                    // 空結果は読みフォールバック契約: 旧アンカーを残すと次打鍵が
-                    // 空表示前の旧変換結果を継ぎ足してしまう。
-                    self.invalidate_live_display();
+                let anchor = if text.is_empty() {
+                    None
                 } else if pending.is_empty() {
-                    self.live_display_anchor = Some(LiveDisplayAnchor {
+                    Some(LiveDisplayAnchor {
                         reading: stable.to_owned(),
                         text: text.clone(),
-                    });
-                }
+                    })
+                } else {
+                    self.live_display_anchor.clone()
+                };
+                self.pending_live_display = Some((text.clone(), anchor));
                 Self::display_operation(text)
             }
             EngineResult::LiveAutoCommitProposal(proposal) => {
@@ -895,6 +963,7 @@ impl InputModule {
         self.state.reset();
         self.local_kana.clear();
         self.replay_from_canonical = false;
+        self.cursor_replay_pending = false;
         self.clear_candidates();
         self.expected_candidates = None;
         self.expected_snapshot = None;
@@ -914,6 +983,79 @@ impl InputModule {
 
     pub(crate) fn canonical_reading(&self) -> &str {
         self.local_kana.reading()
+    }
+
+    pub(crate) fn clause_identity(&self, configuration_generation: u64, connection_generation: u64) -> ipc::clause::SnapshotIdentity {
+        ipc::clause::SnapshotIdentity { composition: self.composition, revision: self.revision,
+            configuration_generation, connection_generation }
+    }
+
+    pub(crate) fn reading_cursor(&self) -> ipc::clause::ReadingPosition { self.local_kana.cursor() }
+
+    pub(crate) fn set_reading_cursor(&mut self, cursor: ipc::clause::ReadingPosition) -> ModuleOutput {
+        let moved = self.local_kana.set_cursor(cursor);
+        self.reading_navigation_output(moved)
+    }
+
+    pub(crate) fn reading_revision(&self) -> u64 { self.revision }
+
+    pub(crate) fn finalize_pending_n(&mut self) -> Option<bool> {
+        let mut composer = self.local_kana.clone();
+        if !composer.finalize_pending_n() { return Some(false); }
+        let revision = self.revision.checked_add(1)?;
+        self.local_kana = composer;
+        self.revision = revision;
+        self.reanchor_after_surface_edit(self.state.latin_mode());
+        self.clear_candidates();
+        self.invalidate_live_snapshot();
+        self.invalidate_live_display();
+        Some(true)
+    }
+
+    pub(crate) fn adopt_conversion_reading(&mut self, reading: &str) -> bool {
+        if !self.local_kana.adopt_conversion_reading(reading) { return false; }
+        self.reanchor_after_surface_edit(self.state.latin_mode());
+        self.invalidate_live_snapshot();
+        self.invalidate_live_display();
+        true
+    }
+
+    pub(crate) fn reading_cursor_utf16(&self) -> ipc::clause::DisplayUtf16Position {
+        ipc::clause::DisplayUtf16Position(self.canonical_reading().chars().take(self.reading_cursor().0 as usize)
+            .map(char::len_utf16).sum::<usize>() as u32)
+    }
+
+    pub(crate) fn original_input(&self, start: ipc::clause::ReadingPosition, end: ipc::clause::ReadingPosition) -> Option<String> {
+        self.local_kana.original_input(start, end)
+    }
+
+    pub(crate) fn preserve_last_literal_original(&mut self, original: char) {
+        self.local_kana.preserve_last_literal_original(original);
+    }
+
+    fn reading_navigation_output(&mut self, moved: bool) -> ModuleOutput {
+        if !moved { return ModuleOutput { eaten: true, ..ModuleOutput::default() }; }
+        self.clear_candidates();
+        self.state.notation_fixed = None;
+        self.invalidate_live_snapshot();
+        self.invalidate_live_display();
+        self.replay_from_canonical = true;
+        self.cursor_replay_pending = true;
+        ModuleOutput { eaten: true, immediate: Some(Self::display_operation(self.canonical_reading().to_owned())), background: None }
+    }
+
+    pub(crate) fn retain_clause_reading_prefix(&mut self, prefix: &str) -> Option<u64> {
+        let revision = self.revision.checked_add(1)?;
+        if !self.local_kana.reading().starts_with(prefix) || prefix.len() >= self.local_kana.reading().len()
+            || !ipc::clause::legal_boundaries(self.local_kana.reading()).ok()?
+                .contains(&ipc::clause::ReadingPosition(prefix.chars().count() as u32)) { return None; }
+        if !self.local_kana.retain_prefix(prefix) { return None; }
+        self.reanchor_after_surface_edit(false);
+        self.revision = revision;
+        self.clear_candidates();
+        self.invalidate_live_snapshot();
+        self.invalidate_live_display();
+        Some(revision)
     }
 
     fn reanchor_after_surface_edit(&mut self, keep_latin_mode: bool) {
@@ -994,6 +1136,181 @@ pub(crate) fn apply_presenter_candidate_selection(
 mod tests {
     use super::*;
 
+    #[test]
+    fn folded_literal_keeps_original_keys_in_the_journal() {
+        use ipc::clause::ReadingPosition as P;
+        let mut module = InputModule::default();
+        module.handle(key('a'));
+        module.handle(key('。'));
+        module.preserve_last_literal_original('.');
+        assert_eq!(module.canonical_reading(), "あ。");
+        assert_eq!(module.original_input(P(0), P(2)).as_deref(), Some("a."));
+        module.handle(InputEvent::Key(KeyEvent::ReadingHome));
+        module.handle(key('、'));
+        module.preserve_last_literal_original(',');
+        assert_eq!(module.original_input(P(0), P(3)).as_deref(), Some(",a."));
+    }
+
+    #[test]
+    fn interior_pending_input_cannot_combine_with_existing_suffix_on_replay() {
+        let mut module = InputModule::default();
+        for ch in "au".chars() { module.handle(key(ch)); }
+        module.handle(InputEvent::Key(KeyEvent::MoveReading(-1)));
+        module.handle(key('n'));
+        assert_eq!(module.canonical_reading(), "あnう");
+        assert_eq!(replayed_reading(&module.canonical_segments()), "あnう");
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "あなう");
+        assert_eq!(replayed_reading(&module.canonical_segments()), "あなう");
+    }
+
+    #[test]
+    fn navigation_reissues_snapshot_without_reusing_its_identity() {
+        let mut module = InputModule::default();
+        module.handle(key('n'));
+        let BackgroundIntent::LiveSnapshot { snapshot: old } = module.live_snapshot(1, 1, None).unwrap() else { unreachable!() };
+        module.handle(InputEvent::Key(KeyEvent::ReadingHome));
+        module.handle(InputEvent::Key(KeyEvent::ReadingEnd));
+        let BackgroundIntent::LiveSnapshot { snapshot: new } = module.live_snapshot(1, 1, None).unwrap() else { unreachable!() };
+        assert_eq!(old.identity.revision, new.identity.revision);
+        assert_ne!(old.segments, new.segments);
+        assert_ne!(old.identity.request, new.identity.request);
+        assert_eq!(module.handle(InputEvent::Engine(EngineResult::LiveSnapshot { identity: old.identity, text: "ん".into() })), ModuleOutput::default());
+        assert!(module.handle(InputEvent::Engine(EngineResult::LiveSnapshot { identity: new.identity, text: "n".into() })).immediate.is_some());
+        module.next_snapshot_request = u64::MAX;
+        assert!(module.live_snapshot(1, 1, None).is_none());
+        assert!(module.explicit_snapshot(1, 1, None).is_none());
+    }
+
+    #[test]
+    fn cursor_edits_reseed_full_reading_and_reject_the_old_live_snapshot() {
+        use ipc::clause::ReadingPosition as P;
+        let mut module = InputModule::default();
+        for ch in "kyou".chars() { module.handle(key(ch)); }
+        let BackgroundIntent::LiveSnapshot { snapshot } = module.live_snapshot(1, 1, None).unwrap() else { unreachable!() };
+        let revision = module.revision;
+        module.handle(InputEvent::Key(KeyEvent::MoveReading(-1)));
+        assert_eq!(module.reading_cursor(), P(2));
+        assert_eq!(module.revision, revision);
+        assert!(module.live_snapshot(1, 1, None).is_none());
+        assert_eq!(module.handle(InputEvent::Engine(EngineResult::LiveSnapshot { identity: snapshot.identity, text: "今日".into() })), ModuleOutput::default());
+        for ch in "ka".chars() {
+            let output = module.handle(key(ch));
+            let Some(BackgroundIntent::Reseed { segments, .. }) = output.background else { panic!("cursor edit must reseed") };
+            assert_eq!(replayed_reading(&segments), module.canonical_reading());
+        }
+        assert_eq!(module.canonical_reading(), "きょかう");
+        assert_eq!(module.original_input(P(0), P(4)).as_deref(), Some("kyokau"));
+        module.handle(InputEvent::Key(KeyEvent::Delete));
+        assert_eq!(module.canonical_reading(), "きょか");
+        module.handle(InputEvent::Key(KeyEvent::ReadingHome));
+        let before = module.revision;
+        let output = module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert!(output.eaten && output.immediate.is_none() && output.background.is_none());
+        assert_eq!(module.revision, before);
+        module.handle(InputEvent::Key(KeyEvent::ReadingEnd));
+        assert_eq!(module.reading_cursor(), P(3));
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "きょ");
+    }
+
+    #[test]
+    fn reading_cursor_converts_scalar_position_to_utf16_without_splitting_surrogates() {
+        let mut module = InputModule::default();
+        for ch in "a😀b".chars() { module.handle(InputEvent::Key(KeyEvent::Text { ch, style: TextStyle::Direct, replay: ReplayMode::Full })); }
+        assert_eq!(module.reading_cursor_utf16().0, 4);
+        module.handle(InputEvent::Key(KeyEvent::MoveReading(-1)));
+        assert_eq!(module.reading_cursor_utf16().0, 3);
+        module.handle(InputEvent::Key(KeyEvent::MoveReading(-1)));
+        assert_eq!(module.reading_cursor_utf16().0, 1);
+        module.handle(InputEvent::Key(KeyEvent::Delete));
+        assert_eq!(module.canonical_reading(), "ab");
+        assert_eq!(module.reading_cursor_utf16().0, 1);
+    }
+
+    #[test]
+    fn clause_prefix_removal_rejects_stale_snapshot_and_retains_future_input() {
+        let mut module = InputModule::default();
+        for ch in "kyouhaiitenkidesu".chars() { module.handle(key(ch)); }
+        let BackgroundIntent::LiveSnapshot { snapshot } = module.live_snapshot(3, 7, None).unwrap()
+        else { unreachable!() };
+        assert!(module.retain_clause_reading_prefix("きゅう").is_none());
+        assert!(module.retain_clause_reading_prefix("きょうはいい").is_some());
+        assert_eq!(module.handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+            identity: snapshot.identity, text: "今日はいい天気です".into(),
+        })), ModuleOutput::default());
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "きょうはいいあ");
+        assert_eq!(replayed_reading(&module.canonical_segments()), "きょうはいいあ");
+    }
+
+    #[test]
+    fn deleted_invalid_romaji_recombines_in_display_and_replay() {
+        for (keys, expected) in [
+            ("dhyBBa", "だ"),
+            ("dqBa", "だ"),
+            ("kqBa", "か"),
+            ("nyBya", "にゃ"),
+            ("adhyBBa", "あだ"),
+        ] {
+            for replay in [ReplayMode::Delta, ReplayMode::Full] {
+                let mut module = InputModule::default();
+                for ch in keys.chars() {
+                    let event = if ch == 'B' {
+                        InputEvent::Key(KeyEvent::Backspace)
+                    } else {
+                        InputEvent::Key(KeyEvent::Text {
+                            ch,
+                            style: TextStyle::Kana,
+                            replay,
+                        })
+                    };
+                    let output = module.handle(event);
+                    if let Some(ImmediateOperation::SetPreedit { text }) = output.immediate {
+                        assert_eq!(text, module.canonical_reading());
+                    }
+                    assert_eq!(
+                        replayed_reading(&module.canonical_segments()),
+                        module.canonical_reading()
+                    );
+                }
+                assert_eq!(module.canonical_reading(), expected, "{keys}");
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_romaji_origin_survives_partial_commit_and_stale_snapshots() {
+        let mut module = InputModule::default();
+        for ch in "adhy".chars() {
+            module.handle(key(ch));
+        }
+        let BackgroundIntent::LiveSnapshot { snapshot } = module.live_snapshot(3, 7, None).unwrap()
+        else {
+            unreachable!()
+        };
+        module.reseed_after_partial_commit("dhy");
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "だ");
+        assert_eq!(replayed_reading(&module.canonical_segments()), "だ");
+        assert_eq!(
+            module.handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+                identity: snapshot.identity,
+                text: "あdhy".into(),
+            })),
+            ModuleOutput::default()
+        );
+        let deletion = module.handle(InputEvent::Key(KeyEvent::Backspace));
+        module.complete(deletion.immediate.as_ref().unwrap(), true);
+        assert!(module.canonical_reading().is_empty());
+        for ch in "da".chars() {
+            module.handle(key(ch));
+        }
+        assert_eq!(module.canonical_reading(), "だ");
+    }
+
     fn text(value: &str) -> String {
         value.to_string()
     }
@@ -1044,6 +1361,7 @@ mod tests {
             identity: snapshot.identity,
             text: text.into(),
         }));
+        module.complete(output.immediate.as_ref().unwrap(), true);
         assert!(matches!(
             output.immediate,
             Some(ImmediateOperation::SetPreedit { .. })
@@ -1156,6 +1474,44 @@ mod tests {
     }
 
     #[test]
+    fn rejected_live_display_does_not_replace_the_visible_anchor() {
+        let mut module = InputModule::default();
+        for ch in "nihongo".chars() {
+            module.handle(key(ch));
+        }
+        for accepted in [false, true] {
+            let BackgroundIntent::LiveSnapshot { snapshot } =
+                module.live_snapshot(3, 7, None).unwrap()
+            else {
+                unreachable!()
+            };
+            let output = module.handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+                identity: snapshot.identity,
+                text: "日本語".into(),
+            }));
+            module.complete(output.immediate.as_ref().unwrap(), accepted);
+            assert_eq!(
+                module.immediate_display(),
+                if accepted {
+                    "日本語"
+                } else {
+                    "にほんご"
+                }
+            );
+        }
+        let BackgroundIntent::LiveSnapshot { snapshot } = module.live_snapshot(3, 7, None).unwrap()
+        else {
+            unreachable!()
+        };
+        let output = module.handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+            identity: snapshot.identity,
+            text: "別の表記".into(),
+        }));
+        module.complete(output.immediate.as_ref().unwrap(), false);
+        assert_eq!(displayed(&mut module, key('n')), "日本語n");
+    }
+
+    #[test]
     fn anchored_display_keeps_the_anchor_through_sokuon_and_youon() {
         let mut module = InputModule::default();
         for ch in "honn".chars() {
@@ -1173,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn an_awaiting_llm_snapshot_is_rejected_until_llm_finishes() {
+    fn pre_llm_snapshot_stays_stale_after_llm_finishes() {
         let mut module = InputModule::default();
         for ch in "nihongo".chars() {
             module.handle(key(ch));
@@ -1191,12 +1547,18 @@ mod tests {
             })),
             ModuleOutput::default()
         );
-        // LLM 完了後は同一 identity でも受理され、anchor が構築される。
         module.set_awaiting_llm(false);
+        assert_eq!(module.handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+            identity: snapshot.identity, text: "古い表層".into(),
+        })), ModuleOutput::default());
+        let BackgroundIntent::LiveSnapshot { snapshot } =
+            module.live_snapshot(3, 7, None).expect("new snapshot")
+        else { unreachable!() };
         let output = module.handle(InputEvent::Engine(EngineResult::LiveSnapshot {
             identity: snapshot.identity,
             text: "日本語".into(),
         }));
+        module.complete(output.immediate.as_ref().unwrap(), true);
         assert!(matches!(
             output.immediate,
             Some(ImmediateOperation::SetPreedit { .. })
@@ -1236,6 +1598,7 @@ mod tests {
         let stale = module.handle(InputEvent::Engine(EngineResult::LiveSnapshot {
             identity: SnapshotIdentity {
                 revision: 999,
+                request: 0,
                 composition: 1,
                 configuration_generation: 3,
                 connection_generation: 7,
@@ -1601,7 +1964,7 @@ mod tests {
             ("sha", "し", 'a', "しあ"),
             ("kaki", "か", 'o', "かお"),
             ("ny", "n", 'a', "な"),
-            ("kq", "k", 'a', "kあ"),
+            ("kq", "k", 'a', "か"),
         ] {
             let mut module = InputModule::default();
             for ch in before.chars() {
@@ -1649,7 +2012,9 @@ mod tests {
         let BackgroundIntent::Insert { segments, .. } = direct.background_reseed() else {
             unreachable!()
         };
-        assert_eq!(replayed_reading(&segments), "x");
+        // P6/C2: U+0301 is a separate legal reading position; only kana
+        // dakuten/handakuten attach to the preceding scalar in reading edits.
+        assert_eq!(replayed_reading(&segments), "xe");
     }
 
     #[test]

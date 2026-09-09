@@ -3,6 +3,30 @@
 //! 確定文字列／preedit／候補ログを観測する。
 
 mod doc_state;
+mod clause_navigation;
+mod receipt_relay;
+mod apply_faults;
+#[path = "../../tip/src/commit_session.rs"]
+mod commit_session;
+#[path = "../../tip/src/edit_range.rs"]
+mod edit_range;
+#[allow(dead_code)]
+#[path = "../../tip/src/apply_state.rs"]
+mod apply_state;
+#[allow(dead_code)]
+#[path = "../../tip/src/preedit_apply.rs"]
+mod preedit_apply;
+#[path = "../../tip/src/preedit_session.rs"]
+mod preedit_session;
+// The shared COM session normally holds a DLL lifetime reference. Here it is
+// linked into the executable, which cannot unload while the test is running.
+mod globals {
+    pub(crate) struct ComObjectGuard;
+    impl ComObjectGuard { pub(crate) fn new() -> Self { Self } }
+}
+mod text_service {
+    pub(crate) fn tip_log(message: &str) { crate::text_store::hlog(message); }
+}
 mod driver;
 mod log_parse;
 mod manual_inline_apps;
@@ -42,6 +66,25 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let code = match mode {
+        "--apply-faults" => apply_faults::run(),
+        "--clause-navigation" => clause_navigation::run(),
+        "--clause-deferred-commit" => clause_navigation::run_deferred_commit(),
+        "--clause-receipt-delivery-expiry" => clause_navigation::run_receipt_delivery_expiry(),
+        "--clause-learning-clear" => clause_navigation::run_learning_clear(),
+        "--clause-learning-clear-receipt" => clause_navigation::run_learning_clear_receipt(),
+        "--clause-learning-toggle" => clause_navigation::run_learning_toggle(),
+        "--clause-boundary-resize" => clause_navigation::run_boundary_resize(),
+        "--clause-boundary-restart" => clause_navigation::run_boundary_restart(),
+        "--clause-backspace-escape" => clause_navigation::run_backspace_escape(),
+        "--clause-reading-cursor" => clause_navigation::run_reading_cursor(),
+        "--clause-notation-cycle" => clause_navigation::run_notation_cycle(),
+        "--clause-mixed-edit" => clause_navigation::run_mixed_edit(),
+        "--clause-display" => clause_navigation::run_display(),
+        "--clause-mode-toggle-commit" => clause_navigation::run_mode_toggle_commit(),
+        "--clause-receipt-retry" => clause_navigation::run_receipt_retry(),
+        "--clause-receipt-expired" => clause_navigation::run_receipt_expired(),
+        "--clause-rebaseline" => clause_navigation::run_rebaseline(),
+        "--clause-rebaseline-restart" => clause_navigation::run_rebaseline_restart(),
         "--stage0" | "" => tsf_host::stage0_spike(),
         "--canonical" => run_canonical(),
         "--scenarios" => run_scenarios_reported(json_path),
@@ -1377,6 +1420,30 @@ fn run_item9_mode() -> i32 {
     }
 }
 
+/// Pin only the model/setup conditions needed to observe multiple native clauses.
+/// The settings path is restored after the host is dropped, including on errors.
+fn run_item16_with_classic_fixture() -> Result<driver::Item16Result, String> {
+    struct LocalAppDataGuard(Option<std::ffi::OsString>);
+    impl Drop for LocalAppDataGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("LOCALAPPDATA", value),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+        }
+    }
+    let scratch = tempfile::Builder::new().prefix("nospacekey-item16-").tempdir()
+        .map_err(|error| format!("scratch: {error}"))?;
+    let settings = scratch.path().join("nospacekey");
+    std::fs::create_dir_all(&settings).and_then(|_| std::fs::write(settings.join("settings.json"),
+        r#"{"version":2,"zenzai":{"enabled":false},"learning":{"enabled":false},"default_direct":false,"live_conversion":{"enabled":false}}"#))
+        .map_err(|error| format!("settings: {error}"))?;
+    let _environment = LocalAppDataGuard(std::env::var_os("LOCALAPPDATA"));
+    std::env::set_var("LOCALAPPDATA", scratch.path());
+    let host = tsf_host::TsfHost::start().map_err(|error| format!("start: {error:?}"))?;
+    Ok(driver::run_item16(&host))
+}
+
 /// item12: Tab→外部LLM変換のスレッド配線（echo）。ComSta ガードを host より先に束縛して start。
 fn run_item12_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
@@ -2405,49 +2472,6 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         }
     }
 
-    // item8: エンジン kill 耐性（新しい host）。
-    match tsf_host::TsfHost::start() {
-        Ok(host) => {
-            let r8 = driver::run_item8(&host, 5000);
-            items.push(ItemReport {
-                item: 8,
-                name: "engine kill resilience".into(),
-                status: if r8.passed { "pass" } else { "fail" }.into(),
-                detail: r8.detail,
-                max_elapsed_ms: 0,
-            });
-        }
-        Err(e) => items.push(ItemReport {
-            item: 8,
-            name: "engine kill resilience".into(),
-            status: "error".into(),
-            detail: format!("start fail: {e:?}"),
-            max_elapsed_ms: 0,
-        }),
-    }
-
-    // item9: 解除後 eaten=false。必ず最後（解除はスレッド状態を変えるため）。
-    match tsf_host::TsfHost::start() {
-        Ok(mut host) => {
-            let (before, after) = driver::run_item9(&mut host);
-            let pass9 = before && !after;
-            items.push(ItemReport {
-                item: 9,
-                name: "deactivate returns to normal".into(),
-                status: if pass9 { "pass" } else { "fail" }.into(),
-                detail: format!("before={before} after={after}"),
-                max_elapsed_ms: 0,
-            });
-        }
-        Err(e) => items.push(ItemReport {
-            item: 9,
-            name: "deactivate returns to normal".into(),
-            status: "error".into(),
-            detail: format!("start fail: {e:?}"),
-            max_elapsed_ms: 0,
-        }),
-    }
-
     // item12: Tab→外部LLM変換のスレッド配線（worker→ポーリング→preedit 反映）を echo 検証。
     // 専用ドライバ（合成→Tab→settle_llm）が要るので個別実行する。新しい host で。
     match tsf_host::TsfHost::start() {
@@ -2537,14 +2561,12 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         }),
     }
 
-    // item16: 前方一致候補の部分確定でデータロスしない（"日本"確定→残り読み"ご"が継続）。専用ドライバ
-    // （nihongo+Space で候補→日本 を Behavior 確定→committed/preedit/ログ観測）が要るので個別実行。新 host で。
-    match tsf_host::TsfHost::start() {
-        Ok(host) => {
-            let r16 = driver::run_item16(&host);
+    // item16: first-clause replacement preserves all later clauses through finalization.
+    match run_item16_with_classic_fixture() {
+        Ok(r16) => {
             items.push(ItemReport {
                 item: 16,
-                name: "prefix-candidate partial commit keeps remainder".into(),
+                name: "first-clause replacement commits all following clauses".into(),
                 status: if r16.passed { "pass" } else { "fail" }.into(),
                 detail: r16.detail,
                 max_elapsed_ms: 0,
@@ -2552,7 +2574,7 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         }
         Err(e) => items.push(ItemReport {
             item: 16,
-            name: "prefix-candidate partial commit keeps remainder".into(),
+            name: "first-clause replacement commits all following clauses".into(),
             status: "error".into(),
             detail: format!("start fail: {e:?}"),
             max_elapsed_ms: 0,
@@ -2718,6 +2740,49 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
     }
 
     // 実行順（…,10,8,9,12,13,14,15,16,17,18,19,24）ではなく item 番号昇順で表示・出力する。
+    // item8: エンジン kill 耐性（新しい host）。
+    match tsf_host::TsfHost::start() {
+        Ok(host) => {
+            let r8 = driver::run_item8(&host, 5000);
+            items.push(ItemReport {
+                item: 8,
+                name: "engine kill resilience".into(),
+                status: if r8.passed { "pass" } else { "fail" }.into(),
+                detail: r8.detail,
+                max_elapsed_ms: 0,
+            });
+        }
+        Err(e) => items.push(ItemReport {
+            item: 8,
+            name: "engine kill resilience".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
+        }),
+    }
+
+    // item9: 解除後 eaten=false。必ず最後（解除はスレッド状態を変えるため）。
+    match tsf_host::TsfHost::start() {
+        Ok(mut host) => {
+            let (before, after) = driver::run_item9(&mut host);
+            let pass9 = before && !after;
+            items.push(ItemReport {
+                item: 9,
+                name: "deactivate returns to normal".into(),
+                status: if pass9 { "pass" } else { "fail" }.into(),
+                detail: format!("before={before} after={after}"),
+                max_elapsed_ms: 0,
+            });
+        }
+        Err(e) => items.push(ItemReport {
+            item: 9,
+            name: "deactivate returns to normal".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
+        }),
+    }
+
     items.sort_by_key(|i| i.item);
     let all_pass = items.iter().all(|i| i.status == "pass");
     let rep = HarnessReport {

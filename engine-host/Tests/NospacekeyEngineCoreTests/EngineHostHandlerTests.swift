@@ -115,7 +115,7 @@ final class EngineHostHandlerTests: XCTestCase {
         let obj = try JSONSerialization.jsonObject(
             with: handler(1, Data(#"{"method":"StartSession"}"#.utf8)).reply) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
-        XCTAssertEqual(obj["proto"] as? Int, 8)
+        XCTAssertEqual(obj["proto"] as? Int, 9)
         XCTAssertEqual(obj["boot"] as? String, BuildInfo.version)
     }
 
@@ -307,6 +307,31 @@ final class EngineHostHandlerTests: XCTestCase {
         XCTAssertEqual(resultTag((leaderReply.data ?? Data(), false)), "Ok")
     }
 
+    func testSnapshotReceiptAcceptsNonzeroRequestStampAndRejectsWrongIdentity() throws {
+        let service = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+            learning: LearningSettings(enabled: false, memoryDir: nil),
+            autoCommit: .ultrastrong, autoCommitMaxReading: 8)
+        let handler = makeEngineHandler(service: service, serviceLock: NSLock())
+        var raw = ""
+        for (offset, character) in "watashiha,gakkouheikimasu".enumerated() {
+            raw.append(character)
+            let revision = offset + 1
+            let request = Data(#"{"method":"LiveSnapshot","params":{"composition":700,"revision":\#(revision),"configuration_generation":2,"connection_generation":5,"conversion_revision":3,"request_id":\#(revision + 100),"segments":[{"text":"\#(raw)"}]}}"#.utf8)
+            let response = try XCTUnwrap(try JSONSerialization.jsonObject(with: handler(1, request).reply) as? [String: Any])
+            guard let proposal = response["auto_commit"] as? [String: Any],
+                  let id = proposal["proposal"] as? NSNumber else { continue }
+            func receipt(_ generation: Int) -> Data {
+                Data(#"{"method":"AutoCommitReceipt","params":{"composition":700,"revision":\#(revision),"configuration_generation":\#(generation),"connection_generation":5,"proposal":\#(id.uint64Value)}}"#.utf8)
+            }
+            XCTAssertEqual(resultTag(handler(1, receipt(9))), "Error")
+            XCTAssertEqual(resultTag(handler(2, receipt(2))), "Error")
+            XCTAssertEqual(resultTag(handler(1, receipt(2))), "Ok")
+            XCTAssertEqual(resultTag(handler(1, receipt(2))), "Ok")
+            return
+        }
+        XCTFail("representative input must propose an auto commit")
+    }
+
     private func firstSnapshotProposal(_ service: ConversionService)
         -> (ConversionService.SnapshotEnhancementKey, ConversionService.SnapshotAutoCommitProposal)? {
         var raw = ""
@@ -338,9 +363,9 @@ final class EngineHostHandlerTests: XCTestCase {
         // ひらがな literal 候補("にほんご"自身)は除外する: reading==surface だと
         // 入れ替えバグでも同じアサートが通り、テストの検出力がハッシュ順次第で消える。
         guard let surface = { () -> String? in
-            _ = svc.reconvert(session: s, surface: "にほんご")
+            let modelTop = svc.reconvert(session: s, surface: "にほんご")?.first
             return svc.recordableSurfacesForTesting(reading: "にほんご")
-                .first(where: { $0 != "にほんご" })
+                .sorted().first(where: { $0 != "にほんご" && $0 != modelTop })
         }() else {
             svc.endSession(session: s)
             return XCTFail("no recordable surface")
@@ -465,7 +490,7 @@ final class EngineHostHandlerTests: XCTestCase {
 
     func testLiveSnapshotRebuildsStyledInputAndEchoesIdentity() throws {
         let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
-        let request = Data(#"{"method":"LiveSnapshot","params":{"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"segments":[{"text":"nihongo"},{"text":"GPU","style":"direct"}]}}"#.utf8)
+        let request = Data(#"{"method":"LiveSnapshot","params":{"conversion_revision":0,"request_id":1,"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"segments":[{"text":"nihongo"},{"text":"GPU","style":"direct"}]}}"#.utf8)
         let outcome = handler(4, request)
         let object = try JSONSerialization.jsonObject(with: outcome.reply) as! [String: Any]
         XCTAssertEqual(object["result"] as? String, "SnapshotResult")
@@ -474,16 +499,21 @@ final class EngineHostHandlerTests: XCTestCase {
         XCTAssertEqual(object["configuration_generation"] as? Int, 2)
         XCTAssertEqual(object["connection_generation"] as? Int, 5)
         XCTAssertNotNil(object["baseline"] as? NSNumber)
-        XCTAssertNil(object["reading"])
+        XCTAssertEqual(object["reading"] as? String, "にほんごGPU")
+        XCTAssertEqual(object["conversion_revision"] as? Int, 0)
+        XCTAssertEqual(object["request_id"] as? Int, 1)
+        let clauses = try JSONDecoder().decode(SnapshotClauseData.self, from: outcome.reply)
+        try ClauseCoordinates.validate(reading: clauses.reading, clauses: clauses.clauses,
+            start: 0, end: UInt32(clauses.reading.unicodeScalars.count), text: object["text"] as! String)
         XCTAssertNil(object["candidates"])
     }
 
     func testSnapshotEnhancementPollIsTerminalWhenGPUIsUnavailable() throws {
         let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
-        let classic = handler(1, Data(#"{"method":"LiveSnapshot","params":{"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"segments":[{"text":"nihongo"}]}}"#.utf8))
+        let classic = handler(1, Data(#"{"method":"LiveSnapshot","params":{"conversion_revision":0,"request_id":1,"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"segments":[{"text":"nihongo"}]}}"#.utf8))
         let object = try JSONSerialization.jsonObject(with: classic.reply) as! [String: Any]
         let baseline = try XCTUnwrap(object["baseline"] as? NSNumber).uint64Value
-        let poll = Data("{\"method\":\"PollSnapshotEnhancement\",\"params\":{\"composition\":8,\"revision\":13,\"configuration_generation\":2,\"connection_generation\":5,\"baseline\":\(baseline)}}".utf8)
+        let poll = Data("{\"method\":\"PollSnapshotEnhancement\",\"params\":{\"conversion_revision\":0,\"request_id\":1,\"composition\":8,\"revision\":13,\"configuration_generation\":2,\"connection_generation\":5,\"baseline\":\(baseline)}}".utf8)
         XCTAssertEqual(resultTag(handler(1, poll)), "SnapshotEnhancementUnavailable")
     }
 
@@ -495,7 +525,7 @@ final class EngineHostHandlerTests: XCTestCase {
         let reply = ReplyBox()
         let done = DispatchSemaphore(value: 0)
         Thread.detachNewThread {
-            reply.data = handler(1, Data(#"{"method":"PollSnapshotEnhancement","params":{"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"baseline":42}}"#.utf8)).reply
+            reply.data = handler(1, Data(#"{"method":"PollSnapshotEnhancement","params":{"conversion_revision":0,"request_id":1,"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"baseline":42}}"#.utf8)).reply
             done.signal()
         }
         XCTAssertEqual(done.wait(timeout: .now() + 1), .success)
@@ -504,7 +534,7 @@ final class EngineHostHandlerTests: XCTestCase {
 
     func testExplicitSnapshotReturnsClassicCandidatesWithTheSameIdentity() throws {
         let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
-        let request = Data(#"{"method":"LiveSnapshot","params":{"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"segments":[{"text":"nihongo"}],"explicit":true}}"#.utf8)
+        let request = Data(#"{"method":"LiveSnapshot","params":{"conversion_revision":0,"request_id":1,"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"segments":[{"text":"nihongo"}],"explicit":true}}"#.utf8)
         let outcome = handler(4, request)
         let object = try JSONSerialization.jsonObject(with: outcome.reply) as! [String: Any]
         XCTAssertEqual(object["result"] as? String, "SnapshotResult")

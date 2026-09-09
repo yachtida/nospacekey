@@ -53,7 +53,7 @@
 ; these three literals match; update BOTH files together or the test goes RED.
 ; The .gguf is fetched from the origin (HuggingFace) at install time and is
 ; NEVER bundled -- bundling would make this installer a CC-BY-SA-4.0
-; redistributor (see docs/superpowers/specs/2026-07-16-installer-zenzai-
+; redistributor (see docs/design/2026-07-16-installer-zenzai-
 ; download-design.md).
 #define ModelFileName "ggml-model-Q5_K_M.gguf"
 #define ModelDownloadURL "https://huggingface.co/Miwa-Keita/zenz-v3.1-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf"

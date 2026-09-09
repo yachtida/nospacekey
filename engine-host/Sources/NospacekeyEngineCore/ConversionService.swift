@@ -123,12 +123,59 @@ struct LearningFileSystem: @unchecked Sendable {
 /// `dictStateLock`（保持中に他のロックを取らない＝反転しない）、`environment` は immutable。
 /// 実作業はbounded maintenance lane上で走り、serviceLockを保持しない。
 public final class ConversionService: @unchecked Sendable {
+    let engineEpoch = UUID().uuidString
+    private enum SentenceAction { case unchanged, correction, unlearn }
+    private struct ClauseTokenMaterial {
+        let candidate: Candidate
+        let readingStart: UInt32
+        let readingEnd: UInt32
+        let generation: UInt64
+        let issuedAt: TimeInterval
+        let originalSurface: String
+        let modelTop: String?
+        var sentenceAction: SentenceAction? = nil
+    }
+    private var clauseTokens: [String: ClauseTokenMaterial] = [:]
+    private var nextClauseToken: UInt64 = 0
+    private var receiptLedger = CommitReceiptLedger()
+    var clauseClock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    private struct ClauseBaseline {
+        let key: SnapshotEnhancementKey
+        let leftContext: String?
+        let issuedAt: TimeInterval
+        var clauses: [WireClause] = []
+    }
+    private var nextClauseBaseline: UInt64 = 0
+    private var clauseBaselines: [UInt64: ClauseBaseline] = [:]
+    private var clauseCandidateReplies: [ClauseRequestKey: (ClauseCandidatesRequest, ClauseCandidatesResult, TimeInterval)] = [:]
+    private var clauseConversionReplies: [ClauseRequestKey: (ConvertClausesRequest, ConvertClausesResult, TimeInterval)] = [:]
+
+    var currentLearningGeneration: UInt64 {
+        learningStateLock.lock()
+        defer { learningStateLock.unlock() }
+        return learningGeneration
+    }
     static let defaultSnapshotAutoCommitStateLimit = 64
     struct SnapshotEnhancementKey: Equatable, Sendable {
         let composition: UInt64
         let revision: UInt64
         let configurationGeneration: UInt64
         let connectionGeneration: UInt64
+        let conversionRevision: UInt64
+        let requestID: UInt64
+
+        func sameReadingIdentity(as other: Self) -> Bool {
+            composition == other.composition && revision == other.revision
+                && configurationGeneration == other.configurationGeneration
+                && connectionGeneration == other.connectionGeneration
+        }
+
+        init(composition: UInt64, revision: UInt64, configurationGeneration: UInt64, connectionGeneration: UInt64,
+             conversionRevision: UInt64 = 0, requestID: UInt64 = 0) {
+            self.composition = composition; self.revision = revision
+            self.configurationGeneration = configurationGeneration; self.connectionGeneration = connectionGeneration
+            self.conversionRevision = conversionRevision; self.requestID = requestID
+        }
     }
 
     struct SnapshotAutoCommitProposal: Equatable, Sendable {
@@ -152,7 +199,7 @@ public final class ConversionService: @unchecked Sendable {
     enum SnapshotEnhancementPoll: Sendable {
         case pending
         case unavailable
-        case ready(text: String, candidates: [String]?, candidateRemaining: [String]?)
+        case ready(text: String, candidates: [String]?, candidateRemaining: [String]?, clauseData: SnapshotClauseData)
     }
 
     private struct SnapshotCandidateIdentity: Hashable {
@@ -201,6 +248,26 @@ public final class ConversionService: @unchecked Sendable {
     private var learningConverter = KanaKanjiConverter.withDefaultDictionary()
     private let recentLearning = RecentLearningOverlay()
     private let learningStateLock = NSLock()
+    // Serializes actual vendor writes with settings generation changes. Reload
+    // uses try(), preserving its existing busy/retry contract during disk I/O.
+    private let learningPersistenceLock = NSLock()
+    private struct LearningPersistenceContext: Equatable {
+        let session: Int
+        let compositionReset: Int
+        let directory: URL
+        var receipt: CommitId? = nil
+        var run: Int = 0
+    }
+    private struct PendingLearning {
+        let candidate: Candidate
+        let options: ConvertRequestOptions
+        let generation: UInt64
+        let context: LearningPersistenceContext?
+    }
+    // Events are retained under learningStateLock; only the wake-up is coalesced.
+    private var pendingLearning: [PendingLearning] = []
+    // Owned exclusively by the maintenance lane (clear replaces it after a barrier).
+    private var persistedLearningContext: LearningPersistenceContext?
     private var learningGeneration: UInt64 = 0
     private var clearingLearning = false
     private let learningPersistenceForTesting: (@Sendable (Candidate) -> Void)?
@@ -890,7 +957,7 @@ public final class ConversionService: @unchecked Sendable {
     /// テストは `init(config:)` の後に任意の URL（nil=テンプレートのみ）で呼ぶ。
     /// converter を触るので converterLock 下で行う（init 時点では無競合だが、後から呼ばれても
     /// warm-up/変換と直列化される規律を守る）。起動後の辞書更新は ReloadDictionary IPC →
-    /// `requestDictionaryReload` で反映する（docs/superpowers/specs/2026-08-02-custom-dictionary-design.md
+    /// `requestDictionaryReload` で反映する（docs/design/2026-08-02-custom-dictionary-design.md
     /// §4.3 が旧 plan の設計ロック「起動時ロードのみ」を上書きした）。
     /// `enabled=false` は**ファイルを読まずに**テンプレートのみ（評価順序は enabled が先 — 同 §4.1）。
     func loadUserDictionary(from url: URL?, enabled: Bool = true) {
@@ -1091,6 +1158,9 @@ public final class ConversionService: @unchecked Sendable {
                 // LOCALAPPDATA; turning learning OFF must keep clearing that injected root.
                 newLearningDirectory = self.learningDirectory ?? resolvedEnvironmentDirectory
             }
+            let learningChanged = self.learning.enabled != newLearning.enabled || self.learningDirectory != newLearningDirectory
+            if learningChanged && !learningPersistenceLock.try() { return false }
+            defer { if learningChanged { learningPersistenceLock.unlock() } }
             // Spec2: OFF へ切り替わる前に保留分を保存（.nothing では新規更新が止まり save も skip される
             // ＝保留分が「凍結」され、後で ON に戻すと古い保留分が書かれうる。先に保存して空にしておく。
             // 注: ライブラリの updateConfig(.nothing) は一時トライをクリアしない — LearningMemory.swift:645-650）。
@@ -1132,6 +1202,13 @@ public final class ConversionService: @unchecked Sendable {
             // self.config の差し替え前に、旧 weightURL をキャプチャ（新規有効化判定で self.config が
             // 既に newZenzai に置き換わった後だと old==new で常に false になる — 行451 と同じパターン）。
             let oldWeightURL = self.config.weightURL
+            if learningChanged {
+                learningStateLock.lock()
+                learningGeneration &+= 1
+                pendingLearning.removeAll()
+                learningStateLock.unlock()
+                recentLearning.clear()
+            }
             self.learning = newLearning
             self.learningDirectory = newLearningDirectory
             configurationLock.lock()
@@ -1315,6 +1392,12 @@ public final class ConversionService: @unchecked Sendable {
     /// updateLearningData は vendor の `lastData` も更新するため、その所有者も追跡する。
     private func updateLearningDataLocked(_ candidate: Candidate, session: Int) {
         converter.updateLearningData(candidate)
+        if processRole == .mainClassicOnly && learning.enabled && candidate.isLearningTarget {
+            let options = makeOptions(nBest: 1, forceClassic: true)
+            enqueueLearningPersistence(candidate: candidate, options: options,
+                context: LearningPersistenceContext(session: session,
+                    compositionReset: compositionResetCount, directory: options.memoryDirectoryURL))
+        }
         learningDataSession = session
         refreshDeferredClassicResetLocked()
         vendorTemporaryState = .mayContainData
@@ -1455,7 +1538,8 @@ public final class ConversionService: @unchecked Sendable {
             leftContext: leftContext,
             nBest: poolSize,
             inferenceLimit: config.inferenceLimit,
-            deadline: deadline.workerBudget)
+            deadline: deadline.workerBudget,
+            caller: deadline == .live ? .live : .convert)
         if let failure = decision.failure {
             // Only the sanitized category is logged; no input/candidate text.
             engineLog("ev=zenzai_worker_fallback reason=\(failure.rawValue)\n")
@@ -2188,7 +2272,8 @@ public final class ConversionService: @unchecked Sendable {
         var clauses: [Candidate] = []
         var data = candidate.data[...]
         while !data.isEmpty {
-            let clause = Candidate.makePrefixClauseCandidate(data: data)
+            var clause = Candidate.makePrefixClauseCandidate(data: data)
+            clause.isLearningTarget = clause.isLearningTarget && candidate.isLearningTarget
             if clause.data.isEmpty { break }
             clauses.append(clause)
             data = data.dropFirst(clause.data.count)
@@ -2602,6 +2687,13 @@ public final class ConversionService: @unchecked Sendable {
         return { release.signal() }
     }
 
+    func saturateCoalescedMaintenanceForTesting() -> BackgroundMaintenance.Snapshot {
+        for index in 0...64 {
+            maintenance.submitLatest(label: "test_fill_\(index)") {}
+        }
+        return maintenance.snapshot
+    }
+
     var recentLearningCountForTesting: Int { recentLearning.count }
 
     var snapshotReceiptLedgerCountsForTesting: (pending: Int, applied: Int) {
@@ -2620,10 +2712,24 @@ public final class ConversionService: @unchecked Sendable {
         return composing
     }
 
+    var snapshotCandidatesForTesting: [Candidate]?
+
+    private static func snapshotCandidate(_ candidates: [Candidate], reading: String) -> Candidate? {
+        let normalized = ClauseCoordinates.normalize(reading)
+        let valid = candidates.filter {
+            let ruby = ClauseCoordinates.normalize($0.data.map(\.ruby).joined())
+            return !ruby.isEmpty && !($0.text.isEmpty)
+                && normalized.unicodeScalars.starts(with: ruby.unicodeScalars)
+        }
+        return valid.first {
+            ClauseCoordinates.normalize($0.data.map(\.ruby).joined()).unicodeScalars.elementsEqual(normalized.unicodeScalars)
+        } ?? valid.first
+    }
+
     func snapshot(_ segments: [SnapshotSegment], explicit: Bool, leftContext: String? = nil,
                   enhancementKey: SnapshotEnhancementKey? = nil, snapshotConnection: Int = 0)
         -> (text: String, reading: String, candidates: [String]?, candidateRemaining: [String]?, baseline: UInt64,
-            autoCommit: SnapshotAutoCommitProposal?)
+            autoCommit: SnapshotAutoCommitProposal?, clauseData: SnapshotClauseData)
     {
         let composing = Self.makeSnapshotComposing(segments)
         converterLock.lock()
@@ -2631,6 +2737,7 @@ public final class ConversionService: @unchecked Sendable {
         stopCompositionLocked()
         let options = makeOptions(nBest: explicit ? 10 : 1, leftSideContext: leftContext, forceClassic: true)
         var classic = requestCandidatesLocked(composing, options: options)
+        if let snapshotCandidatesForTesting { classic.mainResults = snapshotCandidatesForTesting }
         let reading = composing.convertTarget
         let ranked = recentLearning.rank(
             mainResults: classic.mainResults, firstClauseResults: classic.firstClauseResults,
@@ -2638,16 +2745,21 @@ public final class ConversionService: @unchecked Sendable {
         classic.mainResults = ranked.main
         classic.firstClauseResults = ranked.firstClause
         let results = classic.mainResults
-        let baseline = Self.snapshotBaselineDigest(explicit: explicit, reading: reading, candidates: results)
-        let whole = results.filter {
-            $0.data.reduce(0) { $0 + $1.ruby.count } == reading.count
-        }.map(\.text)
-        let display = whole.first ?? reading
+        guard nextClauseBaseline < UInt64.max else {
+            let data = makeSnapshotClauseDataLocked(reading: reading, candidate: nil, key: enhancementKey)
+            return (data.clauses.map(\.surface).joined(), reading, explicit ? [] : nil, explicit ? [] : nil, 0, nil, data)
+        }
+        nextClauseBaseline += 1
+        let baseline = nextClauseBaseline
+        let now = ProcessInfo.processInfo.systemUptime
+        clauseBaselines = clauseBaselines.filter { now - $0.value.issuedAt < 60 }
+        if let enhancementKey, clauseBaselines.count < 4096 {
+            clauseBaselines[baseline] = ClauseBaseline(key: enhancementKey, leftContext: leftContext, issuedAt: now)
+        }
+        let selected = Self.snapshotCandidate(results, reading: reading)
         engineLog("ev=infer kind=\(explicit ? "explicit" : "live")_snapshot target_chars=\(reading.count)\n")
         guard explicit else {
-            let liveCandidate = results.first(where: {
-                $0.data.reduce(0) { $0 + $1.ruby.count } == reading.count
-            }) ?? Candidate(
+            let liveCandidate = selected ?? Candidate(
                 text: reading, value: 0,
                 composingCount: .inputCount(composing.input.count),
                 lastMid: MIDData.一般.mid,
@@ -2664,15 +2776,12 @@ public final class ConversionService: @unchecked Sendable {
                     classic: classic, snapshot: GPUWorkerCompositionSnapshot(composing),
                     leftContext: leftContext, inferenceLimit: config.inferenceLimit))
             }
-            let proposalDisplay: String
-            if let proposal {
-                let remainder = display.hasPrefix(proposal.text)
-                    ? String(display.dropFirst(proposal.text.count)) : proposal.remaining
-                proposalDisplay = remainder.isEmpty ? proposal.remaining : remainder
-            } else {
-                proposalDisplay = display.isEmpty ? reading : display
-            }
-            return (proposalDisplay, reading, nil, nil, baseline, proposal)
+            let clauseReading = proposal?.remaining ?? reading
+            let data = makeSnapshotClauseDataLocked(reading: clauseReading, candidate: proposal == nil ? liveCandidate : nil,
+                key: enhancementKey)
+            let safeDisplay = data.clauses.map(\.surface).joined()
+            clauseBaselines[baseline]?.clauses = data.clauses
+            return (safeDisplay, reading, nil, nil, baseline, proposal, data)
         }
         let candidates = results.map(\.text)
         let remaining = results.map { candidate in
@@ -2685,7 +2794,296 @@ public final class ConversionService: @unchecked Sendable {
                 classic: classic, snapshot: GPUWorkerCompositionSnapshot(composing),
                 leftContext: leftContext, inferenceLimit: config.inferenceLimit))
         }
-        return (display.isEmpty ? reading : display, reading, candidates, remaining, baseline, nil)
+        let data = makeSnapshotClauseDataLocked(reading: reading,
+            candidate: selected, key: enhancementKey)
+        clauseBaselines[baseline]?.clauses = data.clauses
+        return (data.clauses.map(\.surface).joined(), reading, candidates, remaining, baseline, nil, data)
+    }
+
+    func snapshotClausesForTesting(reading: String, candidate: Candidate?) -> SnapshotClauseData {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        return makeSnapshotClauseDataLocked(reading: reading, candidate: candidate, key: nil)
+    }
+
+    private func makeSnapshotClauseDataLocked(reading: String, candidate: Candidate?, key: SnapshotEnhancementKey?) -> SnapshotClauseData {
+        let normalized = ClauseCoordinates.normalize(reading)
+        let length = UInt32(normalized.unicodeScalars.count)
+        func readingClause(_ start: UInt32, _ id: UInt64) -> WireClause {
+            WireClause(id: id, reading_start: start, reading_end: length, state: .reading,
+                surface: ClauseCoordinates.slice(normalized, start: start, end: length)!, candidate_token: nil)
+        }
+        var clauses: [WireClause] = []
+        if let candidate {
+            let consumed = ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined())
+            let consumedLength = UInt32(consumed.unicodeScalars.count)
+            if consumedLength > 0, consumedLength <= length,
+               ClauseCoordinates.slice(normalized, start: 0, end: consumedLength)?.utf8.elementsEqual(consumed.utf8) == true {
+                var pieces = Self.decomposeClauses(candidate)
+                if !pieces.map(\.text).joined().utf8.elementsEqual(candidate.text.utf8) {
+                    pieces = consumedLength == length ? [candidate] : []
+                }
+                let now = clauseClock()
+                clauseTokens = clauseTokens.filter { now - $0.value.issuedAt < 60 }
+                if !pieces.isEmpty, clauseTokens.count + pieces.count <= 4096 {
+                    let generation = currentLearningGeneration
+                    var cursor: UInt32 = 0
+                    for (index, piece) in pieces.enumerated() {
+                        let part = ClauseCoordinates.normalize(piece.data.map(\.ruby).joined())
+                        let end = cursor + UInt32(part.unicodeScalars.count)
+                        let token = newClauseTokenLocked()
+                        clauses.append(WireClause(id: UInt64(index + 1), reading_start: cursor, reading_end: end,
+                            state: .converted, surface: piece.text, candidate_token: token))
+                        clauseTokens[token] = ClauseTokenMaterial(candidate: piece, readingStart: cursor, readingEnd: end,
+                            generation: generation, issuedAt: now, originalSurface: piece.text, modelTop: piece.text)
+                        cursor = end
+                    }
+                    if cursor < length { clauses.append(readingClause(cursor, UInt64(clauses.count + 1))) }
+                    if (try? ClauseCoordinates.validate(reading: normalized, clauses: clauses, start: 0, end: length,
+                        text: clauses.map(\.surface).joined())) == nil {
+                        for clause in clauses { if let token = clause.candidate_token { clauseTokens[token] = nil } }
+                        clauses = []
+                    }
+                }
+            }
+        }
+        if clauses.isEmpty && length > 0 { clauses = [readingClause(0, 1)] }
+        return SnapshotClauseData(reading: normalized, conversion_revision: key?.conversionRevision ?? 0,
+            request_id: key?.requestID ?? 0, clauses: clauses, sentence_token: nil)
+    }
+
+    private func clauseBaselineLocked(_ key: ClauseRequestKey, now: TimeInterval) -> ClauseBaseline? {
+        guard let baseline = clauseBaselines[key.baseline], now - baseline.issuedAt < 60,
+              baseline.key.composition == key.identity.composition,
+              baseline.key.configurationGeneration == key.identity.configuration_generation,
+              baseline.key.connectionGeneration == key.identity.connection_generation,
+              baseline.key.revision <= key.identity.revision else { return nil }
+        return baseline
+    }
+
+    private func completeClauseCandidatesLocked(reading: String, context: String?) -> (candidates: [Candidate], modelTop: String?, promoted: Bool) {
+        var composing = ComposingText()
+        composing.insertAtCursorPosition(reading, inputStyle: .direct)
+        stopCompositionLocked()
+        let results = requestCandidatesLocked(composing, options: makeOptions(nBest: 100, leftSideContext: context, forceClassic: true)).mainResults
+        func covers(_ candidate: Candidate) -> Bool {
+            !candidate.text.isEmpty && ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined()).utf8.elementsEqual(reading.utf8)
+        }
+        let complete = results.filter(covers)
+        let displayed = (promoted(complete, composing: composing) ?? complete).filter(covers)
+        return (displayed, complete.first?.text, displayed.first?.text != complete.first?.text)
+    }
+
+    private func retainClauseCandidateLocked(_ candidate: Candidate, start: UInt32, end: UInt32,
+                                             generation: UInt64, now: TimeInterval, originalSurface: String, modelTop: String?,
+                                             sentenceAction: SentenceAction? = nil) -> ClauseCandidate? {
+        guard clauseTokens.count < 4096 else { return nil }
+        let token = newClauseTokenLocked()
+        clauseTokens[token] = ClauseTokenMaterial(candidate: candidate, readingStart: start, readingEnd: end,
+            generation: generation, issuedAt: now, originalSurface: originalSurface, modelTop: modelTop,
+            sentenceAction: sentenceAction)
+        return ClauseCandidate(surface: candidate.text, token: token, reading_start: start, reading_end: end)
+    }
+
+    private func newClauseTokenLocked() -> String {
+        nextClauseToken += 1
+        return "\(engineEpoch):\(nextClauseToken)"
+    }
+
+    func retainClauseCandidateForTesting(_ candidate: Candidate, start: UInt32, end: UInt32,
+                                         originalSurface: String? = nil, modelTop: String? = nil,
+                                         sentenceSelectionIndex: Int? = nil, promoted: Bool = false) -> ClauseCandidate? {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        return retainClauseCandidateLocked(candidate, start: start, end: end,
+            generation: currentLearningGeneration, now: clauseClock(),
+            originalSurface: originalSurface ?? candidate.text, modelTop: modelTop ?? candidate.text,
+            sentenceAction: sentenceSelectionIndex.map {
+                Self.sentenceAction(candidate, index: $0, modelTop: modelTop, promoted: promoted)
+            })
+    }
+
+    private static func sentenceAction(_ candidate: Candidate, index: Int, modelTop: String?, promoted: Bool) -> SentenceAction {
+        guard index != 0, candidate.isLearningTarget else { return .unchanged }
+        if sameWireText(candidate.text, modelTop) { return promoted ? .unlearn : .unchanged }
+        return .correction
+    }
+
+    private func missingClauseTokenReason(_ token: String) -> ReceiptRejection {
+        let prefix = engineEpoch + ":"
+        guard token.hasPrefix(prefix), let sequence = UInt64(token.dropFirst(prefix.count)),
+              sequence > 0, sequence <= nextClauseToken,
+              token == prefix + String(sequence) else { return .invalidToken }
+        return .expired
+    }
+
+    /// Lock order matches conversion/configuration: converter, then learning.
+    /// Clear takes learning only to establish its generation boundary, releases
+    /// it before its maintenance barrier, and then takes converter.
+    func commitReceipt(_ receipt: CommitReceipt) -> CommitReceiptAck {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        learningStateLock.lock()
+        defer { learningStateLock.unlock() }
+        guard receipt.engine_epoch == engineEpoch else {
+            return CommitReceiptAck(commitId: receipt.commit_id, outcome: .rejected(.expired))
+        }
+        let now = clauseClock()
+        return receiptLedger.process(receipt, now: now) {
+            guard !clearingLearning, receipt.learning_generation == learningGeneration else {
+                return .rejected(.staleLearningGeneration)
+            }
+            guard UUID(uuidString: receipt.commit_id.client_instance) != nil else {
+                return .rejected(.invalidIntervals)
+            }
+            // Validate the entire immutable payload before touching any learner.
+            do { try receipt.validate(tokenMatches: { _, _ in true }) }
+            catch { return .rejected(.invalidIntervals) }
+            var materials: [ClauseTokenMaterial?] = []
+            for interval in receipt.intervals {
+                guard case .candidate(let token, _) = interval.learning else {
+                    materials.append(nil)
+                    continue
+                }
+                guard let material = clauseTokens[token] else {
+                    return .rejected(missingClauseTokenReason(token))
+                }
+                guard now - material.issuedAt < 60 else { return .rejected(.expired) }
+                guard material.generation == receipt.learning_generation else {
+                    return .rejected(.staleLearningGeneration)
+                }
+                let reading = ClauseCoordinates.slice(receipt.reading, start: interval.reading_start,
+                                                       end: interval.reading_end)
+                guard material.readingStart == interval.reading_start,
+                      material.readingEnd == interval.reading_end,
+                      sameWireText(material.candidate.text, interval.surface),
+                      sameWireText(ClauseCoordinates.normalize(material.candidate.data.map(\.ruby).joined()), reading) else {
+                    return .rejected(.invalidToken)
+                }
+                materials.append(material)
+            }
+            var sentence: ClauseTokenMaterial?
+            if let token = receipt.sentence_token {
+                guard let material = clauseTokens[token] else { return .rejected(missingClauseTokenReason(token)) }
+                guard now - material.issuedAt < 60 else { return .rejected(.expired) }
+                guard material.generation == receipt.learning_generation else { return .rejected(.staleLearningGeneration) }
+                guard material.sentenceAction != nil, material.readingStart == 0,
+                      material.readingEnd == UInt32(receipt.reading.unicodeScalars.count),
+                      sameWireText(ClauseCoordinates.normalize(material.candidate.data.map(\.ruby).joined()), receipt.reading)
+                else { return .rejected(.invalidToken) }
+                sentence = material
+            }
+            guard learning.enabled else { return .applied }
+            let options = makeOptions(nBest: 1, forceClassic: true)
+            var run = 0
+            var recorded = false
+            for (interval, material) in zip(receipt.intervals, materials) {
+                guard let material, material.candidate.isLearningTarget else {
+                    run += 1
+                    continue
+                }
+                recentLearning.record(material.candidate)
+                enqueueLearningPersistenceLocked(candidate: material.candidate, options: options,
+                    context: LearningPersistenceContext(session: 0, compositionReset: 0,
+                        directory: options.memoryDirectoryURL, receipt: receipt.commit_id, run: run))
+                if case .candidate(_, let explicit) = interval.learning, explicit,
+                   !sameWireText(interval.surface, material.originalSurface),
+                   !sameWireText(interval.surface, material.modelTop) {
+                    corrections.record(reading: Self.clauseReading(material.candidate), surface: interval.surface)
+                    recorded = true
+                }
+            }
+            if let sentence, sameWireText(receipt.text, sentence.candidate.text), sentence.candidate.isLearningTarget {
+                switch sentence.sentenceAction {
+                case .correction:
+                    corrections.record(reading: receipt.reading, surface: receipt.text)
+                    recorded = true
+                case .unlearn:
+                    recorded = corrections.remove(reading: receipt.reading) || recorded
+                default: break
+                }
+            }
+            if recorded { enqueueCorrectionPersistenceLocked() }
+            return .applied
+        }
+    }
+
+    func clauseCandidates(_ request: ClauseCandidatesRequest) -> ClauseCandidatesResult {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        func unavailable(_ reason: ClauseUnavailableReason) -> ClauseCandidatesResult {
+            ClauseCandidatesResult(key: request.key, outcome: .unavailable(reason))
+        }
+        clauseCandidateReplies = clauseCandidateReplies.filter { now - $0.value.2 < 60 }
+        if clauseConversionReplies[request.key] != nil { return unavailable(.invalidRequest) }
+        if let cached = clauseCandidateReplies[request.key] {
+            guard cached.0 == request else { return unavailable(.invalidRequest) }
+            return now - cached.2 < 1.2 ? cached.1 : unavailable(.expired)
+        }
+        guard (try? request.validate()) != nil else { return unavailable(.invalidRequest) }
+        guard let baseline = clauseBaselineLocked(request.key, now: now) else { return unavailable(.expired) }
+        guard clauseCandidateReplies.count < 4096 else { return unavailable(.busy) }
+        clauseTokens = clauseTokens.filter { now - $0.value.issuedAt < 60 }
+        let generation = currentLearningGeneration
+        let reading = ClauseCoordinates.slice(request.reading, start: request.reading_start, end: request.reading_end)!
+        let context = (baseline.leftContext ?? "") + request.preceding_surfaces.map(\.surface).joined()
+        let native = completeClauseCandidatesLocked(reading: reading, context: context)
+        let originalSurface = baseline.clauses.first(where: { $0.reading_start == request.reading_start && $0.reading_end == request.reading_end })?.surface ?? reading
+        let fullReading = request.reading_start == 0 && request.reading_end == UInt32(request.reading.unicodeScalars.count)
+        let candidates = native.candidates.enumerated().compactMap { index, candidate in
+            retainClauseCandidateLocked(candidate, start: request.reading_start,
+                end: request.reading_end, generation: generation, now: now, originalSurface: originalSurface,
+                modelTop: native.modelTop, sentenceAction: fullReading
+                    ? Self.sentenceAction(candidate, index: index, modelTop: native.modelTop, promoted: native.promoted) : nil)
+        }
+        let response: ClauseCandidatesResult
+        if ProcessInfo.processInfo.systemUptime - now >= 1.2 { response = unavailable(.expired) }
+        else if candidates.isEmpty { response = unavailable(native.candidates.isEmpty ? .noCandidates : .busy) }
+        else { response = ClauseCandidatesResult(key: request.key, outcome: .ready(candidates)) }
+        clauseCandidateReplies[request.key] = (request, response, now)
+        return response
+    }
+
+    func convertClauses(_ request: ConvertClausesRequest) -> ConvertClausesResult {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        func unavailable(_ reason: ClauseUnavailableReason) -> ConvertClausesResult {
+            ConvertClausesResult(key: request.key, outcome: .unavailable(reason))
+        }
+        clauseConversionReplies = clauseConversionReplies.filter { now - $0.value.2 < 60 }
+        if clauseCandidateReplies[request.key] != nil { return unavailable(.invalidRequest) }
+        if let cached = clauseConversionReplies[request.key] {
+            guard cached.0 == request else { return unavailable(.invalidRequest) }
+            return now - cached.2 < 1.2 ? cached.1 : unavailable(.expired)
+        }
+        guard (try? request.validate()) != nil else { return unavailable(.invalidRequest) }
+        guard let baseline = clauseBaselineLocked(request.key, now: now) else { return unavailable(.expired) }
+        guard clauseConversionReplies.count < 4096 else { return unavailable(.busy) }
+        clauseTokens = clauseTokens.filter { now - $0.value.issuedAt < 60 }
+        let generation = currentLearningGeneration
+        var context = (baseline.leftContext ?? "") + request.preceding_surfaces.map(\.surface).joined()
+        var clauses: [WireClause] = []
+        for range in request.clauses {
+            let reading = ClauseCoordinates.slice(request.reading, start: range.reading_start, end: range.reading_end)!
+            let native = completeClauseCandidatesLocked(reading: reading, context: context)
+            let candidate = native.candidates.first
+            let retained = candidate.flatMap { retainClauseCandidateLocked($0, start: range.reading_start,
+                end: range.reading_end, generation: generation, now: now, originalSurface: $0.text, modelTop: native.modelTop) }
+            let clause = WireClause(id: range.id, reading_start: range.reading_start, reading_end: range.reading_end,
+                state: retained == nil ? .reading : .converted, surface: retained?.surface ?? reading,
+                candidate_token: retained?.token)
+            clauses.append(clause)
+            context += clause.surface
+            if ProcessInfo.processInfo.systemUptime - now >= 1.2 { break }
+        }
+        let response: ConvertClausesResult
+        if ProcessInfo.processInfo.systemUptime - now >= 1.2 { response = unavailable(.expired) }
+        else if (try? request.validateResult(clauses)) == nil { response = unavailable(.invalidRequest) }
+        else { response = ConvertClausesResult(key: request.key, outcome: .ready(clauses)) }
+        clauseConversionReplies[request.key] = (request, response, now)
+        return response
     }
 
     private func snapshotAutoCommitProposalLocked(
@@ -2751,13 +3149,13 @@ public final class ConversionService: @unchecked Sendable {
                                         proposal: UInt64) -> Bool {
         converterLock.lock()
         let stream = SnapshotAutoCommitStream(connection: connection, composition: key.composition)
-        if let applied = appliedSnapshotAutoCommitReceipts[stream], applied.0 == key,
+        if let applied = appliedSnapshotAutoCommitReceipts[stream], applied.0.sameReadingIdentity(as: key),
            applied.1 == proposal {
             converterLock.unlock()
             return true
         }
         guard var state = snapshotAutoCommitStates[stream],
-              state.pending?.key == key,
+              state.pending?.key.sameReadingIdentity(as: key) == true,
               state.pending?.value.proposal == proposal else {
             converterLock.unlock()
             return false
@@ -2776,34 +3174,58 @@ public final class ConversionService: @unchecked Sendable {
         return true
     }
 
-    private func enqueueLearningPersistence(candidate: Candidate, options: ConvertRequestOptions) {
+    private func enqueueLearningPersistence(candidate: Candidate, options: ConvertRequestOptions,
+                                            context: LearningPersistenceContext? = nil) {
         learningStateLock.lock()
-        guard !clearingLearning else {
-            learningStateLock.unlock()
-            return
+        defer { learningStateLock.unlock() }
+        enqueueLearningPersistenceLocked(candidate: candidate, options: options, context: context)
+    }
+
+    private func enqueueLearningPersistenceLocked(candidate: Candidate, options: ConvertRequestOptions,
+                                                  context: LearningPersistenceContext?) {
+        guard !clearingLearning else { return }
+        pendingLearning.append(PendingLearning(candidate: candidate, options: options,
+                                              generation: learningGeneration, context: context))
+        // A single wake-up covers every retained event, including arrivals during a write.
+        // If even the coalesced-label lane is full, a later enqueue retries the wake-up;
+        // shutdown also drains on this same serial lane, so rejection cannot discard learning.
+        maintenance.submitLatest(label: "learning") { [weak self] in
+            self?.drainLearningPersistence()
         }
-        let generation = learningGeneration
+    }
+
+    /// Runs only on the maintenance lane, including the shutdown fence.
+    private func drainLearningPersistence() {
+        learningStateLock.lock()
+        let pending = pendingLearning
+        pendingLearning.removeAll(keepingCapacity: true)
         learningStateLock.unlock()
-        maintenance.submit(label: "learning") { [weak self] in
-            guard let self else { return }
-            self.learningStateLock.lock()
-            let current = !self.clearingLearning && self.learningGeneration == generation
-            self.learningStateLock.unlock()
-            guard current else { return }
-            if let hook = self.learningPersistenceForTesting {
-                hook(candidate)
-                return
+        for item in pending {
+            learningPersistenceLock.lock()
+            defer { learningPersistenceLock.unlock() }
+            learningStateLock.lock()
+            let current = !clearingLearning && learningGeneration == item.generation
+            learningStateLock.unlock()
+            guard current else { continue }
+            if let hook = learningPersistenceForTesting {
+                hook(item.candidate)
+                continue
             }
             var composing = ComposingText()
-            let reading = candidate.data.map(\.ruby).joined()
-            guard !reading.isEmpty else { return }
+            let reading = item.candidate.data.map(\.ruby).joined()
+            guard !reading.isEmpty else { continue }
             composing.insertAtCursorPosition(reading, inputStyle: .direct)
-            // Snapshot conversion deliberately has no cross-request composition context. Reset
-            // the persistence converter too, or receipts from different apps could form a bigram.
-            self.learningConverter.stopComposition()
-            _ = self.learningConverter.requestCandidates(composing, options: options)
-            self.learningConverter.updateLearningData(candidate)
-            self.learningConverter.commitUpdateLearningData()
+            // Keep adjacent manual clauses together, but never join different sessions,
+            // shared-converter resets, memory directories, or context-free snapshot receipts.
+            if item.context == nil || persistedLearningContext != item.context {
+                // The pinned vendor clears lastData here. This dedicated
+                // classic learner has no GPU context to reset.
+                learningConverter.stopComposition()
+            }
+            persistedLearningContext = item.context
+            _ = learningConverter.requestCandidates(composing, options: item.options)
+            learningConverter.updateLearningData(item.candidate)
+            learningConverter.commitUpdateLearningData()
         }
     }
 
@@ -2891,25 +3313,29 @@ public final class ConversionService: @unchecked Sendable {
             classic: work.classic, snapshot: work.snapshot, leftContext: work.leftContext,
             nBest: work.explicit ? 10 : 1, inferenceLimit: work.inferenceLimit,
             deadline: work.explicit ? GPUWorkerDeadlineTier.convert.workerBudget
-                                    : GPUWorkerDeadlineTier.live.workerBudget)
+                                    : GPUWorkerDeadlineTier.live.workerBudget,
+            caller: work.explicit ? .explicitSnapshot : .liveSnapshot)
         guard decision.usedWorker, decision.failure == nil,
               Self.isSnapshotEnhancement(decision.conversion.mainResults,
                                          of: work.classic.mainResults) else {
             return .unavailable
         }
         let enhanced = decision.conversion.mainResults
-        let whole = enhanced.filter { Self.consumedReading(of: $0) == work.reading.count }
-        let display = whole.first?.text ?? work.reading
+        let selected = Self.snapshotCandidate(enhanced, reading: work.reading)
+        converterLock.lock()
+        let clauseData = makeSnapshotClauseDataLocked(reading: work.reading, candidate: selected, key: work.key)
+        converterLock.unlock()
+        let safeDisplay = clauseData.clauses.map(\.surface).joined()
         guard work.explicit else {
-            return .ready(text: display.isEmpty ? work.reading : display,
-                          candidates: nil, candidateRemaining: nil)
+            return .ready(text: safeDisplay,
+                          candidates: nil, candidateRemaining: nil, clauseData: clauseData)
         }
         return .ready(
-            text: display.isEmpty ? work.reading : display,
+            text: safeDisplay,
             candidates: enhanced.map(\.text),
             candidateRemaining: enhanced.map {
                 String(work.reading.dropFirst(min(work.reading.count, Self.consumedReading(of: $0))))
-            })
+            }, clauseData: clauseData)
     }
 
     static func isSnapshotEnhancement(_ enhanced: [Candidate], of classic: [Candidate]) -> Bool {
@@ -3213,7 +3639,7 @@ public final class ConversionService: @unchecked Sendable {
     /// converterLock を取ってから呼ぶ公開ラッパ。呼び出し元 handler は serviceLock を保持しており、
     /// converterLock をその内側で取るのは既存の順序（clearLearning と同型）に従う。
     public func prepareForShutdown() {
-        maintenance.barrier()
+        maintenance.barrier { self.drainLearningPersistence() }
         converterLock.lock()
         defer { converterLock.unlock() }
         // Snapshot receipts are persisted by the isolated learning converter. Flushing the
@@ -3373,6 +3799,7 @@ public final class ConversionService: @unchecked Sendable {
         }
         clearingLearning = true
         learningGeneration &+= 1
+        pendingLearning.removeAll()
         learningStateLock.unlock()
         learningClearStartedForTesting?()
         defer {
@@ -3404,6 +3831,7 @@ public final class ConversionService: @unchecked Sendable {
         // Dropping the dedicated converter is the only observable way to discard vendor
         // temporary learning after a failed commit; its API does not report commit success.
         learningConverter = KanaKanjiConverter.withDefaultDictionary()
+        persistedLearningContext = nil
 
         let dir = learningDirectory
         guard let dir else {

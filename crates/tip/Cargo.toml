@@ -13,7 +13,8 @@ ids = { path = "../ids" }
 settings = { path = "../settings" }
 nospacekey-lifetime = { path = "../lifetime" }
 tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
-unicode-segmentation = "1.13"
+# P5 display deletion is fixed to UAX #29 / Unicode 15.1.
+unicode-segmentation = "=1.11.0"
 semver = "1"
 crossbeam-queue = "0.3"
 # windows 0.62 は windows-result 0.4 系。windows-registry 0.5 は 0.3 系を引き込み
@@ -51,6 +52,9 @@ features = [
 # PIPE_ACCESS_DUPLEX(Win32_Storage_FileSystem)がテストにのみ必要なので dev-dependency で追加。
 # A': 遅延応答サーバの接続待ち ConnectNamedPipe(Win32_System_IO)も同経路で追加。
 # cargo は同一 crate の dep/dev-dep の feature を union してテストビルドへ渡す。
+[dev-dependencies]
+serde_json = "1"
+
 [dev-dependencies.windows]
 version = "0.62"
 features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_UI_Shell"]
@@ -62,3 +66,7 @@ features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_Storage_FileSystem"
 # unresolved crate になる。リソース処理を実行するかどうかは build.rs 側で分岐する。
 [build-dependencies]
 winresource = "0.1"
+
+[features]
+# Fault checkpoints are absent from normal product builds.
+tsf-test-hooks = []

@@ -1,100 +1,119 @@
-//! 外部LLM変換のワーカスレッドと結果スロット。
-//!
-//! TIP 本体（`TextService`）は STA・`!Send`（Rc/Cell/RefCell・COM）だが、`EngineClient` は
-//! `std::fs::File` を包むだけで `Send`。Tab 押下中は入力ロックで UI スレッドが IPC を出さない
-//! ので、接続1本このワーカへ move して秒オーダのブロッキング呼び出しをさせ、結果だけを
-//! 共有スロット（`Arc<Mutex>`）へ書き戻す。UI スレッドは別途ポーリングタイマでスロットを見る。
-//! **スレッド境界を越えるのは owned 値（`EngineClient`/`String`）のみ。**
-
+//! Owned LLM request lane: connect, replay the captured styled reading, then convert.
+//! No STA connection or COM pointer crosses the thread boundary.
 use std::sync::{Arc, Mutex};
-
+use std::time::{Duration, Instant};
 use ipc::client::EngineClient;
 use ipc::protocol::{Request, Response};
+use crate::input_module::{InputSegment, TextStyle};
 
-/// ワーカ→UIスレッドへ返す結果。借りた `EngineClient` を同梱して返却する。
 pub struct LlmOutcome {
     pub seq: u64,
-    /// Ok(補正文) / Err(メッセージ)。
     pub result: Result<String, String>,
-    /// 借りた接続。UI スレッドが Ok 時は再格納、Err 時は drop（破棄）する。
-    pub client: Option<EngineClient>,
 }
-
-/// ワーカ→UIスレッド受け渡しスロット。Tab ごとに新規生成する。
 pub type LlmSlot = Arc<Mutex<Option<LlmOutcome>>>;
 
-/// ワーカスレッドを起動する。`client` を move し `LlmConvert` を実行、結果を slot へ。
-/// `timeout` はワーカ自身の待ち上限（B10: 旧実装は無期限 `request` で、応答しないエンジンが
-/// 生きている限りワーカスレッドとエンジン側接続スレッドを永久占有した）。UI 側の LLM_TIMEOUT(8s)
-/// より長く取り、通常のエンジン側タイムアウト応答（llm_timeout_ms 既定 15s）は従来どおり受け取る。
-/// 既知の限界: `request_within` の期限は read 待ちにのみ効き、write は非有界のまま
-/// （client.rs の phase1 制約）。LlmConvert は小フレームで実際には write ブロックしないが、
-/// 期限が write 詰まりまで覆う保証は無い（監査 B3 と同根・レビュー M-1）。
-/// 巡3 P6: `std::thread::spawn` は OS のスレッド生成失敗で panic する — awaiting_llm=true 済みの
-/// 呼び出し側から panic されると poll timer 未武装のまま入力ロックが残るため、panic しない
-/// `Builder::spawn` の `io::Result` を返し、呼び出し側が abort へ劣化できるようにする。
-pub fn spawn_llm_worker(
-    mut client: EngineClient,
+fn convert_reading(
     session: i64,
+    segments: Vec<InputSegment>,
+    seq: u64,
+    left_context: Option<String>,
+    mut request: impl FnMut(&Request) -> Result<Response, String>,
+) -> Result<String, String> {
+    for segment in segments {
+        let response = request(&Request::Insert {
+            session,
+            text: segment.text,
+            style: match segment.style { TextStyle::Kana => None, TextStyle::Direct => Some("direct".into()) },
+        })?;
+        if !matches!(response, Response::Reading { .. }) {
+            return Err("reading replay rejected".into());
+        }
+    }
+    match request(&Request::LlmConvert { session, seq, left_context })? {
+        Response::LlmResult { seq: echoed, text } if echoed == seq => Ok(text),
+        Response::LlmResult { .. } => Err("LLM sequence mismatch".into()),
+        _ => Err("LLM request rejected".into()),
+    }
+}
+
+/// A single deadline covers the verified handshake, replay, and conversion.
+/// The worker closes its own connection even when the STA abandons the result slot.
+pub fn spawn_llm_worker(
+    pipe: String,
+    segments: Vec<InputSegment>,
     seq: u64,
     left_context: Option<String>,
     slot: LlmSlot,
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .spawn(move || {
-            let deadline = std::time::Instant::now() + timeout;
-            let result: Result<String, String> = match client.request_within(
-                &Request::LlmConvert {
-                    session,
-                    seq,
-                    left_context,
-                },
-                deadline,
-            ) {
-                // エコーされた seq が一致する応答だけ採用する。接続は Tab 毎に再利用されるため、
-                // 前要求の未読フレームを読んでしまった場合（ストリーム desync）はここで弾き、
-                // Err にして接続を破棄＝次操作で貼り直す（誤った結果を確定させない）。
-                Ok(Response::LlmResult { seq: echoed, text }) if echoed == seq => Ok(text),
-                Ok(Response::LlmResult { seq: echoed, .. }) => {
-                    Err(format!("seq mismatch: got {echoed}, want {seq}"))
-                }
-                Ok(Response::Error { message }) => Err(message),
-                Ok(other) => Err(format!("unexpected response: {other:?}")),
-                Err(e) => Err(format!("ipc error: {e}")),
-            };
-            // IPC 成功なら接続を返す。エラー（接続破損の可能性）なら返さない＝UIで drop_engine。
-            let client_back = if result.is_ok() { Some(client) } else { None };
-            if let Ok(mut g) = slot.lock() {
-                *g = Some(LlmOutcome {
-                    seq,
-                    result,
-                    client: client_back,
-                });
-            }
-        })
-        .map(|_| ())
+    let guard = crate::globals::ComObjectGuard::new();
+    std::thread::Builder::new().name("nospacekey-llm".into()).spawn(move || {
+        let _guard = guard;
+        let deadline = Instant::now() + timeout;
+        let result = EngineClient::connect_verified_to(&pipe, timeout.min(Duration::from_millis(500)), deadline)
+            .map_err(|_| "LLM connection failed".to_string())
+            .and_then(|mut client| {
+                convert_reading(client.session(), segments, seq, left_context, |request| {
+                    client.request_within(request, deadline).map_err(|_| "LLM IPC failed".into())
+                })
+            });
+        if let Ok(mut outcome) = slot.lock() {
+            *outcome = Some(LlmOutcome { seq, result });
+        }
+    }).map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn captured_segments_are_acknowledged_in_order_before_conversion() {
+        let segments = vec![
+            InputSegment { text: "にほん".into(), style: TextStyle::Kana },
+            InputSegment { text: "GPU".into(), style: TextStyle::Direct },
+        ];
+        let mut calls = 0;
+        let result = convert_reading(7, segments, 3, Some("context".into()), |request| {
+            match calls {
+                0 => assert!(matches!(request, Request::Insert { session: 7, text, style: None } if text == "にほん")),
+                1 => assert!(matches!(request, Request::Insert { session: 7, text, style: Some(style) } if text == "GPU" && style == "direct")),
+                2 => assert!(matches!(request, Request::LlmConvert { session: 7, seq: 3, left_context: Some(context) } if context == "context")),
+                _ => panic!("unexpected extra request"),
+            }
+            calls += 1;
+            Ok(match request {
+                Request::Insert { .. } => Response::Reading { reading: "reading".into() },
+                _ => Response::LlmResult { seq: 3, text: "日本GPU".into() },
+            })
+        });
+        assert_eq!(result.unwrap(), "日本GPU");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn replay_rejection_prevents_conversion_and_wrong_sequence_is_rejected() {
+        let mut calls = 0;
+        let result = convert_reading(7, vec![InputSegment { text: "に".into(), style: TextStyle::Kana }], 3, None, |_| {
+            calls += 1;
+            Ok(Response::Error { message: "rejected".into() })
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        assert!(convert_reading(7, vec![], 3, None, |_| Ok(Response::LlmResult { seq: 2, text: "stale".into() })).is_err());
+    }
+
+    #[test]
     fn slot_holds_outcome() {
         let slot: LlmSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
         *slot.lock().unwrap() = Some(LlmOutcome {
             seq: 1,
             result: Ok("x".into()),
-            client: None,
         });
         let taken = slot.lock().unwrap().take();
         assert!(matches!(taken, Some(LlmOutcome { seq: 1, .. })));
     }
 
-    /// Windows 限定: 応答を返さない dead-reply pipe を相手に、ワーカが `timeout` で諦めて
-    /// Err を slot へ書き、接続を返さない（=UI 側 drop_engine 合流）ことを証明する。
-    /// 旧実装（無期限 `request`）はエンジンが生きているが応答しない間ワーカスレッドが永久ブロックし、
-    /// エンジン側の接続スレッドも1本占有し続けた（2026-07-10 跨プロセスブロッキング監査 B10）。
+    /// A nonresponsive verified handshake is bounded and publishes an error.
     #[cfg(windows)]
     mod win {
         use super::super::*;
@@ -135,11 +154,10 @@ mod tests {
             // 一意名（スタックアドレス由来）。Date/rand は使えないのでアドレスで一意化。
             let name = format!(r"\\.\pipe\nospacekey-llmw-test-{:p}", &0u8 as *const u8);
             let server = create_server(&name);
-            let client = EngineClient::connect_to(&name, Duration::from_secs(1)).expect("connect");
 
             let slot: LlmSlot = Arc::new(Mutex::new(None));
             // 巡3 P6: io::Result 返却化に伴う戻り値の明示的破棄（生成失敗はテスト対象外）。
-            let _ = spawn_llm_worker(client, 7, 3, None, slot.clone(), Duration::from_millis(200));
+            let _ = spawn_llm_worker(name.clone(), vec![], 3, None, slot.clone(), Duration::from_millis(200));
 
             // 5秒以内に必ず outcome が書かれること（旧実装ならここで永久に来ない）。
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -161,10 +179,6 @@ mod tests {
                 outcome.result.is_err(),
                 "expected error, got {:?}",
                 outcome.result
-            );
-            assert!(
-                outcome.client.is_none(),
-                "timed-out connection must not be returned"
             );
         }
     }

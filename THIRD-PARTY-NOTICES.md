@@ -325,6 +325,7 @@ notice in the subsections immediately after this table.
 | `crossbeam-channel` | 0.5.15 | MIT OR Apache-2.0 | the crossbeam-channel developers |
 | `crossbeam-deque` | 0.8.7 | MIT OR Apache-2.0 | The Crossbeam Project Developers |
 | `crossbeam-epoch` | 0.9.20 | MIT OR Apache-2.0 | The Crossbeam Project Developers |
+| `crossbeam-queue` | 0.3.13 | MIT OR Apache-2.0 | The Crossbeam Project Developers |
 | `crossbeam-utils` | 0.8.21 | MIT OR Apache-2.0 | the crossbeam-utils developers |
 | `crypto-common` | 0.1.7 | MIT OR Apache-2.0 | RustCrypto Developers |
 | `ctor` | 0.8.0 | Apache-2.0 OR MIT | Matt Mastracci |
@@ -482,7 +483,7 @@ notice in the subsections immediately after this table.
 | `unic-ucd-ident` | 0.9.0 | MIT/Apache-2.0 | The UNIC Project Developers |
 | `unic-ucd-version` | 0.9.0 | MIT/Apache-2.0 | The UNIC Project Developers |
 | `unicode-normalization-alignments` | 0.1.12 | MIT/Apache-2.0 | Anthony Moi |
-| `unicode-segmentation` | 1.13.3 | MIT OR Apache-2.0 | kwantam; Manish Goregaokar |
+| `unicode-segmentation` | 1.11.0 | MIT OR Apache-2.0 | Copyright (c) 2015 The Rust Project Developers |
 | `unicode_categories` | 0.1.1 | MIT OR Apache-2.0 | Sean Gillespie |
 | `url` | 2.5.8 | MIT OR Apache-2.0 | The rust-url developers |
 | `urlpattern` | 0.3.0 | MIT | the Deno authors; crowlKats |
@@ -532,7 +533,7 @@ notice in the subsections immediately after this table.
 | `zerovec` | 0.11.6 | Unicode-3.0 | The ICU4X Project Developers |
 | `zmij` | 1.0.21 | MIT | David Tolnay |
 
-Total: 230 crates.
+Total: 231 crates.
 
 ### BSD-3-Clause (alloc-no-stdlib, alloc-stdlib, brotli, brotli-decompressor)
 

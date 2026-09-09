@@ -138,7 +138,7 @@ final class ProtocolTests: XCTestCase {
     func testEncodeResponseNeverEmpty() {
         let cases: [Response] = [
             .pong,
-            .session(7, proto: nil, boot: nil),
+            .session(7, proto: nil, boot: nil, engineEpoch: "fixture-engine", learningGeneration: 0),
             .reading(""),                                   // 空読みでもフレーム本体は非空
             .candidates([]),                                // 空候補でもフレーム本体は非空
             .ok,
@@ -210,7 +210,7 @@ final class ProtocolTests: XCTestCase {
     }
 
     func testSnapshotAutoCommitBumpsProtocolGeneration() {
-        XCTAssertEqual(ProtocolVersion.current, 8)
+        XCTAssertEqual(ProtocolVersion.current, 9)
     }
 
     func testSnapshotAutoCommitProposalAndReceiptWireContract() throws {
@@ -219,7 +219,9 @@ final class ProtocolTests: XCTestCase {
             connectionGeneration: 5, text: "語", candidates: nil,
             candidateRemaining: nil, baseline: 41,
             autoCommit: AutoCommitProposal(
-                proposal: 17, text: "日本", consumedReading: "にほん", remaining: "ご"))
+                proposal: 17, text: "日本", consumedReading: "にほん", remaining: "ご"),
+            clauseData: SnapshotClauseData(reading: "ご", conversion_revision: 0, request_id: 1,
+                clauses: [WireClause(id: 1, reading_start: 0, reading_end: 1, state: .converted, surface: "語", candidate_token: "fixture-candidate")], sentence_token: nil))
         let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(response)) as! [String: Any]
         let proposal = object["auto_commit"] as! [String: Any]
         XCTAssertEqual(proposal["proposal"] as? Int, 17)
@@ -298,17 +300,17 @@ final class ProtocolTests: XCTestCase {
 
     func testEncodeSessionCarriesProto() throws {
         // 新エンジン: Session 応答に proto を載せる。dict 比較（キー順非保証のためバイト一致比較はしない）。
-        let res = Response.session(7, proto: 5, boot: BuildInfo.version)
+        let res = Response.session(7, proto: 9, boot: BuildInfo.version, engineEpoch: "fixture-engine", learningGeneration: 6)
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
         XCTAssertEqual(obj["session"] as? Int, 7)
-        XCTAssertEqual(obj["proto"] as? Int, 5)
+        XCTAssertEqual(obj["proto"] as? Int, 9)
         XCTAssertEqual(obj["boot"] as? String, BuildInfo.version)
     }
 
     func testEncodeSessionWithoutProtoOmitsKey() throws {
         // proto=nil はキー自体を省略＝handshake 導入前と wire 形一致（旧TIP互換。Rust 側 Option と対）。
-        let res = Response.session(7, proto: nil, boot: nil)
+        let res = Response.session(7, proto: nil, boot: nil, engineEpoch: "fixture-engine", learningGeneration: 0)
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
         XCTAssertEqual(obj["session"] as? Int, 7)

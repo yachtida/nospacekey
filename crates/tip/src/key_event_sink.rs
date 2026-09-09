@@ -8,6 +8,7 @@
 //! 「このキーを実際に食うか」を返すだけにする。
 
 use std::cell::Cell;
+use std::time::Instant;
 use windows::core::{Ref, Result, BOOL, GUID};
 use windows::Win32::Foundation::{FALSE, LPARAM, TRUE, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState, ToUnicode};
@@ -21,8 +22,8 @@ use crate::input_module::{
     ReplayMode as ModuleReplayMode, RequestId as ModuleRequestId, TextStyle as ModuleTextStyle,
 };
 use crate::input_state::{
-    plan_live_enter, should_widen_digits, to_hankaku_ascii, to_hankaku_kana, to_kana_reading_char,
-    to_katakana, to_zenkaku_ascii, to_zenkaku_digits, CommitPlan, InsertStyle, LiveEnterPlan,
+    plan_live_enter, should_widen_digits, to_kana_reading_char,
+    to_zenkaku_digits, CommitPlan, InsertStyle, LiveEnterPlan,
 };
 use crate::text_service::{
     tip_log, PendingEndKeySignature, PendingEndTestDecision, TextService_Impl,
@@ -44,8 +45,19 @@ const VK_UP: u32 = 0x26;
 const VK_RIGHT: u32 = 0x27;
 const VK_DOWN: u32 = 0x28;
 
+/// P1(clause-nav): explicit snapshot 待ちを維持するキー（←→文節移動）。Space 変換の
+/// 応答待ちに←→が来ても待ちをキャンセルしない — キャンセルすると composing-only の
+/// ←→は settle（全文確定）へ劣化する（385da4b7 で Space が snapshot 経路へ移行した際、
+/// ←→が旧同期経路に取り残されて接続切れになった）。poll は継続し、OnKeyDown の
+/// dispatch 側で pending 中なら食い切る。
+#[cfg(test)]
+fn exempts_explicit_snapshot_wait(vk: u32) -> bool {
+    matches!(vk, VK_LEFT | VK_RIGHT)
+}
+
+#[cfg(test)]
 fn cancel_explicit_wait_for_actual_keydown(vk: u32, cancel: impl FnOnce()) {
-    if !is_pure_modifier_vk(vk) {
+    if !is_pure_modifier_vk(vk) && !exempts_explicit_snapshot_wait(vk) {
         cancel();
     }
 }
@@ -58,6 +70,24 @@ fn apply_and_complete_module_operation(
     let applied = apply();
     complete(operation, applied);
     applied
+}
+
+fn queued_digit_selects_candidate(barrier: bool, window_open: bool) -> bool { !barrier && window_open }
+
+fn queued_reading_char(ch: char, symbol_key: bool, punctuation: bool, overlay: bool,
+    chars: settings::symbol::SymbolCharSet) -> char {
+    if symbol_key { zenkaku_symbol(ch, punctuation, overlay, chars).unwrap_or(ch) }
+    else { to_kana_reading_char(ch) }
+}
+
+fn queued_nonalpha(ch: char, latin: bool, symbol_key: bool, punctuation: bool, overlay: bool,
+    chars: settings::symbol::SymbolCharSet) -> (char, ModuleTextStyle) {
+    if latin { (ch, ModuleTextStyle::Direct) }
+    else { (queued_reading_char(ch, symbol_key, punctuation, overlay, chars), ModuleTextStyle::Kana) }
+}
+
+fn apply_accepted_text(text: &str, mut apply: impl FnMut(char) -> bool) -> usize {
+    text.chars().take_while(|ch| apply(*ch)).count()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +308,30 @@ pub fn arms_undo(source: &str) -> bool {
     matches!(source, "candidate" | "live" | "clause")
 }
 
+#[cfg(test)]
+mod queue_recovery_tests {
+    use super::*;
+    #[test]
+    fn idle_recovery_admits_escape_and_enter_without_admitting_shortcuts() {
+        for vk in [VK_ESCAPE, VK_RETURN] {
+            assert!(queue_recovery_claims(vk, false, false, true, false));
+            assert!(queue_recovery_claims(vk, false, false, false, true));
+            assert!(!queue_recovery_claims(vk, true, true, true, true));
+        }
+        assert!(queue_recovery_claims(VK_A, false, true, true, true));
+        assert!(queue_recovery_claims(VK_A, false, false, true, true));
+        assert!(!queue_recovery_claims(VK_A, true, false, true, true));
+        assert!(!queue_recovery_claims(VK_A, false, false, false, false));
+    }
+}
+
+fn queue_recovery_claims(vk: u32, command_modifier: bool, owner_lost: bool, failed: bool, barrier: bool) -> bool {
+    !command_modifier && (((failed || barrier) && matches!(vk, VK_RETURN | VK_ESCAPE))
+        || ((owner_lost || failed) && (is_text_vk(vk) || matches!(vk, VK_A..=VK_Z | 0x30..=0x39 |
+            0x20 | 0x09 | VK_BACK | VK_DELETE | VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN
+            | VK_HOME | VK_END | VK_RETURN | VK_ESCAPE | 0x75..=0x79))))
+}
+
 fn prediction_commit_source(
     source: &str,
     suppressed: bool,
@@ -471,8 +525,9 @@ pub fn will_handle(
         // 一般的な日本語IMEに倣い、食って開いている入力を確定（settle）してから畳む。
         // idle では素通し（本文のキャレット移動/前方削除はアプリに任せる）。
         // ←→ も食う条件は同じ（composing||showing）だが処理が違う: 候補表示中は文節移動
-        // （MS-IME の文節ナビゲーション。劣化時は settle）、composition のみは「確定して畳む」
-        // （打鍵作法 Task2 — InputState にカーソル概念が無く読み内移動は実装できないため）。
+        // （MS-IME の文節ナビゲーション。失敗時は no-op 食い切り=P1）、composition のみは
+        // 「確定して畳む」（打鍵作法 Task2 — InputState にカーソル概念が無く読み内移動は
+        // 実装できないため）。
         VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_DELETE | VK_LEFT | VK_RIGHT => {
             composing || showing
         }
@@ -835,7 +890,6 @@ impl TextService_Impl {
         let vk = crate::keymap::normalize_vk(raw_vk);
         if !is_pure_modifier_vk(vk) {
             self.cancel_deferred_prediction_preserved_on_input();
-            self.cancel_explicit_snapshot_wait();
         }
         if should_invalidate_hidden_prediction(
             vk,
@@ -930,7 +984,11 @@ impl TextService_Impl {
         let direct = self.is_direct_mode();
         // Bug 3: 待機ロック(AwaitingLlm)まで含めて実処理と同じ述語で判定する。TestKeyDown を
         // 先に呼ぶ行儀よいホストでも、待機中は実処理が全キーを食うのと eaten 判定を一致させる。
-        let handled = will_handle_awaiting(
+        let recovery = {
+            let queue = self.conversion_queue.borrow();
+            queue_recovery_claims(vk, cmd_modifier_down(), queue.owner_lost, queue.commit_failed, queue.has_commit())
+        };
+        let handled = recovery || ((self.local_converting() || self.explicit_snapshot_pending.get()) && !cmd_modifier_down() && matches!(vk, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_HOME | VK_END | VK_DELETE)) || will_handle_awaiting(
             vk,
             composing,
             showing,
@@ -964,7 +1022,6 @@ impl TextService_Impl {
         if !is_pure_modifier_vk(vk) {
             self.cancel_deferred_prediction_preserved_on_input();
         }
-        cancel_explicit_wait_for_actual_keydown(vk, || self.cancel_explicit_snapshot_wait());
         if should_invalidate_hidden_prediction(
             vk,
             self.prediction_ghost_actionable(),
@@ -1012,10 +1069,23 @@ impl TextService_Impl {
         // 「食うか」と実処理の一致を保つ）。armed Ctrl+BS や Ctrl 併用チョードは cmd_modifier=true
         // として届くため、carve-out（action != None）で cmd ゲートを通す必要がある。composing/showing/
         // direct は resolve_action_now が ctx 未使用の純粋な状態参照として内部で読む。
+        #[cfg(feature = "tsf-test-hooks")]
+        if crate::commit_test_hook::take_display_exhaustion() { self.preedit_apply.force_near_capacity(); }
+        self.end_display_at_capacity(&ctx);
         let action = self.resolve_action_now(vk);
         // Consume the slot for every KeyDown.  Only exact signature+pair generation gets the
+        #[cfg(feature = "tsf-test-hooks")]
+        if let Some(model) = self.local_clauses.borrow_mut().as_mut() {
+            if crate::commit_test_hook::take_clause_exhaustion() { model.revision = u64::MAX; }
+        }
         // one-shot reservation; mismatch/stale is discarded so a future same-VK event cannot eat it.
         let pending_test_reserved = self.take_pending_end_test(signature);
+        let recovery = {
+            let queue = self.conversion_queue.borrow();
+            queue_recovery_claims(vk, cmd_modifier_down(), queue.owner_lost, queue.commit_failed, queue.has_commit())
+        };
+        if recovery && self.handle_conversion_wait_key(&ctx, vk, lparam, action) { return Ok(TRUE); }
+
         let pending_at_entry = self.composition_end_pending.get();
         if self.prediction_cleanup_in_progress() && !is_pure_modifier_vk(vk) {
             self.retry_prediction_cleanup_on_input();
@@ -1064,6 +1134,15 @@ impl TextService_Impl {
         // 1打鍵は TRUE で食う（失敗時は再押下で再試行、成功時は次打鍵から通常判定）。これにより
         // direct A-Z が FALSE で素通りし続け、古い composition が回収不能になる状態を作らない。
         if pending_test_reserved || pending_at_entry {
+            if vk == VK_ESCAPE && !cmd_modifier_down() && self.composition_end_caret.borrow().is_some() {
+                self.clear_conversion_queue();
+                if self.do_cancel(&ctx) {
+                    self.state.borrow_mut().reset();
+                    self.clear_clause_nav();
+                }
+                self.show_conversion_queue_notice(&ctx, "後続の未処理入力を取り消しました。確定済みの文字は残します");
+                return Ok(TRUE);
+            }
             if self.composition_end_pending.get() && !self.finish_pending_composition(&ctx) {
                 tip_log("ev=keydown skip=pending_end");
                 return Ok(TRUE);
@@ -1173,6 +1252,87 @@ impl TextService_Impl {
             )
         {
             return Ok(FALSE);
+        }
+
+        if self.handle_conversion_wait_key(&ctx, vk, lparam, action) { return Ok(TRUE); }
+        if self.mixed_editing() && action == crate::keymap::KeyAction::Convert {
+            self.convert_edited_interval(&ctx);
+            return Ok(TRUE);
+        }
+        if self.mixed_editing() && vk == VK_RETURN && !cmd_modifier_down() {
+            if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.mode = crate::clause_conversion::OperationMode::Converting; }
+            self.queue_local_clause_commit(&ctx, false);
+            return Ok(TRUE);
+        }
+        if !matches!(action, crate::keymap::KeyAction::Notation(_) | crate::keymap::KeyAction::NotationRotate) {
+            if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.reset_notation_cycle(); }
+        }
+        if self.local_converting() && action == crate::keymap::KeyAction::Convert {
+            self.local_clause_space(&ctx);
+            return Ok(TRUE);
+        }
+        if self.local_converting() && !cmd_modifier_down() {
+            match vk {
+                VK_LEFT | VK_RIGHT => {
+                    let direction = if vk == VK_RIGHT { 1 } else { -1 };
+                    if shift_down() {
+                        if self.bind_conversion_queue_context(&ctx) {
+                            let admitted = self.conversion_queue.borrow_mut().push(crate::conversion_queue::ConversionAction::ResizeClause(direction));
+                            if admitted == crate::conversion_queue::QueueAdmission::Accepted { self.drain_conversion_actions(&ctx); }
+                            else { self.show_conversion_queue_notice(&ctx, "入力を受け付けられません。Enterで再試行、Escで取消"); }
+                        }
+                    } else {
+                        if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.move_clause(direction); }
+                        self.render_local_edit(&ctx);
+                    }
+                    return Ok(TRUE);
+                }
+                VK_UP | VK_DOWN => {
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.advance_candidate(if vk == VK_DOWN { 1 } else { -1 }); }
+                    self.render_local_edit(&ctx);
+                    return Ok(TRUE);
+                }
+                VK_RETURN => { self.queue_local_clause_commit(&ctx, false); return Ok(TRUE); }
+                VK_HOME | VK_END => {
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() {
+                        if let crate::clause_conversion::CandidateWindow::Ready { candidates, .. } = &model.window {
+                            let index = if vk == VK_HOME { 0 } else { candidates.len() - 1 };
+                            model.select_candidate(index);
+                        } else { model.move_clause(if vk == VK_HOME { i32::MIN } else { i32::MAX }); }
+                    }
+                    self.render_local_edit(&ctx);
+                    return Ok(TRUE);
+                }
+                VK_1..=VK_9 if !shift_down() && self.local_clauses.borrow().as_ref().is_some_and(|m| !matches!(m.window, crate::clause_conversion::CandidateWindow::Closed)) => {
+                    let selected = {
+                        let mut state = self.local_clauses.borrow_mut();
+                        let model = state.as_mut().unwrap();
+                        if let crate::clause_conversion::CandidateWindow::Ready { selected, .. } = &model.window {
+                            let index = selected / 9 * 9 + (vk - VK_1) as usize;
+                            model.select_candidate(index)
+                        } else { false }
+                    };
+                    if selected { self.queue_local_clause_commit(&ctx, false); }
+                    return Ok(TRUE);
+                }
+                VK_ESCAPE => {
+                    self.local_clause_escape(&ctx);
+                    return Ok(TRUE);
+                }
+                VK_BACK => {
+                    if self.bind_conversion_queue_context(&ctx) {
+                        let admitted = self.conversion_queue.borrow_mut().push(crate::conversion_queue::ConversionAction::Backspace);
+                        if admitted == crate::conversion_queue::QueueAdmission::Accepted {
+                            self.drain_conversion_actions(&ctx);
+                        } else {
+                            self.show_conversion_queue_notice(&ctx, "入力を受け付けられません。Enterで再試行、Escで取消");
+                        }
+                    }
+                    return Ok(TRUE);
+                }
+                VK_DELETE => return Ok(TRUE),
+                _ => {}
+            }
         }
 
         // keymap コマンドのディスパッチ（文脈ゲートは resolve_action が判定済み — 相互排他の
@@ -1478,83 +1638,7 @@ impl TextService_Impl {
                     BackspaceRoute::Pass => return Ok(FALSE),
                     BackspaceRoute::Compose => {}
                 }
-                if self.showing.get() {
-                    self.candidate_ui.borrow_mut().hide();
-                    self.showing.set(false);
-                    self.clear_clause_nav();
-                }
-                let module_output = self
-                    .state
-                    .borrow_mut()
-                    .handle(ModuleEvent::Key(ModuleKeyEvent::Backspace));
-                let local_reading = match module_output.immediate.as_ref() {
-                    Some(ModuleOperation::SetPreedit { text }) => Some(text.clone()),
-                    Some(ModuleOperation::Cancel) => None,
-                    other => unreachable!(
-                        "backspace must produce local preedit or cancel, got {other:?}"
-                    ),
-                };
-                let operation = module_output
-                    .immediate
-                    .clone()
-                    .expect("backspace must produce an immediate operation");
-                let (background_request, background_segments) = match module_output.background {
-                    Some(ModuleIntent::Reseed { request, segments }) => (request, segments),
-                    _ => unreachable!("composing backspace must produce one background intent"),
-                };
-                let local_applied = local_reading.as_ref().is_some_and(|text| {
-                    *self.last_reading.borrow_mut() = text.clone();
-                    *self.live_text.borrow_mut() = text.clone();
-                    self.run_preedit(&ctx, &self.widen_display_text(text))
-                });
-                // A surface deletion can preserve the same text while changing whether its
-                // trailing ASCII is frozen or still composable. A stateful engine Backspace
-                // cannot carry that distinction, so the next worker state starts from the
-                // canonical styled replay instead.
-                if local_reading.is_some() {
-                    reseed_background(
-                        || self.background_input.request_close(),
-                        || ModuleIntent::Insert {
-                            request: background_request,
-                            segments: background_segments,
-                        },
-                        |request, segments| self.background_input.try_reseed(request, segments),
-                    );
-                } else {
-                    self.background_input.request_close();
-                }
-                match operation {
-                    operation @ ModuleOperation::Cancel => {
-                        self.disarm_debounce();
-                        let applied = apply_and_complete_module_operation(
-                            &operation,
-                            || self.do_cancel(&ctx),
-                            |operation, applied| {
-                                self.state.borrow_mut().complete(operation, applied)
-                            },
-                        );
-                        if !applied {
-                            tip_log("ev=cancel_rejected source=backspace_empty");
-                            return Ok(TRUE);
-                        }
-                        self.last_reading.borrow_mut().clear();
-                        self.reading_monitor.borrow_mut().hide();
-                        self.live_text.borrow_mut().clear();
-                        *self.current_context.borrow_mut() = None;
-                        self.background_input.request_close();
-                    }
-                    ModuleOperation::SetPreedit { text } => {
-                        *self.current_context.borrow_mut() = Some(ctx.clone());
-                        if !local_applied {
-                            self.run_preedit(&ctx, &self.widen_display_text(&text));
-                        }
-                        self.arm_debounce();
-                    }
-                    other => {
-                        unreachable!("backspace result cannot produce {other:?}");
-                    }
-                }
-                Ok(TRUE)
+                self.backspace_reading(&ctx)
             }
 
             // 変換キー(0x1C) は KeyAction::Reconvert（direct+idle）/ Convert（composing・showing）
@@ -1582,7 +1666,8 @@ impl TextService_Impl {
                         match key_to_char(vk, lparam) {
                             // 英字＝ローマ字合成、テンキー `-`→ー（to_kana_reading_char 維持）、テンキー `.` は literal。
                             Some(ch) => {
-                                self.input_char(&ctx, to_kana_reading_char(ch), InsertStyle::Kana)
+                                let folded = to_kana_reading_char(ch);
+                                self.input_char_with_original(&ctx, folded, InsertStyle::Kana, (folded != ch).then_some(ch))
                             }
                             // L-3: 合成中の印字不能キー（デッドキー/合字）は食って無視（stray char 漏れ防止）。
                             None => Ok(TRUE),
@@ -1610,13 +1695,19 @@ impl TextService_Impl {
 
             // ---- ←/→: 候補表示中は文節移動（MS-IME の文節ナビゲーション）----
             // 変換候補の表示中に選択文節を左右へ動かし、候補窓を「選択文節の候補」へ差し替える。
-            // 劣化は 2 段: 文節モードに**入れない**（旧エンジン非対応/被覆候補無し/再変換中）は
-            // 従来どおり「確定して畳む」、**確立後**の失敗（一時的な IPC タイムアウト等）は
-            // no-op で食い切る — settle へ落とすと移動のつもりの矢印 1 打が合成の全確定になる
-            // （マージ後敵対レビュー④。両者は move_clause=false からは区別できない）。
-            // composition のみ（候補窓なし）も従来どおり settle — 読み内カーソル移動は据え置き。
+            // move_clause の失敗（文節モード確立前・確立後を問わず）は no-op で食い切る —
+            // settle へ落とすと移動のつもりの矢印 1 打が合成の全確定になる（マージ後敵対
+            // レビュー④ + P1。両者は move_clause=false からは区別できないため in_nav 前提を
+            // 撤去した）。文節モードに入れない理由（旧エンジン非対応/被覆候補無し）は
+            // ユーザーの再試行（Esc/Space/Enter）で解決される。
+            // explicit snapshot 応答待ち中も食い切る（待ちは cancel せず維持 — 冒頭の
+            // exempt と対）。結果到着後の移動適用は P4e の保留キューで導入するまで捨てる。
+            // 読み編集中は合成を維持して読み上のカーソルを動かす。
             // eaten 契約（composing||showing で食い切る）は不変（will_handle_gated と一致）。
             VK_LEFT | VK_RIGHT => {
+                if self.explicit_snapshot_pending.get() {
+                    return Ok(TRUE);
+                }
                 if self.showing.get() && !self.reconverting.get() {
                     let in_nav = self.clause_nav.borrow().is_some();
                     // 自動リピート中の文節モードは IPC を発行せず食い切る(is_autorepeat 注記。
@@ -1627,11 +1718,11 @@ impl TextService_Impl {
                     if self.move_clause(&ctx, if vk == VK_RIGHT { 1 } else { -1 }) {
                         return Ok(TRUE);
                     }
-                    if in_nav {
-                        return Ok(TRUE);
-                    }
+                    return Ok(TRUE);
                 }
-                if self.state.borrow().composing || self.showing.get() {
+                if self.state.borrow().composing && !self.showing.get() {
+                    self.edit_reading(&ctx, ModuleKeyEvent::MoveReading(if vk == VK_RIGHT { 1 } else { -1 }))
+                } else if self.showing.get() {
                     // 巡5 GLM M-2: settle の成否は受けるが navigate は再試行可能 — 拒否時も
                     // TRUE で食いてユーザの再押下に任せる（モードトグルと違い状態を壊さない）。
                     let _ = self.settle_active_input(Some(&ctx), "navigate");
@@ -1648,7 +1739,14 @@ impl TextService_Impl {
             // 食い切る（Test/実の eaten 判定を一致させる）。idle では上の gate に到達せず
             // will_handle=false で OnKeyDown 自体が呼ばれない（呼ばれてもここで FALSE を返す）。
             VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_DELETE => {
-                if self.state.borrow().composing || self.showing.get() {
+                if self.state.borrow().composing && !self.showing.get()
+                    && matches!(vk, VK_HOME | VK_END | VK_DELETE) {
+                    self.edit_reading(&ctx, match vk {
+                        VK_HOME => ModuleKeyEvent::ReadingHome,
+                        VK_END => ModuleKeyEvent::ReadingEnd,
+                        _ => ModuleKeyEvent::Delete,
+                    })
+                } else if self.state.borrow().composing || self.showing.get() {
                     // 巡5 GLM M-2: 矢印と同じ（成否を受けるが TRUE で食く）。
                     let _ = self.settle_active_input(Some(&ctx), "navigate");
                     Ok(TRUE)
@@ -1669,58 +1767,489 @@ impl TextService_Impl {
     /// stale 候補リストを操作し、画面表示と違う文字列を確定してしまう。
     /// レビュー M-2（既知の限界）: raw は「打鍵の生入力」だが、部分確定後の reseed では残り読みの
     /// **かな**になる。その状態の全角/半角英数はかなベース表示になる（元ローマ字は復元不能で許容）。
+    fn handle_conversion_wait_key(&self, ctx: &ITfContext, vk: u32, lparam: LPARAM, action: crate::keymap::KeyAction) -> bool {
+        use crate::conversion_queue::{ConversionAction as A, OperationTarget, QueueAdmission};
+        if self.conversion_queue.borrow().owner_lost {
+            if vk == VK_ESCAPE && !cmd_modifier_down() {
+                self.clear_conversion_queue();
+                self.hide_explicit_snapshot_status();
+                self.show_conversion_queue_notice(ctx, "後続の未処理入力を取り消しました。確定済みの文字は残します");
+            } else {
+                self.show_conversion_queue_notice(ctx, "元の入力先が終了しました。未処理入力を保持しています。Escで取消");
+            }
+            return true;
+        }
+
+        // After a queued F-key changes mode, its display retry may yield before
+        // the next Insert can run. Materialize that head's Commit before later
+        // admissions can reuse the slot freed by the F-key.
+        if self.local_converting() && matches!(self.conversion_queue.borrow().front(), Some(A::Insert { .. })) {
+            if !self.conversion_queue.borrow_mut().prepend_commit_for_insert() {
+                self.conversion_queue.borrow_mut().commit_failed = true;
+                self.show_conversion_queue_notice(ctx, "入力を反映できません。Enterで再試行、Escで取消");
+                return true;
+            }
+        }
+        let barrier = self.conversion_queue.borrow().has_commit();
+        let initial = self.explicit_snapshot_pending.get();
+        let candidates_loading = self.local_clause_loading();
+        let boundary_loading = self.local_clauses.borrow().as_ref().is_some_and(|model| model.boundary_loading());
+        if !initial && !candidates_loading && !barrier && !self.local_clause_redraw_pending.get()
+            && !self.conversion_queue.borrow().commit_failed { return false; }
+        if !self.bind_conversion_queue_context(ctx) { return true; }
+        let target = self.local_clauses.borrow().as_ref().and_then(|m| m.clauses.get(m.selected).map(|c| OperationTarget {
+            clause: Some(c.id), start: c.start, end: c.end, candidate_window: !matches!(m.window, crate::clause_conversion::CandidateWindow::Closed),
+        })).unwrap_or_else(|| OperationTarget { clause: None, start: ipc::clause::ReadingPosition(0),
+            end: ipc::clause::ReadingPosition(self.state.borrow().canonical_reading().chars().count() as u32),
+            candidate_window: self.conversion_queue.borrow().logical_window_open() });
+        let target = OperationTarget { candidate_window: if boundary_loading {
+            self.conversion_queue.borrow().logical_window_open()
+        } else { target.candidate_window }, ..target };
+        let semantic = if action == crate::keymap::KeyAction::Convert { Some(A::Candidate(1)) }
+        else if let crate::keymap::KeyAction::Notation(kind) = action { Some(A::Transform { kind, target: target.clone() }) }
+        else if action == crate::keymap::KeyAction::NotationRotate { Some(A::RotateNotation(target.clone())) }
+        else if !cmd_modifier_down() {
+            match vk {
+                VK_LEFT | VK_RIGHT if self.mixed_editing() => Some(A::MoveReading(if vk == VK_RIGHT { 1 } else { -1 })),
+                VK_HOME if self.mixed_editing() => Some(A::ReadingHome),
+                VK_END if self.mixed_editing() => Some(A::ReadingEnd),
+                VK_LEFT | VK_RIGHT => Some(if shift_down() { A::ResizeClause(if vk == VK_RIGHT { 1 } else { -1 }) } else { A::MoveClause(if vk == VK_RIGHT { 1 } else { -1 }) }),
+                VK_UP | VK_DOWN => {
+                    if !target.candidate_window { return true; }
+                    Some(A::Candidate(if vk == VK_DOWN { 1 } else { -1 }))
+                }
+                VK_RETURN => Some(A::Commit), VK_ESCAPE => Some(A::Cancel),
+                VK_BACK => Some(A::Backspace), VK_DELETE => Some(A::Delete),
+                VK_HOME => Some(A::Home(target.clone())), VK_END => Some(A::End(target.clone())),
+                VK_1..=VK_9 if (queued_digit_selects_candidate(barrier, target.candidate_window) || (boundary_loading && !barrier)) && !shift_down() => return true,
+                VK_A..=VK_Z => {
+                    let latin = !barrier && self.state.borrow().latin_mode();
+                    let (ch, style, direct_commit) = match resolve_az_char(vk, shift_down(), key_to_char(vk, lparam), self.shift_latin_compose.get(), latin) {
+                        AzRoute::Kana(ch) => (ch, ModuleTextStyle::Kana, false),
+                        AzRoute::Latin(ch) => (ch, ModuleTextStyle::Direct, false),
+                        AzRoute::DirectCommit(ch) => (ch, ModuleTextStyle::Direct, true),
+                    };
+                    Some(A::Insert { text: ch.to_string(), original: None, style, direct_commit })
+                }
+                _ => key_to_char(vk, lparam).map(|ch| {
+                    let original = ch;
+                    let (ch, style) = queued_nonalpha(ch, !barrier && self.state.borrow().latin_mode(),
+                        is_symbol_keystroke(vk, shift_down(), self.symbol_overlay.get()), self.punctuation_full_width.get(),
+                        self.symbol_overlay.get(), self.symbol_chars.get());
+                    A::Insert { text: ch.to_string(), original: (ch != original).then(|| original.to_string()), style, direct_commit: false }
+                }),
+            }
+        } else { None };
+        let Some(semantic) = semantic else { return barrier; };
+        if candidates_loading {
+            use crate::conversion_queue::{candidate_wait_disposition, CandidateWaitDisposition as D};
+            let disposition = if boundary_loading && matches!(semantic, A::MoveClause(_) | A::ResizeClause(_)) {
+                D::Defer
+            } else { candidate_wait_disposition(&semantic, barrier) };
+            match disposition {
+                D::Defer => {}
+                D::Noop => return true,
+                D::Commit | D::CommitThenInsert => {
+                    self.clear_conversion_queue();
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+                    if matches!(semantic, A::Insert { .. }) { self.conversion_queue.borrow_mut().push(A::Commit); }
+                }
+                D::Immediate | D::Close => {
+                    self.clear_conversion_queue();
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+                    if matches!(semantic, A::Cancel) { self.render_local_edit(ctx); return true; }
+                    return false;
+                }
+            }
+        }
+        if self.conversion_queue.borrow().commit_failed && matches!(semantic, A::Cancel) {
+            self.show_conversion_queue_notice(ctx, "確定を取り消し、後続の未処理入力を破棄しました");
+            self.clear_conversion_queue();
+            if self.do_cancel(ctx) { self.state.borrow_mut().reset(); self.clear_clause_nav(); }
+            return true;
+        }
+        if initial && !barrier && matches!(semantic, A::Insert { .. } | A::Backspace | A::Delete | A::Cancel) {
+            self.cancel_explicit_snapshot_wait();
+            self.clear_conversion_queue();
+            if matches!(semantic, A::Cancel) {
+                let reading = self.state.borrow().canonical_reading().to_string();
+                *self.live_text.borrow_mut() = reading.clone();
+                self.run_preedit(ctx, &reading);
+                return true;
+            }
+            self.conversion_queue.borrow_mut().push(semantic);
+            self.drain_conversion_actions(ctx);
+            return true;
+        }
+        if self.conversion_queue.borrow().commit_failed && matches!(semantic, A::Commit) {
+            if !self.finish_pending_composition(ctx) { return true; }
+            self.conversion_queue.borrow_mut().commit_failed = false;
+            self.hide_explicit_snapshot_status();
+            self.drain_conversion_actions(ctx);
+            return true;
+        }
+        let admit = || {
+            let needs_commit = self.local_converting() && !self.conversion_queue.borrow().has_commit();
+            if let A::Insert { ref text, ref original, style, direct_commit } = semantic {
+                if needs_commit {
+                    return self.conversion_queue.borrow_mut().push_commit_then_mapped_insert(text.clone(), original.clone(), style, direct_commit);
+                }
+            }
+            if self.mixed_editing() {
+                self.conversion_queue.borrow_mut().push_reserving_commit(semantic.clone())
+            } else {
+                self.conversion_queue.borrow_mut().push(semantic.clone())
+            }
+        };
+        let admission = admit();
+        if admission == QueueAdmission::Full {
+            self.fail_conversion_wait(ctx);
+            self.drain_conversion_actions(ctx);
+            if admit() != QueueAdmission::Accepted {
+                tip_log("ev=conversion_input_rejected reason=queue_full");
+                self.show_conversion_queue_notice(ctx, "入力を受け付けられません。Enterで確定を再試行、Escで取消");
+            }
+        } else if admission == QueueAdmission::TooLarge {
+            tip_log("ev=conversion_input_rejected reason=payload_limit");
+            self.show_conversion_queue_notice(ctx, "入力が長すぎるため受け付けられません");
+        }
+        if !self.explicit_snapshot_pending.get() { self.drain_conversion_actions(ctx); }
+        true
+    }
+
+    pub(crate) fn fail_conversion_wait(&self, ctx: &ITfContext) {
+        if self.pending_commit.borrow().is_some() {
+            // A full queue must not replay or cancel a still-running TSF body.
+            self.poll_pending_commit(ctx);
+            return;
+        }
+        self.cancel_explicit_snapshot_wait();
+        self.conversion_queue.borrow_mut().fail_wait();
+        if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+        self.drain_conversion_actions(ctx);
+    }
+
+    pub(crate) fn drain_conversion_actions(&self, ctx: &ITfContext) {
+        use crate::conversion_queue::ConversionAction as A;
+        if self.replaying_conversion_queue.get() { return; }
+        if !self.bind_conversion_queue_context(ctx) { return; }
+        let _replay = ScopedCellFlag::set(&self.replaying_conversion_queue);
+        loop {
+            if self.conversion_queue.borrow().owner_lost || self.conversion_queue.borrow().waiting || self.conversion_queue.borrow().commit_failed { return; }
+            if !self.retry_local_clause_redraw(ctx) { return; }
+            let action = self.conversion_queue.borrow().front().cloned();
+            let Some(action) = action else {
+                self.release_idle_conversion_queue_context();
+                return;
+            };
+            if matches!(action, A::Insert { .. }) && self.local_converting() {
+                if self.conversion_queue.borrow_mut().prepend_commit_for_insert() { continue; }
+                self.conversion_queue.borrow_mut().commit_failed = true;
+                self.show_conversion_queue_notice(ctx, "入力を反映できません。Enterで再試行、Escで取消");
+                return;
+            }
+            let was_commit = matches!(action, A::Commit);
+            if !matches!(action, A::Transform { .. } | A::RotateNotation(_)) {
+                if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.reset_notation_cycle(); }
+            }
+            let success = match action {
+                A::MoveReading(direction) => { self.replay_reading_navigation(ctx, ModuleKeyEvent::MoveReading(direction)); true }
+                A::ReadingHome => { self.replay_reading_navigation(ctx, ModuleKeyEvent::ReadingHome); true }
+                A::ReadingEnd => { self.replay_reading_navigation(ctx, ModuleKeyEvent::ReadingEnd); true }
+                A::MoveClause(direction) => {
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.move_clause(direction); }
+                    self.render_local_edit(ctx); true
+                }
+                A::Candidate(direction) => {
+                    if self.local_converting() {
+                        if direction > 0 { self.local_clause_space(ctx); }
+                        else {
+                            if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.advance_candidate(direction); }
+                            self.render_local_edit(ctx);
+                        }
+                        if self.local_clause_loading() { self.conversion_queue.borrow_mut().begin(Instant::now(), None); }
+                    } else if self.mixed_editing() { self.convert_edited_interval(ctx); }
+                    else { self.trigger_convert(ctx); }
+                    true
+                }
+                A::Commit => {
+                    let suppress_prediction = self.conversion_queue.borrow().suppress_commit_prediction;
+                    let _prediction_guard = suppress_prediction.then(|| ScopedCellFlag::set(&self.prediction_commit_suppressed));
+                    let fallback = self.conversion_queue.borrow().initial_reading.clone();
+                    let text = if self.state.borrow().notation_fixed.is_some() {
+                        self.live_text.borrow().clone()
+                    } else {
+                        fallback.unwrap_or_else(|| self.state.borrow().canonical_reading().to_string())
+                    };
+                    let ok = if self.local_clauses.borrow().is_some() { self.commit_local_clauses(ctx) }
+                        else if self.state.borrow().composing { self.commit_and_reset(ctx, &text, "clause", None) }
+                        else { true };
+                    if self.conversion_queue.borrow().owner_lost { return; }
+                    if !ok {
+                        if self.pending_commit_waiting() {
+                            self.conversion_queue.borrow_mut().waiting = true;
+                            self.arm_clause_poll();
+                            if self.live_result_timer.get() == 0 {
+                                let pending = self.pending_commit.borrow().clone();
+                                if let Some(pending) = pending { pending.request.state.begin(false); }
+                                self.poll_pending_commit(ctx);
+                            }
+                        } else {
+                            self.conversion_queue.borrow_mut().commit_failed = true;
+                            tip_log("ev=conversion_commit_failed retry=enter cancel=escape");
+                            self.show_conversion_queue_notice(ctx, "確定できません。Enterで再試行、Escで取消");
+                        }
+                    }
+                    ok
+                }
+                A::Insert { text, original, style, direct_commit } => {
+                    let mut originals = original.as_deref().unwrap_or(&text).chars();
+                    let applied = apply_accepted_text(&text, |ch| {
+                        if !self.finish_pending_composition(ctx) { return false; }
+                        if self.local_converting() { return false; }
+                        let needs_settle = direct_commit && input_needs_settle(self.state.borrow().composing, self.showing.get(), self.composition_end_pending.get());
+                        if needs_settle && !self.settle_active_input(Some(ctx), "shift_latin") { return false; }
+                        let result = if direct_commit { self.commit_char_direct(ctx, ch) }
+                            else { self.input_char_with_original(ctx, ch, if style == ModuleTextStyle::Direct { InsertStyle::Direct } else { InsertStyle::Kana }, originals.next().filter(|original| *original != ch)) };
+                        result.is_ok_and(|eaten| eaten.as_bool())
+                    });
+                    if matches!(self.conversion_queue.borrow().front(), Some(A::Commit)) { continue; }
+                    self.conversion_queue.borrow_mut().consume_front_insert_prefix(applied);
+                    let success = applied == text.chars().count();
+                    if !success {
+                        self.conversion_queue.borrow_mut().commit_failed = true;
+                        self.show_conversion_queue_notice(ctx, "入力を反映できません。Enterで再試行、Escで取消");
+                    }
+                    success
+                }
+                A::Cancel => {
+                    if self.local_converting() { self.local_clause_escape(ctx); true }
+                    else if !self.state.borrow().composing { true }
+                    else if self.do_cancel(ctx) { self.state.borrow_mut().reset(); self.clear_clause_nav(); true }
+                    else { false }
+                }
+                A::Backspace => {
+                    if self.local_converting() {
+                        let ok = self.local_clause_backspace(ctx);
+                        if !ok { self.conversion_queue.borrow_mut().commit_failed = true; }
+                        ok
+                    } else if self.state.borrow().composing { self.backspace_reading(ctx).is_ok_and(|eaten| eaten.as_bool()) }
+                    else { true }
+                }
+                A::Home(ref target) | A::End(ref target) => {
+                    let end = matches!(action, A::End(_));
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() {
+                        let target_current = target.clause.is_none() || model.clauses.iter()
+                            .any(|clause| Some(clause.id) == target.clause && clause.start == target.start && clause.end == target.end);
+                        if target_current {
+                            if target.candidate_window {
+                                if let crate::clause_conversion::CandidateWindow::Ready { candidates, .. } = &model.window {
+                                    let index = if end { candidates.len() - 1 } else { 0 };
+                                    model.select_candidate(index);
+                                }
+                            } else { model.move_clause(if end { i32::MAX } else { i32::MIN }); }
+                        } else { tip_log("ev=conversion_action_ignored reason=retired_target"); }
+                    }
+                    self.render_local_edit(ctx);
+                    true
+                }
+                A::Transform { ref target, .. } | A::RotateNotation(ref target) => {
+                    if self.local_clauses.borrow().as_ref().is_some_and(|model| model.revision == u64::MAX) {
+                        self.conversion_queue.borrow_mut().commit_exhausted_action();
+                        continue;
+                    }
+                    // Resolve rotation after earlier accepted transforms have taken effect.
+                    let kind = match &action {
+                        A::Transform { kind, .. } => *kind,
+                        _ => crate::keymap::next_notation(self.state.borrow().notation_fixed),
+                    };
+                    let changed = {
+                        let mut state = self.local_clauses.borrow_mut();
+                        state.as_mut().is_some_and(|model| {
+                            if target.clause.is_some_and(|id| !model.clauses.iter().any(|c|
+                                c.id == id && c.start == target.start && c.end == target.end)) {
+                                tip_log("ev=conversion_action_ignored reason=retired_target");
+                                return false;
+                            }
+                            let original = self.state.borrow().original_input(target.start, target.end);
+                            model.transform_notation(target.start, target.end, kind, original.as_deref())
+                        })
+                    };
+                    if changed {
+                        self.state.borrow_mut().set_notation(kind);
+                        self.disarm_debounce();
+                        self.render_local_edit(ctx);
+                    } else if self.local_clauses.borrow().is_none() && self.state.borrow().composing {
+                        // Esc may have completed its retained all-reading redraw
+                        // before this accepted notation action reaches the head.
+                        let _ = self.apply_notation(ctx, 0, kind);
+                    }
+                    true
+                }
+                A::ResizeClause(direction) => {
+                    let outcome = self.local_clauses.borrow_mut().as_mut().map(|model| model.resize_selected(direction));
+                    if outcome == Some(crate::clause_conversion::LocalEditOutcome::Exhausted) {
+                        self.conversion_queue.borrow_mut().commit_exhausted_action();
+                        continue;
+                    } else { self.render_local_edit(ctx); true }
+                }
+                A::Delete => { if self.mixed_editing() { self.edit_reading(ctx, ModuleKeyEvent::Delete).is_ok_and(|eaten| eaten.as_bool()) } else { true } },
+            };
+            if !success || self.conversion_queue.borrow().owner_lost { return; }
+            if !was_commit && matches!(self.conversion_queue.borrow().front(), Some(A::Commit)) {
+                // Exhaustion replaced this semantic operation with a barrier.
+                // Execute it before acknowledging the head or its suffix.
+                continue;
+            }
+            self.conversion_queue.borrow_mut().complete_front();
+            if self.composition_end_pending.get() {
+                // The Commit action's body has been acknowledged and removed.
+                // Keep accepting subsequent text into the queue while only its
+                // presentation/close is pending; never replay the Commit body.
+                self.conversion_queue.borrow_mut().commit_failed = true;
+                self.show_conversion_queue_notice(ctx, "確定後の表示を修復できません。Enterで再試行、Escで後続入力を取消");
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn backspace_reading(&self, ctx: &ITfContext) -> Result<BOOL> {
+        self.edit_reading(ctx, ModuleKeyEvent::Backspace)
+    }
+
+    fn edit_reading(&self, ctx: &ITfContext, key: ModuleKeyEvent) -> Result<BOOL> {
+        if self.mixed_editing() { return self.edit_mixed_reading(ctx, key, None); }
+        if self.showing.get() {
+            self.candidate_ui.borrow_mut().hide();
+            self.showing.set(false);
+            self.clear_clause_nav();
+        }
+        let module_output = self
+            .state
+            .borrow_mut()
+            .handle(ModuleEvent::Key(key));
+        if module_output.immediate.is_none() { return Ok(TRUE); }
+        let local_reading = match module_output.immediate.as_ref() {
+            Some(ModuleOperation::SetPreedit { text }) => Some(text.clone()),
+            Some(ModuleOperation::Cancel) => None,
+            other => unreachable!(
+                "backspace must produce local preedit or cancel, got {other:?}"
+            ),
+        };
+        let operation = module_output
+            .immediate
+            .clone()
+            .expect("backspace must produce an immediate operation");
+        let background = match module_output.background {
+            Some(ModuleIntent::Reseed { request, segments }) => Some((request, segments)),
+            None => None,
+            _ => unreachable!("reading edit must reseed"),
+        };
+        let local_applied = local_reading.as_ref().is_some_and(|text| {
+            *self.last_reading.borrow_mut() = text.clone();
+            *self.live_text.borrow_mut() = text.clone();
+            self.apply_preedit_with_target(ctx, &self.widen_display_text(text), None).fully_applied()
+        });
+        // A surface deletion can preserve the same text while changing whether its
+        // trailing ASCII is frozen or still composable. A stateful engine Backspace
+        // cannot carry that distinction, so the next worker state starts from the
+        // canonical styled replay instead.
+        if let Some((background_request, background_segments)) = background.filter(|_| local_reading.is_some()) {
+            reseed_background(
+                || self.background_input.request_close(),
+                || ModuleIntent::Insert {
+                    request: background_request,
+                    segments: background_segments,
+                },
+                |request, segments| self.background_input.try_reseed(request, segments),
+            );
+        } else if local_reading.is_none() {
+            self.background_input.request_close();
+        }
+        match operation {
+            operation @ ModuleOperation::Cancel => {
+                self.disarm_debounce();
+                let applied = apply_and_complete_module_operation(
+                    &operation,
+                    || self.do_cancel(&ctx),
+                    |operation, applied| {
+                        self.state.borrow_mut().complete(operation, applied)
+                    },
+                );
+                if !applied {
+                    tip_log("ev=cancel_rejected source=backspace_empty");
+                    return Ok(TRUE);
+                }
+                self.last_reading.borrow_mut().clear();
+                self.reading_monitor.borrow_mut().hide();
+                self.live_text.borrow_mut().clear();
+                *self.current_context.borrow_mut() = None;
+                self.background_input.request_close();
+            }
+            ModuleOperation::SetPreedit { .. } => {
+                *self.current_context.borrow_mut() = Some(ctx.clone());
+                if !local_applied {
+                    self.partial_preedit_redraw_pending.set(true);
+                    self.partial_preedit_redraw_retries.set(0);
+                    self.arm_partial_preedit_redraw_retry();
+                }
+                self.arm_debounce();
+            }
+            other => {
+                unreachable!("backspace result cannot produce {other:?}");
+            }
+        }
+        Ok(TRUE)
+    }
+
     fn apply_notation(
         &self,
         ctx: &ITfContext,
         vk: u32,
         kind: crate::keymap::Notation,
     ) -> Result<BOOL> {
-        use crate::keymap::Notation;
-        if self.showing.get() {
-            self.candidate_ui.borrow_mut().hide();
-            self.showing.set(false);
-            self.clear_clause_nav();
-        }
-        self.disarm_debounce();
-        let reading = self.last_reading.borrow().clone();
-        let raw = self.state.borrow().raw.clone();
-        let shown = match kind {
-            Notation::Hiragana => reading,
-            Notation::Katakana => to_katakana(&reading),
-            Notation::HankakuKana => to_hankaku_kana(&reading),
-            // どちらも raw をそのまま素材にしない: 句読点/記号は合成時に全角へ畳み込まれて
-            // raw に積まれる(symbol_keydown)ため、まず逆写像で打鍵の半角へ戻す。全角英数は
-            // その上で機械全角化(「、。」→",."→"，．")。戻さないと 、。 が「英数記号」表記に
-            // ならず素通りする(F10 側と同型の非対称 — 敵対レビュー M-1)。
-            Notation::ZenkakuEisu => to_zenkaku_ascii(&to_hankaku_ascii(&raw)),
-            Notation::HankakuEisu => to_hankaku_ascii(&raw),
-        };
-        // 巡11(round11): 素材が空(空 Backspace の cancel 拒否巻き戻し中は reading/raw とも空)
-        // なら何もしない — 空文字の run_preedit が文書に残る composition を潰してしまう。
-        // notation_fixed も書かない(次の入力で表記指定が誤発火しない)。
-        if shown.is_empty() {
-            tip_log("ev=notation_skip_empty_text");
+        if self.local_clauses.borrow().as_ref().is_some_and(|model| model.revision == u64::MAX) {
+            self.queue_local_clause_commit(ctx, false);
             return Ok(TRUE);
         }
-        self.state.borrow_mut().set_notation(kind);
-        // 表示だけ全角化する（input_char と同じ規律）。live_text は半角 canonical の
-        // まま置くのは、それが確定・リプレイでエンジンへ戻る素材だから。
-        // widen は notation_fixed を書いた**後**で呼ぶ — 先だと F10/半角カナが半角指定として
-        // 効かず、機能名と真逆に数字が全角化される。
-        *self.live_text.borrow_mut() = shown.clone();
-        *self.current_context.borrow_mut() = Some(ctx.clone());
-        self.run_preedit(ctx, &self.widen_display_text(&shown));
-        tip_log(&format!(
-            "ev=notation vk={vk:#04x} chars={}",
-            shown.chars().count()
-        ));
-        Ok(TRUE)
+        if self.local_clauses.borrow().is_none() {
+            let model = {
+                let state = self.state.borrow();
+                crate::clause_conversion::ClauseConversion::from_reading(
+                    state.clause_identity(self.acknowledged_configuration_generation.get(), self.background_input.connection_generation()),
+                    state.canonical_reading().to_owned())
+            };
+            if model.is_none() { return Ok(TRUE); }
+            self.clear_clause_nav();
+            *self.local_clauses.borrow_mut() = model;
+        }
+        {
+            let changed = {
+                let mut state = self.local_clauses.borrow_mut();
+                state.as_mut().is_some_and(|model| {
+                    let Some(clause) = model.clauses.get(model.selected) else { return false; };
+                    let original = self.state.borrow().original_input(clause.start, clause.end);
+                    model.transform_notation(clause.start, clause.end, kind, original.as_deref())
+                })
+            };
+            self.disarm_debounce();
+            if changed {
+                self.state.borrow_mut().set_notation(kind);
+                *self.current_context.borrow_mut() = Some(ctx.clone());
+                self.render_local_edit(ctx);
+            }
+            tip_log(&format!("ev=notation vk={vk:#04x} changed={changed}"));
+            Ok(TRUE)
+        }
     }
 
     /// NotationRotate(無変換連打)のディスパッチ。現在表記(notation_fixed)から次を導出して
     /// apply_notation へ。OnKeyDown の KeyAction::NotationRotate と OnPreservedKey の
     /// ToggleMode 委譲(受理配送ホスト)の両経路が共有し、二重実装のズレを防ぐ(spec §6.3)。
     fn dispatch_notation_rotate(&self, ctx: &ITfContext, vk: u32) -> Result<BOOL> {
+        if self.handle_conversion_wait_key(ctx, vk, LPARAM(0), crate::keymap::KeyAction::NotationRotate) {
+            return Ok(TRUE);
+        }
         let next = crate::keymap::next_notation(self.state.borrow().notation_fixed);
         self.apply_notation(ctx, vk, next)
     }
@@ -1860,6 +2389,20 @@ impl TextService_Impl {
     /// （拒否時 composition が残ったまま direct へ落ちると上記の「閉じる手段がない」状態を
     /// 自ら作ることになる）。
     pub(crate) fn settle_before_mode_toggle(&self, ctx: Option<&ITfContext>) -> bool {
+        // A menu command must not bypass an accepted commit or its pending input.
+        // Existing failures are resolved by Enter/Esc before another mode change.
+        if self.conversion_queue_has_work() || self.pending_commit.borrow().is_some() {
+            return false;
+        }
+        if self.local_converting() {
+            let Some(ctx) = ctx else { return false; };
+            self.queue_local_clause_commit(ctx, true);
+            return !self.conversion_queue_has_work()
+                && self.pending_commit.borrow().is_none()
+                && !self.composition_end_pending.get()
+                && !self.state.borrow().composing
+                && !self.local_converting();
+        }
         self.settle_active_input(ctx, "mode_toggle")
     }
 
@@ -1922,6 +2465,7 @@ impl TextService_Impl {
     ///   巡4 T3(d): 戻り値は確定の成否（idle/放棄は true=後続を進めてよい）。呼び出し側は
     ///   false なら後続処理（Shift 直打ち等）を止めること — composition が文書に残るため。
     pub(crate) fn settle_active_input(&self, ctx: Option<&ITfContext>, source: &str) -> bool {
+        if self.local_converting() { return ctx.is_some_and(|ctx| self.commit_local_clauses(ctx)); }
         let composing = self.state.borrow().composing;
         let showing = self.showing.get();
         let end_pending = self.composition_end_pending.get();
@@ -2133,6 +2677,10 @@ impl TextService_Impl {
     /// （InsertTextAtSelection＋末尾 SetSelection）で 1 発挿入し、連続 Shift 打鍵の順序も
     /// キャレット末尾追従で保たれる。
     pub(crate) fn commit_char_direct(&self, ctx: &ITfContext, ch: char) -> Result<BOOL> {
+        if self.local_converting() && !self.replaying_conversion_queue.get() {
+            self.queue_commit_before_text(ctx, ch, ModuleTextStyle::Direct, true);
+            return Ok(TRUE);
+        }
         if input_needs_settle(
             self.state.borrow().composing,
             self.showing.get(),
@@ -2197,7 +2745,7 @@ impl TextService_Impl {
             Some(ch) => {
                 let folded = zenkaku_symbol(ch, punct, symbol, chars).unwrap_or(ch);
                 // 呼び出し側が英語モードを先に分岐させるので、ここは常にかな読みへの畳み込み。
-                self.input_char(ctx, folded, InsertStyle::Kana)
+                self.input_char_with_original(ctx, folded, InsertStyle::Kana, (folded != ch).then_some(ch))
             }
             // L-3: 印字不能キー（デッドキー/合字）は食って無視（stray char 漏れ防止）。
             None => Ok(TRUE),
@@ -2206,12 +2754,52 @@ impl TextService_Impl {
 
     /// 1文字 `ch` を入力としてエンジンへ送り、読みを即 preedit 表示してデバウンス変換を仕込む。
     /// A–Z でも記号/数字でも共通。候補窓が出ていれば閉じてライブ入力へ戻す。
+    fn queue_commit_before_text(&self, ctx: &ITfContext, ch: char, style: ModuleTextStyle, direct_commit: bool) {
+        if !self.bind_conversion_queue_context(ctx) { return; }
+        let admitted = self.conversion_queue.borrow_mut().push_commit_then_insert(ch.to_string(), style, direct_commit);
+        if admitted == crate::conversion_queue::QueueAdmission::Accepted {
+            if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+            self.drain_conversion_actions(ctx);
+        } else {
+            self.show_conversion_queue_notice(ctx, "入力を受け付けられません。Enterで再試行、Escで取消");
+        }
+    }
+
     pub(crate) fn input_char(
         &self,
         ctx: &ITfContext,
         ch: char,
         style: InsertStyle,
     ) -> Result<BOOL> {
+        self.input_char_with_original(ctx, ch, style, None)
+    }
+
+    fn replay_reading_navigation(&self, ctx: &ITfContext, key: ModuleKeyEvent) {
+        if self.local_converting() {
+            let direction = match key { ModuleKeyEvent::MoveReading(direction) => direction,
+                ModuleKeyEvent::ReadingHome => i32::MIN, ModuleKeyEvent::ReadingEnd => i32::MAX, _ => return };
+            if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.move_clause(direction); }
+            self.render_local_edit(ctx);
+        } else { let _ = self.edit_reading(ctx, key); }
+    }
+
+    fn input_char_with_original(&self, ctx: &ITfContext, ch: char, style: InsertStyle, original: Option<char>) -> Result<BOOL> {
+        if self.mixed_editing() {
+            return self.edit_mixed_reading(ctx, ModuleKeyEvent::Text { ch,
+                style: if style == InsertStyle::Direct { ModuleTextStyle::Direct } else { ModuleTextStyle::Kana },
+                replay: ModuleReplayMode::Full }, original);
+        }
+        if self.local_converting() && !self.replaying_conversion_queue.get() {
+            let style = match style { InsertStyle::Direct => ModuleTextStyle::Direct, InsertStyle::Kana => ModuleTextStyle::Kana };
+            if !self.bind_conversion_queue_context(ctx) { return Ok(TRUE); }
+            let admitted = self.conversion_queue.borrow_mut().push_commit_then_mapped_insert(ch.to_string(), original.map(|ch| ch.to_string()), style, false);
+            if admitted == crate::conversion_queue::QueueAdmission::Accepted {
+                if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+                self.drain_conversion_actions(ctx);
+            } else { self.show_conversion_queue_notice(ctx, "入力を受け付けられません。Enterで再試行、Escで取消"); }
+            return Ok(TRUE);
+        }
+        if self.local_converting() && !self.commit_local_clauses(ctx) { return Ok(FALSE); }
         if self.showing.get() {
             self.candidate_ui.borrow_mut().hide();
             self.showing.set(false);
@@ -2240,8 +2828,10 @@ impl TextService_Impl {
             Some(ModuleOperation::SetPreedit { text }) => text.clone(),
             other => unreachable!("text input must produce local preedit, got {other:?}"),
         };
-        let (request, segments) = match module_output.background {
-            Some(ModuleIntent::Insert { request, segments }) => (request, segments),
+        if let Some(original) = original { self.state.borrow_mut().preserve_last_literal_original(original); }
+        let (request, segments, background_reseed) = match module_output.background {
+            Some(ModuleIntent::Insert { request, segments }) => (request, segments, background_reseed),
+            Some(ModuleIntent::Reseed { request, segments }) => (request, segments, true),
             _ => unreachable!("composing text input must produce one insert intent"),
         };
         *self.current_context.borrow_mut() = Some(ctx.clone());
@@ -2249,7 +2839,7 @@ impl TextService_Impl {
         // 読みと一致しなくなったため、ここで分離する。
         *self.last_reading.borrow_mut() = self.state.borrow().canonical_reading().to_owned();
         *self.live_text.borrow_mut() = displayed.clone();
-        let local_applied = self.run_preedit(ctx, &self.widen_display_text(&displayed));
+        let local_applied = self.apply_preedit_with_target(ctx, &self.widen_display_text(&displayed), None).fully_applied();
         if !local_applied {
             // ghost cleanup の一過性競合などで表示だけ拒否されても、打鍵は logical/raw と
             // local composer に保存済み。cleanup 後に同じ読みを再描画して入力を失わない。
@@ -2372,6 +2962,11 @@ impl TextService_Impl {
             0
         };
         let reading = self.last_reading.borrow().clone();
+        let correction_reading = if self.reconverting.get() && source == "candidate" {
+            let reading = self.reconvert_reading.borrow().clone();
+            sel.filter(|index| crate::text_service::should_record_correction(*index, &reading))
+                .map(|_| reading)
+        } else { None };
         let direct = self.is_direct_mode();
         let ephemeral = self.ephemeral_kana.get();
         let fields = commit_fields(sel, cand_n, &reading, text, direct);
@@ -2389,6 +2984,11 @@ impl TextService_Impl {
         if !self.do_commit(ctx, text) {
             tip_log("ev=commit_rejected source=do_commit");
             return false;
+        }
+        // do_commit acknowledges the actual body write, including a later
+        // caret/close failure. Send before cleanup drops the reconversion pipe.
+        if let Some(reading) = correction_reading {
+            self.engine_record_correction(&reading, text);
         }
         // Phase 1 はユーザーが明示した全確定だけを起点にする。settle / 部分確定は除外。
         let prediction_source = prediction_commit_source(
@@ -2470,18 +3070,7 @@ impl TextService_Impl {
         self.disarm_debounce();
         // 再変換中の確定は対象外（g1 リプレイ由来の別セッション）。従来確定へフォールバック。
         if self.reconverting.get() {
-            let reading = self.reconvert_reading.borrow().clone();
-            // 巡4 T3(e): 確定拒否時は訂正通知（学習記録）を飛ばさない — 文書に存在しない
-            // 確定に対する記録が学習データを汚染する。
-            if self.commit_and_reset(ctx, resolved_text, "candidate", Some(index))
-                && crate::text_service::should_record_correction(index, &reading)
-            {
-                // 訂正通知は確定完了後(ユーザ可視の確定を待たせない)。確定契約(Commit IPC 迂回・
-                // 直接挿入)は不変で、これは記録専用の別 op。resolved_text を widen 前の値で
-                // 記録できるのは should_widen_digits が source=="candidate" を除外している前提
-                // (除外を外すなら widen 後の文字列を送ること — 確定本文と記録表層の一致が契約)。
-                self.engine_record_correction(&reading, resolved_text);
-            }
+            self.commit_and_reset(ctx, resolved_text, "candidate", Some(index));
             return;
         }
         let snapshot_candidate = self.explicit_snapshot_candidates_active.replace(false);
@@ -2711,6 +3300,29 @@ impl TextService_Impl {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_digit_after_commit_is_input_even_when_old_window_was_open() {
+        assert!(!super::queued_digit_selects_candidate(true, true));
+        assert!(super::queued_digit_selects_candidate(false, true));
+    }
+
+    #[test]
+    fn queued_symbols_keep_the_normal_reading_mapping() {
+        use settings::symbol::SymbolCharSet;
+        assert_eq!(super::queued_reading_char('.', true, true, false, SymbolCharSet::ALL), '。');
+        assert_eq!(super::queued_reading_char('-', false, false, false, SymbolCharSet::ALL), 'ー');
+        assert_eq!(super::queued_reading_char('.', false, true, false, SymbolCharSet::ALL), '.');
+        assert_eq!(super::queued_nonalpha('.', true, true, true, false, SymbolCharSet::ALL), ('.', super::ModuleTextStyle::Direct));
+        assert_eq!(super::queued_nonalpha('.', false, true, true, false, SymbolCharSet::ALL), ('。', super::ModuleTextStyle::Kana));
+    }
+
+    #[test]
+    fn rejected_replayed_character_stops_before_later_accepted_text() {
+        let mut attempted = Vec::new();
+        assert_eq!(super::apply_accepted_text("ABC", |ch| { attempted.push(ch); ch != 'B' }), 1);
+        assert_eq!(attempted, vec!['A', 'B']);
+        assert_eq!(super::apply_accepted_text("B", |_| false), 0);
+    }
     use super::{
         apply_and_complete_module_operation, backspace_route,
         cancel_explicit_wait_for_actual_keydown, commit_keeps_records, commit_session_cleanup_plan,
@@ -2747,6 +3359,22 @@ mod tests {
         deadline.set(Some(Instant::now()));
         assert_eq!(dispatches.get(), 1, "the key still reaches Space dispatch");
         assert!(pending.get(), "Space owns exactly one fresh wait");
+    }
+
+    /// P1(clause-nav): ←→は explicit snapshot 待ちをキャンセルしない。Space 変換の応答
+    /// 待ちに←→が来ると composing-only の settle（全文確定）へ劣化するため、待ちの
+    /// キャンセル対象から外す（ poll は継続し dispatch 側で食い切る）。
+    #[test]
+    fn arrow_keys_keep_the_explicit_snapshot_wait_alive() {
+        for vk in [0x25, 0x27] {
+            let cancelled = Cell::new(false);
+            cancel_explicit_wait_for_actual_keydown(vk, || cancelled.set(true));
+            assert!(!cancelled.get(), "vk={vk:#04x} must not cancel the explicit wait");
+        }
+        // exempt は←→だけ: 他の打鍵（'A'）は従来どおり古い待ちをキャンセルする。
+        let cancelled = Cell::new(false);
+        cancel_explicit_wait_for_actual_keydown(0x41, || cancelled.set(true));
+        assert!(cancelled.get(), "'A' must still cancel the explicit wait");
     }
 
     #[test]

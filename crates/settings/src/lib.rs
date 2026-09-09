@@ -35,7 +35,7 @@ impl Default for LlmSettings {
 
 /// LLM変換(外部API)の開発凍結フラグ(2026-07-21)。当面実装予定がないため UI/機能を閉じる。
 /// 再開時はこれを false へ(ゲート4箇所は実効判定経由で自動復帰。UI とテストの復元は
-/// docs/superpowers/specs/2026-07-21-llm-freeze-design.md の「再開手順」)。
+/// docs/design/2026-07-21-llm-freeze-design.md の「再開手順」)。
 pub const LLM_CONVERT_FROZEN: bool = true;
 
 /// 凍結を考慮した実効有効判定(bool 版)。Settings を持たない層(config の DTO 検証)は
@@ -1839,7 +1839,7 @@ mod tests {
     }
     #[test]
     fn llm_effective_is_false_while_frozen_even_when_enabled() {
-        // 凍結契約(docs/superpowers/specs/2026-07-21-llm-freeze-design.md):
+        // 凍結契約(docs/design/2026-07-21-llm-freeze-design.md):
         // settings 直編集で enabled=true でも実効は無効。再開時は LLM_CONVERT_FROZEN=false で復帰。
         assert!(LLM_CONVERT_FROZEN);
         assert!(!llm_effective(true));

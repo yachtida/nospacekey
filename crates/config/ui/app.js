@@ -139,7 +139,7 @@ const KEYMAP_FUNCS = [
   ["ephemeral", "一時かなモード開始", "F8", false], // 既定表示は keymapValueLabel が旧 trigger 設定から動的に出す
   ["commit_undo", "確定取り消し", "Ctrl+Backspace", false],
   ["typo_correct", "修正変換", "Tab", false],
-  // llm_convert は開発凍結中につき非露出(docs/superpowers/specs/2026-07-21-llm-freeze-design.md)。
+  // llm_convert は開発凍結中につき非露出(docs/design/2026-07-21-llm-freeze-design.md)。
   ["to_hiragana", "表記変換: ひらがな", "F6", false],
   ["to_katakana", "表記変換: カタカナ", "F7", false],
   ["to_hankaku_kana", "表記変換: 半角カナ", "F8", false],
@@ -854,6 +854,7 @@ async function applyNow() {
     }).catch(() => {});
     // Apply/reload observes the engine; it never clears a failure latch. Only the
     // explicit GPU retry button sends RetryZenzai.
+    void refreshZenzaiStatus();
     void refreshZenzaiRuntimeStatus();
   } catch (errors) {
     if (Array.isArray(errors)) showFieldErrors(errors);
@@ -1541,6 +1542,9 @@ function dictHasControlChar(s) {
 }
 // ruby=かな+ー のみ・word=任意。共通で非空/300文字(スカラ単位)以下/制御文字なし。
 function dictFieldValid(value, isRuby) {
+  // Match Rust trim_ws and compose_kana: do not trim newlines or compose Latin text.
+  value = value.replace(/^[\t \u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]+|[\t \u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]+$/g, "")
+    .replace(/[\u3041-\u3096\u309d\u30a1-\u30fa\u30fd][\u3099\u309a]/g, pair => pair.normalize("NFC"));
   const len = [...value].length;
   if (len === 0 || len > 300) return false;
   if (dictHasControlChar(value)) return false;

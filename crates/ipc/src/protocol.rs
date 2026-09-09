@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// 訂正昇格で顕在化）。読み手が依存しない optional フィールドの追加
 /// （skip_serializing_if で旧形とバイト一致）では bump しない。Swift 側
 /// `ProtocolVersion.current` とミラー（一字一句一致規約）。
-pub const PROTO_VERSION: u32 = 8;
+pub const PROTO_VERSION: u32 = 9;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotSegment {
@@ -39,6 +39,9 @@ fn is_false(b: &bool) -> bool {
 pub enum Request {
     Ping,
     StartSession,
+    ClauseCandidates(crate::clause::ClauseCandidatesRequest),
+    ConvertClauses(crate::clause::ConvertClausesRequest),
+    CommitReceipt(crate::clause::CommitReceipt),
     /// 挿入文字の解釈。省略(None)=roman2kana(従来)。"direct"=リテラル挿入(Shift英語モード)。
     /// 必須フィールドにしないのは旧エンジン/旧TIPとの wire 互換のため(left_context と同じ
     /// Option+skip 規約 — None ならバイト一致)。
@@ -104,6 +107,8 @@ pub enum Request {
         revision: u64,
         configuration_generation: u64,
         connection_generation: u64,
+        conversion_revision: u64,
+        request_id: u64,
         segments: Vec<SnapshotSegment>,
         #[serde(default, skip_serializing_if = "is_false")]
         explicit: bool,
@@ -116,6 +121,8 @@ pub enum Request {
         configuration_generation: u64,
         connection_generation: u64,
         baseline: u64,
+        conversion_revision: u64,
+        request_id: u64,
     },
     AutoCommitReceipt {
         composition: u64,
@@ -225,9 +232,26 @@ pub enum Request {
 #[serde(tag = "result")]
 pub enum Response {
     Pong,
+    ClauseCandidatesResult {
+        key: crate::clause::ClauseRequestKey,
+        #[serde(flatten)]
+        status: crate::clause::ClauseCandidatesStatus,
+    },
+    ConvertClausesResult {
+        key: crate::clause::ClauseRequestKey,
+        #[serde(flatten)]
+        status: crate::clause::ConvertClausesStatus,
+    },
+    CommitReceiptAck {
+        commit_id: crate::clause::CommitId,
+        #[serde(flatten)]
+        status: crate::clause::ReceiptStatus,
+    },
     /// StartSession 応答。wire世代とEngineHost buildの完全一致だけをTIPが採用する。
     Session {
         session: i64,
+        engine_epoch: String,
+        learning_generation: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proto: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,6 +286,8 @@ pub enum Response {
         committed: Option<String>,
     },
     SnapshotResult {
+        #[serde(flatten)]
+        clause_data: crate::clause::SnapshotClauseData,
         composition: u64,
         revision: u64,
         configuration_generation: u64,
@@ -276,6 +302,8 @@ pub enum Response {
         auto_commit: Option<AutoCommitProposal>,
     },
     SnapshotEnhancement {
+        #[serde(flatten)]
+        clause_data: crate::clause::SnapshotClauseData,
         composition: u64,
         revision: u64,
         configuration_generation: u64,
@@ -287,8 +315,14 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         candidate_remaining: Option<Vec<String>>,
     },
-    SnapshotEnhancementPending,
-    SnapshotEnhancementUnavailable,
+    SnapshotEnhancementPending {
+        #[serde(flatten)]
+        key: crate::clause::SnapshotResponseKey,
+    },
+    SnapshotEnhancementUnavailable {
+        #[serde(flatten)]
+        key: crate::clause::SnapshotResponseKey,
+    },
     /// 外部LLM変換結果。seq は要求エコー、text は補正済み文（preedit 全置換）。
     LlmResult {
         seq: u64,
@@ -332,6 +366,8 @@ mod tests {
     #[test]
     fn live_snapshot_identity_and_styled_input_roundtrip() {
         let request = Request::LiveSnapshot {
+            conversion_revision: 0,
+            request_id: 1,
             composition: 8,
             revision: 13,
             configuration_generation: 2,
@@ -353,6 +389,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
 
         let response = Response::SnapshotResult {
+            clause_data: crate::clause::SnapshotClauseData::from_reading("日本GPU".into(), 0, 1),
             composition: 8,
             revision: 13,
             configuration_generation: 2,
@@ -368,8 +405,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_snapshot_candidates_roundtrip_and_require_protocol_eight() {
+    fn explicit_snapshot_candidates_roundtrip_and_require_protocol_nine() {
         let request = Request::LiveSnapshot {
+            conversion_revision: 0,
+            request_id: 1,
             composition: 8,
             revision: 13,
             configuration_generation: 2,
@@ -386,6 +425,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
 
         let response = Response::SnapshotResult {
+            clause_data: crate::clause::SnapshotClauseData::from_reading("日本語".into(), 0, 1),
             composition: 8,
             revision: 13,
             configuration_generation: 2,
@@ -398,7 +438,7 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), response);
-        assert_eq!(PROTO_VERSION, 8);
+        assert_eq!(PROTO_VERSION, 9);
     }
 
     #[test]
@@ -410,6 +450,7 @@ mod tests {
             remaining: "ご".into(),
         };
         let response = Response::SnapshotResult {
+            clause_data: crate::clause::SnapshotClauseData::from_reading("日本語".into(), 0, 1),
             composition: 8,
             revision: 13,
             configuration_generation: 2,
@@ -437,6 +478,8 @@ mod tests {
     #[test]
     fn snapshot_enhancement_poll_binds_identity_and_classic_baseline() {
         let request = Request::PollSnapshotEnhancement {
+            conversion_revision: 0,
+            request_id: 1,
             composition: 8,
             revision: 13,
             configuration_generation: 2,
@@ -446,6 +489,7 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
         let response = Response::SnapshotEnhancement {
+            clause_data: crate::clause::SnapshotClauseData::from_reading("日本語".into(), 0, 1),
             composition: 8,
             revision: 13,
             configuration_generation: 2,
@@ -869,37 +913,29 @@ mod tests {
     // ---- version handshake: Session.proto ----
 
     #[test]
-    fn legacy_session_without_proto_deserializes_to_none() {
-        // 旧エンジンの Session 応答は proto=None で受かる（committed/left_context と同型の互換規約）。
-        let r: Response = serde_json::from_str(r#"{"result":"Session","session":7}"#).unwrap();
-        assert_eq!(
-            r,
-            Response::Session {
-                session: 7,
-                proto: None,
-                boot: None
-            }
-        );
+    fn legacy_session_without_learning_identity_is_rejected() {
+        assert!(serde_json::from_str::<Response>(r#"{"result":"Session","session":7}"#).is_err());
     }
 
     #[test]
     fn session_with_proto_roundtrips() {
-        // 新エンジンは proto を載せる。None のとき wire 形は旧形とバイト一致（legacy テストが固定）。
         let r = Response::Session {
             session: 7,
+            engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+            learning_generation: 6,
             proto: Some(PROTO_VERSION),
             boot: Some(env!("CARGO_PKG_VERSION").into()),
         };
         assert_eq!(
             serde_json::to_string(&r).unwrap(),
             format!(
-                r#"{{"result":"Session","session":7,"proto":8,"boot":"{}"}}"#,
+                r#"{{"result":"Session","session":7,"engine_epoch":"11111111-1111-4111-8111-111111111111","learning_generation":6,"proto":9,"boot":"{}"}}"#,
                 env!("CARGO_PKG_VERSION")
             )
         );
         assert_eq!(
             serde_json::from_str::<Response>(&format!(
-                r#"{{"result":"Session","session":7,"proto":8,"boot":"{}"}}"#,
+                r#"{{"result":"Session","session":7,"engine_epoch":"11111111-1111-4111-8111-111111111111","learning_generation":6,"proto":9,"boot":"{}"}}"#,
                 env!("CARGO_PKG_VERSION")
             ))
             .unwrap(),
@@ -1117,6 +1153,6 @@ mod tests {
 
     #[test]
     fn explicit_snapshot_candidates_bump_protocol_generation() {
-        assert_eq!(PROTO_VERSION, 8);
+        assert_eq!(PROTO_VERSION, 9);
     }
 }

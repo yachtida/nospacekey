@@ -46,6 +46,7 @@ pub(crate) fn hud_window_size(dpi: i32) -> (i32, i32) {
 
 /// HWND ごとの描画状態（GWLP_USERDATA に格納）。表示文字・テーマ・描画バックエンドを持つ。
 struct HudState {
+    font_point_tenths: i32,
     /// 現在の表示文字（"あ" or "A"。mode_label の &'static を持つので確保不要）。
     label: &'static str,
     /// A 段: 共有テーマ。flash ごとに更新される。
@@ -66,7 +67,7 @@ impl HudState {
     unsafe fn font_for_dpi(&mut self, dpi: i32) -> Option<HFONT> {
         let family = popup::family_utf16z(&self.theme.font_family);
         self.backend
-            .font_for_dpi(&family, HUD_FONT_POINT_TENTHS, dpi)
+            .font_for_dpi(&family, self.font_point_tenths, dpi)
     }
 }
 
@@ -252,7 +253,7 @@ unsafe fn paint_d2d(hwnd: HWND) {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let font_px = font_size_px(HUD_FONT_POINT_TENTHS, dpi);
+    let font_px = font_size_px(state.font_point_tenths, dpi);
     let Some(fmt) = state
         .backend
         .text_format(&family, font_px, DWRITE_TEXT_ALIGNMENT_CENTER, true)
@@ -393,6 +394,7 @@ impl ModeHud {
             popup::install_state(
                 hwnd,
                 Box::new(HudState {
+                    font_point_tenths: HUD_FONT_POINT_TENTHS,
                     label: mode_label_ephemeral(false, false),
                     theme,
                     backend: Backend::new(renderer),
@@ -414,6 +416,15 @@ impl ModeHud {
         y: i32,
         theme: crate::theme::Theme,
     ) {
+        self.flash_label(mode_label_ephemeral(is_direct, ephemeral), false, x, y, theme);
+    }
+
+    pub fn flash_learning_failure(&mut self, theme: crate::theme::Theme) {
+        let (x, y) = popup::harmless_anchor();
+        self.flash_label("学習の保存に失敗しました。文字は確定済みです。", true, x, y, theme);
+    }
+
+    fn flash_label(&mut self, label: &'static str, notice: bool, x: i32, y: i32, theme: crate::theme::Theme) {
         // デバイスロスト（前回 paint で検知）していたら、まず窓を破棄して null に戻す。
         // ensure_hwnd の前に行い、再生成される窓で最新テーマ・chrome を適用しなおす。
         self.recover_if_device_lost();
@@ -421,10 +432,10 @@ impl ModeHud {
         if self.hwnd.is_invalid() {
             return;
         }
-        let label = mode_label_ephemeral(is_direct, ephemeral);
         unsafe {
             if let Some(state) = hud_state(self.hwnd) {
                 state.label = label;
+                state.font_point_tenths = if notice { 105 } else { HUD_FONT_POINT_TENTHS };
                 // Task 7: DWM chrome に効く属性（角丸/アクリル）が変わったときだけ再適用する
                 // （色だけの変化は後段の InvalidateRect による再描画で足りる）。
                 let chrome_changed =
@@ -445,7 +456,8 @@ impl ModeHud {
         // DPI は表示先アンカー(x, y)のモニタから先に確定する（候補窓と同じ理由 — 窓の
         // 現位置 DPI では混合DPIのモニタ越え初回フレームで窓とグリフの縮尺が食い違う、UIバグ2）。
         let dpi = popup::dpi_for_anchor(x, y);
-        let (w, h) = hud_window_size(dpi);
+        let (w, h) = if notice { (2 * BORDER + scale(400, dpi), 2 * BORDER + scale(HUD_SIDE, dpi)) }
+            else { hud_window_size(dpi) };
         let (fx, fy) = popup::place_on_monitor(x, y, w, h);
         unsafe {
             popup::set_popup_pos(self.hwnd, Some((fx, fy)), w, h);
@@ -475,7 +487,7 @@ impl ModeHud {
             // 武装に失敗したまま表示し続けると TOPMOST の HUD が永久に残る。一瞬も
             // 出せないことより残留の方が害が大きいので、失敗時は即座に退場させる。
             let armed = hud_state(self.hwnd)
-                .map(|s| s.backend.arm_show_timer(self.hwnd, HUD_DURATION_MS))
+                .map(|s| s.backend.arm_show_timer(self.hwnd, if notice { 4000 } else { HUD_DURATION_MS }))
                 .unwrap_or(false);
             if !armed {
                 begin_dismiss(self.hwnd);

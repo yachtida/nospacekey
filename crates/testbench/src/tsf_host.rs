@@ -780,8 +780,9 @@ impl TsfHost {
     /// TIP の実効モードを、通常文字キーが処理対象になるかで観測する。
     /// conversion compartment は TIP の `direct_mode_owned` と食い違うホストがあるため、
     /// モード遷移の成否判定にはこちらを使う。TestKeyDown だけなので文書は変更しない。
+    /// pending close 中はキー予約を作るため、この観測を呼んではならない。
     /// Nospacekey 以外のプロファイルがアクティブなら TestKeyDown=false を direct と誤認せず None。
-    fn effective_mode_is_direct(&self) -> Option<bool> {
+    pub(crate) fn effective_mode_is_direct(&self) -> Option<bool> {
         let mut active = TF_INPUTPROCESSORPROFILE::default();
         if unsafe {
             self.profiles
@@ -946,6 +947,50 @@ impl TsfHost {
         Ok(())
     }
 
+    pub(crate) fn langbar_toggle_mode(&self) -> windows::core::Result<()> {
+        use windows::Win32::UI::TextServices::{ITfLangBarItemMgr, ITfLangBarItemButton, GUID_LBI_INPUTMODE, TF_LANGBARITEMINFO};
+        let manager = self.thread_mgr.cast::<ITfLangBarItemMgr>()?;
+        let item = unsafe { manager.GetItem(&GUID_LBI_INPUTMODE) }?;
+        let mut info = TF_LANGBARITEMINFO::default();
+        unsafe { item.GetInfo(&mut info) }?;
+        if info.clsidService != CLSID_NOSPACEKEY { return Err(windows::Win32::Foundation::E_FAIL.into()); }
+        let button = item.cast::<ITfLangBarItemButton>()?;
+        unsafe { button.OnMenuSelect(2) }
+    }
+
+    /// End the host-owned composition through msctf, including the TIP callback.
+    pub fn terminate_compositions(&self) -> windows::core::Result<()> {
+        let owner: windows::Win32::UI::TextServices::ITfContextOwnerCompositionServices = self._ctx.cast()?;
+        unsafe { owner.TerminateComposition(None) }
+    }
+
+    /// Focus a distinct document/context, then remove the previous context.
+    pub fn replace_document(&mut self, initial_text: &str) -> windows::core::Result<()> {
+        unsafe {
+            let hwnd = ensure_foreground_window()?;
+            let (store_if, store) = HarnessTextStore::create(hwnd);
+            store.seed_committed(initial_text);
+            let document = self.thread_mgr.CreateDocumentMgr()?;
+            let mut context = None;
+            let mut cookie = 0;
+            document.CreateContext(self.tid, 0, &store_if, &mut context, &mut cookie)?;
+            let context = context.ok_or_else(|| Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED))?;
+            document.Push(&context)?;
+            if let Err(error) = self.thread_mgr.SetFocus(&document) {
+                let _ = self.thread_mgr.SetFocus(&self.doc_mgr);
+                let _ = document.Pop(windows::Win32::UI::TextServices::TF_POPF_ALL);
+                return Err(error);
+            }
+            let previous_document = std::mem::replace(&mut self.doc_mgr, document);
+            let previous_context = std::mem::replace(&mut self._ctx, context);
+            self.store = store;
+            let result = previous_document.Pop(windows::Win32::UI::TextServices::TF_POPF_ALL);
+            drop(previous_context);
+            pump();
+            result
+        }
+    }
+
     /// 実機特有の罠への best-effort 防御: verify-harness が TIP を regsvr32 でシステム登録すると、
     /// 別アプリ（explorer / シェル等）が nospacekey を IME として活性化し前面/フォーカスを奪うことがある
     /// （nospacekey-tip.log に harness 以外の `[pid N] Activate` が混ざる＝item13 RUN2 で観測した pid 59912）。
@@ -1015,8 +1060,8 @@ impl TsfHost {
     /// 最後に begun した UIElement を ITfCandidateListUIElementBehavior へ cast し
     /// SetSelection(k)→Finalize を呼ぶ。戻り値=cast＋呼び出しに到達できたか。
     pub fn behavior_select_and_finalize(&self, k: u32) -> bool {
-        let ids = self.ui_log.begun.borrow();
-        let Some(&id) = ids.last() else {
+        let id = self.ui_log.begun.borrow().last().copied();
+        let Some(id) = id else {
             return false;
         };
         let Ok(el) = (unsafe { self.ui_mgr.GetUIElement(id) }) else {
@@ -1025,11 +1070,15 @@ impl TsfHost {
         let Ok(beh) = el.cast::<ITfCandidateListUIElementBehavior>() else {
             return false;
         };
-        unsafe {
-            let _ = beh.SetSelection(k);
-            let _ = beh.Finalize();
-        }
-        true
+        unsafe { beh.SetSelection(k).and_then(|_| beh.Finalize()).is_ok() }
+    }
+
+    pub fn behavior_select(&self, k: u32) -> bool {
+        let id = self.ui_log.begun.borrow().last().copied();
+        let Some(id) = id else { return false; };
+        let Ok(element) = (unsafe { self.ui_mgr.GetUIElement(id) }) else { return false; };
+        let Ok(behavior) = element.cast::<ITfCandidateListUIElementBehavior>() else { return false; };
+        unsafe { behavior.SetSelection(k).is_ok() }
     }
 
     /// 測定打鍵に入る前にエンジンと合成を「温める」。
@@ -1114,6 +1163,22 @@ impl TsfHost {
                 )?;
             }
             self.activated = false;
+            pump();
+        }
+        Ok(())
+    }
+
+    pub fn reactivate(&mut self) -> windows::core::Result<()> {
+        if !self.activated {
+            unsafe {
+                self.profiles.ActivateProfile(
+                    TF_PROFILETYPE_INPUTPROCESSOR, LANGID_JA, &CLSID_NOSPACEKEY,
+                    &PROFILE_NOSPACEKEY, HKL::default(),
+                    TF_IPPMF_ENABLEPROFILE | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE,
+                )?;
+                self.activated = true;
+                self.thread_mgr.SetFocus(&self.doc_mgr)?;
+            }
             pump();
         }
         Ok(())

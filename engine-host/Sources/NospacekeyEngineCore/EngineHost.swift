@@ -54,22 +54,25 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
 
         if case .pollSnapshotEnhancement(let composition, let revision,
                                          let configurationGeneration, let connectionGeneration,
-                                         let baseline) = req {
+                                         let baseline, let conversionRevision, let requestID) = req {
             let key = ConversionService.SnapshotEnhancementKey(
                 composition: composition, revision: revision,
                 configurationGeneration: configurationGeneration,
-                connectionGeneration: connectionGeneration)
+                connectionGeneration: connectionGeneration, conversionRevision: conversionRevision, requestID: requestID)
+            let responseKey = SnapshotResponseKey(composition: composition, revision: revision,
+                configuration_generation: configurationGeneration, connection_generation: connectionGeneration,
+                baseline: baseline, conversion_revision: conversionRevision, request_id: requestID)
             let response: Response = switch service.pollSnapshotEnhancement(
                 key: key, baseline: baseline)
             {
-            case .pending: .snapshotEnhancementPending
-            case .unavailable: .snapshotEnhancementUnavailable
-            case .ready(let text, let candidates, let candidateRemaining):
+            case .pending: .snapshotEnhancementPending(responseKey)
+            case .unavailable: .snapshotEnhancementUnavailable(responseKey)
+            case .ready(let text, let candidates, let candidateRemaining, let clauseData):
                 .snapshotEnhancement(
                     composition: composition, revision: revision,
                     configurationGeneration: configurationGeneration,
                     connectionGeneration: connectionGeneration, baseline: baseline,
-                    text: text, candidates: candidates, candidateRemaining: candidateRemaining)
+                    text: text, candidates: candidates, candidateRemaining: candidateRemaining, clauseData: clauseData)
             }
             return (encodeResponse(response), false)
         }
@@ -126,7 +129,13 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                 response = .session(
                     Int64(service.startSession(connection: connId)),
                     proto: ProtocolVersion.current,
-                    boot: BuildInfo.version)
+                    boot: BuildInfo.version, engineEpoch: service.engineEpoch, learningGeneration: service.currentLearningGeneration)
+            case .clauseCandidates(let request):
+                response = .clauseCandidatesResult(service.clauseCandidates(request))
+            case .convertClauses(let request):
+                response = .convertClausesResult(service.convertClauses(request))
+            case .commitReceipt(let receipt):
+                response = .commitReceiptAck(service.commitReceipt(receipt))
             case .insert(let s, let t, let style):
                 response = service.insert(session: Int(s), text: t, style: style).map(Response.reading) ?? .error("no session")
             case .backspace(let s):
@@ -151,11 +160,11 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                     response = .error("no session")
                 }
             case .liveSnapshot(let composition, let revision, let configurationGeneration,
-                               let connectionGeneration, let segments, let explicit, let context):
+                               let connectionGeneration, let segments, let explicit, let context, let conversionRevision, let requestID):
                 let key = ConversionService.SnapshotEnhancementKey(
                     composition: composition, revision: revision,
                     configurationGeneration: configurationGeneration,
-                    connectionGeneration: connectionGeneration)
+                    connectionGeneration: connectionGeneration, conversionRevision: conversionRevision, requestID: requestID)
                 let result = service.snapshot(
                     segments, explicit: explicit, leftContext: context, enhancementKey: key,
                     snapshotConnection: connId)
@@ -169,7 +178,7 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                         AutoCommitProposal(
                             proposal: $0.proposal, text: $0.text,
                             consumedReading: $0.consumedReading, remaining: $0.remaining)
-                    })
+                    }, clauseData: result.clauseData)
             case .autoCommitReceipt(let composition, let revision,
                                     let configurationGeneration, let connectionGeneration,
                                     let proposal):
@@ -182,7 +191,7 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                     ? .ok : .error("stale auto commit receipt")
             case .pollSnapshotEnhancement(let composition, let revision,
                                           let configurationGeneration, let connectionGeneration,
-                                          let baseline):
+                                          let baseline, _, _):
                 _ = (composition, revision, configurationGeneration, connectionGeneration, baseline)
                 response = .error("snapshot enhancement routing error")
             case .llmConvert(let s, let seq, let ctx):
@@ -344,6 +353,20 @@ private func sessionID(fromStablePipeName pipeName: String) -> UInt32? {
     return UInt32(pipeName[marker.upperBound...])
 }
 
+/// 安定 pipe 名 `\\.\pipe\nospacekey-engine.v{proto}.b{build}.s{session}`（crates/ipc の
+/// pipe_name_for_session が生成）から `{build}` 部分を抽出する。末尾 `.s{数字}` の直前の
+/// `.b` を後ろから探す — build には `.` を含められないが `+meta` は許す。形式に従わない
+/// pipe 名（テスト用の任意名）は nil を返し、呼び出し側は版検証を skip する。
+func pipeNameEmbeddedBuild(_ pipeName: String) -> String? {
+    guard let sessionMarker = pipeName.range(of: ".s", options: .backwards),
+          sessionMarker.upperBound < pipeName.endIndex,
+          pipeName[sessionMarker.upperBound...].allSatisfy(\.isNumber) else { return nil }
+    let beforeSession = pipeName[..<sessionMarker.lowerBound]
+    guard let buildMarker = beforeSession.range(of: ".b", options: .backwards),
+          buildMarker.upperBound < beforeSession.endIndex else { return nil }
+    return String(beforeSession[buildMarker.upperBound...])
+}
+
 /// Handle の存在自体が「この user-scope/session の Engine が RAM 学習を保持し得る」証拠。
 /// Config は lifecycle gate を保持して全 session の同名 object を probe する。process crash 時は
 /// kernel が handle を閉じるので stale marker の生存判定は不要。
@@ -363,6 +386,15 @@ private func createLearningPresence(name: String) -> HANDLE? {
 /// ConversionService を名前付きパイプに配線して常駐する。main.swift から呼ぶ唯一の公開関数。
 /// oneShot=true なら1接続を捌いて切断したら終了する（TIP のプロセス毎一意エンジン向け）。
 public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, oneShot: Bool = false) {
+    // 版混在事故（2026-09-06）: 旧版 TIP が DLL 隣の新版 exe を旧版 pipe 名で起動でき、
+    // そのプロセスが（learning presence の名前はバイナリ実体の版で決まるため）新版の
+    // presence を占有し、新版 TIP の正当な起動まで弾いていた。pipe 名埋め込み版と自版が
+    // 不一致なら presence 等の起動ガードを取得する前に終了する — 誤った組み合わせを
+    // 拒否し、少なくとも新版側を巻き込まない。形式外の pipe 名（テスト用）は検証しない。
+    if let embedded = pipeNameEmbeddedBuild(pipeName), embedded != BuildInfo.version {
+        engineLog("ev=engine_start_blocked reason=pipe_name_build_mismatch pipe=\(pipeName) self=\(BuildInfo.version)\n")
+        return
+    }
     guard let versionLease = createVersionLifetimeLease() else {
         engineLog("ev=engine_start_blocked reason=version_lifetime_unavailable\n")
         return

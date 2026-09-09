@@ -1,6 +1,60 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
+
+test("dictionary validation accepts imported normalized kana and preserves backend limits", () => {
+  const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
+  const code = source.slice(source.indexOf("const DICT_RUBY_RE"), source.indexOf("function dictErrorKind"));
+  const valid = runInNewContext(code + "; dictFieldValid");
+  for (const ruby of ["か\u3099", " が ", "\tが\u3000", "か\u3099".repeat(300)]) assert.equal(valid(ruby, true), true, ruby);
+  for (const ruby of ["が\n", "\ufeffが", "が".repeat(301), "", "e\u0301"]) assert.equal(valid(ruby, true), false, ruby);
+  assert.equal(valid("e\u0301".repeat(151), false), false, "Latin text must not be NFC composed");
+  assert.equal(valid("か\u3099".repeat(300), false), true);
+});
+
+test("applying a model path refreshes installation and GPU retry in both directions", async () => {
+  const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
+  const apply = source.slice(source.indexOf("async function applyNow()"), source.indexOf("async function confirmDiscardIfDirty()"));
+  const refresh = source.slice(source.indexOf("async function refreshZenzaiStatus()"), source.indexOf("function renderZenzaiRuntimeStatus()"));
+  const elements = new Map();
+  let persisted = { api_key_input: "", model_path: "" };
+  let queries = 0;
+  const errors = [];
+  const noop = () => {};
+  const app = runInNewContext(`
+    let state = { api_key_input: "", model_path: "" }, baseline = structuredClone(state);
+    let applyInFlight = false, reconcileRefreshInFlight = false, zenzaiModelReady = false;
+    ${apply}\n${refresh}
+    ({ apply: async path => { state.model_path = path; await applyNow(); }, ready: () => zenzaiModelReady })
+  `, {
+    structuredClone,
+    document: { getElementById: id => {
+      if (!elements.has(id)) elements.set(id, {});
+      return elements.get(id);
+    } },
+    settingsOperationBusy: () => false, clearFieldErrors: noop, syncBusyButtons: noop,
+    clearDirty: noop, renderAll: noop, renderKeymapValues: noop, renderSymbolGrid: noop,
+    refreshZenzaiRuntimeStatus: noop,
+    toast: (message, error) => { if (error) errors.push(message); },
+    invoke: async (command, args) => {
+      if (command === "apply_settings") persisted = structuredClone(args.dto);
+      if (command === "get_settings") return { dto: structuredClone(persisted) };
+      if (command === "zenzai_model_status") {
+        queries++;
+        return { installed: Boolean(persisted.model_path), path: persisted.model_path };
+      }
+      return "ok";
+    },
+  });
+  for (const path of ["existing.gguf", ""]) {
+    await app.apply(path);
+    assert.equal(app.ready(), Boolean(path));
+    assert.equal(canRetryZenzai({ enabled: true, modelReady: app.ready(), status: { state: "classic" } }), Boolean(path));
+  }
+  assert.equal(queries, 2);
+  assert.deepEqual(errors, []);
+});
 import {
   bindDefaultSettingsHandler,
   canRetryZenzai,

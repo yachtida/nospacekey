@@ -62,6 +62,32 @@ final class ConversionServiceTypoTests: XCTestCase {
         svc.endSession(session: sid2)
     }
 
+    func testProductionRepairLearningSurvivesNewService() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func service() -> ConversionService {
+            ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                              learning: LearningSettings(enabled: true, memoryDir: dir),
+                              processRole: .mainClassicOnly)
+        }
+        do {
+            let svc = service()
+            let sid = svc.startSession()
+            for ch in "shitekudassai" { _ = svc.insert(session: sid, text: String(ch)) }
+            let cands = try XCTUnwrap(svc.typoConvert(session: sid))
+            _ = try XCTUnwrap(svc.commit(session: sid, index: XCTUnwrap(cands.firstIndex(of: "してください"))))
+            svc.endSession(session: sid)
+            svc.prepareForShutdown()
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("memory.louds").path))
+        let restored = service()
+        let sid = restored.startSession()
+        for ch in "shitekudassai" { _ = restored.insert(session: sid, text: String(ch)) }
+        XCTAssertTrue(try XCTUnwrap(restored.convert(session: sid)).contains("してください"))
+        restored.endSession(session: sid)
+        restored.prepareForShutdown()
+    }
+
     /// typoLearn=false のときは合成ペア学習をスキップする（誤読みのままでは浮上しない）。
     func testTypoLearnOffSkipsPairLearning() throws {
         let dir = try makeTempDir()

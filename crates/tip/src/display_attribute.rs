@@ -15,20 +15,21 @@ use windows::Win32::Foundation::{E_INVALIDARG, S_FALSE};
 use windows::Win32::Graphics::Gdi::COLOR_GRAYTEXT;
 use windows::Win32::UI::TextServices::{
     IEnumTfDisplayAttributeInfo, IEnumTfDisplayAttributeInfo_Impl, ITfDisplayAttributeInfo,
-    ITfDisplayAttributeInfo_Impl, ITfDisplayAttributeProvider_Impl, TF_ATTR_INPUT,
+    ITfDisplayAttributeInfo_Impl, ITfDisplayAttributeProvider_Impl, TF_ATTR_INPUT, TF_ATTR_CONVERTED,
     TF_ATTR_TARGET_CONVERTED, TF_CT_SYSCOLOR, TF_DA_COLOR, TF_DA_COLOR_0, TF_DISPLAYATTRIBUTE,
     TF_LS_DOT, TF_LS_SOLID,
 };
 
 use crate::globals::{
     ComObjectGuard, GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_PREDICTION,
-    GUID_DISPLAY_ATTRIBUTE_TARGET,
+    GUID_DISPLAY_ATTRIBUTE_TARGET, GUID_DISPLAY_ATTRIBUTE_CONVERTED,
 };
 
 #[derive(Clone, Copy)]
 enum DisplayAttributeKind {
     Input,
     Target,
+    Converted,
     PredictionGhost,
 }
 
@@ -43,7 +44,7 @@ fn ghost_color() -> TF_DA_COLOR {
 
 fn display_attribute(kind: DisplayAttributeKind) -> TF_DISPLAYATTRIBUTE {
     match kind {
-        DisplayAttributeKind::Input | DisplayAttributeKind::Target => TF_DISPLAYATTRIBUTE {
+        DisplayAttributeKind::Input | DisplayAttributeKind::Target | DisplayAttributeKind::Converted => TF_DISPLAYATTRIBUTE {
             crText: TF_DA_COLOR::default(),
             crBk: TF_DA_COLOR::default(),
             lsStyle: TF_LS_SOLID,
@@ -51,6 +52,8 @@ fn display_attribute(kind: DisplayAttributeKind) -> TF_DISPLAYATTRIBUTE {
             crLine: TF_DA_COLOR::default(),
             bAttr: if matches!(kind, DisplayAttributeKind::Target) {
                 TF_ATTR_TARGET_CONVERTED
+            } else if matches!(kind, DisplayAttributeKind::Converted) {
+                TF_ATTR_CONVERTED
             } else {
                 TF_ATTR_INPUT
             },
@@ -96,6 +99,9 @@ impl UnderlineInfo {
             _guard: ComObjectGuard::new(),
         }
     }
+    pub fn new_converted() -> Self {
+        Self { kind: DisplayAttributeKind::Converted, _guard: ComObjectGuard::new() }
+    }
 }
 
 impl ITfDisplayAttributeInfo_Impl for UnderlineInfo_Impl {
@@ -103,6 +109,7 @@ impl ITfDisplayAttributeInfo_Impl for UnderlineInfo_Impl {
         Ok(match self.kind {
             DisplayAttributeKind::Input => GUID_DISPLAY_ATTRIBUTE,
             DisplayAttributeKind::Target => GUID_DISPLAY_ATTRIBUTE_TARGET,
+            DisplayAttributeKind::Converted => GUID_DISPLAY_ATTRIBUTE_CONVERTED,
             DisplayAttributeKind::PredictionGhost => GUID_DISPLAY_ATTRIBUTE_PREDICTION,
         })
     }
@@ -111,6 +118,7 @@ impl ITfDisplayAttributeInfo_Impl for UnderlineInfo_Impl {
         Ok(BSTR::from(match self.kind {
             DisplayAttributeKind::Input => "nospacekey input",
             DisplayAttributeKind::Target => "nospacekey target clause",
+            DisplayAttributeKind::Converted => "nospacekey converted clause",
             DisplayAttributeKind::PredictionGhost => "nospacekey inline prediction",
         }))
     }
@@ -136,12 +144,13 @@ impl ITfDisplayAttributeInfo_Impl for UnderlineInfo_Impl {
 }
 
 /// 属性情報の総数（既定下線＋選択文節の太下線）。
-const ATTR_COUNT: u32 = 3;
+const ATTR_COUNT: u32 = 4;
 
 fn attr_at(index: u32) -> ITfDisplayAttributeInfo {
     match index {
         0 => UnderlineInfo::new().into(),
         1 => UnderlineInfo::new_target().into(),
+        3 => UnderlineInfo::new_converted().into(),
         _ => UnderlineInfo::new_prediction().into(),
     }
 }
@@ -237,6 +246,8 @@ impl ITfDisplayAttributeProvider_Impl for crate::text_service::TextService_Impl 
                 Ok(UnderlineInfo::new_target().into())
             } else if *guid == GUID_DISPLAY_ATTRIBUTE_PREDICTION {
                 Ok(UnderlineInfo::new_prediction().into())
+            } else if *guid == GUID_DISPLAY_ATTRIBUTE_CONVERTED {
+                Ok(UnderlineInfo::new_converted().into())
             } else {
                 Err(E_INVALIDARG.into())
             }
@@ -247,6 +258,16 @@ impl ITfDisplayAttributeProvider_Impl for crate::text_service::TextService_Impl 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn converted_and_target_attributes_remain_distinct_from_reading() {
+        assert_eq!(display_attribute(DisplayAttributeKind::Input).bAttr, TF_ATTR_INPUT);
+        let converted = display_attribute(DisplayAttributeKind::Converted);
+        assert_eq!(converted.bAttr, TF_ATTR_CONVERTED);
+        assert!(!converted.fBoldLine.as_bool());
+        let target = display_attribute(DisplayAttributeKind::Target);
+        assert_eq!(target.bAttr, TF_ATTR_TARGET_CONVERTED);
+        assert!(target.fBoldLine.as_bool());
+    }
     use windows::Win32::Graphics::Gdi::COLOR_GRAYTEXT;
     use windows::Win32::UI::TextServices::{TF_CT_SYSCOLOR, TF_LS_DOT};
 

@@ -8,6 +8,9 @@
 //! 単一スレッドアパートメント（STA）前提のため、内部状態は `Rc`/`Cell`/`RefCell` で持つ
 //! （Send/Sync は不要）。COM 境界を越えて panic させないこと（IPC/COM 失敗は no-op に潰す）。
 
+use crate::apply_state::{ApplyOutcome, ApplyReport};
+use crate::preedit_apply::PreeditApply;
+use crate::preedit_session::StartOrUpdatePreedit;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
@@ -24,6 +27,7 @@ use windows::Win32::UI::TextServices::{
     ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextView,
     ITfDisplayAttributeProvider, ITfDocumentMgr, ITfEditRecord, ITfEditSession, ITfFnConfigure,
     ITfFnConfigure_Impl, ITfFunction_Impl, ITfKeyEventSink, ITfKeystrokeMgr, ITfLangBarItemButton,
+    ITfMouseSink, ITfMouseTracker,
     ITfLangBarItemMgr, ITfLangBarItemSink, ITfSource, ITfTextEditSink, ITfTextEditSink_Impl,
     ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl,
     ITfTextLayoutSink, ITfTextLayoutSink_Impl, ITfThreadFocusSink, ITfThreadFocusSink_Impl,
@@ -43,11 +47,11 @@ use crate::edit_session::{
     classify_composition_end_error, CancelComposition, CommitText, CommitUndoStart,
     CompositionEndStatus, EndCompositionOnly, FinishPredictionGhost, QueryCaretRect,
     QueryInputScopes, QueryMonitorAnchorRect, ReconvertCapture, ReconvertStart, RestoreText,
-    StartOrUpdatePreedit, StartPredictionGhost,
+    StartPredictionGhost,
 };
 use crate::globals::{
     ComObjectGuard, GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_PREDICTION,
-    GUID_DISPLAY_ATTRIBUTE_TARGET,
+    GUID_DISPLAY_ATTRIBUTE_TARGET, GUID_DISPLAY_ATTRIBUTE_CONVERTED,
 };
 use crate::input_module::{
     apply_presenter_candidate_selection, resolve_absolute_flat_candidate,
@@ -419,68 +423,6 @@ fn plan_start_session(result: std::io::Result<Response>) -> Option<i64> {
     }
 }
 
-/// LLM ワーカーへ移した接続の所有権。接続は UI スレッドの client slot には無いが、
-/// lifecycle 境界で close-on-return を記録しておけば、返却時に古い pipe だけを確実に閉じられる。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LlmClientLease {
-    generation: u64,
-    close_on_return: bool,
-}
-
-impl LlmClientLease {
-    fn new(generation: u64) -> Self {
-        Self {
-            generation,
-            close_on_return: false,
-        }
-    }
-
-    fn close_on_return(mut self) -> Self {
-        self.close_on_return = true;
-        self
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LlmClientReturnPlan {
-    Restore { generation: u64 },
-    DropReturned,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LlmFailureCleanupPlan {
-    DropDisconnected,
-    PreserveCurrent,
-}
-
-/// 古い LLM 接続の返却を現在の UI 接続と混ぜない。lifecycle が終了を要求した lease、
-/// または既に新接続がある場合は、返却値だけを drop して現在の接続には触れない。
-fn llm_client_return_plan(
-    lease: Option<LlmClientLease>,
-    current_generation: Option<u64>,
-) -> LlmClientReturnPlan {
-    match (lease, current_generation) {
-        (
-            Some(LlmClientLease {
-                generation,
-                close_on_return: false,
-            }),
-            None,
-        ) => LlmClientReturnPlan::Restore { generation },
-        _ => LlmClientReturnPlan::DropReturned,
-    }
-}
-
-/// Worker failure owns no usable returned connection. A client established after the worker was
-/// leased belongs to a newer lifecycle and must remain usable.
-fn llm_failure_cleanup_plan(current_generation: Option<u64>) -> LlmFailureCleanupPlan {
-    if current_generation.is_some() {
-        LlmFailureCleanupPlan::PreserveCurrent
-    } else {
-        LlmFailureCleanupPlan::DropDisconnected
-    }
-}
-
 /// IPC failure diagnostics must describe only the response shape / I/O class. `Response` carries
 /// readings, candidates, committed text and predictions, so formatting it with `Debug` would put
 /// user input back into the log even when the caller's normal event is redacted.
@@ -496,8 +438,11 @@ fn response_kind(response: &Response) -> &'static str {
         Response::LiveResult { .. } => "live_result",
         Response::SnapshotResult { .. } => "snapshot_result",
         Response::SnapshotEnhancement { .. } => "snapshot_enhancement",
-        Response::SnapshotEnhancementPending => "snapshot_enhancement_pending",
-        Response::SnapshotEnhancementUnavailable => "snapshot_enhancement_unavailable",
+        Response::SnapshotEnhancementPending { .. } => "snapshot_enhancement_pending",
+        Response::SnapshotEnhancementUnavailable { .. } => "snapshot_enhancement_unavailable",
+        Response::ClauseCandidatesResult { .. } => "clause_candidates_result",
+        Response::ConvertClausesResult { .. } => "convert_clauses_result",
+        Response::CommitReceiptAck { .. } => "commit_receipt_ack",
         Response::LlmResult { .. } => "llm_result",
         Response::Prediction { .. } => "prediction",
         Response::PredictionUnavailable { .. } => "prediction_unavailable",
@@ -636,6 +581,7 @@ fn snapshot_status_action(
         SnapshotStatus::Configured {
             configuration_generation,
             connection_epoch,
+            ..
         } if configuration_generation == current_configuration
             && connection_epoch == current_connection =>
         {
@@ -853,7 +799,8 @@ pub(crate) struct DeferredPredictionPreservedKey {
     ITfThreadFocusSink,
     ITfFnConfigure,
     ITfTextLayoutSink,
-    ITfTextEditSink
+    ITfTextEditSink,
+    ITfMouseSink
 )]
 pub struct TextService {
     pub(crate) tid: Cell<u32>,
@@ -905,8 +852,6 @@ pub struct TextService {
     /// 新しい pipe 接続ごとに進める単調世代。古い LLM lease と新接続を区別する。
     pub(crate) next_client_generation: Cell<u64>,
     pub(crate) engine_session: Cell<i64>,
-    /// LLM worker が所有する接続の lifecycle。終了要求後は返却された client を再利用せず drop する。
-    pub(crate) llm_client_lease: Cell<Option<LlmClientLease>>,
     pub(crate) state: RefCell<InputModule>,
     /// 通常打鍵のIPCだけを所有するbounded worker。STA側の変換sessionとは共有しない。
     pub(crate) background_input: crate::background_input::BackgroundInputWorker,
@@ -942,6 +887,7 @@ pub struct TextService {
     pub(crate) prediction_failed_context: Rc<RefCell<Option<ITfContext>>>,
     /// Some(accept) は終了 edit session の実行待ち／再試行待ち。
     pub(crate) prediction_finish_pending: Rc<Cell<Option<bool>>>,
+    prediction_preserve_selection: Cell<bool>,
     pub(crate) prediction_retry_timer: Cell<usize>,
     pub(crate) prediction_retry_count: Cell<u8>,
     pub(crate) prediction_deferred_preserved: RefCell<VecDeque<DeferredPredictionPreservedKey>>,
@@ -960,6 +906,7 @@ pub struct TextService {
     /// composition lifecycle の世代。focus/pop で pending を捨てた後に届く古い
     /// callback は identity とこの世代境界で無害化する。
     pub(crate) composition_generation: Cell<u64>,
+    pub(crate) preedit_apply: Rc<PreeditApply>,
     pub(crate) pending_end_generation: Cell<u64>,
     /// Test→Key pair だけの世代。composition_generation とは独立で、pending close の
     /// 成功/callback/quarantine では進めず pair を維持し、focus/context/activation 境界
@@ -987,9 +934,26 @@ pub struct TextService {
     pub(crate) da_atom: Cell<u32>,
     /// 文節ナビゲーションの選択文節（太下線）用の表示属性 atom（0=未登録）。
     pub(crate) da_target_atom: Cell<u32>,
+    pub(crate) da_converted_atom: Cell<u32>,
+    pub(crate) display_end_context: RefCell<Option<ITfContext>>,
     /// インライン予測ゴースト属性 atom（0=未登録）。
     pub(crate) da_prediction_atom: Cell<u32>,
     pub(crate) showing: Cell<bool>,
+    pub(crate) local_clauses: RefCell<Option<crate::clause_conversion::ClauseConversion>>,
+    pub(crate) local_clause_redraw_pending: Cell<bool>,
+    pub(crate) local_clause_redraw_deadline: Cell<Option<Instant>>,
+    pub(crate) conversion_queue: RefCell<crate::conversion_queue::ConversionQueue>,
+    pub(crate) conversion_queue_context: RefCell<Option<ITfContext>>,
+    pub(crate) replaying_conversion_queue: Cell<bool>,
+    pub(crate) pending_commit: RefCell<Option<Rc<crate::pending_commit::PendingCommit>>>,
+    pub(crate) composition_end_caret:
+        Rc<RefCell<Option<windows::Win32::UI::TextServices::ITfRange>>>,
+    pub(crate) composition_end_epoch: Rc<Cell<u64>>,
+    pub(crate) composition_end_report: RefCell<Option<Rc<crate::apply_state::ApplyState>>>,
+    #[cfg(feature = "tsf-test-hooks")]
+    pub(crate) commit_fail_attributes: Rc<Cell<bool>>,
+    pub(crate) clause_worker: crate::clause_worker::ClauseWorker,
+    pub(crate) receipt_outbox: RefCell<Option<crate::receipt_outbox::ReceiptOutbox>>,
     /// 文節ナビゲーション（変換中の←/→）のビュー。Some=文節モード中（不変条件:
     /// Some ⇒ showing。候補窓を閉じる/確定する全経路が clear_clause_nav で None に落とす）。
     /// segments の連結が preedit 全体、selected が太下線を引く文節。候補列そのものは
@@ -1025,6 +989,7 @@ pub struct TextService {
     pub(crate) debounce_timer: Cell<usize>,
     /// 遅延 convert 時に edit session を張るための直近 ITfContext。
     pub(crate) current_context: RefCell<Option<ITfContext>>,
+    pub(crate) clause_mouse: RefCell<Option<(ITfMouseTracker, u32, ITfComposition, Rc<Cell<bool>>)>>,
     /// このインスタンス専用エンジンのパイプ名（初回に生成して固定）。
     pub(crate) pipe_name: RefCell<String>,
     /// この活性化中にエンジン起動を既に試みたか（連打での多重起動を防ぐ）。
@@ -1260,7 +1225,6 @@ impl TextService {
             client_generation: Cell::new(None),
             next_client_generation: Cell::new(0),
             engine_session: Cell::new(0),
-            llm_client_lease: Cell::new(None),
             state: RefCell::new(InputModule::default()),
             background_input: crate::background_input::BackgroundInputWorker::start(
                 crate::engine_link::stable_pipe_name(),
@@ -1292,6 +1256,7 @@ impl TextService {
             prediction_slot: RefCell::new(None),
             prediction_failed_context: Rc::new(RefCell::new(None)),
             prediction_finish_pending: Rc::new(Cell::new(None)),
+            prediction_preserve_selection: Cell::new(false),
             prediction_retry_timer: Cell::new(0),
             prediction_retry_count: Cell::new(0),
             prediction_deferred_preserved: RefCell::new(VecDeque::new()),
@@ -1301,6 +1266,7 @@ impl TextService {
             composition_end_status: Rc::new(Cell::new(CompositionEndStatus::Idle)),
             composition_end_retry_count: Rc::new(Cell::new(0)),
             composition_generation: Cell::new(0),
+            preedit_apply: Rc::new(PreeditApply::default()),
             pending_end_generation: Cell::new(0),
             key_pair_generation: Cell::new(0),
             composition_started_signal: Rc::new(Cell::new(false)),
@@ -1310,8 +1276,26 @@ impl TextService {
             left_context: Rc::new(RefCell::new(None)),
             da_atom: Cell::new(0),
             da_target_atom: Cell::new(0),
+            da_converted_atom: Cell::new(0),
+            display_end_context: RefCell::new(None),
             da_prediction_atom: Cell::new(0),
             showing: Cell::new(false),
+            local_clauses: RefCell::new(None),
+            local_clause_redraw_pending: Cell::new(false),
+            local_clause_redraw_deadline: Cell::new(None),
+            conversion_queue: RefCell::new(crate::conversion_queue::ConversionQueue::default()),
+            conversion_queue_context: RefCell::new(None),
+            replaying_conversion_queue: Cell::new(false),
+            pending_commit: RefCell::new(None),
+            composition_end_caret: Rc::new(RefCell::new(None)),
+            composition_end_epoch: Rc::new(Cell::new(0)),
+            composition_end_report: RefCell::new(None),
+            #[cfg(feature = "tsf-test-hooks")]
+            commit_fail_attributes: Rc::new(Cell::new(false)),
+            clause_worker: crate::clause_worker::ClauseWorker::start(
+                crate::engine_link::stable_pipe_name(),
+            ),
+            receipt_outbox: RefCell::new(None),
             clause_nav: RefCell::new(None),
             last_valid_anchor: RefCell::new(None),
             candidate_ui,
@@ -1324,6 +1308,7 @@ impl TextService {
             live_text: RefCell::new(String::new()),
             debounce_timer: Cell::new(0),
             current_context: RefCell::new(None),
+            clause_mouse: RefCell::new(None),
             pipe_name: RefCell::new(String::new()),
             spawn_attempted: Cell::new(false),
             prespawn_failed: Cell::new(false),
@@ -1389,6 +1374,23 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         if self.deactivating.get() {
             tip_log("ev=activate_rejected reason=deactivating");
             return Err(E_FAIL.into());
+        }
+        // A rejected terminal edit must be resolved before a new activation
+        // can reuse its composition slot. No subscriptions exist during retry.
+        if self.thread_mgr.borrow().is_none()
+            && (self.composition.borrow().is_some() || self.prediction_ghost_visible())
+        {
+            let composition = self.composition.borrow().clone();
+            *self.current_context.borrow_mut() =
+                composition.as_ref().and_then(|composition| unsafe {
+                    composition
+                        .GetRange()
+                        .and_then(|range| range.GetContext())
+                        .ok()
+                });
+            self.tid.set(tid);
+            let _guard = DeactivatingGuard::new(&self.deactivating);
+            self.deactivate_inner()?;
         }
         self.consume_started_composition();
         // Activation is a new key lifecycle.  A reservation from a previous activation must
@@ -1538,6 +1540,9 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                 if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_TARGET) {
                     self.da_target_atom.set(atom);
                 }
+                if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_CONVERTED) {
+                    self.da_converted_atom.set(atom);
+                }
                 if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_PREDICTION) {
                     self.da_prediction_atom.set(atom);
                 }
@@ -1662,6 +1667,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
     }
 
     fn Deactivate(&self) -> Result<()> {
+        self.preedit_apply.invalidate();
         // Medium fix: ネスト Deactivate（清算の COM コールアウト中にホストが同期再入する）は
         // 二重清算をしない — 外側の Deactivate が継続中なので即座に戻る（冪等）。
         if self.deactivating.get() {
@@ -1694,7 +1700,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
 enum DeactivateCancelPlan {
     /// composition 無し — 取消不要、そのまま清算へ。
     Nothing,
-    /// composition ありだが所有 context 無し — 取消不能。清算前に中断（再試行可能）。
+    /// composition ありだが所有 context 無し — 文書取消は失敗、サービス資源は清算する。
     AbortNoContext,
     /// 再変換中 — RestoreText で元ラテンを書き戻す cancel_reconvert（do_cancel は原文を消す）。
     CancelReconvert,
@@ -1771,21 +1777,41 @@ impl TextService_Impl {
     }
 
     fn deactivate_inner(&self) -> Result<()> {
+        self.deactivate_with_document_cancel(|| self.cancel_deactivating_document())
+    }
+
+    fn apply_live_preedit(&self, text: &str, apply: impl FnOnce() -> bool) {
+        let applied = apply();
+        if applied {
+            *self.live_text.borrow_mut() = text.to_owned();
+            tip_log("ev=live_snapshot_applied");
+        }
+        self.state.borrow_mut().complete(
+            &crate::input_module::ImmediateOperation::SetPreedit {
+                text: text.to_owned(),
+            },
+            applied,
+        );
+    }
+
+    fn deactivate_with_document_cancel(&self, cancel: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.retire_conversion_owner();
+        let cancellation = cancel();
+        self.release_deactivated_resources(cancellation.is_ok());
+        cancellation
+    }
+
+    fn cancel_deactivating_document(&self) -> Result<()> {
         // 通常 preedit と別 slot の予測ゴーストも、登録解除より前に本文を消して閉じる。
         if !self
             .abandon_prediction_for_context_change(crate::prediction_state::Invalidation::Disabled)
         {
-            tip_log("ev=deactivate_abort reason=prediction_cancel_rejected");
+            tip_log("ev=deactivate_document_cancel_failed reason=prediction_cancel_rejected");
             return Err(E_FAIL.into());
         }
-        // High fix: 取消 preflight を**最初**の操作として行う（unadvise_layout_sink 等の
-        // 不可逆清算より前）。従来は sink/cookie 解除の後に取消を試み、その失敗（context 無し・
-        // edit session 拒否）を無視して composition を強制クリアしていた — 文書に合成が孤児化し、
-        // 再変換中なら reconvert_original ごと消えて元ラテンが復元不能になる。ここでは何も壊す
-        // 前に中断して Err を返す（composition・再変換ラッチ/原文・入力状態・engine/session・
-        // 登録を全保持＝ホストの再 Deactivate で再試行可能）。成功/元々 composition 無しのみが
-        // 続きの清算に進める。通常 composition は current_context、SetText 済みの pending-end
-        // composition は専用 owner context を使う。どちらも無い場合だけ取消不能な例外状態。
+        // Document cancellation precedes resource teardown, but failure only
+        // preserves the composition/restoration material. It never skips teardown.
+        // A committed pending-end composition uses its dedicated owner context.
         let lifecycle_cancel = self
             .state
             .borrow_mut()
@@ -1819,7 +1845,7 @@ impl TextService_Impl {
                 if let Some(operation) = lifecycle_cancel.as_ref() {
                     self.state.borrow_mut().complete(operation, false);
                 }
-                tip_log("ev=deactivate_abort reason=no_context");
+                tip_log("ev=deactivate_document_cancel_failed reason=no_context");
                 return Err(E_FAIL.into());
             }
             (DeactivateCancelPlan::CancelReconvert, Some(ctx)) => {
@@ -1843,19 +1869,26 @@ impl TextService_Impl {
                 if let Some(operation) = lifecycle_cancel.as_ref() {
                     self.state.borrow_mut().complete(operation, false);
                 }
-                tip_log("ev=deactivate_abort reason=cancel_rejected");
+                tip_log("ev=deactivate_document_cancel_failed reason=cancel_rejected");
                 return Err(E_FAIL.into());
             }
         }
         if let Some(operation) = lifecycle_cancel.as_ref() {
             self.state.borrow_mut().complete(operation, true);
         }
+        Ok(())
+    }
+
+    // Resource teardown is unconditional. Failed document edits retain only
+    // their composition and restoration material until the host terminates it
+    // or activation retries it; subscriptions, workers and timers never survive.
+    fn release_deactivated_resources(&self, document_cancelled: bool) {
         self.background_input.request_close();
-        // 取消成功（または元々 composition 無し）だけがここを通れる。edit session
-        // （RestoreText/CancelComposition）が composition を閉じた後の保険として sink 強参照を
-        // 断つ C-2 の解放点 — 失敗経路は上で中断済みなので、composition を None にしてよいのは
-        // この行だけ。
-        *self.composition.borrow_mut() = None;
+        // A failed document edit must retain the handle needed to restore its
+        // text. Successful cancellation can release the remaining sink reference.
+        if document_cancelled {
+            *self.composition.borrow_mut() = None;
+        }
         self.composition_end_pending.set(false);
         *self.composition_end_context.borrow_mut() = None;
         self.composition_end_status
@@ -1948,10 +1981,7 @@ impl TextService_Impl {
         // 張り直された分を最終確認する（巡1と同型の循環参照残存を Deactivate 成功経路でも
         // 残さない。旧配置の「末尾 unadvise が回収する」性質の復元）。
         self.unadvise_layout_sink();
-        // C-2（composition 取消と sink 強参照の解放）は preflight（関数冒頭）へ前方移動した。
-        // 旧位置の「context 無しでも composition を強制クリア」保険は廃止 — 取消に失敗した
-        // 状態でクリアすると文書へ孤児合成を残し再変換元を消失させるので、失敗は何も壊さ
-        // ない Err 中断（再試行可能）に置き換えた（High fix）。
+        // The failed composition, if any, remains isolated from the next activation.
 
         // エンジン接続を破棄する。EndSession の同期往復は送らない — Deactivate は IME 切替時に
         // 切替先プロセスの UI スレッドで走るため、エンジンが多忙（serviceLock 直列化）だと
@@ -1994,9 +2024,11 @@ impl TextService_Impl {
         self.monitor_committed_reading.borrow_mut().clear();
         // SP5: 再変換ラッチも残さない（残ると再活性化後に start_reconvert の
         // 再入ガードに居残り、以降の再変換が不能になる＝awaiting_llm と同じ理由）。
-        self.reconverting.set(false);
-        self.reconvert_original.borrow_mut().clear();
-        self.reconvert_reading.borrow_mut().clear();
+        if document_cancelled {
+            self.reconverting.set(false);
+            self.reconvert_original.borrow_mut().clear();
+            self.reconvert_reading.borrow_mut().clear();
+        }
         // 品質ループ③: 直前確定バッファも持ち越さない（再活性化後の Ctrl+変換が
         // 非活性前の古い確定を記録しないように）。
         *self.last_commit.borrow_mut() = None;
@@ -2080,7 +2112,6 @@ impl TextService_Impl {
 
         *self.thread_mgr.borrow_mut() = None;
         self.tid.set(0);
-        Ok(())
     }
 }
 
@@ -2228,17 +2259,20 @@ impl TextService_Impl {
             tip_log("ev=comp_terminated skipped=stale_generation");
             return Ok(());
         }
+        self.preedit_apply.invalidate();
         // SetText 済みで close-only 再試行待ちだった composition の終了通知。本文確定後の
         // InputState は呼出し側が既に次状態へ進めているため、通常の放棄 reset を掛けず handle と
         // marker だけを清算する（部分確定の残り読みも巻き添えにしない）。
         if self.composition_end_pending.get() {
             let owner_ctx = self.composition_end_context.borrow().clone();
+            let retired_caret = self.composition_end_caret.borrow_mut().take();
             *self.composition.borrow_mut() = None;
             self.composition_end_pending.set(false);
             *self.composition_end_context.borrow_mut() = None;
             self.composition_end_status
                 .set(CompositionEndStatus::Closed);
             self.composition_end_retry_count.set(0);
+            drop(retired_caret);
             // TestKeyDown と KeyDown の間に pending callback が入っても、ここでは key-pair
             // slot/generation に触れない。次の matching KeyDown が一度だけ消費する。
             // commit_and_reset 済みの idle ephemeral だけをここで direct へ戻す。部分確定中は
@@ -2291,6 +2325,8 @@ impl TextService_Impl {
     /// （`OnCompositionTerminated` と、別ウィンドウへのフォーカス喪失 `OnSetFocus` で共有）。
     /// 文書側はホストが既に確定/破棄済みなので、ここでは cancel/commit はせず**自分の状態だけ**畳む。
     pub(crate) fn reset_abandoned_composition(&self) {
+        self.retire_conversion_owner();
+        self.preedit_apply.invalidate();
         self.background_input.request_close();
         // 放棄時点で LLM(Tab変換)が in-flight だったか（client がワーカへ move 済みか）を、
         // state.reset() が phase を畳む前に捕まえる。awaiting_llm ⟺ client はワーカ側。
@@ -2378,6 +2414,7 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         Ok(())
     }
     fn OnPushContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
+        self.preedit_apply.invalidate();
         self.consume_started_composition();
         // 巡4 T6: refresh_layout_sink_target の Advise/UnadviseSink コールアウト中に同期再入しうる
         // 入口 — 保護なし入口の panic は shim 越えで abort するため、他入口と同じ規律で包む。
@@ -2402,6 +2439,7 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         }
     }
     fn OnPopContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
+        self.preedit_apply.invalidate();
         self.consume_started_composition();
         // 巡4 T6: OnPushContext と同じ規律。
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2461,6 +2499,12 @@ impl TextService_Impl {
         let new_focus_ctx = new_focus
             .as_ref()
             .and_then(|doc| unsafe { doc.GetTop() }.ok());
+        self.preedit_apply.retain_context(new_focus_ctx.as_ref());
+        // A host can end an already-written composition before this focus
+        // callback. Accepted suffix input still belongs to the original field.
+        if self.conversion_queue_context_changed(new_focus_ctx.as_ref()) {
+            self.retire_conversion_owner();
+        }
         // DocumentMgr ではなく top context で比較する。同じ document manager が
         // 複数の編集欄を再利用するホストでも、欄Aの文脈／failure を欄Bへ持ち越さない。
         let prediction_field = self
@@ -2536,6 +2580,7 @@ impl ITfThreadFocusSink_Impl for TextService_Impl {
     /// 非フォーカスなので、should_abandon の focus_is_our_doc=false 相当で判定する。
     /// 巡3 P2: 同期再入しうる入口 — OnSetFocus と同じ入口保護を通す（shim 越え abort 防止）。
     fn OnKillThreadFocus(&self) -> Result<()> {
+        self.preedit_apply.invalidate();
         self.consume_started_composition();
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.on_kill_thread_focus_inner()
@@ -2554,6 +2599,9 @@ impl ITfThreadFocusSink_Impl for TextService_Impl {
 
 impl TextService_Impl {
     fn on_kill_thread_focus_inner(&self) -> Result<()> {
+        if self.conversion_queue_context_changed(None) {
+            self.retire_conversion_owner();
+        }
         // 巡1検証G2: 前面（スレッド）フォーカス喪失でも旧 context のアンカー保持を破棄 —
         // クロスプロセス前面化では OnSetFocus が届かないことがあるため（password と同じ理屈）。
         // Cross-process focus loss invalidates the pair even when there is no active composition.
@@ -2747,6 +2795,7 @@ impl TextService_Impl {
                 session,
                 proto,
                 boot,
+                ..
             }) => {
                 // version handshake は接続確立時（fresh StartSession）にだけ効かせる。proto はエンジン
                 // プロセスの属性で、一度確立した接続の途中では変わらないため、既存接続に StartSession を
@@ -3125,13 +3174,8 @@ impl TextService_Impl {
         // 接続世代が変わる = anchor の変換結果は旧接続の産物。preedit は書き換えないが、
         // 次打鍵から継ぎ足しに使わせない（Enter で現在表示のまま確定できる）。
         self.state.borrow_mut().invalidate_live_display();
-        let dropped_client = self.client.borrow_mut().take().is_some();
+        self.client.borrow_mut().take();
         self.client_generation.set(None);
-        if !dropped_client {
-            if let Some(lease) = self.llm_client_lease.get() {
-                self.llm_client_lease.set(Some(lease.close_on_return()));
-            }
-        }
         self.engine_session.set(0);
         // 巡4 T5: busy 再送タイマも接続と運命を共にする — 旧接続向けの再送が残っていると
         // 新接続確立後に重複 ReloadConfig を送る。予算は次の start_and_store で数え直す。
@@ -3350,11 +3394,9 @@ impl TextService_Impl {
         }
     }
 
-    /// 変換候補を要求する。失敗なら None（劣化）し接続を破棄する。
-    pub(crate) fn engine_convert(&self) -> Option<Vec<String>> {
-        if !self.reanchor_engine_from_local() {
-            return None;
-        }
+    /// Reconvert/undo owns a captured reading, independent of the current input journal.
+    fn engine_convert_reading(&self, reading: &str) -> Option<(String, Vec<String>)> {
+        let kana = self.engine_insert(reading, InsertStyle::Kana)?;
         if !self.prepare_send_or_drop("convert", IPC_TIMEOUT_CONVERT) {
             return None;
         }
@@ -3386,7 +3428,7 @@ impl TextService_Impl {
             r
         };
         match result {
-            Ok(Response::Candidates { candidates }) => Some(candidates),
+            Ok(Response::Candidates { candidates }) => Some((kana, candidates)),
             other => {
                 tip_log(&engine_failure_event("convert", &other));
                 tip_log("ev=degraded reason=convert_failed");
@@ -3740,6 +3782,7 @@ impl TextService_Impl {
     /// Space/Enter で SP1 候補フローに任せる（既存タイマがあれば畳むだけ）。
     pub(crate) fn arm_debounce(&self) {
         self.disarm_debounce();
+        if self.local_clauses.borrow().is_some() && !self.partial_preedit_redraw_pending.get() { return; }
         if !self.live_enabled.get() && !self.partial_preedit_redraw_pending.get() {
             return;
         }
@@ -3804,6 +3847,7 @@ impl TextService_Impl {
     /// text_mismatch・NoBuffer・TooLong → disarm／CompositionOpen → 維持（no-op）。
     /// ログは長さのみ（確定本文を出さない — I-3）。
     pub(crate) fn start_commit_undo(&self, ctx: &ITfContext) {
+        self.preedit_apply.invalidate();
         // 前回確定の EndComposition だけが保留なら先に close-only で回収する。本文は既に
         // SetText 済みなので、ここで新しい composition を重ねてはいけない。
         if !self.finish_pending_composition(ctx) {
@@ -3890,8 +3934,7 @@ impl TextService_Impl {
         self.engine_end_session();
         self.ensure_engine();
         self.ensure_session();
-        let _ = self.engine_insert(&reading, InsertStyle::Kana);
-        let cands = self.engine_convert().unwrap_or_default();
+        let cands = self.engine_convert_reading(&reading).map(|(_, candidates)| candidates).unwrap_or_default();
         if cands.is_empty() {
             // 空結果: cancel_reconvert が reconvert_original（=確定文字列）を書き戻して畳む無害離脱。
             self.cancel_reconvert(ctx);
@@ -3908,7 +3951,7 @@ impl TextService_Impl {
         ));
     }
 
-    /// Tab: 現在の読みを外部LLMへ。接続をワーカへ move し、preedit を「変換中…」にして
+    /// Tab: 現在の読みを外部LLMへ。専用ワーカに読みを渡し、preedit を「変換中…」にして
     /// 入力ロック（AwaitingLlm）。UI スレッドはポーリングタイマで結果を受け取る。
     pub(crate) fn start_llm_convert(&self, ctx: &ITfContext) {
         // 外部LLM変換が無効(フィーチャーフラグ off)なら何もしない（呼び元でも弾くが多重防御）。
@@ -3926,30 +3969,26 @@ impl TextService_Impl {
             tip_log("ev=llm_skip_empty_text");
             return;
         }
-        // 接続を取り出して move（無ければ劣化＝何もしない）。
-        let (client, generation) = match self.client.borrow_mut().take() {
-            Some(c) => (
-                c,
-                self.client_generation
-                    .replace(None)
-                    .expect("stored client has a generation"),
-            ),
-            None => {
-                tip_log("ev=llm_no_client");
+        if self.explicit_snapshot_pending.get() {
+            if !self.conversion_queue.borrow_mut().supersede_calculation() {
+                self.show_conversion_queue_notice(ctx, "未処理入力があります。処理完了後に変換してください");
                 return;
             }
-        };
-        self.llm_client_lease
-            .set(Some(LlmClientLease::new(generation)));
-        let session = self.engine_session.get();
+            self.cancel_explicit_snapshot_wait();
+            tip_log("ev=llm_supersede_pending");
+        }
+        let segments = self.state.borrow().canonical_segments();
+        if segments.is_empty() { return; }
+        let pipe = self.engine_pipe_name();
         *self.pre_llm_text.borrow_mut() = self.live_text.borrow().clone();
         *self.current_context.borrow_mut() = Some(ctx.clone());
-        // 修正候補窓が出ていれば閉じる（その上に「変換中…」を出さない）。input_char と同じ片付け。
-        if self.showing.get() {
-            self.candidate_ui.borrow_mut().hide();
-            self.showing.set(false);
-            self.clear_clause_nav();
-        }
+        // Local candidate windows deliberately do not use the legacy showing flag.
+        // Retire both kinds of UI before replacing the preedit with the LLM status.
+        self.showing.set(false);
+        self.clause_nav.borrow_mut().take();
+        self.state.borrow_mut().handle(ModuleEvent::Candidates(ModuleCandidateEvent::Closed));
+        if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+        self.candidate_ui.borrow_mut().hide();
         let seq = self.state.borrow_mut().bump_llm_seq();
         self.state.borrow_mut().set_awaiting_llm(true);
         self.llm_started.set(Some(std::time::Instant::now())); // タイムアウト計測の起点
@@ -3960,14 +3999,14 @@ impl TextService_Impl {
         *self.llm_slot.borrow_mut() = Some(slot.clone());
         let left_context = self.left_context.borrow().clone();
         // ワーカ上限 30s: UI の LLM_TIMEOUT(8s) 打ち切り後もエンジン側タイムアウト応答
-        // （llm_timeout_ms 既定 15s の Error）は受け取って接続を正常返却できる長さ。
+        // （llm_timeout_ms 既定 15s の Error）を受け取れる長さ。
         // これを超える無応答は接続破棄（B10: 無期限ブロックでワーカ/エンジン接続スレッドを
         // 永久占有しない）。
         // 巡3 P6: スレッド生成失敗（OS 資源枯渇）は panic させない — awaiting_llm=true の
         // まま poll 未武装で入力ロックが残る。arm_llm_poll 失敗と同じ abort_llm 劣化へ。
         if spawn_llm_worker(
-            client,
-            session,
+            pipe,
+            segments,
             seq,
             left_context,
             slot,
@@ -3985,7 +4024,7 @@ impl TextService_Impl {
             self.abort_llm("poll_arm_failed");
             return;
         }
-        tip_log(&format!("ev=llm_request seq={seq} session={session}"));
+        tip_log(&format!("ev=llm_request seq={seq}"));
     }
 
     /// LLM ポーリングタイマを武装する。失敗（タイマ資源枯渇。稀）は false — 呼び出し側は
@@ -4012,18 +4051,8 @@ impl TextService_Impl {
         }
     }
 
-    /// LLM 待機を中断する共通経路（Esc 手動取消・タイムアウト共用）。世代を進めて in-flight
-    /// 結果を確実に stale 化し、入力ロック（AwaitingLlm）を解除、ポーリング/スロット/起点時刻を
-    /// 片付け、接続を捨てて読み preedit へ復元する。これが無いと、応答が来ないエンジンでは
-    /// `awaiting_llm()` が永久に真のまま残り、IME 全体がフリーズする。
-    ///
-    /// 注意: 接続（EngineClient）はワーカスレッドへ move 済みで、エンジンが真に無応答の場合は
-    /// ワーカが read でブロックしたままになりうる（スレッド/ハンドルのリーク）。これを避けるため、
-    /// spawn したエンジンを Child ハンドル経由で kill して pipe を壊し、ブロック中のワーカ read を
-    /// 即座に失敗させてスレッド/ハンドルを回収する（L-5）。あわせて pipe_name を破棄し、次打鍵の
-    /// `ensure_engine` が stable_pipe_name で同名パイプに再接続できるようにする（engine は永続
-    /// singleton — pipe_name のキャッシュを空にするのは engine_pipe_name に再計算させるためで、
-    /// 名前自体は logon session 固定で変わらない）。
+    /// Retire the result slot and restore the pre-request surface. The worker owns its
+    /// bounded connection; cancelling it must not close a newer STA connection.
     pub(crate) fn abort_llm(&self, reason: &str) {
         {
             let mut st = self.state.borrow_mut();
@@ -4033,12 +4062,6 @@ impl TextService_Impl {
         self.disarm_llm_poll();
         *self.llm_slot.borrow_mut() = None;
         self.llm_started.set(None);
-        self.pipe_name.borrow_mut().clear(); // キャッシュを空にし、次回 engine_pipe_name に同名で再解決させる
-                                             // 共有 engine は殺さない（他ホストが接続中の永続 singleton。旧 oneShot 専用 engine 時代の kill を
-                                             // ここで行うと設定アプリ等を巻き込んで変換不可にする）。drop_engine が Child ハンドルを手放す
-                                             // （プロセス継続）。ブロック中の LLM worker は engine 応答で自然完了し、戻った接続は stale 化済みで
-                                             // drop される＝その1接続のみ閉じ engine は生存。真にハングした稀ケースは worker リークを許容する。
-        self.drop_engine();
         let ctx = self.current_context.borrow().clone();
         self.restore_pre_llm(ctx);
         tip_log(&format!("ev=llm_abort reason={reason}"));
@@ -4052,27 +4075,23 @@ impl TextService_Impl {
             .unwrap_or(false)
     }
 
-    /// ワーカ結果を UI スレッドで反映する。seq 最新かつ成功なら適用、古い/空/失敗なら pre-LLM へ復元。
+    /// 最新の待機にだけ結果を反映する。空/失敗なら pre-LLM へ復元する。
     pub(crate) fn on_llm_outcome(&self, o: LlmOutcome) {
+        let current = self.state.borrow().llm_seq;
+        if !is_fresh_live(o.seq, current) || !self.state.borrow().awaiting_llm() {
+            return;
+        }
         self.state.borrow_mut().set_awaiting_llm(false);
         self.llm_started.set(None);
         let ctx = self.current_context.borrow().clone();
-        let current = self.state.borrow().llm_seq;
-        let fresh = is_fresh_live(o.seq, current);
-        let current_generation = self.client_generation.get();
-        if let Some(client) = o.client {
-            match llm_client_return_plan(self.llm_client_lease.replace(None), current_generation) {
-                LlmClientReturnPlan::Restore { generation } => {
-                    self.client_generation.set(Some(generation));
-                    *self.client.borrow_mut() = Some(client);
-                }
-                LlmClientReturnPlan::DropReturned => drop(client),
-            }
-        } else {
-            self.llm_client_lease.set(None);
-        }
         match o.result {
-            Ok(text) if fresh && !text.is_empty() => {
+            Ok(text) if !text.is_empty() => {
+                let accepted = self.local_clauses.borrow_mut().as_mut()
+                    .map_or(true, |model| model.replace_whole_surface(text.clone()));
+                if !accepted {
+                    self.restore_pre_llm(ctx);
+                    return;
+                }
                 *self.live_text.borrow_mut() = text.clone();
                 self.state.borrow_mut().invalidate_live_display();
                 if let Some(ctx) = ctx {
@@ -4081,7 +4100,7 @@ impl TextService_Impl {
                 tip_log(&format!("ev=llm_applied seq={}", o.seq));
             }
             Ok(_) => {
-                // 古い seq（Esc等）or 空 → 接続を戻し pre-LLM へ復元。
+                // 空結果は pre-LLM へ復元。古い結果は上のガードで捨てる。
                 self.restore_pre_llm(ctx);
                 tip_log(&format!(
                     "ev=llm_stale_or_empty seq={} current={}",
@@ -4089,14 +4108,6 @@ impl TextService_Impl {
                 ));
             }
             Err(_) => {
-                // Worker が失敗した時点で返却 client は無い。新しい lifecycle が既に接続を
-                // 作っていたらそれは落とさず、worker が所有していた切断済み接続だけを清算する。
-                if matches!(
-                    llm_failure_cleanup_plan(current_generation),
-                    LlmFailureCleanupPlan::DropDisconnected
-                ) {
-                    self.drop_engine();
-                }
                 self.restore_pre_llm(ctx);
                 tip_log("ev=llm_failed");
             }
@@ -4136,7 +4147,7 @@ impl TextService_Impl {
             self.arm_partial_preedit_redraw_retry();
             return;
         }
-        if !self.live_enabled.get() {
+        if !self.live_enabled.get() || self.local_clauses.borrow().is_some() {
             return;
         }
         let configuration = self.configuration_generation.get();
@@ -4168,6 +4179,10 @@ impl TextService_Impl {
     }
 
     pub(crate) fn begin_explicit_snapshot_wait(&self) {
+        let reading = self.state.borrow().canonical_reading().to_string();
+        self.conversion_queue
+            .borrow_mut()
+            .begin(Instant::now(), Some(reading));
         self.explicit_snapshot_pending.set(true);
         self.explicit_status_deadline
             .set(Some(Instant::now() + EXPLICIT_STATUS_DELAY));
@@ -4222,6 +4237,15 @@ impl TextService_Impl {
             self.behavior_outbox.borrow_mut().take();
             self.selection_dirty.set(false);
         }
+    }
+
+    pub(crate) fn show_conversion_queue_notice(&self, context: &ITfContext, message: &str) {
+        let anchor = self.caret_point(context);
+        let theme = self.appearance.borrow_mut().current_theme();
+        self.candidate_ui
+            .borrow_mut()
+            .show(&[message.to_string()], 0, anchor, theme);
+        self.explicit_status_visible.set(true);
     }
 
     fn show_explicit_snapshot_status_if_due(&self) {
@@ -4280,7 +4304,13 @@ impl TextService_Impl {
                     .desired_snapshot_configuration_generation(),
             );
         let Some(interval) = snapshot_poll_interval(
-            self.live_result_deadline.get().is_some(),
+            self.live_result_deadline.get().is_some()
+                || self.local_clause_loading()
+                || self.local_clause_redraw_deadline.get().is_some()
+                || self.display_end_context.borrow().is_some()
+                || self.conversion_queue.borrow().waiting
+                || self.clause_worker.learning_pending()
+                || self.receipt_outbox.borrow().as_ref().is_some_and(|outbox| outbox.pending()),
             self.snapshot_configuration_pending.get(),
             monitor_configured_link,
         ) else {
@@ -4316,13 +4346,21 @@ impl TextService_Impl {
         }
     }
 
+    pub(crate) fn arm_clause_poll(&self) {
+        self.arm_snapshot_poll_timer();
+    }
+
     fn finish_live_result_wait(&self) {
         self.live_result_deadline.set(None);
         self.arm_snapshot_poll_timer();
     }
 
     fn disarm_snapshot_poll_if_idle(&self) {
-        if !self.snapshot_configuration_pending.get() && self.live_result_deadline.get().is_none() {
+        if !self.snapshot_configuration_pending.get() && self.live_result_deadline.get().is_none()
+            && self.local_clause_redraw_deadline.get().is_none()
+            && self.display_end_context.borrow().is_none()
+            && !self.clause_worker.learning_pending()
+            && !self.receipt_outbox.borrow().as_ref().is_some_and(|outbox| outbox.pending()) {
             self.disarm_live_result_poll();
         }
     }
@@ -4346,7 +4384,16 @@ impl TextService_Impl {
     }
 
     fn poll_live_result(&self) {
+        let capacity_context = self.display_end_context.borrow_mut().take();
+        if let Some(context) = capacity_context { self.end_display_at_capacity(&context); }
+        self.poll_receipt_notice();
+        self.poll_local_clause_redraw();
+        self.poll_local_clause_results();
         while let Some(status) = self.background_input.try_snapshot_status() {
+            let learning_identity = match &status {
+                crate::background_input::SnapshotStatus::Configured { learning_identity, .. } => learning_identity.clone(),
+                _ => None,
+            };
             let current_configuration = self.configuration_generation.get();
             let current_connection = self.background_input.connection_generation();
             let composing = self.state.borrow().composing;
@@ -4362,6 +4409,7 @@ impl TextService_Impl {
                 SnapshotStatusAction::Configured {
                     schedule_conversion,
                 } => {
+                    self.apply_configured_learning_identity(learning_identity);
                     self.acknowledged_configuration_generation
                         .set(current_configuration);
                     self.acknowledged_snapshot_connection_generation
@@ -4382,6 +4430,7 @@ impl TextService_Impl {
                     }
                 }
                 SnapshotStatusAction::Invalidated => {
+                    self.apply_configured_learning_identity(None);
                     self.acknowledged_configuration_generation.set(0);
                     self.acknowledged_snapshot_connection_generation.set(0);
                     self.snapshot_configuration_pending.set(
@@ -4398,6 +4447,7 @@ impl TextService_Impl {
                     actual,
                     actual_boot,
                 } => {
+                    self.apply_configured_learning_identity(None);
                     self.acknowledged_configuration_generation.set(0);
                     self.acknowledged_snapshot_connection_generation.set(0);
                     self.apply_snapshot_ui_wait_state(snapshot_ui_version_mismatch(
@@ -4431,13 +4481,46 @@ impl TextService_Impl {
             ) {
                 continue;
             }
-            if result.purpose == crate::input_module::SnapshotPurpose::Explicit
-                && result.candidates.as_ref().is_none_or(Vec::is_empty)
+            if result.enhancement
+                && self
+                    .local_clauses
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|m| m.user_driven)
             {
-                self.explicit_snapshot_pending.set(false);
-                self.explicit_status_deadline.set(None);
-                self.hide_explicit_snapshot_status();
-                self.finish_live_result_wait();
+                continue;
+            }
+            let local_snapshot = if result.purpose == crate::input_module::SnapshotPurpose::Explicit
+            {
+                crate::clause_conversion::ClauseConversion::from_snapshot(
+                    ipc::clause::SnapshotIdentity {
+                        composition: result.identity.composition,
+                        revision: result.identity.revision,
+                        configuration_generation: result.identity.configuration_generation,
+                        connection_generation: result.identity.connection_generation,
+                    },
+                    result.baseline,
+                    result.clause_data.clone(),
+                    &result.text,
+                )
+                .ok()
+                .map(|mut model| {
+                    model.learning_identity = result.learning_identity.clone();
+                    if let Some(outbox) = self.receipt_outbox.borrow().as_ref() {
+                        outbox.invalidate_model(&mut model);
+                    }
+                    model
+                })
+                .filter(|model| {
+                    model.reading
+                        == ipc::clause::normalize_reading(self.state.borrow().canonical_reading())
+                })
+            } else {
+                None
+            };
+            if result.purpose == crate::input_module::SnapshotPurpose::Explicit
+                && local_snapshot.is_none()
+            {
                 continue;
             }
             if let Some(proposal) = result.auto_commit.clone() {
@@ -4473,7 +4556,7 @@ impl TextService_Impl {
                         Some(result.candidate_remaining.unwrap_or_default());
                     crate::input_module::EngineResult::ExplicitSnapshot {
                         identity: result.identity,
-                        candidates: result.candidates.unwrap_or_default(),
+                        candidates: vec![result.text.clone()],
                     }
                 }
             };
@@ -4483,16 +4566,33 @@ impl TextService_Impl {
                 .handle(crate::input_module::InputEvent::Engine(engine_result));
             match output.immediate {
                 Some(crate::input_module::ImmediateOperation::SetPreedit { text }) => {
-                    *self.live_text.borrow_mut() = text.clone();
-                    if let Some(context) = self.current_context.borrow().clone() {
-                        self.run_preedit(&context, &self.widen_display_text(&text));
-                    }
+                    let context = self.current_context.borrow().clone();
+                    self.apply_live_preedit(&text, || {
+                        context.as_ref().is_some_and(|context| {
+                            self.run_preedit(context, &self.widen_display_text(&text))
+                        })
+                    });
                 }
                 Some(crate::input_module::ImmediateOperation::ShowCandidates {
                     values,
                     selected,
                     ..
                 }) => {
+                    if let Some(model) = local_snapshot {
+                        *self.local_clauses.borrow_mut() = Some(model);
+                        self.hide_explicit_snapshot_status();
+                        let context = self.current_context.borrow().clone();
+                        if let Some(context) = context.as_ref() {
+                            self.render_local_edit(context);
+                        }
+                        self.explicit_snapshot_pending.set(false);
+                        self.explicit_status_deadline.set(None);
+                        self.conversion_queue.borrow_mut().resolved();
+                        if let Some(context) = context {
+                            self.drain_conversion_actions(&context);
+                        }
+                        continue;
+                    }
                     *self.explicit_snapshot_candidate_remaining.borrow_mut() =
                         accepted_candidate_remaining.unwrap_or_default();
                     let Some(context) = self.current_context.borrow().clone() else {
@@ -4517,6 +4617,16 @@ impl TextService_Impl {
         {
             self.finish_live_result_wait();
             self.state.borrow_mut().invalidate_live_snapshot();
+            // P1(clause-nav): explicit snapshot 応答の永久欠落（タイムアウト）で待ちを
+            // 解除する。finish_live_result_wait は deadline しか消さず、poll は pending を
+            // 監視条件に含むため、ここで解除しないと pending が残り←→を食い続ける
+            // （P1 の保護は「待ちが成功するまで」で、失敗後は従来動作へ戻す）。
+            if self.explicit_snapshot_pending.get() {
+                self.explicit_snapshot_pending.set(false);
+                self.explicit_status_deadline.set(None);
+                self.hide_explicit_snapshot_status();
+                self.disarm_snapshot_poll_if_idle();
+            }
         }
         self.show_explicit_snapshot_status_if_due();
         self.arm_snapshot_poll_timer();
@@ -4559,7 +4669,8 @@ impl TextService_Impl {
             )
         };
         match result {
-            Ok(_) => {} // 記録は best-effort のため明示的なError応答も変換本体へ波及させない。
+            Ok(Response::Ok) => tip_log("ev=reconvert_correction_ack"),
+            Ok(_) => {} // 記録拒否は変換本体へ波及させない。
             Err(_) => {
                 tip_log("ev=degraded reason=record_correction_failed");
                 self.drop_engine();
@@ -4905,6 +5016,7 @@ impl TextService_Impl {
             self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
             return false;
         }
+        self.prediction_preserve_selection.set(false);
         if self.prediction_failed_for(ctx)
             || self.da_prediction_atom.get() == 0
             || self.composition.borrow().is_some()
@@ -5055,6 +5167,7 @@ impl TextService_Impl {
             editing: Rc::clone(&self.prediction_editing),
             failure_context: Rc::clone(&self.prediction_failed_context),
             pending: Rc::clone(&self.prediction_finish_pending),
+            preserve_selection: self.prediction_preserve_selection.get(),
             accept,
             _guard: ComObjectGuard::new(),
         }
@@ -5119,6 +5232,7 @@ impl TextService_Impl {
     }
 
     fn invalidate_prediction_after_external_edit(&self) {
+        self.prediction_preserve_selection.set(true);
         self.invalidate_prediction(crate::prediction_state::Invalidation::SelectionChanged);
         if !self.prediction_ghost_visible() {
             *self.prediction_context.borrow_mut() = None;
@@ -5153,7 +5267,7 @@ impl TextService_Impl {
         true
     }
 
-    /// preedit を `text` にする編集セッションを同期実行する。失敗は no-op。
+    /// preeditの本文適用を返す。装飾修復待ちでも本文適用済みならtrue。
     pub(crate) fn run_preedit(&self, ctx: &ITfContext, text: &str) -> bool {
         self.run_preedit_with_target(ctx, text, None)
     }
@@ -5192,7 +5306,9 @@ impl TextService_Impl {
         } else {
             text
         };
-        let applied = self.run_preedit(ctx, &self.widen_display_text(&shown));
+        let applied = self
+            .apply_preedit_with_target(ctx, &self.widen_display_text(&shown), None)
+            .fully_applied();
         let redrawn =
             applied && self.composition.borrow().is_some() && !self.composition_end_pending.get();
         if redrawn {
@@ -5210,42 +5326,131 @@ impl TextService_Impl {
         text: &str,
         target: Option<(usize, usize)>,
     ) -> bool {
+        self.apply_preedit_with_target(ctx, text, target)
+            .body_applied()
+    }
+
+    pub(crate) fn apply_preedit_with_target(
+        &self,
+        ctx: &ITfContext,
+        text: &str,
+        target: Option<(usize, usize)>,
+    ) -> ApplyReport {
+        // A retained Commit owns this display identity and its frozen body.
+        // Background preedit work cannot replace it before queue acknowledgement.
+        if self.pending_commit.borrow().is_some() {
+            return ApplyReport::default();
+        }
         // 前回確定は SetText 済みなので、EndComposition の再試行に失敗したまま同じ range を
         // preedit で上書きしない。次打鍵では累積済み text を渡して再試行できる。
         if !self.finish_pending_composition(ctx) {
             tip_log("ev=preedit_rejected reason=pending_end");
-            return false;
+            return ApplyReport::default();
+        }
+        if self.preedit_apply.needs_end() {
+            if self.composition.borrow().is_none() {
+                self.preedit_apply.restart_after_end();
+            } else {
+                *self.display_end_context.borrow_mut() = Some(ctx.clone());
+                self.arm_clause_poll();
+                return ApplyReport::default();
+            }
         }
         // atom 未登録（RegisterGUID 失敗）で target を渡すと、sub-range へ atom 0
         // （TF_INVALID_GUIDATOM）を SetValue して既定下線ごと消す — 太下線を諦め区間を
         // 渡さない方が「選択文節だけ下線が無い」より良い劣化。
         let target = target.filter(|_| self.da_target_atom.get() != 0);
         let sink: ITfCompositionSink = self.to_interface();
+        let composition = self.composition.borrow().clone();
+        // Derive caret only by a forward mapping from the reading. Converted
+        // surfaces have no invertible correspondence to reading positions.
+        let reading_caret = {
+            let state = self.state.borrow();
+            let editing = self.local_clauses.borrow().as_ref()
+                .is_none_or(|model| model.mode == crate::clause_conversion::OperationMode::Editing);
+            (state.composing && (state.notation_fixed.is_none()
+                || state.notation_fixed == Some(crate::keymap::Notation::Hiragana))
+                && editing && !self.showing.get())
+                .then(|| (state.canonical_reading().to_owned(), state.reading_cursor()))
+        };
+        let mixed_caret = {
+            let state = self.state.borrow();
+            self.local_clauses.borrow().as_ref().and_then(|model| {
+                let (start, end) = model.editing_range()?;
+                if model.text() != text { return None; }
+                let cursor = state.reading_cursor().max(start).min(end);
+                let prefix: String = model.reading.chars().skip(start.0 as usize).take((cursor.0 - start.0) as usize).collect();
+                let before: usize = model.clauses.iter().take_while(|clause| clause.start < start)
+                    .map(|clause| clause.surface.encode_utf16().count()).sum();
+                u32::try_from(before + prefix.encode_utf16().count()).ok().map(ipc::clause::DisplayUtf16Position)
+            })
+        };
+        let caret = mixed_caret.or_else(|| reading_caret.and_then(|(reading, cursor)| {
+            if self.widen_display_text(&reading) != text { return None; }
+            let prefix: String = reading.chars().take(cursor.0 as usize).collect();
+            u32::try_from(self.widen_display_text(&prefix).encode_utf16().count()).ok()
+                .map(ipc::clause::DisplayUtf16Position)
+        }));
+        let converted = self.local_clauses.borrow().as_ref().filter(|model|
+            model.text() == text && self.da_converted_atom.get() != 0).map_or_else(Vec::new, |model| {
+                let mut offset = 0;
+                model.clauses.iter().filter_map(|clause| {
+                    let start = offset;
+                    let len = clause.surface.encode_utf16().count();
+                    offset += len;
+                    (!matches!(clause.source, crate::clause_conversion::SurfaceSource::Reading)).then_some((start, len))
+                }).collect()
+            });
+        let request = self.preedit_apply.request_display(ctx, composition, text, target, caret, converted);
+        if request.state.outcome() == ApplyOutcome::Deferred {
+            return request.state.report();
+        }
+        request.state.prepare_request();
         let session_obj: ITfEditSession = StartOrUpdatePreedit {
-            context: ctx.clone(),
-            text: HSTRING::from(text),
+            #[cfg(feature = "tsf-test-hooks")]
+            faults: Rc::new(crate::preedit_session::PreeditFaults::default()),
+            on_complete: |request| {
+                let text_applied = request.state.take_text_applied();
+                tip_log(&format!("ev=preedit_complete operation={} outcome={:?} text_applied={text_applied} stale={}",
+                    request.identity.operation_id, request.state.outcome(), request.state.stale()));
+            },
+            capture_left_context: crate::edit_session::read_left_context,
+            apply: Rc::clone(&self.preedit_apply),
+            request: Rc::clone(&request),
             sink,
             da_variant: self.da_variant(),
-            target,
             da_target_variant: self.da_target_variant(),
+            da_converted_variant: VARIANT::from(self.da_converted_atom.get() as i32),
             composition: Rc::clone(&self.composition),
             started: Rc::clone(&self.composition_started_signal),
             left_context_out: Rc::clone(&self.left_context),
             _guard: ComObjectGuard::new(),
         }
         .into();
-        let applied = unsafe {
-            // 巡4 T4: 表示系の失敗は状態破棄を伴わないため early-return 不要だが、黙らない —
-            // preedit が文書へ反映されない不整合の診断用に phrSession 判定のログを残す。
-            match ctx.RequestEditSession(
+        let result = unsafe {
+            ctx.RequestEditSession(
                 self.tid.get(),
                 &session_obj,
                 TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
-            ) {
-                Ok(hr) => hr.is_ok(),
-                Err(_) => false,
-            }
+            )
         };
+        match result {
+            Ok(hr) => request.state.requested(
+                0,
+                Some(hr.0),
+                windows::Win32::UI::TextServices::TF_S_ASYNC.0,
+            ),
+            Err(error) => request.state.requested(
+                error.code().0,
+                None,
+                windows::Win32::UI::TextServices::TF_S_ASYNC.0,
+            ),
+        }
+        let outcome = request.state.outcome();
+        let applied = outcome == ApplyOutcome::Applied && !request.state.stale();
+        let text_applied = request.state.text_applied();
+        tip_log(&format!("ev=preedit_apply operation={} outcome={outcome:?} text_applied={text_applied} stale={}",
+            request.identity.operation_id, request.state.stale()));
         // Consume only the explicit StartComposition success signal.  Do this even when a later
         // SetText/SetSelection step makes the overall session fail: the new composition lifecycle
         // has already begun and must invalidate old callbacks/reservations.
@@ -5259,15 +5464,42 @@ impl TextService_Impl {
         if applied {
             self.update_reading_monitor(ctx);
         }
-        applied
+        let composition = self.composition.borrow().clone();
+        if !self.preedit_apply.is_current(&request, &composition) {
+            request.state.begin(false);
+        }
+        request.state.report()
     }
 
-    /// composition を確定文字列 `text` で確定する編集セッションを同期実行する。
-    /// 巡3 P3: 戻り値はセッション確立+実行の成否。RequestEditSession は外側 HRESULT とは
-    /// 別に [out] phrSession（windows-rs では Ok(hr) に載る）へ結果を返し、TF_E_LOCKED 等
-    /// の失敗では CommitText が実行されない — 呼び出し側は false を見て状態破棄を止め、
-    /// 確定文字の消失を防ぐ（旧実装は `let _ =` で両方捨てていた）。
+    /// composition を確定文字列 `text` で確定する編集セッションを要求する。
+    /// 戻り値は本文の書込み成功。RequestEditSessionの外側HRESULTやphrSessionの成功値だけ
+    /// では確定としない。queued CommitのDeferredは期限内で保持し、STAのpollが受領する。
+    /// その他の未実行sessionは失効させる。falseを見たcallerは読みと後続入力を保持する。
     pub(crate) fn do_commit(&self, ctx: &ITfContext, text: &str) -> bool {
+        let pending = self.pending_commit.borrow().clone();
+        if let Some(pending) = pending {
+            if !pending.owns(ctx, self.composition_generation.get())
+                || self.composition_generation.get() != pending.generation
+                || !self.pending_commit_is(&pending)
+                || pending.request.text != text
+            {
+                return false;
+            }
+            if pending.request.state.text_applied() {
+                let inserted = pending.request.state.take_text_applied();
+                self.revoke_pending_commit();
+                if inserted && self.composition_end_pending.get() {
+                    let _ = self.finish_pending_composition(ctx);
+                }
+                return inserted;
+            }
+            if pending.waiting(Instant::now()) {
+                return false;
+            }
+            // Enter retries the same immutable body after timeout/rejection.
+            self.revoke_pending_commit();
+        }
+        self.preedit_apply.invalidate();
         // 直前の SetText は成功済み。close-only が通るまでは新しい text を同じ composition へ
         // SetText しない（二重確定・直前確定の置換を防ぐ）。
         if !self.finish_pending_composition(ctx) {
@@ -5275,7 +5507,33 @@ impl TextService_Impl {
         }
         self.pending_end_generation
             .set(self.composition_generation.get());
+        self.composition_end_epoch.set(
+            self.composition_end_epoch
+                .get()
+                .checked_add(1)
+                .expect("commit epoch exhausted"),
+        );
+        let composition = self.composition.borrow().clone();
+        let request = self.preedit_apply.request(ctx, composition, text, None);
+        *self.composition_end_report.borrow_mut() = Some(Rc::clone(&request.state));
+        let queued_commit = self.replaying_conversion_queue.get()
+            && matches!(
+                self.conversion_queue.borrow().front(),
+                Some(crate::conversion_queue::ConversionAction::Commit)
+            );
+        let generation = self.composition_generation.get();
+        let deadline = queued_commit.then(|| Instant::now() + Duration::from_millis(1200));
         let session_obj: ITfEditSession = CommitText {
+            // Local clause commits use the semantic queue. Legacy entrances
+            // still own their existing learning path until their migration.
+            on_text_applied: RefCell::new(if queued_commit { self.prepare_commit_receipt(text) } else { None }),
+            #[cfg(feature = "tsf-test-hooks")]
+            fail_attributes: Rc::clone(&self.commit_fail_attributes),
+            caret: Rc::clone(&self.composition_end_caret),
+            apply: Rc::clone(&self.preedit_apply),
+            request: Rc::clone(&request),
+            executed: Cell::new(false),
+            deadline,
             context: ctx.clone(),
             text: HSTRING::from(text),
             composition: Rc::clone(&self.composition),
@@ -5286,20 +5544,69 @@ impl TextService_Impl {
             _guard: ComObjectGuard::new(),
         }
         .into();
-        let inserted = match unsafe {
+        #[cfg(feature = "tsf-test-hooks")]
+        let held = queued_commit && crate::commit_test_hook::hold(ctx, self.tid.get(), &session_obj);
+        #[cfg(not(feature = "tsf-test-hooks"))]
+        let held = false;
+        let requested = if held {
+            Ok(windows::Win32::UI::TextServices::TF_S_ASYNC)
+        } else { unsafe {
             ctx.RequestEditSession(
                 self.tid.get(),
                 &session_obj,
                 TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
             )
-        } {
-            Ok(hr) => hr.is_ok(),
-            Err(_) => false,
-        };
+        } };
+        match requested {
+            Ok(hr) => request.state.requested(
+                0,
+                Some(hr.0),
+                windows::Win32::UI::TextServices::TF_S_ASYNC.0,
+            ),
+            Err(error) => request.state.requested(
+                error.code().0,
+                None,
+                windows::Win32::UI::TextServices::TF_S_ASYNC.0,
+            ),
+        }
+        let learning_pending = self.receipt_outbox.borrow().as_ref().is_some_and(|outbox| outbox.pending());
+        if learning_pending {
+            self.arm_clause_poll();
+        }
+        // A positive phrSession (including TF_S_ASYNC) is not evidence that
+        // the document changed. Conversely, a later close failure cannot undo
+        // a successful body write, including a synchronous termination callback.
+        let inserted = request.state.take_text_applied();
+        let composition = self.composition.borrow().clone();
+        if !inserted
+            && request.state.outcome() == ApplyOutcome::Deferred
+            && !request.state.stale()
+            && self.preedit_apply.is_current(&request, &composition)
+            && self.composition_generation.get() == generation
+        {
+            if let Some(deadline) = deadline {
+                *self.pending_commit.borrow_mut() =
+                    Some(Rc::new(crate::pending_commit::PendingCommit {
+                        request,
+                        deadline,
+                        generation,
+                    }));
+                return false;
+            }
+        }
+        // This synchronous entry point has no completion consumer after return.
+        // Revoke only this request, so a retained late session cannot write after
+        // the caller keeps its reading for retry or switches compositions.
+        if !inserted {
+            request.state.begin(false);
+        }
         if inserted && self.composition_end_pending.get() {
             // SetText は成功済みなので確定自体は true のまま。最初の EndComposition が一過性に
             // 失敗した場合を、caller が InputState/context を畳む前に close-only で一度回収する。
             let _ = self.finish_pending_composition(ctx);
+        }
+        if !self.composition_end_pending.get() {
+            self.composition_end_report.borrow_mut().take();
         }
         inserted
     }
@@ -5391,6 +5698,13 @@ impl TextService_Impl {
                     tip_log("ev=composition_end_retry rejected");
                     false
                 } else {
+                    // A still-owned caret must be repaired or explicitly
+                    // cancelled before subsequent text can be inserted.
+                    if self.composition_end_caret.borrow().is_some() {
+                        self.composition_end_status
+                            .set(CompositionEndStatus::Retryable);
+                        return false;
+                    }
                     self.abandon_pending_composition_end("retry_exhausted");
                     true
                 }
@@ -5405,11 +5719,37 @@ impl TextService_Impl {
     /// quarantine して入力を解放し、locked/synchronous は初回込み
     /// `COMPOSITION_END_RETRY_MAX` 回まで再試行する。SetText はこの経路では一度も呼ばれない。
     pub(crate) fn finish_pending_composition(&self, ctx: &ITfContext) -> bool {
+        self.finish_pending_composition_with_cancel(ctx, false)
+    }
+
+    fn finish_pending_composition_with_cancel(
+        &self,
+        ctx: &ITfContext,
+        cancel_selection: bool,
+    ) -> bool {
         if !self.composition_end_pending.get() {
             return true;
         }
         self.composition_end_status.set(CompositionEndStatus::Idle);
+        let active = Rc::new(Cell::new(true));
+        let expected_epoch = self.composition_end_epoch.get();
+        let request_context = self
+            .composition_end_context
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| ctx.clone());
         let session_obj: ITfEditSession = EndCompositionOnly {
+            report: self.composition_end_report.borrow().clone(),
+            cancel_selection,
+            #[cfg(feature = "tsf-test-hooks")]
+            fail_attributes: Rc::clone(&self.commit_fail_attributes),
+            expected_context: request_context.clone(),
+            expected_composition: self.composition.borrow().clone(),
+            epoch: Rc::clone(&self.composition_end_epoch),
+            expected_epoch,
+            caret: Rc::clone(&self.composition_end_caret),
+            active: Rc::clone(&active),
+            executed: Cell::new(false),
             composition: Rc::clone(&self.composition),
             end_pending: Rc::clone(&self.composition_end_pending),
             end_context: Rc::clone(&self.composition_end_context),
@@ -5420,11 +5760,6 @@ impl TextService_Impl {
         .into();
         // pending 専用 context を正とする。次打鍵が current_context を新文書へ更新済みでも、
         // 古い composition を新文書の edit cookie で閉じようとしてはいけない。
-        let request_context = self
-            .composition_end_context
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| ctx.clone());
         let request_status = match unsafe {
             request_context.RequestEditSession(
                 self.tid.get(),
@@ -5432,10 +5767,17 @@ impl TextService_Impl {
                 TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
             )
         } {
-            Ok(hr) if hr.is_ok() => CompositionEndStatus::Closed,
+            Ok(hr) if hr.is_ok() => CompositionEndStatus::Retryable,
             Ok(hr) => classify_composition_end_error(hr, None),
             Err(err) => classify_composition_end_error(err.code(), None),
         };
+
+        // A positive request status cannot stand in for an executed close.
+        // Retained sessions must not later close a different composition.
+        active.set(false);
+        if self.composition_end_epoch.get() != expected_epoch {
+            return false;
+        }
 
         // DoEditSession の結果（GetRange/EndComposition）を優先し、RequestEditSession の
         // phrSession/外側 HRESULT はセッション自体が走らなかった場合の分類に使う。
@@ -5445,14 +5787,25 @@ impl TextService_Impl {
         };
         // EndCompositionOnly の実結果と RequestEditSession の外側結果を共通 state
         // transition へ通す。予約 VK は transition では触らず、matching KeyDown まで残す。
-        self.apply_pending_end_attempt(status)
+        let finished = self.apply_pending_end_attempt(status);
+        if !self.composition_end_pending.get() {
+            self.composition_end_report.borrow_mut().take();
+        }
+        finished
     }
 
     fn clear_pending_composition_end(&self, status: CompositionEndStatus) {
         if !self.composition_end_pending.replace(false) {
             return;
         }
+        if status == CompositionEndStatus::Terminal {
+            if let Some(report) = self.composition_end_report.borrow().as_ref() {
+                report.begin(false);
+            }
+        }
         *self.composition.borrow_mut() = None;
+        let retired_caret = self.composition_end_caret.borrow_mut().take();
+        drop(retired_caret);
         *self.composition_end_context.borrow_mut() = None;
         self.composition_end_status.set(status);
         self.composition_end_retry_count.set(0);
@@ -5479,10 +5832,12 @@ impl TextService_Impl {
     /// 残るため、 Esc は「効かなかった」扱いにしてユーザの再操作に任せる。
     /// false でも left_context/読みキャッシュの清算は行う（合成継続でも文脈汚染は防ぐ）。
     pub(crate) fn do_cancel(&self, ctx: &ITfContext) -> bool {
+        self.revoke_pending_commit();
+        self.preedit_apply.invalidate();
         // 確定文字列は既に SetText 済み。CancelComposition は range を空にしてしまうため、
         // pending_end では close-only を取消成功として扱う。
         if self.composition_end_pending.get() {
-            let ok = self.finish_pending_composition(ctx);
+            let ok = self.finish_pending_composition_with_cancel(ctx, true);
             *self.left_context.borrow_mut() = None;
             self.monitor_committed_reading.borrow_mut().clear();
             return ok;
@@ -5545,6 +5900,10 @@ impl TextService_Impl {
     /// （不変条件: clause_nav が Some ⇒ showing。残すと次に候補窓を開いたとき
     /// 選択同期/確定が文節ビューと取り違える）。
     pub(crate) fn clear_clause_nav(&self) {
+        self.clear_clause_mouse();
+        self.local_clause_redraw_pending.set(false);
+        self.local_clause_redraw_deadline.set(None);
+        self.local_clauses.borrow_mut().take();
         self.clause_nav.borrow_mut().take();
         self.state
             .borrow_mut()
@@ -5997,6 +6356,11 @@ impl TextService_Impl {
         let out: Rc<RefCell<Option<RECT>>> = Rc::new(RefCell::new(None));
         let sess: ITfEditSession = QueryCaretRect {
             context: ctx.clone(),
+            clause_start: self.local_clauses.borrow().as_ref().and_then(|model| {
+                let start = model.clauses.iter().take(model.selected)
+                    .map(|clause| clause.surface.encode_utf16().count()).sum();
+                self.composition.borrow().clone().map(|composition| (composition, start))
+            }),
             out: Rc::clone(&out),
             _guard: ComObjectGuard::new(),
         }
@@ -6369,6 +6733,7 @@ impl TextService_Impl {
 
     /// 再変換: 直前ラテン列(or 選択)を掴んで composition 化し、g1 リプレイで候補を出す。
     pub(crate) fn start_reconvert(&self, ctx: &ITfContext) {
+        self.preedit_apply.invalidate();
         if !self.finish_pending_composition(ctx) {
             tip_log("ev=reconvert_skip reason=pending_end");
             return;
@@ -6433,9 +6798,13 @@ impl TextService_Impl {
                 // かな読みは insert 応答の Reading から採取する(RecordCorrection のキー)。
                 // latin_reconvert_reading の戻り値は ASCII ローマ字で、かな化はエンジン側
                 // roman2kana にしか無いため TIP では作れない。
-                let kana = self.engine_insert(&reading, InsertStyle::Kana);
-                *self.reconvert_reading.borrow_mut() = kana.unwrap_or_default();
-                self.engine_convert().unwrap_or_default()
+                match self.engine_convert_reading(&reading) {
+                    Some((kana, candidates)) => {
+                        *self.reconvert_reading.borrow_mut() = kana;
+                        candidates
+                    }
+                    None => Vec::new(),
+                }
             }
             ReconvertKind::Surface => {
                 *self.reconvert_reading.borrow_mut() = text.clone();
@@ -6489,6 +6858,7 @@ impl TextService_Impl {
     /// true は RestoreText 成功とその後始末を完了した後にのみ返す。呼び出し側は false を
     /// 「取消に失敗した」と扱い、Deactivate preflight は中断、キー経路は再操作に任せる。
     pub(crate) fn cancel_reconvert(&self, ctx: &ITfContext) -> bool {
+        self.preedit_apply.invalidate();
         let original = self.reconvert_original.borrow().clone();
         let sess: ITfEditSession = RestoreText {
             context: ctx.clone(),
@@ -6665,6 +7035,31 @@ impl TextService_Impl {
             return;
         };
         // 選択同期は action より先。Finalize と同時に届いた場合でも「見えている文字列を確定する」
+        if self.local_converting() {
+            let mut finalize = false;
+            {
+                let mut local = self.local_clauses.borrow_mut();
+                let model = local.as_mut().unwrap();
+                if let crate::clause_conversion::CandidateWindow::Ready { selected, .. } =
+                    &model.window
+                {
+                    let index = selected / 9 * 9 + self.cand_state.borrow().selected();
+                    if sync_selection || matches!(action, Some(BehaviorAction::Finalize)) {
+                        model.select_candidate(index);
+                    }
+                    finalize = matches!(action, Some(BehaviorAction::Finalize));
+                }
+                if matches!(action, Some(BehaviorAction::Abort)) {
+                    model.close_window();
+                }
+            }
+            if finalize {
+                self.queue_local_clause_commit(&ctx, false);
+            } else {
+                self.render_local_edit(&ctx);
+            }
+            return;
+        }
         // 順序になり、確定直前だけ preedit が古いまま、という観測可能な隙間を作らない。
         if sync_selection {
             self.sync_preedit_to_selection(&ctx);
@@ -6813,6 +7208,52 @@ pub(crate) fn drain_behavior_via_tls() {
             }
         }
     });
+}
+
+// The installed-TIP gate invokes the existing configuration path on its STA.
+// BEHAVIOR_TS is registered at activation and cleared at deactivation/drop.
+#[cfg(feature = "tsf-test-hooks")]
+#[no_mangle]
+extern "system" fn NospacekeyTestReloadConfiguration(command: u32) -> u64 {
+    std::panic::catch_unwind(|| {
+        let pointer = BEHAVIOR_TS.with(|slot| slot.get());
+        if pointer.is_null() { return u64::MAX; }
+        let ts = unsafe { &*pointer };
+        match command {
+            0 => { ts.engine_reload_config(); 0 }
+            1 => {
+                if ts.snapshot_configuration_pending.get()
+                    || ts.acknowledged_configuration_generation.get() != ts.configuration_generation.get() {
+                    return 0;
+                }
+                ts.local_clauses.borrow().as_ref().and_then(|model| model.learning_identity.as_ref())
+                    .map_or(0, |identity| identity.learning_generation)
+            }
+            _ => u64::MAX,
+        }
+    }).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn finalize_native_clause_click_via_tls() -> bool {
+    BEHAVIOR_TS.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return false;
+        }
+        let ts = unsafe { &*pointer };
+        let ready = ts.local_clauses.borrow().as_ref().is_some_and(|m| {
+            matches!(
+                m.window,
+                crate::clause_conversion::CandidateWindow::Ready { .. }
+            )
+        });
+        if !ready {
+            return false;
+        }
+        *ts.behavior_outbox.borrow_mut() = Some(BehaviorAction::Finalize);
+        ts.drain_behavior();
+        true
+    })
 }
 
 /// 巡3 P7/P8 + 巡4 T1: schedule_behavior_flush が武装する 0ms タイマの発火口。現在のメッセージ
@@ -7217,6 +7658,7 @@ mod snapshot_status_tests {
         assert_eq!(
             snapshot_status_action(
                 SnapshotStatus::Configured {
+                    learning_identity: None,
                     configuration_generation: 3,
                     connection_epoch: 8,
                 },
@@ -7235,6 +7677,7 @@ mod snapshot_status_tests {
         assert_eq!(
             snapshot_status_action(
                 SnapshotStatus::Configured {
+                    learning_identity: None,
                     configuration_generation: 3,
                     connection_epoch: 7,
                 },
@@ -7246,6 +7689,7 @@ mod snapshot_status_tests {
         );
         let stale = SnapshotIdentity {
             composition: 1,
+            request: 1,
             revision: 2,
             configuration_generation: 3,
             connection_generation: 7,
@@ -7860,7 +8304,7 @@ mod uu5_reload_config_tests {
 
     #[test]
     fn frozen_llm_sends_empty_fields_even_when_enabled() {
-        // 凍結契約(docs/superpowers/specs/2026-07-21-llm-freeze-design.md): enabled=true+鍵ありでも
+        // 凍結契約(docs/design/2026-07-21-llm-freeze-design.md): enabled=true+鍵ありでも
         // llm_enabled:false+LLM系フィールド空で送る=平文キーがパイプを流れない。timeout_ms は
         // llm_enabled:false でエンジンが読まないスカラなので生値のまま。凍結前の
         // enabled_llm_carries_settings_values は再開時に spec の再開手順で復元する。
@@ -7962,7 +8406,7 @@ mod uu5_reload_config_tests {
     }
 }
 
-/// 再変換確定の RecordCorrection 送出条件(commit_candidate の reconverting 分岐から呼ぶ)。
+/// 再変換確定の RecordCorrection 送出条件（本文ACK後・接続終了前に送る）。
 /// index 0 は 1 位受諾=訂正ではない。空読みは採取できなかった劣化経路(送らない)。
 pub(crate) fn should_record_correction(index: usize, reading: &str) -> bool {
     index != 0 && !reading.is_empty()
@@ -8023,6 +8467,8 @@ mod a8_tests {
         // 正常応答: セッション採用。
         assert_eq!(
             plan_start_session(Ok(Response::Session {
+                engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+                learning_generation: 0,
                 session: 7,
                 proto: None,
                 boot: None,
@@ -8291,46 +8737,6 @@ mod a8_tests {
 
             server.join().ok();
         }
-    }
-}
-
-#[cfg(test)]
-mod llm_client_lifecycle_tests {
-    use super::{
-        llm_client_return_plan, llm_failure_cleanup_plan, LlmClientLease, LlmClientReturnPlan,
-        LlmFailureCleanupPlan,
-    };
-
-    #[test]
-    fn ended_llm_lease_drops_only_the_returned_old_connection() {
-        let lease = LlmClientLease::new(7);
-        assert_eq!(
-            llm_client_return_plan(Some(lease), None),
-            LlmClientReturnPlan::Restore { generation: 7 },
-        );
-
-        let ended_lease = lease.close_on_return();
-
-        assert_eq!(
-            llm_client_return_plan(Some(ended_lease), None),
-            LlmClientReturnPlan::DropReturned,
-        );
-        assert_eq!(
-            llm_client_return_plan(Some(ended_lease), Some(8)),
-            LlmClientReturnPlan::DropReturned,
-        );
-    }
-
-    #[test]
-    fn worker_error_without_a_returned_client_preserves_a_new_connection() {
-        assert_eq!(
-            llm_failure_cleanup_plan(Some(8)),
-            LlmFailureCleanupPlan::PreserveCurrent,
-        );
-        assert_eq!(
-            llm_failure_cleanup_plan(None),
-            LlmFailureCleanupPlan::DropDisconnected,
-        );
     }
 }
 
@@ -8677,6 +9083,54 @@ mod deactivate_preflight_tests {
     use super::{deactivate_cancel_plan, DeactivateCancelPlan as Plan};
 
     #[test]
+    fn rejected_document_cancel_still_releases_service_resources_and_keeps_original() {
+        let service = super::TextService::new().into_outer();
+        service.tid.set(123);
+        service.reconverting.set(true);
+        *service.reconvert_original.borrow_mut() = "original".into();
+        service.live_text.borrow_mut().push_str("変換中");
+        let generation = service.composition_generation.get();
+        assert!(service
+            .deactivate_with_document_cancel(|| Err(super::E_FAIL.into()))
+            .is_err());
+        assert_eq!(service.tid.get(), 0);
+        assert!(service.thread_mgr.borrow().is_none());
+        assert_eq!(
+            service.composition_generation.get(),
+            generation.wrapping_add(1)
+        );
+        assert!(service.live_text.borrow().is_empty());
+        assert!(service.reconverting.get());
+        assert_eq!(&*service.reconvert_original.borrow(), "original");
+        assert!(service.deactivate_with_document_cancel(|| Ok(())).is_ok());
+        assert!(service.reconvert_original.borrow().is_empty());
+    }
+
+    #[test]
+    fn deactivation_retains_accepted_input_as_detached_even_when_document_cancel_fails() {
+        for cancel_succeeds in [false, true] {
+            let service = super::TextService::new().into_outer();
+            *service.live_text.borrow_mut() = "日本語".into();
+            service.conversion_queue.borrow_mut().push_commit_then_insert(
+                "a".into(), crate::input_module::TextStyle::Kana, false);
+            let _ = service.deactivate_with_document_cancel(|| if cancel_succeeds { Ok(()) } else { Err(super::E_FAIL.into()) });
+            let queue = service.conversion_queue.borrow();
+            assert!(queue.owner_lost && queue.commit_failed && queue.has_commit());
+            assert_eq!(queue.unwritten_commit.as_deref(), Some("日本語"));
+        }
+    }
+
+    #[test]
+    fn live_preedit_rejection_preserves_enter_text_until_a_successful_redraw() {
+        let service = super::TextService::new().into_outer();
+        *service.live_text.borrow_mut() = "にほんご".into();
+        service.apply_live_preedit("日本語", || false);
+        assert_eq!(&*service.live_text.borrow(), "にほんご");
+        service.apply_live_preedit("日本語", || true);
+        assert_eq!(&*service.live_text.borrow(), "日本語");
+    }
+
+    #[test]
     fn no_composition_needs_no_cancel() {
         // composition 無し = 取消不要。context/reconvert の状態に依らず清算へ直行。
         assert_eq!(
@@ -8691,8 +9145,7 @@ mod deactivate_preflight_tests {
 
     #[test]
     fn composition_without_context_aborts_before_cleanup() {
-        // 取消不能（context 無し）= 不可逆清算の前に中断。composition・再変換ラッチ共に
-        // 残す＝ホストの再 Deactivate で再試行できる。
+        // Context 不在では文書取消を拒否する。資源清算の可否とは独立。
         assert_eq!(
             deactivate_cancel_plan(true, false, false, false),
             Plan::AbortNoContext
@@ -9006,10 +9459,18 @@ mod pending_end_liveness_tests {
     #[test]
     fn terminal_and_retry_limit_quarantine_release_pending_state() {
         let terminal = TextService::new().into_outer();
+        let report = std::rc::Rc::new(crate::apply_state::ApplyState::default());
+        report.wrote_text();
+        report.complete(windows::Win32::Foundation::E_FAIL.0);
+        assert!(report.take_text_applied());
+        *terminal.composition_end_report.borrow_mut() = Some(std::rc::Rc::clone(&report));
         terminal.composition_end_pending.set(true);
         terminal.composition_end_retry_count.set(1);
         assert!(terminal.apply_pending_end_attempt(CompositionEndStatus::Terminal));
         assert!(!terminal.composition_end_pending.get());
+        assert!(report.stale());
+        assert!(report.text_applied());
+        assert!(!report.take_text_applied());
         assert_eq!(
             terminal.composition_end_status.get(),
             CompositionEndStatus::Terminal

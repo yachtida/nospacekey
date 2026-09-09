@@ -63,6 +63,21 @@ public struct GPUWorkerSupervisorSnapshot: Equatable, Sendable {
     }
 }
 
+/// Which conversion path is asking the worker.  Live-tier callers treat the
+/// deadline as a freshness budget (a miss is a weak health signal), while
+/// convert-tier callers treat it as a strong one.  Snapshot callers are the
+/// background enhancement path and are the only ones eligible for the
+/// diagnostic grace mode.
+public enum GPUWorkerCaller: String, Sendable {
+    case convert
+    case live
+    case liveSnapshot = "live_snapshot"
+    case explicitSnapshot = "explicit_snapshot"
+
+    var isLiveTier: Bool { self == .live || self == .liveSnapshot }
+    var isBackgroundSnapshot: Bool { self == .liveSnapshot || self == .explicitSnapshot }
+}
+
 public enum GPUWorkerDeadlineTier: Sendable {
     /// Leave enough time in the external 1200 ms Convert deadline to return
     /// the already-computed classic result and reap the child.
@@ -87,16 +102,43 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
         case stopped
         case starting
         case ready
+        /// A rank timeout terminated the child; a cooldown-armed background
+        /// retry owns the next spawn.  Requests short-circuit to classic.
+        case retryPending
+        /// Auto-respawned child is healthy enough to serve requests, but one
+        /// more failure (without an intervening valid rank) escalates.
+        case probation
+        /// Two live-tier timeouts in a row: live enhancement is suppressed;
+        /// the next convert-tier request arms a single background probe.
+        case liveSuppressed
         case quarantined(GPUWorkerQuarantineReason)
         case disabled
 
         var isLive: Bool {
             switch self {
-            case .starting, .ready: return true
-            case .stopped, .quarantined, .disabled: return false
+            case .starting, .ready, .probation, .liveSuppressed: return true
+            case .stopped, .retryPending, .quarantined, .disabled: return false
+            }
+        }
+
+        /// States from which rerank may send a transport request.
+        var isRequestable: Bool {
+            switch self {
+            case .ready, .probation: return true
+            default: return false
             }
         }
     }
+
+    /// Hard ceiling for the diagnostic grace mode.  A background snapshot
+    /// request that misses its soft deadline keeps waiting up to this bound so
+    /// the late-response behaviour can be measured instead of destroyed.
+    public static let graceHardDeadline: TimeInterval = 3.0
+    /// Cooldown before an auto-respawn actually spawns.  Short repetition of
+    /// process creation plus GPU model load would pressure the driver.
+    public static let defaultRetryCooldown: TimeInterval = 3.0
+    /// Latency samples accumulated before a summary line is emitted.
+    fileprivate static let latencySummaryBatch = 100
 
     private let transport: GPUWorkerTransport
     private let allowsLazyStart: Bool
@@ -117,13 +159,27 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
     /// replacement that acquired operationLock first.
     private var transportGeneration: UInt64?
     private var runtimeConfiguration: GPUWorkerRuntimeConfiguration?
+    /// Generation whose successful auto-respawn must land in probation rather
+    /// than ready.  Lifecycle resets clear it so a stale retry cannot downgrade
+    /// a user-initiated start.
+    private var autoRetryGeneration: UInt64?
+    /// Consecutive rank timeouts without an intervening valid rank response.
+    /// Reset only by a valid rank success or a generation-opening lifecycle op.
+    private var consecutiveTimeouts = 0
+    private let retryCooldown: TimeInterval
+    private let graceEnabled: Bool
+    private let latencyTracker = GPUWorkerLatencyTracker()
 
     public init(transport: GPUWorkerTransport,
                 runtimeConfiguration: GPUWorkerRuntimeConfiguration? = nil,
-                allowsLazyStart: Bool = true) {
+                allowsLazyStart: Bool = true,
+                retryCooldown: TimeInterval = GPUWorkerSupervisor.defaultRetryCooldown,
+                graceEnabled: Bool? = nil) {
         self.transport = transport
         self.runtimeConfiguration = runtimeConfiguration
         self.allowsLazyStart = allowsLazyStart
+        self.retryCooldown = retryCooldown
+        self.graceEnabled = gpuTraceEnabledForTesting(graceEnabled)
     }
 
     public var snapshot: GPUWorkerSupervisorSnapshot {
@@ -141,7 +197,8 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
         leftContext: String?,
         nBest: Int,
         inferenceLimit: Int,
-        deadline: TimeInterval = GPUWorkerDeadlineTier.convert.workerBudget
+        deadline: TimeInterval = GPUWorkerDeadlineTier.convert.workerBudget,
+        caller: GPUWorkerCaller = .convert
     ) -> GPUWorkerRerankDecision {
         // Empty and custom-mapped input remain classic without even spawning or
         // sending a worker request.
@@ -164,11 +221,28 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
         // already-computed classic result within the caller's deadline.
         stateLock.lock()
         let currentState = internalState
+        let traceGeneration = generation
         stateLock.unlock()
         if case .starting = currentState {
+            traceShortCircuit(state: "starting", caller: caller, generation: traceGeneration)
+            return GPUWorkerRerankDecision(conversion: classic, usedWorker: false)
+        }
+        if case .retryPending = currentState {
+            traceShortCircuit(state: "retry_pending", caller: caller, generation: traceGeneration)
             return GPUWorkerRerankDecision(conversion: classic, usedWorker: false)
         }
         if case .stopped = currentState, !allowsLazyStart {
+            return GPUWorkerRerankDecision(conversion: classic, usedWorker: false)
+        }
+        if case .liveSuppressed = currentState {
+            if caller.isLiveTier {
+                traceShortCircuit(state: "live_suppressed", caller: caller, generation: traceGeneration)
+                return GPUWorkerRerankDecision(conversion: classic, usedWorker: false)
+            }
+            // The strong caller is the recovery probe trigger: arm one
+            // background respawn and answer this request with classic without
+            // waiting behind a spawn.
+            armStrongCallerProbe(caller: caller)
             return GPUWorkerRerankDecision(conversion: classic, usedWorker: false)
         }
         if case .quarantined(let quarantineReason) = currentState {
@@ -188,10 +262,20 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
             case .decode: .decode
             case .warmup: .warmup
             }
+            traceShortCircuit(state: "quarantined", reason: quarantineReason.rawValue,
+                              caller: caller, generation: traceGeneration)
             return GPUWorkerRerankDecision(conversion: classic, usedWorker: false, failure: failure)
         }
 
-        operationLock.lock()
+        // Bound foreground contention in production too. The 50ms wait fits
+        // between the worker budget (900ms) and the TIP's IPC deadline (1200ms).
+        if !caller.isBackgroundSnapshot,
+           !operationLock.lock(before: Date().addingTimeInterval(0.05)) {
+            traceShortCircuit(state: "operation_lock_busy", caller: caller, generation: traceGeneration)
+            return GPUWorkerRerankDecision(conversion: classic, usedWorker: false)
+        } else if caller.isBackgroundSnapshot {
+            operationLock.lock()
+        }
         defer { operationLock.unlock() }
         guard ensureReady() else {
             stateLock.lock()
@@ -200,7 +284,7 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
             return GPUWorkerRerankDecision(conversion: classic, usedWorker: false, failure: failure)
         }
         stateLock.lock()
-        guard case .ready = internalState, transportGeneration == generation else {
+        guard internalState.isRequestable, transportGeneration == generation else {
             let failure = currentFailureLocked()
             stateLock.unlock()
             return GPUWorkerRerankDecision(conversion: classic, usedWorker: false, failure: failure)
@@ -216,7 +300,48 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
             inferenceLimit: max(1, inferenceLimit),
             requestID: requestID,
             generation: currentGeneration)
-        let reply = transport.request(request, timeout: deadline)
+        let useGrace = graceEnabled && caller.isBackgroundSnapshot
+        let effectiveDeadline = useGrace ? Self.graceHardDeadline : deadline
+        gpuEngineTraceLog(
+            "ev=zenzai_worker_request_attempt caller=\(caller.rawValue) request_id=\(requestID) " +
+            "generation=\(currentGeneration) deadline_ms=\(Int(deadline * 1000))\n",
+            enabled: graceEnabled)
+        let requestStart = DispatchTime.now()
+        let reply = transport.request(request, timeout: effectiveDeadline)
+        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds &- requestStart.uptimeNanoseconds)
+            / 1_000_000
+        gpuEngineTraceLog(
+            "ev=zenzai_worker_request_end caller=\(caller.rawValue) request_id=\(requestID) " +
+            "generation=\(currentGeneration) outcome=\(traceOutcome(reply)) " +
+            "elapsed_ms=\(String(format: "%.1f", elapsedMs))\n",
+            enabled: graceEnabled)
+        latencyTracker.record(caller: caller, elapsedMs: elapsedMs) { [weak self] line in
+            self?.logEvent(line)
+        }
+        if useGrace, elapsedMs > deadline * 1000 {
+            // The soft deadline is a freshness budget, not a health verdict.
+            // In diagnostic mode keep waiting to the hard bound so the real
+            // response time is observable, then discard the (stale) result.
+            logEvent(
+                "ev=zenzai_worker_soft_deadline_exceeded caller=\(caller.rawValue) " +
+                "request_id=\(requestID) generation=\(currentGeneration) " +
+                "soft_ms=\(Int(deadline * 1000))\n")
+            if case .response(let response) = reply {
+                let valid = response.requestID == requestID && response.generation == currentGeneration
+                logEvent(
+                    "ev=zenzai_worker_late_response request_id=\(requestID) " +
+                    "generation=\(currentGeneration) elapsed_ms=\(String(format: "%.1f", elapsedMs)) " +
+                    "valid=\(valid) action=discard\n")
+                if valid { noteRankSuccess(generation: currentGeneration) }
+                return GPUWorkerRerankDecision(conversion: classic, usedWorker: false)
+            }
+            logEvent(
+                "ev=zenzai_worker_hard_timeout caller=\(caller.rawValue) request_id=\(requestID) " +
+                "generation=\(currentGeneration) hard_ms=\(Int(Self.graceHardDeadline * 1000)) " +
+                "action=terminate\n")
+            handleRankTimeout(caller: caller, generation: currentGeneration, deadline: deadline)
+            return GPUWorkerRerankDecision(conversion: classic, usedWorker: false, failure: .timeout)
+        }
         switch reply {
         case .response(let response):
             stateLock.lock()
@@ -236,9 +361,10 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
                 return GPUWorkerRerankDecision(conversion: classic, usedWorker: false,
                                                failure: Self.rerankFailure(for: mapped))
             }
+            noteRankSuccess(generation: currentGeneration)
             return decision
         case .timeout:
-            quarantine(.timeout, expectedGeneration: currentGeneration)
+            handleRankTimeout(caller: caller, generation: currentGeneration, deadline: deadline)
             return GPUWorkerRerankDecision(conversion: classic, usedWorker: false, failure: .timeout)
         case .exit:
             quarantine(.workerExit, expectedGeneration: currentGeneration)
@@ -274,10 +400,17 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
     }
 
     /// Only explicit retry, model change, or runtime-directory change opens a
-    /// quarantined generation. Duplicate retries while already armed are no-op.
+    /// quarantined or degraded generation. Duplicate retries while already
+    /// armed are no-op.
     public func explicitRetry() {
         stateLock.lock()
-        guard case .quarantined = internalState, !retryArmed else {
+        switch internalState {
+        case .quarantined, .retryPending, .probation, .liveSuppressed:
+            guard !retryArmed else {
+                stateLock.unlock()
+                return
+            }
+        case .stopped, .starting, .disabled, .ready:
             stateLock.unlock()
             return
         }
@@ -288,6 +421,8 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
         device = nil
         reason = nil
         terminatedGeneration = nil
+        autoRetryGeneration = nil
+        consecutiveTimeouts = 0
         stateLock.unlock()
     }
 
@@ -302,10 +437,12 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
         device = nil
         reason = nil
         terminatedGeneration = nil
+        autoRetryGeneration = nil
+        consecutiveTimeouts = 0
         runtimeConfiguration = configuration
         stateLock.unlock()
         if shouldTerminate {
-            scheduleTermination(of: oldGeneration)
+            scheduleTermination(of: oldGeneration, trigger: "model_or_runtime_change")
         }
     }
 
@@ -325,9 +462,11 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
         device = nil
         reason = nil
         terminatedGeneration = nil
+        autoRetryGeneration = nil
+        consecutiveTimeouts = 0
         stateLock.unlock()
         if shouldTerminate {
-            scheduleTermination(of: oldGeneration)
+            scheduleTermination(of: oldGeneration, trigger: "disable")
         }
     }
 
@@ -338,11 +477,27 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
             stateLock.unlock()
             return true
         }
+        if case .probation = state {
+            stateLock.unlock()
+            return true
+        }
         if case .quarantined = state {
             stateLock.unlock()
             return false
         }
         if case .starting = state {
+            stateLock.unlock()
+            return false
+        }
+        if case .retryPending = state {
+            // The cooldown-armed retry owns the next spawn; do not lazy-start
+            // around it.
+            stateLock.unlock()
+            return false
+        }
+        if case .liveSuppressed = state {
+            // Only the strong-caller probe path may respawn from here, and it
+            // arms a background spawn instead of blocking this request.
             stateLock.unlock()
             return false
         }
@@ -364,17 +519,23 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
             stateLock.lock()
             let isCurrent = generation == startGeneration
                 && (ifCaseStarting(internalState))
+            var probationary = false
             if isCurrent {
                 backend = newBackend.isEmpty ? nil : newBackend
                 device = newDevice.isEmpty ? nil : newDevice
                 reason = nil
-                internalState = .ready
+                probationary = autoRetryGeneration == startGeneration
+                autoRetryGeneration = nil
+                internalState = probationary ? .probation : .ready
             } else if transportGeneration == startGeneration {
                 transportGeneration = nil
             }
             stateLock.unlock()
             if !isCurrent { transport.terminate() }
             if !isCurrent { return false }
+            if probationary {
+                logEvent("ev=zenzai_worker_retry_ready generation=\(startGeneration)\n")
+            }
             return true
         case .failure(let failure):
             stateLock.lock()
@@ -385,6 +546,9 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
             }
             stateLock.unlock()
             if isCurrent {
+                logEvent("ev=zenzai_worker_start_failed failure=" +
+                         "\(Self.quarantineReason(for: failure).rawValue) " +
+                         "generation=\(startGeneration)\n")
                 quarantine(Self.quarantineReason(for: failure), expectedGeneration: startGeneration)
             } else {
                 transport.terminate()
@@ -411,16 +575,22 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
             stateLock.lock()
             let isCurrent = generation == startGeneration
                 && ifCaseStarting(internalState)
+            var probationary = false
             if isCurrent {
                 backend = newBackend.isEmpty ? nil : newBackend
                 device = newDevice.isEmpty ? nil : newDevice
                 reason = nil
-                internalState = .ready
+                probationary = autoRetryGeneration == startGeneration
+                autoRetryGeneration = nil
+                internalState = probationary ? .probation : .ready
             } else if transportGeneration == startGeneration {
                 transportGeneration = nil
             }
             stateLock.unlock()
             if !isCurrent { transport.terminate() }
+            if probationary {
+                logEvent("ev=zenzai_worker_retry_ready generation=\(startGeneration)\n")
+            }
         case .failure(let failure):
             stateLock.lock()
             let isCurrent = generation == startGeneration
@@ -430,6 +600,9 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
             }
             stateLock.unlock()
             if isCurrent {
+                logEvent("ev=zenzai_worker_start_failed failure=" +
+                         "\(Self.quarantineReason(for: failure).rawValue) " +
+                         "generation=\(startGeneration)\n")
                 quarantine(Self.quarantineReason(for: failure), expectedGeneration: startGeneration)
             } else {
                 transport.terminate()
@@ -446,23 +619,24 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
     /// behind a native start/request.  The immediate try keeps the common idle
     /// path synchronous for deterministic teardown; a busy operation is
     /// released on a detached reaper thread.
-    private func scheduleTermination(of generation: UInt64) {
+    private func scheduleTermination(of generation: UInt64, trigger: String) {
         if operationLock.lock(before: Date()) {
-            terminateTransportLocked(for: generation)
+            terminateTransportLocked(for: generation, trigger: trigger)
             operationLock.unlock()
             return
         }
         Thread.detachNewThread { [weak self] in
             guard let self else { return }
             self.operationLock.lock()
-            self.terminateTransportLocked(for: generation)
+            self.terminateTransportLocked(for: generation, trigger: trigger)
             self.operationLock.unlock()
         }
     }
 
     /// operationLock must be held.  A replacement generation may have started
     /// while the reaper waited; in that case the old cleanup is a no-op.
-    private func terminateTransportLocked(for generation: UInt64) {
+    private func terminateTransportLocked(for generation: UInt64,
+                                          trigger: String = "lifecycle") {
         stateLock.lock()
         guard transportGeneration == generation else {
             stateLock.unlock()
@@ -470,7 +644,167 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
         }
         transportGeneration = nil
         stateLock.unlock()
+        logEvent("ev=zenzai_worker_terminate trigger=\(trigger) generation=\(generation)\n")
         transport.terminate()
+    }
+
+    // MARK: - Timeout recovery
+
+    /// operationLock is held by the rerank caller.  Terminates the timed-out
+    /// child (a late reply would desync the single-pipe framing), then opens a
+    /// new generation and arms one cooldown-delayed background respawn.  A
+    /// second consecutive failure escalates: convert-tier to a permanent
+    /// latch, live-tier to live-only suppression.
+    private func handleRankTimeout(caller: GPUWorkerCaller,
+                                   generation currentGeneration: UInt64,
+                                   deadline: TimeInterval) {
+        stateLock.lock()
+        guard generation == currentGeneration, internalState.isRequestable else {
+            stateLock.unlock()
+            return
+        }
+        consecutiveTimeouts += 1
+        let streak = consecutiveTimeouts
+        let mustTerminate = terminatedGeneration != generation
+        terminatedGeneration = generation
+        transportGeneration = nil
+        switch internalState {
+        case .ready:
+            generation &+= 1
+            let retryGeneration = generation
+            internalState = .retryPending
+            reason = nil
+            autoRetryGeneration = retryGeneration
+            stateLock.unlock()
+            logEvent("ev=zenzai_worker_timeout caller=\(caller.rawValue) " +
+                     "generation=\(currentGeneration) deadline_ms=\(Int(deadline * 1000)) " +
+                     "streak=\(streak) action=schedule_retry\n")
+            if mustTerminate {
+                logEvent("ev=zenzai_worker_terminate trigger=timeout " +
+                         "generation=\(currentGeneration)\n")
+                transport.terminate()
+            }
+            scheduleAutoRetry(retryGeneration: retryGeneration)
+        case .probation:
+            if caller.isLiveTier {
+                internalState = .liveSuppressed
+                reason = nil
+                stateLock.unlock()
+                logEvent("ev=zenzai_worker_timeout caller=\(caller.rawValue) " +
+                         "generation=\(currentGeneration) deadline_ms=\(Int(deadline * 1000)) " +
+                         "streak=\(streak) action=live_suppress\n")
+            } else {
+                stateLock.unlock()
+                logEvent("ev=zenzai_worker_timeout caller=\(caller.rawValue) " +
+                         "generation=\(currentGeneration) deadline_ms=\(Int(deadline * 1000)) " +
+                         "streak=\(streak) action=quarantine\n")
+                quarantine(.timeout, expectedGeneration: currentGeneration)
+            }
+            if mustTerminate {
+                logEvent("ev=zenzai_worker_terminate trigger=timeout " +
+                         "generation=\(currentGeneration)\n")
+                transport.terminate()
+            }
+        default:
+            stateLock.unlock()
+        }
+    }
+
+    /// The respawn runs on its own thread so no conversion request ever waits
+    /// behind process creation or model load.  The generation token aborts the
+    /// retry when a lifecycle change (disable, model change, explicit retry)
+    /// opened a newer generation while the cooldown was running.
+    private func scheduleAutoRetry(retryGeneration: UInt64) {
+        logEvent("ev=zenzai_worker_retry_scheduled cooldown_ms=\(Int(retryCooldown * 1000)) " +
+                 "generation=\(retryGeneration)\n")
+        Thread.detachNewThread { [weak self] in
+            if let self, self.retryCooldown > 0 {
+                Thread.sleep(forTimeInterval: self.retryCooldown)
+            }
+            guard let self else { return }
+            self.stateLock.lock()
+            guard case .retryPending = self.internalState,
+                  self.generation == retryGeneration,
+                  self.autoRetryGeneration == retryGeneration else {
+                self.stateLock.unlock()
+                self.logEvent("ev=zenzai_worker_retry_aborted " +
+                              "reason=generation_or_state_changed generation=\(retryGeneration)\n")
+                return
+            }
+            self.internalState = .starting
+            self.retryArmed = false
+            self.stateLock.unlock()
+            self.logEvent("ev=zenzai_worker_retry_start generation=\(retryGeneration)\n")
+            self.performStart(generation: retryGeneration)
+        }
+    }
+
+    /// A convert-tier request while live enhancement is suppressed is the
+    /// recovery probe: arm one background respawn.  The triggering request
+    /// itself is answered with classic.
+    private func armStrongCallerProbe(caller: GPUWorkerCaller) {
+        stateLock.lock()
+        guard case .liveSuppressed = internalState else {
+            stateLock.unlock()
+            return
+        }
+        generation &+= 1
+        let probeGeneration = generation
+        internalState = .retryPending
+        reason = nil
+        autoRetryGeneration = probeGeneration
+        stateLock.unlock()
+        logEvent("ev=zenzai_worker_probe_scheduled caller=\(caller.rawValue) " +
+                 "cooldown_ms=\(Int(retryCooldown * 1000)) generation=\(probeGeneration)\n")
+        scheduleAutoRetry(retryGeneration: probeGeneration)
+    }
+
+    /// Only a valid rank response (and, on the apply path, candidate
+    /// validation) may clear the failure escalation.  A plain respawn does
+    /// not: the observed failure loop is "spawn ok, ready ok, first rank
+    /// times out".
+    private func noteRankSuccess(generation currentGeneration: UInt64) {
+        stateLock.lock()
+        guard generation == currentGeneration else {
+            stateLock.unlock()
+            return
+        }
+        guard case .probation = internalState else {
+            consecutiveTimeouts = 0
+            stateLock.unlock()
+            return
+        }
+        internalState = .ready
+        consecutiveTimeouts = 0
+        stateLock.unlock()
+        logEvent("ev=zenzai_worker_latch_reset reason=valid_rank " +
+                 "generation=\(currentGeneration)\n")
+    }
+
+    // MARK: - Diagnostics
+
+    private func logEvent(_ line: String) {
+        engineLog(line)
+    }
+
+    private func traceShortCircuit(state: String, reason: String? = nil,
+                                   caller: GPUWorkerCaller, generation: UInt64) {
+        gpuEngineTraceLog(
+            "ev=zenzai_worker_short_circuit state=\(state)" +
+            (reason.map { " reason=\($0)" } ?? "") +
+            " caller=\(caller.rawValue) generation=\(generation)\n",
+            enabled: graceEnabled)
+    }
+
+    private func traceOutcome(_ reply: GPUWorkerTransportReply) -> String {
+        switch reply {
+        case .response: return "response"
+        case .timeout: return "timeout"
+        case .exit: return "exit"
+        case .crash: return "crash"
+        case .protocolMismatch: return "protocol_mismatch"
+        case .nativeFailure: return "native_failure"
+        }
     }
 
     private static func quarantineReason(for failure: GPUWorkerFailure) -> GPUWorkerQuarantineReason {
@@ -546,11 +880,19 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
         guard case .quarantined = internalState else {
             internalState = .quarantined(quarantineReason)
             reason = quarantineReason.rawValue
+            autoRetryGeneration = nil
+            let streak = consecutiveTimeouts
             let mustTerminate = terminatedGeneration != generation
             terminatedGeneration = generation
             transportGeneration = nil
             stateLock.unlock()
-            if mustTerminate { transport.terminate() }
+            logEvent("ev=zenzai_worker_quarantine reason=\(quarantineReason.rawValue) " +
+                     "generation=\(expectedGeneration) streak=\(streak) action=terminate\n")
+            if mustTerminate {
+                logEvent("ev=zenzai_worker_terminate trigger=quarantine " +
+                         "reason=\(quarantineReason.rawValue) generation=\(expectedGeneration)\n")
+                transport.terminate()
+            }
             return
         }
         stateLock.unlock()
@@ -583,6 +925,16 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
                 state: retryArmed ? .preparing : .stopped, backend: backend, device: device)
         case .starting:
             return GPUWorkerSupervisorSnapshot(state: .preparing, backend: backend, device: device)
+        case .retryPending:
+            // A respawn is already scheduled: report preparing instead of the
+            // old timeout reason so the UI does not show a stale latch.
+            return GPUWorkerSupervisorSnapshot(state: .preparing, backend: nil, device: nil)
+        case .probation:
+            return GPUWorkerSupervisorSnapshot(state: .gpuActive, backend: backend, device: device)
+        case .liveSuppressed:
+            // Convert-tier requests still use the worker; only live
+            // enhancement is suppressed.
+            return GPUWorkerSupervisorSnapshot(state: .gpuActive, backend: backend, device: device)
         case .ready:
             return GPUWorkerSupervisorSnapshot(state: .gpuActive, backend: backend, device: device)
         case .quarantined:
@@ -590,5 +942,46 @@ public final class GPUWorkerSupervisor: @unchecked Sendable {
         case .disabled:
             return GPUWorkerSupervisorSnapshot(state: .disabled)
         }
+    }
+}
+
+/// Per-tier latency samples with a batched summary line.  Success timings are
+/// the evidence for (or against) "the live budget is below the on-device
+/// P95", which single failure logs can never show.
+private final class GPUWorkerLatencyTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var liveSamples: [Double] = []
+    private var convertSamples: [Double] = []
+
+    func record(caller: GPUWorkerCaller, elapsedMs: Double, emit: (String) -> Void) {
+        lock.lock()
+        if caller.isLiveTier {
+            liveSamples.append(elapsedMs)
+        } else {
+            convertSamples.append(elapsedMs)
+        }
+        var summaries: [String] = []
+        if liveSamples.count >= GPUWorkerSupervisor.latencySummaryBatch {
+            summaries.append(Self.summaryLine(tier: "live", samples: liveSamples))
+            liveSamples = []
+        }
+        if convertSamples.count >= GPUWorkerSupervisor.latencySummaryBatch {
+            summaries.append(Self.summaryLine(tier: "convert", samples: convertSamples))
+            convertSamples = []
+        }
+        lock.unlock()
+        summaries.forEach(emit)
+    }
+
+    private static func summaryLine(tier: String, samples: [Double]) -> String {
+        let sorted = samples.sorted()
+        func percentile(_ fraction: Double) -> Double {
+            let index = Int((Double(sorted.count) - 1) * fraction)
+            return sorted[max(0, min(sorted.count - 1, index))]
+        }
+        return "ev=zenzai_worker_latency_summary caller=\(tier) count=\(sorted.count) " +
+            "p50_ms=\(String(format: "%.1f", percentile(0.5))) " +
+            "p95_ms=\(String(format: "%.1f", percentile(0.95))) " +
+            "max_ms=\(String(format: "%.1f", sorted.last ?? 0))\n"
     }
 }

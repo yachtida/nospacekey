@@ -64,3 +64,18 @@ func engineLog(_ s: String) {
     let ms = Int64(Date().timeIntervalSince1970 * 1000)
     engineLogSink.submit(Data(timestampedEngineLogLine(s, epochMs: ms).utf8))
 }
+
+/// `NOSPACEKEY_GPU_TRACE` 専用の高頻度トレース。通常 `NOSPACEKEY_LOG` に混ぜると
+/// キューあふれでイベント級の行が欠落するため、層を分けている。
+private let gpuTraceEnabled = logEnabled(ProcessInfo.processInfo.environment["NOSPACEKEY_GPU_TRACE"])
+
+func gpuTraceEnabledForTesting(_ override: Bool?) -> Bool {
+    guard let override else { return gpuTraceEnabled }
+    return override
+}
+
+func gpuEngineTraceLog(_ s: String, enabled: Bool) {
+    guard enabled else { return }
+    let ms = Int64(Date().timeIntervalSince1970 * 1000)
+    engineLogSink.submit(Data(timestampedEngineLogLine(s, epochMs: ms).utf8))
+}

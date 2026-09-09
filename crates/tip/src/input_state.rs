@@ -1,13 +1,13 @@
 //! COM非依存の入力状態機械。ここをTDDする。
 /// 入力フェーズ。Composing=通常ライブ / AwaitingLlm=LLM変換中（入力ロック）。
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub enum Phase {
     #[default]
     Composing,
     AwaitingLlm,
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct InputState {
     pub raw: String,     // 打鍵で貯めたローマ字（エンジンに送る生入力）
     pub composing: bool, // composition中か
@@ -472,6 +472,7 @@ pub fn to_zenkaku_ascii(s: &str) -> String {
 /// raw は元々半角でこの走査に当たらない。部分確定 reseed 後の raw はかな（M-2 の既知の限界）
 /// でかなは素通しだが、ー だけ '-' へ落ちる — raw が打鍵でない時点で表示は既に劣化して
 /// おり許容。
+#[cfg(test)]
 pub fn to_hankaku_ascii(s: &str) -> String {
     use settings::symbol::{zenkaku_symbol, SymbolCharSet};
     s.chars()

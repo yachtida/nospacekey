@@ -313,6 +313,7 @@ private final class FakeGPUWorkerTransport: GPUWorkerTransport, @unchecked Senda
     private(set) var starts: [UInt64] = []
     private(set) var configurations: [GPUWorkerRuntimeConfiguration?] = []
     private(set) var requests: [GPUWorkerRequest] = []
+    private(set) var requestTimeouts: [TimeInterval] = []
     private(set) var terminateCount = 0
     var blockRequests = false
     var blockStarts = false
@@ -348,6 +349,7 @@ private final class FakeGPUWorkerTransport: GPUWorkerTransport, @unchecked Senda
     func request(_ request: GPUWorkerRequest, timeout: TimeInterval) -> GPUWorkerTransportReply {
         lock.lock(); defer { lock.unlock() }
         requests.append(request)
+        requestTimeouts.append(timeout)
         if blockRequests {
             requestStarted.signal()
             releaseRequest.wait()
@@ -408,10 +410,27 @@ final class GPUWorkerSupervisorTests: XCTestCase {
             convertTarget: "あ")
     }
 
-    func testTimeoutTerminatesOnceLatchesAndSameRequestReturnsClassic() {
+    /// Polls a condition on a short interval so tests can follow the cooldown
+    /// armed background respawn deterministically.
+    private func waitUntil(
+        _ condition: @autoclosure () -> Bool,
+        timeout: TimeInterval = 3,
+        _ message: String = ""
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        return condition()
+    }
+
+    func testTimeoutTerminatesSchedulesRetryAndSameRequestReturnsClassic() {
         let transport = FakeGPUWorkerTransport()
         transport.replies = [.timeout]
-        let supervisor = GPUWorkerSupervisor(transport: transport)
+        // Long cooldown keeps the scheduled respawn out of this test: the
+        // retry thread must own the next spawn, not a request.
+        let supervisor = GPUWorkerSupervisor(transport: transport, retryCooldown: 60)
 
         let first = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
                                       nBest: 1, inferenceLimit: 1, deadline: 1.2)
@@ -419,13 +438,16 @@ final class GPUWorkerSupervisorTests: XCTestCase {
         XCTAssertEqual(first.failure, .timeout)
         XCTAssertEqual(transport.starts, [1])
         XCTAssertEqual(transport.terminateCount, 1)
-        XCTAssertEqual(supervisor.snapshot.state, .classic)
-        XCTAssertEqual(supervisor.snapshot.reason, GPUWorkerQuarantineReason.timeout.rawValue)
+        XCTAssertEqual(supervisor.snapshot.state, .preparing,
+                       "a respawn is scheduled; the stale timeout reason must not surface")
+        XCTAssertNil(supervisor.snapshot.reason)
 
         let second = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
                                        nBest: 1, inferenceLimit: 1, deadline: 1.2)
         XCTAssertFalse(second.usedWorker)
-        XCTAssertEqual(transport.starts, [1], "next request must not respawn after quarantine")
+        XCTAssertNil(second.failure,
+                     "retryPending short-circuits to classic without a failure category")
+        XCTAssertEqual(transport.starts, [1], "the cooldown retry owns the respawn")
         XCTAssertEqual(transport.terminateCount, 1)
     }
 
@@ -551,26 +573,35 @@ final class GPUWorkerSupervisorTests: XCTestCase {
     func testExplicitRetryStartsSingleNewGenerationAndDedupe() {
         let transport = FakeGPUWorkerTransport()
         transport.replies = [.timeout]
-        let supervisor = GPUWorkerSupervisor(transport: transport)
+        let supervisor = GPUWorkerSupervisor(transport: transport, retryCooldown: 60)
         _ = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
                               nBest: 10, inferenceLimit: 1, deadline: 1.2)
         supervisor.explicitRetry()
         supervisor.explicitRetry()
         transport.replies = [.response(GPUWorkerResponse(
-            requestID: 2, generation: 2, mainResults: ["C", "A"], firstClauseResults: ["A"]))]
+            requestID: 2, generation: 3, mainResults: ["C", "A"], firstClauseResults: ["A"]))]
         let result = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
                                        nBest: 10, inferenceLimit: 1, deadline: 1.2)
         XCTAssertTrue(result.usedWorker)
-        XCTAssertEqual(transport.starts, [1, 2])
-        XCTAssertEqual(transport.requests.last?.generation, 2)
+        // gen1 lazy start, gen2 armed by the timeout retry (still cooling down),
+        // gen3 opened by the explicit retry that this request lazily starts.
+        XCTAssertEqual(transport.starts, [1, 3])
+        XCTAssertEqual(transport.requests.last?.generation, 3)
     }
 
     func testOrdinaryReloadDoesNotClearQuarantineAndUnsupportedMappingDoesNotSpawn() {
         let transport = FakeGPUWorkerTransport()
         transport.replies = [.timeout]
-        let supervisor = GPUWorkerSupervisor(transport: transport)
+        let supervisor = GPUWorkerSupervisor(transport: transport, retryCooldown: 0.02)
         _ = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
                               nBest: 10, inferenceLimit: 1, deadline: 1.2)
+        // Escalate to the permanent latch: respawn reaches probation, and the
+        // next convert-tier timeout quarantines.
+        XCTAssertTrue(waitUntil(supervisor.snapshot.state == .gpuActive),
+                      "auto retry should reach probation")
+        _ = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                              nBest: 10, inferenceLimit: 1, deadline: 1.2)
+        XCTAssertEqual(supervisor.snapshot.state, .classic)
         supervisor.ordinaryReload()
         let unsupported = GPUWorkerCompositionSnapshot(
             cursor: 1, input: [GPUWorkerInputElement(
@@ -579,8 +610,261 @@ final class GPUWorkerSupervisorTests: XCTestCase {
         let result = supervisor.rerank(classic: classic(), snapshot: unsupported, leftContext: nil,
                                        nBest: 10, inferenceLimit: 1, deadline: 1.2)
         XCTAssertFalse(result.usedWorker)
-        XCTAssertEqual(transport.starts, [1])
+        XCTAssertEqual(transport.starts, [1, 2])
         XCTAssertEqual(supervisor.snapshot.reason, GPUWorkerQuarantineReason.timeout.rawValue)
+    }
+
+    // MARK: - Timeout recovery ladder
+
+    /// The failure streak is cleared by a valid rank response, not by the
+    /// respawn reaching ready: the observed field failure is "spawn ok, ready
+    /// ok, first rank times out", so probation must survive its own ready.
+    func testProbationRankSuccessResetsStreakSoNextTimeoutRetriesAgain() {
+        let transport = FakeGPUWorkerTransport()
+        transport.replies = [.timeout]
+        let supervisor = GPUWorkerSupervisor(transport: transport, retryCooldown: 0.02)
+        _ = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                              nBest: 10, inferenceLimit: 1, deadline: 1.2)
+        XCTAssertTrue(waitUntil(supervisor.snapshot.state == .gpuActive),
+                      "auto retry should reach probation")
+
+        transport.replies = [.response(GPUWorkerResponse(
+            requestID: 2, generation: 2, mainResults: ["A"], firstClauseResults: ["A"]))]
+        let success = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                                        nBest: 10, inferenceLimit: 1, deadline: 1.2)
+        XCTAssertTrue(success.usedWorker)
+        XCTAssertEqual(supervisor.snapshot.state, .gpuActive)
+
+        transport.replies = []
+        let again = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                                      nBest: 10, inferenceLimit: 1, deadline: 1.2)
+        XCTAssertEqual(again.failure, .timeout)
+        XCTAssertEqual(supervisor.snapshot.state, .preparing,
+                       "after a valid rank the next timeout must schedule a retry, not latch")
+        XCTAssertNotEqual(supervisor.snapshot.state, .classic)
+    }
+
+    func testSecondConvertTimeoutInProbationQuarantinesUntilExplicitRetry() {
+        let transport = FakeGPUWorkerTransport()
+        transport.replies = [.timeout]
+        let supervisor = GPUWorkerSupervisor(transport: transport, retryCooldown: 0.02)
+        _ = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                              nBest: 10, inferenceLimit: 1, deadline: 1.2)
+        XCTAssertTrue(waitUntil(supervisor.snapshot.state == .gpuActive))
+
+        transport.replies = []
+        let second = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                                       nBest: 10, inferenceLimit: 1, deadline: 1.2)
+        XCTAssertEqual(second.failure, .timeout)
+        XCTAssertEqual(supervisor.snapshot.state, .classic)
+        XCTAssertEqual(supervisor.snapshot.reason, GPUWorkerQuarantineReason.timeout.rawValue)
+        XCTAssertEqual(transport.terminateCount, 2)
+
+        let third = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                                      nBest: 10, inferenceLimit: 1, deadline: 1.2)
+        XCTAssertEqual(third.failure, .timeout, "quarantine is a permanent latch")
+        XCTAssertEqual(transport.starts, [1, 2], "no respawn while latched")
+
+        supervisor.explicitRetry()
+        XCTAssertEqual(supervisor.snapshot.state, .preparing)
+    }
+
+    /// Two live-tier timeouts suppress only the live enhancement.  A later
+    /// convert-tier request arms one background probe; a valid probe lifts the
+    /// suppression and live enhancement resumes.
+    func testSecondLiveTimeoutSuppressesLiveOnlyAndStrongCallerProbeRecovers() {
+        let transport = FakeGPUWorkerTransport()
+        transport.replies = [.timeout]
+        let supervisor = GPUWorkerSupervisor(transport: transport, retryCooldown: 0.02)
+        _ = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                              nBest: 10, inferenceLimit: 1, deadline: 0.25, caller: .liveSnapshot)
+        XCTAssertTrue(waitUntil(supervisor.snapshot.state == .gpuActive))
+
+        transport.replies = []
+        _ = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                              nBest: 10, inferenceLimit: 1, deadline: 0.25, caller: .liveSnapshot)
+        XCTAssertEqual(supervisor.snapshot.state, .gpuActive,
+                       "live suppression keeps the worker available for convert-tier")
+
+        let suppressed = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                                           nBest: 10, inferenceLimit: 1, deadline: 0.25,
+                                           caller: .liveSnapshot)
+        XCTAssertFalse(suppressed.usedWorker)
+        XCTAssertNil(suppressed.failure)
+        XCTAssertEqual(transport.requests.count, 2,
+                       "a suppressed live caller must not reach the transport")
+
+        let probeTrigger = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                                             nBest: 10, inferenceLimit: 1, deadline: 1.2,
+                                             caller: .convert)
+        XCTAssertFalse(probeTrigger.usedWorker)
+        XCTAssertNil(probeTrigger.failure)
+        XCTAssertEqual(transport.requests.count, 2,
+                       "the probe-arming request itself must not block behind a spawn")
+        XCTAssertTrue(waitUntil(supervisor.snapshot.state == .gpuActive))
+        XCTAssertEqual(transport.starts, [1, 2, 3])
+
+        transport.replies = [
+            .response(GPUWorkerResponse(
+                requestID: 3, generation: 3, mainResults: ["A"], firstClauseResults: ["A"])),
+            .response(GPUWorkerResponse(
+                requestID: 4, generation: 3, mainResults: ["A"], firstClauseResults: ["A"])),
+        ]
+        let probe = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                                      nBest: 10, inferenceLimit: 1, deadline: 1.2, caller: .convert)
+        XCTAssertTrue(probe.usedWorker)
+
+        let liveAgain = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                                          nBest: 10, inferenceLimit: 1, deadline: 0.25,
+                                          caller: .liveSnapshot)
+        XCTAssertTrue(liveAgain.usedWorker, "a valid probe lifts the live suppression")
+    }
+
+    // MARK: - Diagnostic grace mode
+
+    func testProductionForegroundFallsBackWhileBackgroundOwnsTransport() {
+        let transport = FakeGPUWorkerTransport()
+        transport.blockRequests = true
+        transport.replies = [.timeout]
+        let supervisor = GPUWorkerSupervisor(transport: transport, retryCooldown: 60, graceEnabled: false)
+        let backgroundDone = DispatchSemaphore(value: 0)
+        let foregroundDone = DispatchSemaphore(value: 0)
+        let baseClassic = classic()
+        let baseSnapshot = snapshot()
+        Thread.detachNewThread {
+            _ = supervisor.rerank(classic: baseClassic, snapshot: baseSnapshot, leftContext: nil,
+                                  nBest: 10, inferenceLimit: 1, deadline: 0.9, caller: .explicitSnapshot)
+            backgroundDone.signal()
+        }
+        XCTAssertEqual(transport.requestStarted.wait(timeout: .now() + 2), .success)
+        Thread.detachNewThread {
+            let result = supervisor.rerank(classic: baseClassic, snapshot: baseSnapshot, leftContext: nil,
+                                           nBest: 10, inferenceLimit: 1, deadline: 0.9, caller: .convert)
+            XCTAssertFalse(result.usedWorker)
+            foregroundDone.signal()
+        }
+        let completed = foregroundDone.wait(timeout: .now() + 0.5)
+        transport.releaseRequest.signal()
+        XCTAssertEqual(completed, .success, "foreground must finish before background is released")
+        XCTAssertEqual(backgroundDone.wait(timeout: .now() + 2), .success)
+        if completed != .success { _ = foregroundDone.wait(timeout: .now() + 2) }
+    }
+
+    /// While a background request drains to the hard deadline the foreground
+    /// must answer classic without queuing on operationLock.
+    func testGraceModeForegroundDoesNotQueueBehindBackgroundDrain() {
+        let transport = FakeGPUWorkerTransport()
+        transport.blockRequests = true
+        transport.replies = [.response(GPUWorkerResponse(
+            requestID: 1, generation: 1, mainResults: ["A"], firstClauseResults: ["A"]))]
+        let supervisor = GPUWorkerSupervisor(transport: transport, retryCooldown: 60,
+                                             graceEnabled: true)
+        final class DecisionBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: GPUWorkerRerankDecision?
+            func set(_ decision: GPUWorkerRerankDecision) {
+                lock.lock(); value = decision; lock.unlock()
+            }
+            func get() -> GPUWorkerRerankDecision? {
+                lock.lock(); defer { lock.unlock() }; return value
+            }
+        }
+        let box = DecisionBox()
+        let done = DispatchSemaphore(value: 0)
+        let baseClassic = classic()
+        let baseSnapshot = snapshot()
+        Thread.detachNewThread {
+            box.set(supervisor.rerank(classic: baseClassic, snapshot: baseSnapshot, leftContext: nil,
+                                      nBest: 10, inferenceLimit: 1, deadline: 0.25,
+                                      caller: .liveSnapshot))
+            done.signal()
+        }
+        XCTAssertEqual(transport.requestStarted.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(transport.requestTimeouts, [3.0],
+                       "grace extends only the background transport deadline")
+
+        let start = DispatchTime.now().uptimeNanoseconds
+        let foreground = supervisor.rerank(classic: baseClassic, snapshot: baseSnapshot, leftContext: nil,
+                                           nBest: 10, inferenceLimit: 1, deadline: 0.9,
+                                           caller: .convert)
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        XCTAssertLessThan(elapsed, 500, "foreground must not wait behind the drain")
+        XCTAssertFalse(foreground.usedWorker)
+        XCTAssertNil(foreground.failure)
+
+        Thread.sleep(forTimeInterval: 0.35)
+        transport.releaseRequest.signal()
+        XCTAssertEqual(done.wait(timeout: .now() + 2), .success)
+        let background = box.get()
+        XCTAssertNotNil(background)
+        XCTAssertFalse(background?.usedWorker ?? true,
+                       "a response past the soft deadline is observed, never applied")
+        XCTAssertNil(background?.failure)
+        XCTAssertEqual(supervisor.snapshot.state, .gpuActive)
+    }
+
+    /// With the trace flag off the grace extension must not activate: the
+    /// transport receives the caller's original deadline.
+    func testGraceDisabledPassesOriginalDeadlineAndStaysOff() {
+        let transport = FakeGPUWorkerTransport()
+        transport.replies = [.timeout]
+        let supervisor = GPUWorkerSupervisor(transport: transport, retryCooldown: 60,
+                                             graceEnabled: false)
+        let result = supervisor.rerank(classic: classic(), snapshot: snapshot(), leftContext: nil,
+                                       nBest: 10, inferenceLimit: 1, deadline: 0.25,
+                                       caller: .liveSnapshot)
+        XCTAssertEqual(result.failure, .timeout)
+        XCTAssertEqual(transport.requestTimeouts, [0.25])
+        XCTAssertEqual(supervisor.snapshot.state, .preparing)
+    }
+
+    /// A lifecycle generation change while a grace drain is in flight must
+    /// discard the stale response without terminating the replacement worker.
+    func testGraceDrainDiscardsStaleResponseAndSparesReplacementWorker() {
+        let transport = FakeGPUWorkerTransport()
+        transport.blockRequests = true
+        transport.replies = [.response(GPUWorkerResponse(
+            requestID: 1, generation: 1, mainResults: ["A"], firstClauseResults: ["A"]))]
+        let supervisor = GPUWorkerSupervisor(transport: transport, retryCooldown: 60,
+                                             graceEnabled: true)
+        final class DecisionBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: GPUWorkerRerankDecision?
+            func set(_ decision: GPUWorkerRerankDecision) {
+                lock.lock(); value = decision; lock.unlock()
+            }
+            func get() -> GPUWorkerRerankDecision? {
+                lock.lock(); defer { lock.unlock() }; return value
+            }
+        }
+        let box = DecisionBox()
+        let done = DispatchSemaphore(value: 0)
+        let baseClassic = classic()
+        let baseSnapshot = snapshot()
+        Thread.detachNewThread {
+            box.set(supervisor.rerank(classic: baseClassic, snapshot: baseSnapshot, leftContext: nil,
+                                      nBest: 10, inferenceLimit: 1, deadline: 0.25,
+                                      caller: .liveSnapshot))
+            done.signal()
+        }
+        XCTAssertEqual(transport.requestStarted.wait(timeout: .now() + 2), .success)
+
+        supervisor.modelOrRuntimeChanged()
+        // Push the response past the soft deadline so the drain observes it as
+        // a late response instead of a fast stale-generation protocol miss.
+        Thread.sleep(forTimeInterval: 0.35)
+        transport.releaseRequest.signal()
+        XCTAssertEqual(done.wait(timeout: .now() + 2), .success)
+        XCTAssertFalse(box.get()?.usedWorker ?? true, "the stale response must be discarded")
+        XCTAssertNil(box.get()?.failure)
+        XCTAssertTrue(waitUntil(transport.terminateCount == 1),
+                      "the old generation's transport is reaped exactly once")
+
+        supervisor.startWarmUp()
+        XCTAssertTrue(waitUntil(supervisor.snapshot.state == .gpuActive))
+        XCTAssertEqual(transport.starts, [1, 2])
+        XCTAssertEqual(transport.terminateCount, 1,
+                       "the replacement worker must not be terminated by the stale drain")
     }
 
     func testSnapshotDoesNotWaitForBlockedWorkerRequest() {

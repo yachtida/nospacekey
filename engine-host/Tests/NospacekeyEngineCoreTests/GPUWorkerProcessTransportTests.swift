@@ -23,7 +23,8 @@ final class GPUWorkerProcessTransportTests: XCTestCase {
                                           inferenceLimit: 1))
         let transport = NativeGPUWorkerTransport(executableURL: host)
         let supervisor = GPUWorkerSupervisor(
-            transport: transport, runtimeConfiguration: configuration, allowsLazyStart: false)
+            transport: transport, runtimeConfiguration: configuration, allowsLazyStart: false,
+            retryCooldown: 60)
 
         let oldFault = Self.environmentValue("NOSPACEKEY_GPU_WORKER_TEST_FAULT")
         Self.setEnvironmentValue("NOSPACEKEY_GPU_WORKER_TEST_FAULT", "delay-rank:1000")
@@ -62,8 +63,9 @@ final class GPUWorkerProcessTransportTests: XCTestCase {
         XCTAssertFalse(decision.usedWorker)
         XCTAssertEqual(decision.failure, .timeout)
         XCTAssertEqual(decision.conversion.mainResults.map(\.text), ["classic"])
-        XCTAssertEqual(supervisor.snapshot.state, .classic)
-        XCTAssertEqual(supervisor.snapshot.reason, GPUWorkerQuarantineReason.timeout.rawValue)
+        XCTAssertEqual(supervisor.snapshot.state, .preparing,
+                       "a rank timeout arms a background retry instead of latching")
+        XCTAssertNil(supervisor.snapshot.reason)
         XCTAssertLessThan(elapsedMilliseconds, 400,
                           "live timeout plus worker cleanup must fit the external 400 ms deadline")
 
@@ -73,7 +75,8 @@ final class GPUWorkerProcessTransportTests: XCTestCase {
             nBest: 10, inferenceLimit: 1, deadline: GPUWorkerDeadlineTier.live.workerBudget)
         let latchedMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - latchedStart) / 1_000_000
         XCTAssertFalse(latched.usedWorker)
-        XCTAssertEqual(latched.failure, .timeout)
+        XCTAssertNil(latched.failure,
+                     "retryPending short-circuits to classic without a failure category")
         XCTAssertLessThan(latchedMilliseconds, 50)
     }
 

@@ -12,6 +12,7 @@ use windows::Win32::System::Com::{IDataObject, FORMATETC};
 use windows::Win32::UI::TextServices::{
     ITextStoreACP, ITextStoreACPSink, ITextStoreACP_Impl, ITfCompositionView,
     ITfContextOwnerCompositionSink, ITfContextOwnerCompositionSink_Impl, ITfRange,
+    ITfMouseTrackerACP, ITfMouseTrackerACP_Impl, ITfMouseSink, ITfRangeACP,
     TEXT_STORE_LOCK_FLAGS, TS_ATTRVAL, TS_E_INVALIDPOS, TS_E_NOLOCK, TS_E_SYNCHRONOUS, TS_RT_PLAIN,
     TS_RUNINFO, TS_SELECTIONSTYLE, TS_SELECTION_ACP, TS_STATUS, TS_TEXTCHANGE,
 };
@@ -46,6 +47,15 @@ pub struct StoreState {
     sink: RefCell<Option<ITextStoreACPSink>>,
     locked: Cell<bool>,
     reject_locks: Cell<bool>,
+    pub reject_text: Cell<bool>,
+    pub reject_selection: Cell<bool>,
+    pub rejected_selections: Cell<u32>,
+    pub text_writes: Cell<u32>,
+    pub text_ext_requests: RefCell<Vec<(i32, i32)>>,
+    pub on_selection: RefCell<Option<Box<dyn FnOnce()>>>,
+    pub on_text: RefCell<Option<Box<dyn FnOnce()>>>,
+    mouse_sinks: RefCell<std::collections::BTreeMap<u32, (ITfRangeACP, ITfMouseSink)>>,
+    next_mouse_cookie: Cell<u32>,
 }
 
 impl StoreState {
@@ -55,6 +65,15 @@ impl StoreState {
             sink: RefCell::new(None),
             locked: Cell::new(false),
             reject_locks: Cell::new(false),
+            reject_text: Cell::new(false),
+            reject_selection: Cell::new(false),
+            rejected_selections: Cell::new(0),
+            text_writes: Cell::new(0),
+            text_ext_requests: RefCell::new(Vec::new()),
+            on_selection: RefCell::new(None),
+            on_text: RefCell::new(None),
+            mouse_sinks: RefCell::new(std::collections::BTreeMap::new()),
+            next_mouse_cookie: Cell::new(0),
         }
     }
     /// 実機 item32 用: アプリ側が文書ロックを保持中の状態を擬似し、TSF の同期ロック要求を拒否する。
@@ -79,6 +98,19 @@ impl StoreState {
     pub fn selection(&self) -> (i32, i32) {
         self.doc.selection()
     }
+    pub fn click_preedit(&self, edge: u32, quadrant: u32) -> bool {
+        let absolute = self.committed().encode_utf16().count() as u32 + edge;
+        let bindings: Vec<_> = self.mouse_sinks.borrow().values().cloned().collect();
+        bindings.into_iter().any(|(range, sink)| unsafe {
+            let (mut start, mut len) = (0, 0);
+            range.GetExtent(&mut start, &mut len).is_ok() && start >= 0 && len >= 0
+                && absolute >= start as u32 && absolute <= (start + len) as u32
+                && sink.OnMouseEvent(absolute - start as u32, quadrant, 1).is_ok_and(|eaten| eaten.as_bool())
+        })
+    }
+    pub fn mouse_sinks_snapshot(&self) -> Vec<ITfMouseSink> {
+        self.mouse_sinks.borrow().values().map(|(_, sink)| sink.clone()).collect()
+    }
     /// 合成中か（warm_up が「合成が生き残った」ことを判定するのに使う）。
     pub fn composing(&self) -> bool {
         self.doc.composing()
@@ -100,10 +132,25 @@ impl StoreState {
     }
 }
 
-#[implement(ITextStoreACP, ITfContextOwnerCompositionSink)]
+#[implement(ITextStoreACP, ITfContextOwnerCompositionSink, ITfMouseTrackerACP)]
 pub struct HarnessTextStore {
     st: Rc<StoreState>,
     hwnd: HWND,
+}
+
+impl ITfMouseTrackerACP_Impl for HarnessTextStore_Impl {
+    fn AdviseMouseSink(&self, range: Ref<'_, ITfRangeACP>, sink: Ref<'_, ITfMouseSink>) -> Result<u32> {
+        let range = range.as_ref().ok_or(Error::from(E_INVALIDARG))?.clone();
+        let sink = sink.as_ref().ok_or(Error::from(E_INVALIDARG))?.clone();
+        let cookie = self.st.next_mouse_cookie.get().checked_add(1).ok_or(Error::from(E_INVALIDARG))?;
+        self.st.next_mouse_cookie.set(cookie);
+        self.st.mouse_sinks.borrow_mut().insert(cookie, (range, sink));
+        Ok(cookie)
+    }
+    fn UnadviseMouseSink(&self, cookie: u32) -> Result<()> {
+        self.st.mouse_sinks.borrow_mut().remove(&cookie);
+        Ok(())
+    }
 }
 
 impl HarnessTextStore {
@@ -202,9 +249,15 @@ impl ITextStoreACP_Impl for HarnessTextStore_Impl {
         Ok(())
     }
     fn SetSelection(&self, ulcount: u32, pselection: *const TS_SELECTION_ACP) -> Result<()> {
+        if self.st.reject_selection.get() {
+            self.st.rejected_selections.set(self.st.rejected_selections.get() + 1);
+            return Err(windows::Win32::Foundation::E_FAIL.into());
+        }
         if ulcount >= 1 {
             let sel = unsafe { *pselection };
             self.st.doc.set_selection(sel.acpStart, sel.acpEnd);
+            let callback = self.st.on_selection.borrow_mut().take();
+            if let Some(callback) = callback { callback(); }
         }
         Ok(())
     }
@@ -280,8 +333,12 @@ impl ITextStoreACP_Impl for HarnessTextStore_Impl {
         } else {
             unsafe { std::slice::from_raw_parts(pchtext.0, cch as usize) }
         };
+        if self.st.reject_text.get() { return Err(windows::Win32::Foundation::E_FAIL.into()); }
+        self.st.text_writes.set(self.st.text_writes.get() + 1);
         // SetText 経路: テキストだけ置換しキャレットは動かさない（実 msctf 準拠）。
         self.st.doc.set_text(acpstart, acpend, new);
+        let callback = self.st.on_text.borrow_mut().take();
+        if let Some(callback) = callback { callback(); }
         Ok(TS_TEXTCHANGE {
             acpStart: acpstart,
             acpOldEnd: acpend,
@@ -440,6 +497,7 @@ impl ITextStoreACP_Impl for HarnessTextStore_Impl {
     ) -> Result<()> {
         // 診断: msctf が「初打鍵の合成」前後でレイアウトを要求しているか（NOLAYOUT 即終了説の検証）。
         hlog(&format!("GetTextExt acp=[{acpstart},{acpend})"));
+        self.st.text_ext_requests.borrow_mut().push((acpstart, acpend));
         let left = 100 + acpstart.max(0) * 10;
         let right = 100 + (acpend.max(acpstart) + 1) * 10;
         unsafe {

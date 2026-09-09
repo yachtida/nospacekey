@@ -3,6 +3,12 @@
 #[derive(Debug, Clone)]
 pub enum Ev {
     Activate,
+    ReceiptAcknowledged,
+    ReceiptTokenExpired,
+    ReceiptStaleLearningGeneration,
+    ReconvertCorrectionAcknowledged,
+    ConversionOwnerLost,
+    ClausePresented { ready: bool, selected: usize },
     CandidatesShown {
         n: usize,
         #[allow(dead_code)]
@@ -18,6 +24,8 @@ pub enum Ev {
         source: String,
     },
     /// engine process observed from either on-demand spawn or Activate-time prespawn.
+    // Retained for diagnostic log decoding; fault injection uses the connected pipe PID.
+    #[allow(dead_code)]
     EngineSpawn {
         pid: u32,
         ok: bool,
@@ -168,6 +176,17 @@ fn list_value(body: &str) -> Option<&str> {
 /// 1 行から ev を取り出す（自 PID 前提で呼ぶ）。
 fn parse_one(body: &str) -> Option<Ev> {
     let body = body.trim();
+    if body == "ev=conversion_owner_lost pending_input=true cancel=escape" { return Some(Ev::ConversionOwnerLost); }
+    if body == "ev=reconvert_correction_ack" { return Some(Ev::ReconvertCorrectionAcknowledged); }
+    if body == "ev=receipt_delivery_notice reason=Rejected(Expired)" { return Some(Ev::ReceiptTokenExpired); }
+    if body == "ev=receipt_delivery_notice reason=Rejected(StaleLearningGeneration)" { return Some(Ev::ReceiptStaleLearningGeneration); }
+    if body.starts_with("ev=clause_presented ") {
+        let ready = match kv(body, "window") { Some("ready") => true, Some("closed") => false, _ => return None };
+        return Some(Ev::ClausePresented { ready, selected: kv(body, "sel")?.parse().ok()? });
+    }
+    if body.starts_with("ev=receipt_ack ") && kv(body, "sequence").and_then(|s| s.parse::<u64>().ok()).is_some() {
+        return Some(Ev::ReceiptAcknowledged);
+    }
     // ev=activate は SP6b/SP7 で末尾フィールド (live_conversion=…/default_direct=…) が付く。
     // 他イベント同様に接頭辞許容にする（exact 一致だと activate を取りこぼし item1 が FAIL する）。
     // 末尾の空白ガードで ev=activateX 等の誤マッチを防ぐ。

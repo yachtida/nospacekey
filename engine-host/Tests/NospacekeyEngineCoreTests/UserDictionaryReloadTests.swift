@@ -17,7 +17,7 @@ private final class Box<T>: @unchecked Sendable {
 }
 
 /// カスタム辞書のリロード適用機構（desired 状態+直列キュー+onListening+3値ロード）。
-/// spec: docs/superpowers/specs/2026-08-02-custom-dictionary-design.md §4.1
+/// spec: docs/design/2026-08-02-custom-dictionary-design.md §4.1
 final class UserDictionaryReloadTests: XCTestCase {
     /// environment は辞書ファイル/有効トグルを注入する唯一の入口（env 直読テスト禁止の既存契約）。
     private func makeService(environment: [String: String] = [:],

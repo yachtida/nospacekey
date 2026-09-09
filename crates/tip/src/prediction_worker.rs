@@ -510,6 +510,8 @@ mod tests {
         let result = prediction_session(|request| {
             requests.push(matches!(request, Request::StartSession));
             Ok(Response::Session {
+                engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+                learning_generation: 0,
                 session: 7,
                 proto: Some(ipc::protocol::PROTO_VERSION),
                 boot: Some("loaded-old-build".into()),

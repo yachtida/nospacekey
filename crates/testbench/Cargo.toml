@@ -42,4 +42,10 @@ features = [
   # --own-desktop: lpDesktop 付き自己再起動(CreateProcessW/WaitForSingleObject/GetStdHandle)。
   "Win32_System_Threading",
   "Win32_System_Console",
+  "Win32_System_Pipes",
+  "Win32_Storage_FileSystem",
 ]
+
+[features]
+default = ["tsf-test-hooks"]
+tsf-test-hooks = []

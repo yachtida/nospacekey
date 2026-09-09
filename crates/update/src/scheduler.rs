@@ -165,7 +165,11 @@ fn run_command(program: &str, args: &[String]) -> Result<CommandOutput, String> 
 const TASK_NOT_FOUND_HRESULT: u32 = 0x8007_0002;
 
 fn is_task_not_found(output: &CommandOutput) -> bool {
-    !output.success && output.code.map(|code| code as u32) == Some(TASK_NOT_FOUND_HRESULT)
+    !output.success
+        && matches!(
+            output.code.map(|code| code as u32),
+            Some(TASK_NOT_FOUND_HRESULT | 0x8007_0003)
+        )
 }
 
 fn command_failed(action: &str, output: &CommandOutput) -> String {
@@ -400,21 +404,23 @@ mod tests {
 
     #[test]
     fn delete_treats_task_not_found_hresult_as_idempotent_success() {
-        let identity = task_identity("S-1-5-21-1001");
-        let mut calls = 0;
-        let result = delete_with_runner(&identity, |_program, args| {
-            calls += 1;
-            assert_eq!(args[2], identity.name());
-            if calls == 1 {
-                Ok(output_with_code(false, Some(1)))
-            } else {
-                assert_eq!(args[0], "/Query");
-                assert_eq!(args[3], "/HResult");
-                Ok(output_with_code(false, Some(TASK_NOT_FOUND_HRESULT as i32)))
-            }
-        });
-        assert_eq!(result, Ok(()));
-        assert_eq!(calls, 2);
+        for absent_code in [TASK_NOT_FOUND_HRESULT, 0x8007_0003] {
+            let identity = task_identity("S-1-5-21-1001");
+            let mut calls = 0;
+            let result = delete_with_runner(&identity, |_program, args| {
+                calls += 1;
+                assert_eq!(args[2], identity.name());
+                if calls == 1 {
+                    Ok(output_with_code(false, Some(1)))
+                } else {
+                    assert_eq!(args[0], "/Query");
+                    assert_eq!(args[3], "/HResult");
+                    Ok(output_with_code(false, Some(absent_code as i32)))
+                }
+            });
+            assert_eq!(result, Ok(()));
+            assert_eq!(calls, 2);
+        }
     }
 
     #[test]
@@ -424,6 +430,8 @@ mod tests {
             Ok(output(true)),
             Err("query timed out".to_string()),
             Ok(output_with_code(false, Some(0x8004_130f_u32 as i32))),
+            Ok(output_with_code(false, Some(0x8007_0005_u32 as i32))),
+            Ok(output_with_code(false, Some(1))),
         ] {
             let mut calls = 0;
             let result = delete_with_runner(&identity, |_program, _args| {

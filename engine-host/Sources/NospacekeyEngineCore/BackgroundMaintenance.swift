@@ -109,8 +109,8 @@ final class BackgroundMaintenance: @unchecked Sendable {
 
     /// Waits for work already runnable when the fence enters the serial queue. Future delayed work
     /// is intentionally excluded; callers use generation invalidation when it must become stale.
-    func barrier() {
-        queue.sync {}
+    func barrier(_ work: () -> Void = {}) {
+        queue.sync(execute: work)
     }
 
     func flushForTesting() { barrier() }

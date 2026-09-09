@@ -7,10 +7,30 @@ mod candidate_state;
 mod candidate_uielement;
 mod candidate_window;
 mod class_factory;
+#[allow(dead_code)]
+mod clause_conversion;
+mod grapheme;
+mod input_journal;
+#[allow(dead_code)]
+mod clause_worker;
+mod local_clause_ui;
+mod reading_edit;
+mod clause_mouse;
 mod config_launch;
 mod conversion_mode;
+#[allow(dead_code)]
+mod conversion_queue;
 mod display_attribute;
 mod edit_session;
+mod edit_range;
+mod apply_state;
+mod commit_session;
+#[cfg(feature = "tsf-test-hooks")]
+mod commit_test_hook;
+mod pending_commit;
+mod receipt_outbox;
+mod preedit_apply;
+mod preedit_session;
 pub(crate) mod engine_link;
 mod focus;
 mod globals;

@@ -5,7 +5,7 @@ import Foundation
 /// 新 op が再起動まで無言で decline / no-op になる。読み手が依存しない optional フィールドの追加
 /// （encodeIfPresent で旧形とバイト一致）では bump しない。
 enum ProtocolVersion {
-    static let current: UInt32 = 8
+    static let current: UInt32 = 9
 }
 
 struct AutoCommitProposal: Codable, Equatable {
@@ -27,6 +27,9 @@ struct SnapshotSegment: Codable, Equatable {
 enum Request: Decodable {
     case ping
     case startSession
+    case clauseCandidates(ClauseCandidatesRequest)
+    case convertClauses(ConvertClausesRequest)
+    case commitReceipt(CommitReceipt)
     // style: "direct"=リテラル挿入(Shift英語モード)。nil=roman2kana(従来)。Rust 側は None の
     // ときキーを省略するので Optional デコードで旧 TIP 互換を保つ(left_context と同じ規約)。
     case insert(session: Int64, text: String, style: String?)
@@ -41,10 +44,11 @@ enum Request: Decodable {
     case liveConvert(session: Int64, seq: UInt64, leftContext: String?, autoCommit: Bool)
     case liveSnapshot(composition: UInt64, revision: UInt64,
                       configurationGeneration: UInt64, connectionGeneration: UInt64,
-                      segments: [SnapshotSegment], explicit: Bool, leftContext: String?)
+                      segments: [SnapshotSegment], explicit: Bool, leftContext: String?,
+                      conversionRevision: UInt64, requestID: UInt64)
     case pollSnapshotEnhancement(composition: UInt64, revision: UInt64,
                                  configurationGeneration: UInt64, connectionGeneration: UInt64,
-                                 baseline: UInt64)
+                                 baseline: UInt64, conversionRevision: UInt64, requestID: UInt64)
     case autoCommitReceipt(composition: UInt64, revision: UInt64,
                            configurationGeneration: UInt64, connectionGeneration: UInt64,
                            proposal: UInt64)
@@ -89,11 +93,13 @@ enum Request: Decodable {
         let composition: UInt64; let revision: UInt64
         let configuration_generation: UInt64; let connection_generation: UInt64
         let segments: [SnapshotSegment]; let explicit: Bool?; let left_context: String?
+        let conversion_revision: UInt64; let request_id: UInt64
     }
     private struct SnapshotEnhancementParams: Decodable {
         let composition: UInt64; let revision: UInt64
         let configuration_generation: UInt64; let connection_generation: UInt64
         let baseline: UInt64
+        let conversion_revision: UInt64; let request_id: UInt64
     }
     private struct AutoCommitReceiptParams: Decodable {
         let composition: UInt64; let revision: UInt64
@@ -137,6 +143,9 @@ enum Request: Decodable {
         switch try c.decode(String.self, forKey: .method) {
         case "Ping": self = .ping
         case "StartSession": self = .startSession
+        case "ClauseCandidates": self = .clauseCandidates(try c.decode(ClauseCandidatesRequest.self, forKey: .params))
+        case "ConvertClauses": self = .convertClauses(try c.decode(ConvertClausesRequest.self, forKey: .params))
+        case "CommitReceipt": self = .commitReceipt(try c.decode(CommitReceipt.self, forKey: .params))
         case "Insert": let p = try c.decode(InsertParams.self, forKey: .params); self = .insert(session: p.session, text: p.text, style: p.style)
         case "Backspace": let p = try c.decode(SessionParams.self, forKey: .params); self = .backspace(session: p.session)
         // U9: Convert のみ left_context を持つ。Rust 側は None のときキーを省略するので、
@@ -153,13 +162,14 @@ enum Request: Decodable {
                                  configurationGeneration: p.configuration_generation,
                                  connectionGeneration: p.connection_generation,
                                  segments: p.segments, explicit: p.explicit ?? false,
-                                 leftContext: p.left_context)
+                                 leftContext: p.left_context, conversionRevision: p.conversion_revision, requestID: p.request_id)
         case "PollSnapshotEnhancement":
             let p = try c.decode(SnapshotEnhancementParams.self, forKey: .params)
             self = .pollSnapshotEnhancement(
                 composition: p.composition, revision: p.revision,
                 configurationGeneration: p.configuration_generation,
-                connectionGeneration: p.connection_generation, baseline: p.baseline)
+                connectionGeneration: p.connection_generation, baseline: p.baseline,
+                conversionRevision: p.conversion_revision, requestID: p.request_id)
         case "AutoCommitReceipt":
             let p = try c.decode(AutoCommitReceiptParams.self, forKey: .params)
             self = .autoCommitReceipt(
@@ -196,8 +206,11 @@ enum Request: Decodable {
 
 enum Response: Encodable {
     case pong
+    case clauseCandidatesResult(ClauseCandidatesResult)
+    case convertClausesResult(ConvertClausesResult)
+    case commitReceiptAck(CommitReceiptAck)
     // wire世代とEngineHost buildの完全一致だけをTIPが採用する。Rust `Response::Session` と対。
-    case session(Int64, proto: UInt32?, boot: String?)
+    case session(Int64, proto: UInt32?, boot: String?, engineEpoch: String, learningGeneration: UInt64)
     case reading(String)
     case candidates([String])
     case ok
@@ -206,13 +219,13 @@ enum Response: Encodable {
     case snapshotResult(composition: UInt64, revision: UInt64,
                         configurationGeneration: UInt64, connectionGeneration: UInt64,
                         text: String, candidates: [String]?, candidateRemaining: [String]?, baseline: UInt64,
-                        autoCommit: AutoCommitProposal?)
+                        autoCommit: AutoCommitProposal?, clauseData: SnapshotClauseData)
     case snapshotEnhancement(composition: UInt64, revision: UInt64,
                              configurationGeneration: UInt64, connectionGeneration: UInt64,
                              baseline: UInt64, text: String,
-                             candidates: [String]?, candidateRemaining: [String]?)
-    case snapshotEnhancementPending
-    case snapshotEnhancementUnavailable
+                             candidates: [String]?, candidateRemaining: [String]?, clauseData: SnapshotClauseData)
+    case snapshotEnhancementPending(SnapshotResponseKey)
+    case snapshotEnhancementUnavailable(SnapshotResponseKey)
     case llmResult(seq: UInt64, text: String)
     case prediction(seq: UInt64, text: String)
     case predictionUnavailable(seq: UInt64, state: String)
@@ -228,14 +241,26 @@ enum Response: Encodable {
         case segments, selected, backend, device, reason
         case candidateIndex = "candidate_index"
         case candidateRemaining = "candidate_remaining", baseline, autoCommit = "auto_commit"
+        case engineEpoch = "engine_epoch", learningGeneration = "learning_generation"
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: Keys.self)
         switch self {
         case .pong: try c.encode("Pong", forKey: .result)
-        case .session(let s, let proto, let boot):
+        case .clauseCandidatesResult(let response):
+            try c.encode("ClauseCandidatesResult", forKey: .result)
+            try response.encode(to: encoder)
+        case .convertClausesResult(let response):
+            try c.encode("ConvertClausesResult", forKey: .result)
+            try response.encode(to: encoder)
+        case .commitReceiptAck(let response):
+            try c.encode("CommitReceiptAck", forKey: .result)
+            try response.encode(to: encoder)
+        case .session(let s, let proto, let boot, let engineEpoch, let learningGeneration):
             try c.encode("Session", forKey: .result)
             try c.encode(s, forKey: .session)
+            try c.encode(engineEpoch, forKey: .engineEpoch)
+            try c.encode(learningGeneration, forKey: .learningGeneration)
             // nil のときキー省略＝handshake 導入前と wire 形一致（旧TIP互換。Rust 側 Option と対）。
             try c.encodeIfPresent(proto, forKey: .proto)
             try c.encodeIfPresent(boot, forKey: .boot)
@@ -250,7 +275,7 @@ enum Response: Encodable {
             try c.encodeIfPresent(committed, forKey: .committed)
         case .snapshotResult(let composition, let revision, let configurationGeneration,
                              let connectionGeneration, let text, let candidates, let candidateRemaining, let baseline,
-                             let autoCommit):
+                             let autoCommit, let clauseData):
             try c.encode("SnapshotResult", forKey: .result)
             try c.encode(composition, forKey: .composition)
             try c.encode(revision, forKey: .revision)
@@ -261,9 +286,10 @@ enum Response: Encodable {
             try c.encodeIfPresent(candidateRemaining, forKey: .candidateRemaining)
             try c.encode(baseline, forKey: .baseline)
             try c.encodeIfPresent(autoCommit, forKey: .autoCommit)
+            try clauseData.encode(to: encoder)
         case .snapshotEnhancement(let composition, let revision, let configurationGeneration,
                                   let connectionGeneration, let baseline, let text,
-                                  let candidates, let candidateRemaining):
+                                  let candidates, let candidateRemaining, let clauseData):
             try c.encode("SnapshotEnhancement", forKey: .result)
             try c.encode(composition, forKey: .composition)
             try c.encode(revision, forKey: .revision)
@@ -273,10 +299,13 @@ enum Response: Encodable {
             try c.encode(text, forKey: .text)
             try c.encodeIfPresent(candidates, forKey: .candidates)
             try c.encodeIfPresent(candidateRemaining, forKey: .candidateRemaining)
-        case .snapshotEnhancementPending:
+            try clauseData.encode(to: encoder)
+        case .snapshotEnhancementPending(let key):
             try c.encode("SnapshotEnhancementPending", forKey: .result)
-        case .snapshotEnhancementUnavailable:
+            try key.encode(to: encoder)
+        case .snapshotEnhancementUnavailable(let key):
             try c.encode("SnapshotEnhancementUnavailable", forKey: .result)
+            try key.encode(to: encoder)
         case .llmResult(let seq, let text):
             try c.encode("LlmResult", forKey: .result)
             try c.encode(seq, forKey: .seq)
@@ -318,6 +347,7 @@ extension Request {
     var sessionId: Int64? {
         switch self {
         case .ping, .startSession, .liveSnapshot, .pollSnapshotEnhancement, .autoCommitReceipt,
+             .clauseCandidates, .convertClauses, .commitReceipt,
              .reloadConfig, .clearLearning, .shutdown, .queryZenzaiStatus,
              .retryZenzai, .recordCorrection,
              .reloadDictionary:

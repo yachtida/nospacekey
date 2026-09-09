@@ -356,6 +356,7 @@ unsafe fn on_click(hwnd: HWND, y: i32) {
         let Some(state) = window_state(hwnd) else {
             return;
         };
+        if state.backend.fading_out { return; }
         let Some((abs, changed)) =
             clicked_candidate(state.selected, state.candidates.len(), y, state.layout_dpi)
         else {
@@ -380,6 +381,7 @@ unsafe fn on_click(hwnd: HWND, y: i32) {
     if changed {
         let _ = InvalidateRect(Some(hwnd), None, true);
     }
+    if crate::text_service::finalize_native_clause_click_via_tls() { return; }
     if sync_requested {
         crate::text_service::drain_behavior_via_tls();
     }

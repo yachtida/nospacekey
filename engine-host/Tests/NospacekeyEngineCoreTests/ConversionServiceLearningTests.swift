@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import KanaKanjiConverterModuleWithDefaultDictionary
 @testable import NospacekeyEngineCore
 
 private enum LearningFileSystemListResult {
@@ -72,6 +73,158 @@ private final class LearningFileSystemTracker {
 }
 
 final class ConversionServiceLearningTests: XCTestCase {
+    private func productionService(_ dir: URL) -> ConversionService {
+        ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                          learning: LearningSettings(enabled: true, memoryDir: dir),
+                          processRole: .mainClassicOnly)
+    }
+
+    private func seed(_ svc: ConversionService, session: Int,
+                      words: [String], readings: [String]) -> Candidate {
+        let reading = readings.joined()
+        _ = svc.insert(session: session, text: reading)
+        // Initialize vendor learning configuration before injecting deterministic data.
+        _ = svc.convert(session: session)
+        let candidate = Candidate(
+            text: words.joined(), value: -10, composingCount: .inputCount(reading.count),
+            lastMid: MIDData.一般.mid,
+            data: zip(words, readings).map {
+                DicdataElement(word: $0, ruby: $1, cid: CIDData.一般名詞.cid,
+                               mid: MIDData.一般.mid, value: -10)
+            })
+        svc.cacheCandidatesForTesting(session: session, candidates: [candidate], target: reading)
+        return candidate
+    }
+
+    func testProductionAdjacentClausesPersistAsCombinedEntry() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let svc = productionService(dir)
+        let sid = svc.startSession()
+        let candidate = seed(svc, session: sid, words: ["試験甲", "試験乙"], readings: ["コウ", "オツ"])
+        let view = try XCTUnwrap(svc.moveClause(session: sid, offset: 0, baseIndex: 0))
+        XCTAssertEqual(view.segments, ["試験甲", "試験乙"])
+        XCTAssertEqual(try XCTUnwrap(svc.commitClauses(session: sid)).text, candidate.text)
+        svc.endSession(session: sid)
+        svc.prepareForShutdown()
+        let correctionURL = dir.appendingPathComponent("corrections.json")
+        if FileManager.default.fileExists(atPath: correctionURL.path) {
+            try FileManager.default.removeItem(at: correctionURL)
+        }
+        let restored = productionService(dir)
+        let restoredID = restored.startSession()
+        _ = restored.insert(session: restoredID, text: "コウオツ")
+        XCTAssertEqual(try XCTUnwrap(restored.convert(session: restoredID)).first, candidate.text)
+        XCTAssertEqual(restored.cachedTopElementCountForTesting(session: restoredID), 1,
+                       "The adjacent pair must load as one learned entry, not two learned words")
+        restored.endSession(session: restoredID)
+        restored.prepareForShutdown()
+    }
+
+    func testProductionManualLearningSurvivesFullMaintenanceQueue() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let svc = productionService(dir)
+        let release = svc.beginMaintenanceHoldForTesting()
+        do {
+            defer { release() }
+            for _ in 0..<70 {
+                let sid = svc.startSession()
+                _ = seed(svc, session: sid, words: ["試験甲"], readings: ["コウ"])
+                XCTAssertNotNil(svc.commit(session: sid, index: 0))
+                svc.endSession(session: sid)
+            }
+            let sid = svc.startSession()
+            _ = seed(svc, session: sid, words: ["飽和後の学習"], readings: ["ヘイ"])
+            XCTAssertNotNil(svc.commit(session: sid, index: 0))
+            svc.endSession(session: sid)
+        }
+        svc.prepareForShutdown()
+        let correctionURL = dir.appendingPathComponent("corrections.json")
+        if FileManager.default.fileExists(atPath: correctionURL.path) {
+            try FileManager.default.removeItem(at: correctionURL)
+        }
+        let restored = productionService(dir)
+        for (reading, word) in [("コウ", "試験甲"), ("ヘイ", "飽和後の学習")] {
+            let sid = restored.startSession()
+            _ = restored.insert(session: sid, text: reading)
+            XCTAssertEqual(try XCTUnwrap(restored.convert(session: sid)).first, word)
+            restored.endSession(session: sid)
+        }
+        restored.prepareForShutdown()
+    }
+
+    func testProductionLearningShutdownRecoversRejectedWakeup() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let svc = productionService(dir)
+        let release = svc.beginMaintenanceHoldForTesting()
+        do {
+            defer { release() }
+            let full = svc.saturateCoalescedMaintenanceForTesting()
+            XCTAssertEqual(full.pending, 64)
+            XCTAssertGreaterThan(full.dropped, 0)
+            let sid = svc.startSession()
+            _ = seed(svc, session: sid, words: ["拒否後の学習"], readings: ["ヘイ"])
+            XCTAssertNotNil(svc.commit(session: sid, index: 0))
+            svc.endSession(session: sid)
+        }
+        svc.prepareForShutdown()
+        let restored = productionService(dir)
+        let sid = restored.startSession()
+        _ = restored.insert(session: sid, text: "ヘイ")
+        XCTAssertEqual(try XCTUnwrap(restored.convert(session: sid)).first, "拒否後の学習")
+        restored.endSession(session: sid)
+        restored.prepareForShutdown()
+    }
+
+    func testProductionLearningRespectsSessionAndSnapshotBoundaries() throws {
+        // The no-boundary case also verifies context survives two separate writer drains.
+        for boundary in ["none", "session", "snapshot"] {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let svc = productionService(dir)
+            let first = svc.startSession()
+            _ = seed(svc, session: first, words: ["試験甲"], readings: ["コウ"])
+            XCTAssertNotNil(svc.commit(session: first, index: 0))
+            svc.flushMaintenanceForTesting()
+            var second = first
+            if boundary == "session" {
+                // Keep the first session alive: isolation cannot rely on all-session teardown.
+                second = svc.startSession()
+            } else if boundary == "snapshot" {
+                _ = svc.snapshot([SnapshotSegment(text: "nihongo", style: nil)], explicit: true)
+            }
+            _ = seed(svc, session: second, words: ["試験乙"], readings: ["オツ"])
+            XCTAssertNotNil(svc.commit(session: second, index: 0))
+            svc.endSession(session: first)
+            if second != first { svc.endSession(session: second) }
+            svc.prepareForShutdown()
+            let restored = productionService(dir)
+            let sid = restored.startSession()
+            _ = restored.insert(session: sid, text: "コウオツ")
+            let candidates = try XCTUnwrap(restored.convert(session: sid))
+            if boundary == "none" {
+                XCTAssertEqual(candidates.first, "試験甲試験乙")
+                XCTAssertEqual(restored.cachedTopElementCountForTesting(session: sid), 1)
+            }
+            // A built-in whole-word candidate can outrank two learned words. Inspect the
+            // saved entries for the negative case instead of assuming a particular ranking.
+            XCTAssertTrue(try persistedWord("試験甲", in: dir))
+            XCTAssertTrue(try persistedWord("試験乙", in: dir))
+            XCTAssertEqual(try persistedWord("試験甲試験乙", in: dir), boundary == "none", boundary)
+            restored.endSession(session: sid)
+            restored.prepareForShutdown()
+        }
+    }
+    private func persistedWord(_ word: String, in dir: URL) throws -> Bool {
+        // Vendor Loudstxt3Builder stores each surface as UTF-8 following a tab.
+        // These fixtures use unique surfaces, distinct from their katakana readings.
+        let files = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("memory") && $0.pathExtension == "loudstxt3" }
+        XCTAssertFalse(files.isEmpty, "A missing dictionary cannot prove boundary isolation")
+        return try files.contains { try Data(contentsOf: $0).range(of: Data(("\t" + word).utf8)) != nil }
+    }
     private func makeTempDir() throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("nospacekey-learn-\(UUID().uuidString)")
@@ -124,6 +277,40 @@ final class ConversionServiceLearningTests: XCTestCase {
         let cands2 = try XCTUnwrap(svc.convert(session: sid2))
         XCTAssertEqual(cands2.first, learned, "確定候補が学習で先頭に来るはず: \(cands2)")
         svc.endSession(session: sid2)
+    }
+
+    func testProductionClauseLearningSurvivesNewService() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func service() -> ConversionService {
+            ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                              learning: LearningSettings(enabled: true, memoryDir: dir),
+                              processRole: .mainClassicOnly)
+        }
+        let svc = service()
+        let sid = svc.startSession()
+        _ = svc.insert(session: sid, text: "kyouhaiitenkidesu")
+        _ = svc.convert(session: sid)
+        let view = try XCTUnwrap(svc.moveClause(session: sid, offset: 0, baseIndex: 0))
+        XCTAssertGreaterThan(view.candidates.count, 1)
+        let reading = try XCTUnwrap(svc.clauseReadingsForTesting(session: sid)).first!
+        let recordable = Set(try XCTUnwrap(svc.clauseRecordableSurfacesForTesting(session: sid)))
+        let pick = try XCTUnwrap(view.candidates.indices.first { recordable.contains(view.candidates[$0]) && view.candidates[$0] != view.segments[0] })
+        let target = view.candidates[pick]
+        let updated = try XCTUnwrap(svc.selectClauseCandidate(session: sid, index: pick))
+        XCTAssertEqual(try XCTUnwrap(svc.commitClauses(session: sid)).text, updated.segments.joined())
+        svc.endSession(session: sid)
+        svc.prepareForShutdown()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("memory.louds").path))
+        // Verify dictionary learning independently of the correction table.
+        let corrections = dir.appendingPathComponent("corrections.json")
+        if FileManager.default.fileExists(atPath: corrections.path) { try FileManager.default.removeItem(at: corrections) }
+        let restored = service()
+        let sid2 = restored.startSession()
+        _ = restored.insert(session: sid2, text: reading)
+        XCTAssertEqual(try XCTUnwrap(restored.convert(session: sid2)).first, target)
+        restored.endSession(session: sid2)
+        restored.prepareForShutdown()
     }
 
     /// ③: clearLearning で RAM+ディスクが消える。
@@ -432,8 +619,9 @@ final class ConversionServiceLearningTests: XCTestCase {
                                     learning: LearningSettings(enabled: true, memoryDir: dir),
                                     fileSystem: tracker.fileSystem)
 
-        XCTAssertTrue(svc.reload(overrides: ["NOSPACEKEY_LEARNING": "0"]))
+        XCTAssertTrue(svc.reload(overrides: ["NOSPACEKEY_LEARNING": "0", "NOSPACEKEY_ZENZAI": "off"]))
         XCTAssertTrue(svc.reload(overrides: [
+            "NOSPACEKEY_ZENZAI": "off",
             "NOSPACEKEY_LEARNING": "1",
             "NOSPACEKEY_MEMORY_DIR": dir.path
         ]))

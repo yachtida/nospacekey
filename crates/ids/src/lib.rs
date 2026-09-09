@@ -13,6 +13,9 @@ pub const GUID_DISPLAY_ATTRIBUTE: GUID = GUID::from_u128(0xb8045359_1149_414d_84
 /// 変換対象文節（文節ナビゲーションの選択文節）の太下線表示用の表示属性GUID。
 pub const GUID_DISPLAY_ATTRIBUTE_TARGET: GUID =
     GUID::from_u128(0x5b1a6f0e_9d24_4c31_8a75_36c4de00b917);
+/// 非選択の変換済み文節の表示属性GUID。
+pub const GUID_DISPLAY_ATTRIBUTE_CONVERTED: GUID =
+    GUID::from_u128(0x47615d96_e659_4259_a83e_04371873ea20);
 /// インライン予測ゴースト（灰色文字＋点線下線）の表示属性GUID。
 pub const GUID_DISPLAY_ATTRIBUTE_PREDICTION: GUID =
     GUID::from_u128(0x6d8ce4c7_2e21_4b7a_9a5c_f08f446fe96a);

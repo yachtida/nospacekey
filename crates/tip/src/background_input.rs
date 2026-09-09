@@ -207,6 +207,7 @@ impl BackgroundMailbox {
 }
 
 pub(crate) struct BackgroundInputWorker {
+    request_ids: Arc<AtomicU64>,
     mailbox: BackgroundMailbox,
     // Snapshot bodies never enter this lane. Live wakeups are coalesced to one command, so a
     // typing burst cannot consume the capacity needed to reconfigure or close the private session.
@@ -229,8 +230,11 @@ pub(crate) struct BackgroundInputWorker {
     snapshot_statuses: Arc<ArrayQueue<SnapshotStatus>>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SnapshotEnhancementRequest {
+    learning_identity: Option<ipc::client::EngineLearningIdentity>,
+    conversion_revision: u64,
+    request_id: u64,
     serial: u64,
     identity: SnapshotIdentity,
     purpose: SnapshotPurpose,
@@ -252,6 +256,9 @@ impl SnapshotEnhancementPublisher {
             SnapshotPurpose::Explicit => EXPLICIT_ENHANCEMENT_BUDGET,
         };
         let _ = self.pending.force_push(SnapshotEnhancementRequest {
+            learning_identity: result.learning_identity.clone(),
+            conversion_revision: result.clause_data.conversion_revision,
+            request_id: result.clause_data.request_id,
             serial,
             identity: result.identity,
             purpose: result.purpose,
@@ -342,6 +349,7 @@ pub(crate) enum SnapshotStatus {
     Configured {
         configuration_generation: u64,
         connection_epoch: u64,
+        learning_identity: Option<ipc::client::EngineLearningIdentity>,
     },
     Invalidated {
         configuration_generation: u64,
@@ -357,6 +365,8 @@ pub(crate) enum SnapshotStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LiveSnapshotResult {
+    pub(crate) learning_identity: Option<ipc::client::EngineLearningIdentity>,
+    pub(crate) clause_data: ipc::clause::SnapshotClauseData,
     pub(crate) identity: SnapshotIdentity,
     pub(crate) purpose: SnapshotPurpose,
     pub(crate) text: String,
@@ -369,6 +379,7 @@ pub(crate) struct LiveSnapshotResult {
 
 impl BackgroundInputWorker {
     pub(crate) fn start(pipe: String, capacity: usize) -> Self {
+        let request_ids = Arc::new(AtomicU64::new(0));
         assert!(capacity > 0, "background worker capacity must be positive");
         let (mailbox, receiver) = bounded_mailbox(capacity);
         let (snapshot_sender, snapshot_receiver) = sync_channel(capacity);
@@ -413,6 +424,7 @@ impl BackgroundInputWorker {
         let worker_snapshot_alive = snapshot_worker_alive.clone();
         let worker_results = results.clone();
         let worker_snapshot_statuses = snapshot_statuses.clone();
+        let worker_request_ids = request_ids.clone();
         if std::thread::Builder::new()
             .name("nospacekey-snapshot".to_string())
             .spawn(move || {
@@ -434,7 +446,7 @@ impl BackgroundInputWorker {
                         published_snapshot_epoch,
                         Some(enhancement_publisher),
                         auto_commit_receipt_receiver,
-                    ),
+                    ).with_request_ids(worker_request_ids),
                     worker_results,
                     worker_snapshot_statuses,
                 );
@@ -466,6 +478,7 @@ impl BackgroundInputWorker {
             crate::text_service::tip_log("ev=snapshot_enhancement_worker_spawn_failed");
         }
         Self {
+            request_ids,
             mailbox,
             snapshot_sender,
             pending_snapshot,
@@ -485,6 +498,10 @@ impl BackgroundInputWorker {
 
     pub(crate) fn needs_reseed(&self) -> bool {
         self.mailbox.needs_reseed()
+    }
+
+    pub(crate) fn next_clause_request_id(&self) -> Option<u64> {
+        self.request_ids.fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1)).ok().map(|id| id + 1)
     }
     pub(crate) fn begin_composition(&self) {
         self.mailbox.begin_composition();
@@ -804,6 +821,7 @@ enum SnapshotConfigureOutcome {
 
 trait SnapshotTransport {
     fn configure(&mut self, request: &Request) -> SnapshotConfigureOutcome;
+    fn learning_identity(&self) -> Option<ipc::client::EngineLearningIdentity> { None }
     fn convert(&mut self, snapshot: &CompositionSnapshot) -> Option<LiveSnapshotResult>;
     fn schedule_enhancement(&self, _result: &LiveSnapshotResult) {}
     fn apply_auto_commit_receipt(&mut self, _request: &Request) -> bool {
@@ -833,6 +851,8 @@ trait SnapshotEnhancementTransport {
         identity: SnapshotIdentity,
         purpose: SnapshotPurpose,
         baseline: u64,
+        conversion_revision: u64,
+        request_id: u64,
         deadline: Instant,
     ) -> SnapshotEnhancementPoll;
 }
@@ -999,6 +1019,7 @@ fn run_snapshot_worker_with_retry<T: SnapshotTransport>(
                     let _ = statuses.force_push(SnapshotStatus::Configured {
                         configuration_generation,
                         connection_epoch: transport.connection_epoch(),
+                        learning_identity: transport.learning_identity(),
                     });
                     let rebind = |mut snapshot: CompositionSnapshot| {
                         (snapshot.identity.configuration_generation == configuration_generation)
@@ -1211,7 +1232,7 @@ fn run_snapshot_enhancement_worker<T: SnapshotEnhancementTransport>(
         if let Some(latest) = pending.pop() {
             active = Some(latest);
         }
-        let Some(request) = active else {
+        let Some(request) = active.as_ref() else {
             std::thread::park_timeout(POLL_INTERVAL);
             continue;
         };
@@ -1225,6 +1246,8 @@ fn run_snapshot_enhancement_worker<T: SnapshotEnhancementTransport>(
             request.identity,
             request.purpose,
             request.baseline,
+            request.conversion_revision,
+            request.request_id,
             request.deadline,
         );
         if shutdown.load(Ordering::Acquire) {
@@ -1243,7 +1266,8 @@ fn run_snapshot_enhancement_worker<T: SnapshotEnhancementTransport>(
                         .min(request.deadline.saturating_duration_since(Instant::now())),
                 );
             }
-            SnapshotEnhancementPoll::Ready(result) => {
+            SnapshotEnhancementPoll::Ready(mut result) => {
+                result.learning_identity = request.learning_identity.clone();
                 let _ = results.force_push(result);
                 active = None;
             }
@@ -1275,6 +1299,8 @@ fn adopt_desired_snapshot_configuration(
 }
 
 struct EngineSnapshotTransport {
+    learning_identity: Option<ipc::client::EngineLearningIdentity>,
+    request_ids: Arc<AtomicU64>,
     pipe: String,
     client: Option<EngineClient>,
     connection_epoch: Arc<AtomicU64>,
@@ -1288,6 +1314,11 @@ struct EngineSnapshotEnhancementTransport {
     identity_mismatch: bool,
 }
 
+fn refresh_snapshot_learning_identity(mut send: impl FnMut(&Request) -> Option<Response>) -> Option<ipc::client::EngineLearningIdentity> {
+    let (session, identity) = ipc::client::verify_session_metadata(send(&Request::StartSession)?).ok()?;
+    matches!(send(&Request::EndSession { session }), Some(Response::Ok)).then_some(identity)
+}
+
 fn configure_snapshot_protocol(
     request: &Request,
     mut send: impl FnMut(&Request) -> Option<Response>,
@@ -1296,6 +1327,7 @@ fn configure_snapshot_protocol(
         session,
         proto,
         boot,
+        ..
     }) = send(&Request::StartSession)
     else {
         return SnapshotConfigureOutcome::RetryableFailure;
@@ -1324,6 +1356,8 @@ impl EngineSnapshotTransport {
         auto_commit_receipt_receiver: Receiver<Request>,
     ) -> Self {
         Self {
+            learning_identity: None,
+            request_ids: Arc::new(AtomicU64::new(0)),
             pipe,
             client: None,
             connection_epoch,
@@ -1345,6 +1379,11 @@ impl EngineSnapshotTransport {
         }
     }
 
+    fn with_request_ids(mut self, request_ids: Arc<AtomicU64>) -> Self {
+        self.request_ids = request_ids;
+        self
+    }
+
     fn request(&mut self, request: &Request, timeout: Duration) -> Option<Response> {
         if !self.ensure_client() {
             return None;
@@ -1357,6 +1396,10 @@ impl EngineSnapshotTransport {
 }
 
 impl SnapshotTransport for EngineSnapshotTransport {
+    fn learning_identity(&self) -> Option<ipc::client::EngineLearningIdentity> {
+        self.learning_identity.clone()
+    }
+
     fn configure(&mut self, request: &Request) -> SnapshotConfigureOutcome {
         let outcome = configure_snapshot_protocol(request, |request| {
             self.request(request, Duration::from_millis(250))
@@ -1364,16 +1407,28 @@ impl SnapshotTransport for EngineSnapshotTransport {
         if matches!(outcome, SnapshotConfigureOutcome::VersionMismatch { .. }) {
             self.client = None;
         }
+        self.learning_identity = None;
+        if outcome == SnapshotConfigureOutcome::Configured {
+            // ReloadConfig may advance learning_generation. Stamp snapshots
+            // with a handshake taken after the setting change completed.
+            self.learning_identity = refresh_snapshot_learning_identity(|request| {
+                self.request(request, Duration::from_millis(250))
+            });
+            if self.learning_identity.is_none() { return SnapshotConfigureOutcome::RetryableFailure; }
+        }
         outcome
     }
 
     fn convert(&mut self, snapshot: &CompositionSnapshot) -> Option<LiveSnapshotResult> {
+        let request_id = self.request_ids.fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1)).ok()? + 1;
         let response = self.request(
             &Request::LiveSnapshot {
                 composition: snapshot.identity.composition,
                 revision: snapshot.identity.revision,
                 configuration_generation: snapshot.identity.configuration_generation,
                 connection_generation: snapshot.identity.connection_generation,
+                conversion_revision: 0,
+                request_id,
                 segments: snapshot
                     .segments
                     .iter()
@@ -1395,6 +1450,7 @@ impl SnapshotTransport for EngineSnapshotTransport {
         )?;
         match response {
             Response::SnapshotResult {
+                clause_data,
                 composition,
                 revision,
                 configuration_generation,
@@ -1405,6 +1461,16 @@ impl SnapshotTransport for EngineSnapshotTransport {
                 baseline,
                 auto_commit,
             } => {
+                if composition != snapshot.identity.composition
+                    || revision != snapshot.identity.revision
+                    || configuration_generation != snapshot.identity.configuration_generation
+                    || connection_generation != snapshot.identity.connection_generation
+                    || clause_data.request_id != request_id
+                    || clause_data.conversion_revision != 0
+                    || clause_data.validate(&text).is_err()
+                {
+                    return None;
+                }
                 let (candidates, candidate_remaining) = match snapshot.purpose {
                     SnapshotPurpose::Live => (None, None),
                     SnapshotPurpose::Explicit => {
@@ -1417,7 +1483,10 @@ impl SnapshotTransport for EngineSnapshotTransport {
                     }
                 };
                 Some(LiveSnapshotResult {
+                    learning_identity: self.learning_identity.clone(),
+                    clause_data,
                     identity: SnapshotIdentity {
+                        request: snapshot.identity.request,
                         composition,
                         revision,
                         configuration_generation,
@@ -1433,6 +1502,7 @@ impl SnapshotTransport for EngineSnapshotTransport {
                         crate::input_module::AutoCommitProposal {
                             proposal: proposal.proposal,
                             identity: SnapshotIdentity {
+                                request: snapshot.identity.request,
                                 composition,
                                 revision,
                                 configuration_generation,
@@ -1495,6 +1565,7 @@ impl SnapshotTransport for EngineSnapshotTransport {
 
     fn invalidate(&mut self) -> u64 {
         self.client = None;
+        self.learning_identity = None;
         // A named-pipe connection cannot survive its EngineHost process. Advancing only after
         // dropping that connection therefore identifies both the connection and the observed
         // engine boot boundary; a second wire-level boot UUID would not reject any extra result.
@@ -1571,6 +1642,8 @@ impl SnapshotEnhancementTransport for EngineSnapshotEnhancementTransport {
         identity: SnapshotIdentity,
         purpose: SnapshotPurpose,
         baseline: u64,
+        conversion_revision: u64,
+        request_id: u64,
         deadline: Instant,
     ) -> SnapshotEnhancementPoll {
         let Some(response) = self.request(
@@ -1580,12 +1653,21 @@ impl SnapshotEnhancementTransport for EngineSnapshotEnhancementTransport {
                 configuration_generation: identity.configuration_generation,
                 connection_generation: identity.connection_generation,
                 baseline,
+                conversion_revision,
+                request_id,
             },
             deadline,
         ) else {
             return SnapshotEnhancementPoll::LinkFailure;
         };
-        decode_snapshot_enhancement(response, identity, purpose, baseline)
+        decode_snapshot_enhancement(
+            response,
+            identity,
+            purpose,
+            baseline,
+            conversion_revision,
+            request_id,
+        )
     }
 }
 
@@ -1594,11 +1676,28 @@ fn decode_snapshot_enhancement(
     identity: SnapshotIdentity,
     purpose: SnapshotPurpose,
     baseline: u64,
+    conversion_revision: u64,
+    request_id: u64,
 ) -> SnapshotEnhancementPoll {
+    let expected = ipc::clause::SnapshotResponseKey {
+        identity: ipc::clause::SnapshotIdentity {
+            composition: identity.composition,
+            revision: identity.revision,
+            configuration_generation: identity.configuration_generation,
+            connection_generation: identity.connection_generation,
+        },
+        baseline,
+        conversion_revision,
+        request_id,
+    };
     match response {
-        Response::SnapshotEnhancementPending => SnapshotEnhancementPoll::Pending,
-        Response::SnapshotEnhancementUnavailable => SnapshotEnhancementPoll::Unavailable,
+        Response::SnapshotEnhancementPending { key } if key == expected => {
+            SnapshotEnhancementPoll::Pending
+        }
+        Response::SnapshotEnhancementUnavailable { .. }
+        | Response::SnapshotEnhancementPending { .. } => SnapshotEnhancementPoll::Unavailable,
         Response::SnapshotEnhancement {
+            clause_data,
             composition,
             revision,
             configuration_generation,
@@ -1611,8 +1710,13 @@ fn decode_snapshot_enhancement(
             && identity.revision == revision
             && identity.configuration_generation == configuration_generation
             && identity.connection_generation == connection_generation
-            && baseline == response_baseline =>
+            && baseline == response_baseline
+            && clause_data.conversion_revision == conversion_revision
+            && clause_data.request_id == request_id =>
         {
+            if clause_data.validate(&text).is_err() {
+                return SnapshotEnhancementPoll::Unavailable;
+            }
             let (candidates, candidate_remaining) = match purpose {
                 SnapshotPurpose::Live => (None, None),
                 SnapshotPurpose::Explicit => {
@@ -1629,6 +1733,8 @@ fn decode_snapshot_enhancement(
                 }
             };
             SnapshotEnhancementPoll::Ready(LiveSnapshotResult {
+                    learning_identity: None,
+                clause_data,
                 identity,
                 purpose,
                 text,
@@ -1740,6 +1846,8 @@ mod tests {
     fn snapshot_protocol_sends_nothing_after_a_boot_identity_mismatch() {
         let requests = Mutex::new(Vec::new());
         let mut responses = [Some(Response::Session {
+            engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+            learning_generation: 0,
             session: 41,
             proto: Some(PROTO_VERSION),
             boot: Some("old-build".into()),
@@ -1767,10 +1875,34 @@ mod tests {
     }
 
     #[test]
+    fn learning_handshake_retains_generation_and_requires_session_cleanup() {
+        for closed in [true, false] {
+            let mut requests = Vec::new();
+            let identity = refresh_snapshot_learning_identity(|request| {
+                requests.push(match request { Request::StartSession => "start", Request::EndSession { .. } => "end", _ => "other" });
+                match request {
+                    Request::StartSession => Some(Response::Session {
+                        session: 91, proto: Some(PROTO_VERSION), boot: Some(env!("CARGO_PKG_VERSION").into()),
+                        engine_epoch: "new-engine".into(), learning_generation: 42,
+                    }),
+                    Request::EndSession { session: 91 } if closed => Some(Response::Ok),
+                    _ => None,
+                }
+            });
+            assert_eq!(requests, ["start", "end"]);
+            assert_eq!(identity, closed.then_some(ipc::client::EngineLearningIdentity {
+                engine_epoch: "new-engine".into(), learning_generation: 42,
+            }));
+        }
+    }
+
+    #[test]
     fn snapshot_protocol_configures_only_after_the_full_identity_matches() {
         let requests = Mutex::new(Vec::new());
         let mut responses = [
             Some(Response::Session {
+                engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+                learning_generation: 0,
                 session: 42,
                 proto: Some(PROTO_VERSION),
                 boot: Some(env!("CARGO_PKG_VERSION").into()),
@@ -2200,6 +2332,12 @@ mod tests {
                 .pop_front()
                 .unwrap_or(true)
                 .then(|| LiveSnapshotResult {
+                    learning_identity: None,
+                    clause_data: ipc::clause::SnapshotClauseData::from_reading(
+                        format!("converted:{}", snapshot.identity.revision),
+                        0,
+                        1,
+                    ),
                     identity: snapshot.identity,
                     purpose: snapshot.purpose,
                     text: format!("converted:{}", snapshot.identity.revision),
@@ -2248,6 +2386,12 @@ mod tests {
                 return None;
             }
             Some(LiveSnapshotResult {
+                    learning_identity: None,
+                clause_data: ipc::clause::SnapshotClauseData::from_reading(
+                    format!("converted:{}", snapshot.identity.revision),
+                    0,
+                    1,
+                ),
                 identity: snapshot.identity,
                 purpose: snapshot.purpose,
                 text: format!("converted:{}", snapshot.identity.revision),
@@ -2294,6 +2438,12 @@ mod tests {
 
         fn convert(&mut self, snapshot: &CompositionSnapshot) -> Option<LiveSnapshotResult> {
             Some(LiveSnapshotResult {
+                    learning_identity: None,
+                clause_data: ipc::clause::SnapshotClauseData::from_reading(
+                    "classic".to_string(),
+                    0,
+                    1,
+                ),
                 identity: snapshot.identity,
                 purpose: snapshot.purpose,
                 text: "classic".to_string(),
@@ -2326,9 +2476,13 @@ mod tests {
             identity: SnapshotIdentity,
             purpose: SnapshotPurpose,
             baseline: u64,
+            _conversion_revision: u64,
+            _request_id: u64,
             _deadline: Instant,
         ) -> SnapshotEnhancementPoll {
             SnapshotEnhancementPoll::Ready(LiveSnapshotResult {
+                    learning_identity: None,
+                clause_data: ipc::clause::SnapshotClauseData::from_reading("gpu".to_string(), 0, 1),
                 identity,
                 purpose,
                 text: "gpu".to_string(),
@@ -2352,6 +2506,8 @@ mod tests {
             identity: SnapshotIdentity,
             purpose: SnapshotPurpose,
             baseline: u64,
+            _conversion_revision: u64,
+            _request_id: u64,
             _deadline: Instant,
         ) -> SnapshotEnhancementPoll {
             if let Some(release) = self.release.take() {
@@ -2359,6 +2515,12 @@ mod tests {
                 release.recv().unwrap();
             }
             SnapshotEnhancementPoll::Ready(LiveSnapshotResult {
+                    learning_identity: None,
+                clause_data: ipc::clause::SnapshotClauseData::from_reading(
+                    format!("gpu:{}", identity.revision),
+                    0,
+                    1,
+                ),
                 identity,
                 purpose,
                 text: format!("gpu:{}", identity.revision),
@@ -2381,12 +2543,20 @@ mod tests {
             identity: SnapshotIdentity,
             purpose: SnapshotPurpose,
             baseline: u64,
+            _conversion_revision: u64,
+            _request_id: u64,
             _deadline: Instant,
         ) -> SnapshotEnhancementPoll {
             match self.calls.fetch_add(1, Ordering::AcqRel) {
                 0 => SnapshotEnhancementPoll::LinkFailure,
                 1 => SnapshotEnhancementPoll::Unavailable,
                 _ => SnapshotEnhancementPoll::Ready(LiveSnapshotResult {
+                    learning_identity: None,
+                    clause_data: ipc::clause::SnapshotClauseData::from_reading(
+                        format!("gpu:{}", identity.revision),
+                        0,
+                        1,
+                    ),
                     identity,
                     purpose,
                     text: format!("gpu:{}", identity.revision),
@@ -2412,6 +2582,8 @@ mod tests {
             _identity: SnapshotIdentity,
             _purpose: SnapshotPurpose,
             _baseline: u64,
+            _conversion_revision: u64,
+            _request_id: u64,
             _deadline: Instant,
         ) -> SnapshotEnhancementPoll {
             self.calls.fetch_add(1, Ordering::AcqRel);
@@ -2445,6 +2617,12 @@ mod tests {
             self.started.send(()).unwrap();
             self.release.recv().unwrap();
             Some(LiveSnapshotResult {
+                    learning_identity: None,
+                clause_data: ipc::clause::SnapshotClauseData::from_reading(
+                    "old-result".to_string(),
+                    0,
+                    1,
+                ),
                 identity: snapshot.identity,
                 purpose: snapshot.purpose,
                 text: "old-result".to_string(),
@@ -2585,6 +2763,12 @@ mod tests {
                 .unwrap()
                 .push(snapshot.identity.revision);
             Some(LiveSnapshotResult {
+                    learning_identity: None,
+                clause_data: ipc::clause::SnapshotClauseData::from_reading(
+                    "converted".to_string(),
+                    0,
+                    1,
+                ),
                 identity: snapshot.identity,
                 purpose: snapshot.purpose,
                 text: "converted".to_string(),
@@ -2631,6 +2815,12 @@ mod tests {
 
         fn convert(&mut self, snapshot: &CompositionSnapshot) -> Option<LiveSnapshotResult> {
             Some(LiveSnapshotResult {
+                    learning_identity: None,
+                clause_data: ipc::clause::SnapshotClauseData::from_reading(
+                    "healthy".to_string(),
+                    0,
+                    1,
+                ),
                 identity: snapshot.identity,
                 purpose: snapshot.purpose,
                 text: "healthy".to_string(),
@@ -2700,6 +2890,12 @@ mod tests {
         fn convert(&mut self, snapshot: &CompositionSnapshot) -> Option<LiveSnapshotResult> {
             self.conversions.lock().unwrap().push(snapshot.identity);
             Some(LiveSnapshotResult {
+                    learning_identity: None,
+                clause_data: ipc::clause::SnapshotClauseData::from_reading(
+                    format!("recovered:{}", snapshot.identity.revision),
+                    0,
+                    1,
+                ),
                 identity: snapshot.identity,
                 purpose: snapshot.purpose,
                 text: format!("recovered:{}", snapshot.identity.revision),
@@ -2773,6 +2969,12 @@ mod tests {
 
         fn convert(&mut self, snapshot: &CompositionSnapshot) -> Option<LiveSnapshotResult> {
             Some(LiveSnapshotResult {
+                    learning_identity: None,
+                clause_data: ipc::clause::SnapshotClauseData::from_reading(
+                    "recovered".to_string(),
+                    0,
+                    1,
+                ),
                 identity: snapshot.identity,
                 purpose: snapshot.purpose,
                 text: "recovered".to_string(),
@@ -2820,6 +3022,12 @@ mod tests {
                 self.release.recv().unwrap();
             }
             Some(LiveSnapshotResult {
+                    learning_identity: None,
+                clause_data: ipc::clause::SnapshotClauseData::from_reading(
+                    "result".to_string(),
+                    0,
+                    1,
+                ),
                 identity: snapshot.identity,
                 purpose: snapshot.purpose,
                 text: "result".to_string(),
@@ -2849,6 +3057,7 @@ mod tests {
         CompositionSnapshot {
             identity: SnapshotIdentity {
                 composition: 1,
+                request: 1,
                 revision,
                 configuration_generation,
                 connection_generation,
@@ -2937,6 +3146,40 @@ mod tests {
     }
 
     #[test]
+    fn configuration_completion_publishes_post_reload_learning_metadata_without_a_snapshot() {
+        struct MetadataTransport;
+        impl SnapshotTransport for MetadataTransport {
+            fn configure(&mut self, _: &Request) -> SnapshotConfigureOutcome { SnapshotConfigureOutcome::Configured }
+            fn learning_identity(&self) -> Option<ipc::client::EngineLearningIdentity> {
+                Some(ipc::client::EngineLearningIdentity { engine_epoch: "configured engine".into(), learning_generation: 42 })
+            }
+            fn convert(&mut self, _: &CompositionSnapshot) -> Option<LiveSnapshotResult> { panic!("no snapshot was offered") }
+            fn connection_epoch(&self) -> u64 { 7 }
+            fn invalidate(&mut self) -> u64 { 8 }
+        }
+        let (sender, receiver) = sync_channel(2);
+        let (desired, desired_generation) = desired_configuration_slot();
+        let worker_desired = desired.clone();
+        let worker_generation = desired_generation.clone();
+        let statuses = Arc::new(ArrayQueue::new(SNAPSHOT_STATUS_CAPACITY));
+        let worker_statuses = statuses.clone();
+        let worker = std::thread::spawn(move || run_snapshot_worker(
+            receiver, worker_desired, worker_generation, Arc::new(AtomicBool::new(false)),
+            Arc::new(ArrayQueue::new(1)), Arc::new(AtomicBool::new(false)), MetadataTransport,
+            Arc::new(ArrayQueue::new(1)), worker_statuses,
+        ));
+        offer_configuration(&sender, &desired, &desired_generation, 3, Request::Ping);
+        let status = statuses.recv_timeout(Duration::from_secs(1));
+        drop(sender);
+        worker.join().unwrap();
+        assert_eq!(status.unwrap(), SnapshotStatus::Configured {
+            configuration_generation: 3,
+            connection_epoch: 7,
+            learning_identity: Some(ipc::client::EngineLearningIdentity { engine_epoch: "configured engine".into(), learning_generation: 42 }),
+        });
+    }
+
+    #[test]
     fn blocked_stateful_insert_does_not_block_snapshot_conversion() {
         let (mailbox, stateful_receiver) = bounded_mailbox(2);
         let shared = mailbox.shared.clone();
@@ -3007,6 +3250,7 @@ mod tests {
         assert_eq!(
             acks.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 7,
                 connection_epoch: 1,
             }
@@ -3244,6 +3488,7 @@ mod tests {
         assert_eq!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 7,
                 connection_epoch: 1,
             }
@@ -3293,6 +3538,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(20);
         pending
             .push(SnapshotEnhancementRequest {
+                learning_identity: None,
+                conversion_revision: 0,
+                request_id: 1,
                 serial: 1,
                 identity: snapshot(7, 1, 11).identity,
                 purpose: SnapshotPurpose::Live,
@@ -3325,6 +3573,9 @@ mod tests {
         latest_serial.store(2, Ordering::Release);
         pending
             .push(SnapshotEnhancementRequest {
+                learning_identity: None,
+                conversion_revision: 0,
+                request_id: 1,
                 serial: 2,
                 identity: snapshot(7, 1, 12).identity,
                 purpose: SnapshotPurpose::Live,
@@ -3338,9 +3589,43 @@ mod tests {
     }
 
     #[test]
+    fn enhancement_retains_the_baseline_learning_generation() {
+        struct Echo;
+        impl SnapshotEnhancementTransport for Echo {
+            fn poll_enhancement(&mut self, identity: SnapshotIdentity, purpose: SnapshotPurpose,
+                baseline: u64, _: u64, _: u64, _: Instant) -> SnapshotEnhancementPoll {
+                SnapshotEnhancementPoll::Ready(LiveSnapshotResult {
+                    learning_identity: Some(ipc::client::EngineLearningIdentity { engine_epoch: "engine".into(), learning_generation: 1 }),
+                    clause_data: ipc::clause::SnapshotClauseData::from_reading("gpu".into(), 0, 1),
+                    identity, purpose, text: "gpu".into(), candidates: None, candidate_remaining: None,
+                    baseline, enhancement: true, auto_commit: None,
+                })
+            }
+        }
+        let pending = Arc::new(ArrayQueue::new(1));
+        let current = ipc::client::EngineLearningIdentity { engine_epoch: "engine".into(), learning_generation: 42 };
+        pending.push(SnapshotEnhancementRequest {
+            learning_identity: Some(current.clone()), conversion_revision: 0, request_id: 1, serial: 1,
+            identity: snapshot(7, 1, 11).identity, purpose: SnapshotPurpose::Live, baseline: 42,
+            deadline: Instant::now() + Duration::from_secs(1),
+        }).unwrap();
+        let results = Arc::new(ArrayQueue::new(1));
+        let worker_results = results.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = shutdown.clone();
+        let worker = std::thread::spawn(move || run_snapshot_enhancement_worker(worker_shutdown, pending,
+            Arc::new(AtomicU64::new(1)), Echo, worker_results));
+        let result = results.recv_timeout(Duration::from_secs(1)).unwrap();
+        shutdown.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert_eq!(result.learning_identity, Some(current));
+    }
+
+    #[test]
     fn malformed_enhancement_identity_baseline_and_candidate_ranges_are_unavailable() {
         let identity = snapshot(7, 1, 11).identity;
         let response = |revision, baseline, candidates, remaining| Response::SnapshotEnhancement {
+            clause_data: ipc::clause::SnapshotClauseData::from_reading("gpu".into(), 0, 1),
             composition: identity.composition,
             revision,
             configuration_generation: identity.configuration_generation,
@@ -3361,9 +3646,38 @@ mod tests {
             ),
         ] {
             assert!(matches!(
-                decode_snapshot_enhancement(malformed, identity, SnapshotPurpose::Explicit, 42,),
+                decode_snapshot_enhancement(
+                    malformed,
+                    identity,
+                    SnapshotPurpose::Explicit,
+                    42,
+                    0,
+                    1
+                ),
                 SnapshotEnhancementPoll::Unavailable
             ));
+        }
+    }
+
+    #[test]
+    fn pending_enhancement_requires_the_issued_request_and_conversion_generation() {
+        let identity = snapshot(7, 1, 11).identity;
+        let key = ipc::clause::SnapshotResponseKey {
+            identity: ipc::clause::SnapshotIdentity {
+                composition: identity.composition, revision: identity.revision,
+                configuration_generation: identity.configuration_generation, connection_generation: identity.connection_generation,
+            }, baseline: 42, conversion_revision: 3, request_id: 7,
+        };
+        assert!(matches!(decode_snapshot_enhancement(Response::SnapshotEnhancementPending { key },
+            identity, SnapshotPurpose::Explicit, 42, 3, 7), SnapshotEnhancementPoll::Pending));
+        for stale in [
+            ipc::clause::SnapshotResponseKey { request_id: 6, ..key },
+            ipc::clause::SnapshotResponseKey { conversion_revision: 2, ..key },
+            ipc::clause::SnapshotResponseKey { baseline: 41, ..key },
+            ipc::clause::SnapshotResponseKey { identity: ipc::clause::SnapshotIdentity { composition: 9, ..key.identity }, ..key },
+        ] {
+            assert!(matches!(decode_snapshot_enhancement(Response::SnapshotEnhancementPending { key: stale },
+                identity, SnapshotPurpose::Explicit, 42, 3, 7), SnapshotEnhancementPoll::Unavailable));
         }
     }
 
@@ -3498,6 +3812,7 @@ mod tests {
         assert_eq!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 4,
                 connection_epoch: 1,
             }
@@ -3558,6 +3873,7 @@ mod tests {
         assert_eq!(
             statuses.recv_timeout(Duration::from_secs(2)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 4,
                 connection_epoch: 2,
             }
@@ -3572,6 +3888,7 @@ mod tests {
         assert_eq!(
             statuses.recv_timeout(Duration::from_secs(2)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 4,
                 connection_epoch: 3,
             }
@@ -3649,6 +3966,7 @@ mod tests {
         assert_eq!(
             statuses.recv_timeout(Duration::from_secs(2)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 6,
                 connection_epoch: 2,
             }
@@ -3701,6 +4019,7 @@ mod tests {
         assert_eq!(
             configured,
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 8,
                 connection_epoch: 4,
             }
@@ -3764,6 +4083,7 @@ mod tests {
         assert!(matches!(
             configured,
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 12,
                 connection_epoch: 8,
             }
@@ -4148,6 +4468,7 @@ mod tests {
         assert!(matches!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 21,
                 connection_epoch: 1,
             }
@@ -4162,6 +4483,7 @@ mod tests {
         assert!(matches!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 21,
                 connection_epoch: 2,
             }
@@ -4240,6 +4562,7 @@ mod tests {
         assert_eq!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 31,
                 connection_epoch: 1,
             }
@@ -4266,6 +4589,7 @@ mod tests {
         assert_eq!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 31,
                 connection_epoch: 2,
             }
@@ -4362,6 +4686,7 @@ mod tests {
         assert!(matches!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 32,
                 connection_epoch: 1,
             }
@@ -4447,6 +4772,7 @@ mod tests {
         assert_eq!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 40,
                 connection_epoch: 1,
             }
@@ -4482,6 +4808,7 @@ mod tests {
         assert!(matches!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 40,
                 connection_epoch: 2,
             }
@@ -4578,6 +4905,7 @@ mod tests {
         assert!(matches!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 41,
                 connection_epoch: 2,
             }
@@ -4838,6 +5166,7 @@ mod tests {
         assert!(matches!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 1,
                 ..
             }
@@ -4859,6 +5188,7 @@ mod tests {
         assert_eq!(
             statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 2,
                 connection_epoch: 1,
             }
@@ -5059,6 +5389,7 @@ mod tests {
         let (receipt_sender, receipt_receiver) = channel();
         let identity = SnapshotIdentity {
             composition: 8,
+            request: 1,
             revision: 13,
             configuration_generation: 2,
             connection_generation: 5,
@@ -5238,6 +5569,7 @@ mod tests {
             )
         });
         let owner = BackgroundInputWorker {
+            request_ids: Arc::new(AtomicU64::new(0)),
             mailbox,
             snapshot_sender,
             pending_snapshot: pending,
@@ -5266,6 +5598,7 @@ mod tests {
         assert!(matches!(
             configured,
             SnapshotStatus::Configured {
+                learning_identity: None,
                 configuration_generation: 1,
                 ..
             }
@@ -5297,6 +5630,7 @@ mod tests {
             desired_configuration_slot();
         let snapshot_statuses = Arc::new(ArrayQueue::new(SNAPSHOT_STATUS_CAPACITY));
         let owner = BackgroundInputWorker {
+            request_ids: Arc::new(AtomicU64::new(0)),
             mailbox,
             snapshot_sender,
             pending_snapshot: Arc::new(ArrayQueue::new(1)),
@@ -5342,6 +5676,7 @@ mod tests {
         let (desired_snapshot_configuration, desired_snapshot_configuration_generation) =
             desired_configuration_slot();
         let owner = BackgroundInputWorker {
+            request_ids: Arc::new(AtomicU64::new(0)),
             mailbox,
             snapshot_sender,
             pending_snapshot: Arc::new(ArrayQueue::new(1)),

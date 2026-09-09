@@ -83,14 +83,22 @@ public final class NativeGPUWorkerTransport: GPUWorkerTransport, @unchecked Send
         guard let body = try? JSONEncoder().encode(request) else { return .protocolMismatch }
         guard let pipe = currentPipe() else { return .exit }
         let deadline = deadlineAfter(timeout)
-        switch writeFrame(body, deadline: deadline, on: pipe) {
+        let requestStart = DispatchTime.now()
+        func logTimeoutPhase(_ phase: String) {
+            let elapsedMs = Double(
+                DispatchTime.now().uptimeNanoseconds &- requestStart.uptimeNanoseconds) / 1_000_000
+            engineLog("ev=zenzai_worker_timeout phase=\(phase) " +
+                      "elapsed_ms=\(String(format: "%.1f", elapsedMs)) " +
+                      "process_running=\(processIsRunning())\n")
+        }
+        switch writeFrame(body, deadline: deadline, on: pipe, onTimeout: logTimeoutPhase) {
         case .timedOut:
             return .timeout
         case .failed:
             return processIsRunning() ? .nativeFailure :
                 (processExitedWithFailure() ? .crash : .exit)
         case .success:
-            switch readFrame(deadline: deadline, on: pipe) {
+            switch readFrame(deadline: deadline, on: pipe, onTimeout: logTimeoutPhase) {
             case .success(let responseBody):
                 guard let response = try? JSONDecoder().decode(
                     GPUWorkerResponse.self, from: responseBody) else {
@@ -369,7 +377,8 @@ public final class NativeGPUWorkerTransport: GPUWorkerTransport, @unchecked Send
         return false
     }
 
-    private func writeFrame(_ body: Data, deadline: UInt64, on pipe: HANDLE) -> FrameResult {
+    private func writeFrame(_ body: Data, deadline: UInt64, on pipe: HANDLE,
+                            onTimeout: (String) -> Void = { _ in }) -> FrameResult {
         guard body.count <= namedPipeMaxRequestBodyLength,
               let length = UInt32(exactly: body.count) else { return .failed }
         var frameLength = length.littleEndian
@@ -383,6 +392,7 @@ public final class NativeGPUWorkerTransport: GPUWorkerTransport, @unchecked Send
             WriteFile(pipe, pointer, DWORD(count), nil, overlapped)
         }
         guard case .completed(let headerBytes) = header, headerBytes == 4 else {
+            if header.isTimedOut { onTimeout("write_header") }
             return header.isTimedOut ? .timedOut : .failed
         }
         guard !body.isEmpty else { return .success(Data()) }
@@ -393,21 +403,28 @@ public final class NativeGPUWorkerTransport: GPUWorkerTransport, @unchecked Send
         }
         guard case .completed(let bodyBytes) = bodyResult,
               bodyBytes == DWORD(body.count) else {
+            if bodyResult.isTimedOut { onTimeout("write_body") }
             return bodyResult.isTimedOut ? .timedOut : .failed
         }
         return .success(Data())
     }
 
-    private func readFrame(deadline: UInt64, on pipe: HANDLE) -> FrameResult {
+    private func readFrame(deadline: UInt64, on pipe: HANDLE,
+                           onTimeout: (String) -> Void = { _ in }) -> FrameResult {
         let headerResult = readExact(pipe, count: 4, deadline: deadline)
-        guard case .success(let header) = headerResult else { return headerResult }
+        guard case .success(let header) = headerResult else {
+            if case .timedOut = headerResult { onTimeout("read_header") }
+            return headerResult
+        }
         let length = header.withUnsafeBytes { raw -> Int in
             let bytes = raw.bindMemory(to: UInt8.self)
             return Int(UInt32(bytes[0]) | (UInt32(bytes[1]) << 8) |
                        (UInt32(bytes[2]) << 16) | (UInt32(bytes[3]) << 24))
         }
         guard length <= namedPipeMaxResponseBodyLength else { return .failed }
-        return readExact(pipe, count: length, deadline: deadline)
+        let bodyResult = readExact(pipe, count: length, deadline: deadline)
+        if case .timedOut = bodyResult { onTimeout("read_body") }
+        return bodyResult
     }
 
     private func readExact(_ pipe: HANDLE, count: Int, deadline: UInt64) -> FrameResult {

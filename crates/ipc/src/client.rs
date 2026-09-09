@@ -46,15 +46,35 @@ impl From<io::Error> for EngineIdentityError {
 }
 
 pub fn verify_session_identity(response: Response) -> Result<i64, EngineIdentityError> {
+    verify_session_metadata(response).map(|(session, _)| session)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineLearningIdentity {
+    pub engine_epoch: String,
+    pub learning_generation: u64,
+}
+
+pub fn verify_session_metadata(
+    response: Response,
+) -> Result<(i64, EngineLearningIdentity), EngineIdentityError> {
     match response {
         Response::Session {
             session,
             proto,
             boot,
+            engine_epoch,
+            learning_generation,
         } if proto == Some(crate::protocol::PROTO_VERSION)
             && boot.as_deref() == Some(env!("CARGO_PKG_VERSION")) =>
         {
-            Ok(session)
+            Ok((
+                session,
+                EngineLearningIdentity {
+                    engine_epoch,
+                    learning_generation,
+                },
+            ))
         }
         Response::Session { proto, boot, .. } => Err(EngineIdentityError::Mismatch {
             actual_proto: proto,
@@ -73,9 +93,13 @@ pub fn verify_start_session(
 pub struct VerifiedEngineClient {
     client: EngineClient,
     session: i64,
+    learning_identity: EngineLearningIdentity,
 }
 
 impl VerifiedEngineClient {
+    pub fn learning_identity(&self) -> &EngineLearningIdentity {
+        &self.learning_identity
+    }
     pub fn session(&self) -> i64 {
         self.session
     }
@@ -247,6 +271,17 @@ pub fn stable_pipe_name() -> String {
 }
 
 impl EngineClient {
+    /// Process currently serving this connection, for diagnostics and fault-injection gates.
+    #[cfg(windows)]
+    pub fn server_process_id(&self) -> io::Result<u32> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeServerProcessId};
+        let mut pid = 0;
+        unsafe { GetNamedPipeServerProcessId(HANDLE(self.pipe.as_raw_handle()), &mut pid) }
+            .map_err(io::Error::other)?;
+        Ok(pid)
+    }
+
     /// 既定パイプ `\\.\pipe\nospacekey-engine` へ接続（最大 `timeout` までリトライ）。
     pub fn connect(timeout: Duration) -> io::Result<Self> {
         Self::connect_to(PIPE_PATH, timeout)
@@ -288,12 +323,14 @@ impl EngineClient {
         start_deadline: Instant,
     ) -> Result<VerifiedEngineClient, EngineIdentityError> {
         let mut client = Self::connect_to(pipe_path, connect_timeout)?;
-        let session = verify_start_session(|request| {
-            client
-                .request_within(request, start_deadline)
-                .map_err(EngineIdentityError::Io)
-        })?;
-        Ok(VerifiedEngineClient { client, session })
+        let (session, learning_identity) = verify_session_metadata(
+            client.request_within(&Request::StartSession, start_deadline)?,
+        )?;
+        Ok(VerifiedEngineClient {
+            client,
+            session,
+            learning_identity,
+        })
     }
 
     /// 1要求を送り、1応答を受け取る。フレーミング（4byte長さ前置）は内部で処理する。
@@ -1107,6 +1144,8 @@ mod win_pipe_tests {
             2,
             Duration::from_millis(120),
             Response::Session {
+                engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+                learning_generation: 0,
                 session: 42,
                 proto: None,
                 boot: None,
@@ -1137,6 +1176,8 @@ mod win_pipe_tests {
         assert_eq!(
             response,
             Response::Session {
+                engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+                learning_generation: 0,
                 session: 42,
                 proto: None,
                 boot: None,
@@ -1318,7 +1359,7 @@ mod pipe_name_tests {
         assert_eq!(
             pipe_name_for_session(1),
             concat!(
-                r"\\.\pipe\nospacekey-engine.v8.b",
+                r"\\.\pipe\nospacekey-engine.v9.b",
                 env!("CARGO_PKG_VERSION"),
                 ".s1"
             )
@@ -1330,6 +1371,8 @@ mod pipe_name_tests {
     #[test]
     fn session_identity_requires_exact_wire_and_boot_match() {
         let matching = Response::Session {
+            engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+            learning_generation: 0,
             session: 41,
             proto: Some(crate::protocol::PROTO_VERSION),
             boot: Some(env!("CARGO_PKG_VERSION").into()),
@@ -1338,16 +1381,22 @@ mod pipe_name_tests {
 
         for response in [
             Response::Session {
+                engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+                learning_generation: 0,
                 session: 41,
                 proto: Some(crate::protocol::PROTO_VERSION + 1),
                 boot: Some(env!("CARGO_PKG_VERSION").into()),
             },
             Response::Session {
+                engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+                learning_generation: 0,
                 session: 41,
                 proto: Some(crate::protocol::PROTO_VERSION),
                 boot: Some("different-build".into()),
             },
             Response::Session {
+                engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+                learning_generation: 0,
                 session: 41,
                 proto: None,
                 boot: None,
@@ -1366,6 +1415,8 @@ mod pipe_name_tests {
         let result = verify_start_session(|request| {
             sent.push(matches!(request, Request::StartSession));
             Ok(Response::Session {
+                engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+                learning_generation: 0,
                 session: 9,
                 proto: Some(crate::protocol::PROTO_VERSION),
                 boot: Some("loaded-old-build".into()),

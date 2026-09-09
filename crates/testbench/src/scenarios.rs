@@ -10,8 +10,11 @@ pub const TAB: Vk = Vk(0x09, "Tab");
 pub const ENTER: Vk = Vk(0x0D, "Enter");
 pub const ESC: Vk = Vk(0x1B, "Esc");
 pub const SPACE: Vk = Vk(0x20, "Space");
+// A staging marker, never injected as a virtual key. Burst cases omit it.
+pub const WAIT_CONVERSION: Vk = Vk(0x10000, "WaitConversion");
 pub const UP: Vk = Vk(0x26, "Up");
 pub const DOWN: Vk = Vk(0x28, "Down");
+pub const RIGHT: Vk = Vk(0x27, "Right"); // P1(clause-nav): ←→の explicit snapshot 待ち保護の検証
 pub const NONCONVERT: Vk = Vk(0x1D, "Muhenkan"); // 待機中=モードトグル / 変換中=かなローテーション(2026-07-23 spec)。受理時は OnPreservedKey 委譲・拒否時は OnKeyDown — 両経路とも rotate 共有ヘルパ
 pub const HANKAKU_ZENKAKU: Vk = Vk(0xF3, "HankakuZenkaku"); // 半角/全角(正準 VK)。全文脈モードトグル
 pub const CONVERT: Vk = Vk(0x1C, "Convert"); // 再変換/henkan（Task5: 対象なし→eaten no-op、ephemeral には落ちない）
@@ -68,12 +71,8 @@ fn has_hankaku_digit(s: &str) -> bool {
 fn has_zenkaku_digit(s: &str) -> bool {
     s.chars().any(|c| ('０'..='９').contains(&c))
 }
-fn candidates_contains(evs: &[Ev], want: &str) -> bool {
-    evs.iter()
-        .any(|e| matches!(e, Ev::CandidatesShown { list, .. } if list.iter().any(|x| x == want)))
-}
 fn any_candidate_move(evs: &[Ev]) -> bool {
-    evs.iter().any(|e| matches!(e, Ev::CandidateMove { .. }))
+    evs.iter().any(|e| matches!(e, Ev::CandidateMove { .. } | Ev::ClausePresented { ready: true, selected: 1.. }))
 }
 fn has_candidates_shown(evs: &[Ev]) -> bool {
     evs.iter().any(|e| matches!(e, Ev::CandidatesShown { .. }))
@@ -99,28 +98,34 @@ pub fn all() -> Vec<Scenario> {
         Scenario {
             item: 2,
             name: "romaji->live-converted preedit",
-            keys: typed("nihongo"),
-            expect: |_c, _f, p, _e, _l| {
-                if p == "日本語" {
+            keys: {
+                let mut k = typed("nihongo");
+                k.push(WAIT_CONVERSION);
+                k
+            },
+            expect: |c, f, p, _e, _l| {
+                if p == "日本語" && c.is_empty() && f == p {
                     Ok(())
                 } else {
-                    Err(format!("preedit={p:?} != 日本語（ライブ変換結果）"))
+                    Err(format!("preedit={p:?} committed={c:?} full={f:?}; expected uncommitted 日本語"))
                 }
             },
         },
         Scenario {
             item: 3,
-            name: "space shows 日本語",
+            name: "first space converts with candidate window closed",
             keys: {
                 let mut k = typed("nihongo");
                 k.push(SPACE);
+                k.push(WAIT_CONVERSION);
                 k
             },
-            expect: |_c, _f, _p, evs, _l| {
-                if candidates_contains(evs, "日本語") {
+            expect: |c, _f, p, evs, _l| {
+                if c.is_empty() && p == "日本語" && !has_candidates_shown(evs)
+                    && evs.iter().any(|e| matches!(e, Ev::ClausePresented { ready: false, .. })) {
                     Ok(())
                 } else {
-                    Err("候補に 日本語 が無い".into())
+                    Err(format!("初回Space閉窓変換が成立しない: committed={c:?}, preedit={p:?}"))
                 }
             },
         },
@@ -130,6 +135,9 @@ pub fn all() -> Vec<Scenario> {
             keys: {
                 let mut k = typed("nihongo");
                 k.push(SPACE);
+                k.push(WAIT_CONVERSION);
+                k.push(SPACE);
+                k.push(WAIT_CONVERSION);
                 k.push(SPACE);
                 k
             },
@@ -148,32 +156,35 @@ pub fn all() -> Vec<Scenario> {
                 let mut k = typed("nihongo");
                 k.push(SPACE);
                 k.push(ENTER);
+                k.push(WAIT_CONVERSION);
                 k
             },
-            expect: |c, _f, _p, _e, _l| {
-                if c == "日本語" {
+            expect: |c, f, p, _e, _l| {
+                if c == "日本語" && f == c && p.is_empty() {
                     Ok(())
                 } else {
-                    Err(format!("committed={c:?} != 日本語"))
+                    Err(format!("committed={c:?} full={f:?} preedit={p:?}; expected committed/full=日本語 and no preedit"))
                 }
             },
         },
         Scenario {
             item: 6,
-            name: "esc cancels",
+            name: "three esc presses cancel after closed-window conversion",
             keys: {
                 let mut k = typed("nihongo");
                 k.push(SPACE);
+                k.push(WAIT_CONVERSION);
+                k.push(ESC);
                 k.push(ESC);
                 k.push(ESC);
                 k
             },
-            // 自己証明: SPACE で候補が出た（ev=candidates_shown）ことを確認した上で ESC×2 後に文書が空、を要求する。
+            // 選択Reading→全文Reading→取消。各途中段階の保持はP5c/T22で検証する。
             // これで「TIP が打鍵を素通ししただけ（実は何も処理していない）でも full 空＝PASS」になる偽 PASS を防ぐ。
             expect: |_c, f, _p, evs, _l| {
-                if !has_candidates_shown(evs) {
+                if !evs.iter().any(|e| matches!(e, Ev::ClausePresented { ready: false, .. })) {
                     return Err(
-                        "ev=candidates_shown 未受信（候補が出ておらず Esc 取消の前提が崩れる）"
+                        "閉窓変換の成立を確認できず Esc 取消の前提が崩れる"
                             .into(),
                     );
                 }
@@ -193,13 +204,17 @@ pub fn all() -> Vec<Scenario> {
             keys: {
                 let mut k = typed("nihongo");
                 k.push(BACK);
+                k.push(WAIT_CONVERSION);
                 k
             },
             // 本 item の本質: BACK で読みが にほんご→にほん に縮み、ライブ再変換が走って にほん の
             // 漢字表記になること。top-1 の具体漢字は model 依存（classic では 2本/二本、Zenzai では 日本）
             // なので固定しない。自己証明: (a) BACK 前のライブ "日本語" のままでない（縮んだ）、
             // (b) 語/ご を含まない（ご が確かに削れた）、(c) 本 を含む（にほん→…本… へ変換された）。
-            expect: |_c, _f, p, _e, _l| {
+            expect: |c, f, p, _e, _l| {
+                if !c.is_empty() || f != p {
+                    return Err(format!("backspace unexpectedly committed text: committed={c:?} full={f:?} preedit={p:?}"));
+                }
                 if p == "日本語" {
                     return Err(format!(
                         "preedit={p:?} が BACK 前のライブ結果のまま（読みが縮んでいない）"
@@ -245,6 +260,9 @@ pub fn all() -> Vec<Scenario> {
             keys: {
                 let mut k = typed("nihongo");
                 k.push(SPACE);
+                k.push(WAIT_CONVERSION);
+                k.push(SPACE);
+                k.push(WAIT_CONVERSION);
                 k.push(DOWN);
                 k.push(UP);
                 k
@@ -263,7 +281,7 @@ pub fn all() -> Vec<Scenario> {
                 }
                 if !evs
                     .iter()
-                    .any(|e| matches!(e, Ev::CandidateMove { sel: 1 }))
+                    .any(|e| matches!(e, Ev::CandidateMove { sel: 1 } | Ev::ClausePresented { ready: true, selected: 1 }))
                 {
                     return Err(
                         "↓ で選択が 0→1 に動いていない（ev=candidate_move sel=1 が無い）".into(),
@@ -354,17 +372,10 @@ pub fn all() -> Vec<Scenario> {
                 Ok(())
             },
         },
-        // item21: 合成中に Home を押す → 開いていた合成が確定されて畳まれる（UU-6 回帰）。
-        // 旧実装では Home が match の catch-all に落ちて素通し（Ok(FALSE)）→ アプリのキャレット
-        // だけ移動し preedit が別位置に取り残される。修正後は will_handle が composition 中の
-        // Home を食い、settle で確定して畳む。
-        // 自己証明: (a) Home をちゃんと食う（eaten_last=true。旧実装は素通しで false）、
-        // (b) ev=commit source=navigate が出る（settle 経路が走った）、
-        // (c) preedit が空（composition が畳まれた）、(d) committed=="日本語"
-        // （nihongo のライブ変換確定。item2/item20 が同値を固定済みで model 差異は無い）。
+        // P6: Homeは読み先頭へ移動する。合成維持と確定の不発生を確認する。
         Scenario {
             item: 21,
-            name: "home mid-composition commits preedit",
+            name: "home mid-composition edits reading without commit",
             keys: {
                 let mut k = typed("nihongo");
                 k.push(HOME);
@@ -374,23 +385,23 @@ pub fn all() -> Vec<Scenario> {
                 if !eaten_last {
                     return Err("最後の Home が食われていない（eaten_last=false＝素通しで preedit 取り残し）".into());
                 }
-                if !evs
+                if evs
                     .iter()
                     .any(|e| matches!(e, Ev::Commit { source, .. } if source == "navigate"))
                 {
                     return Err(
-                        "ev=commit source=navigate が出ていない（Home 前の settle が走っていない）"
+                        "Homeで不要な確定が発生した"
                             .into(),
                     );
                 }
-                if !p.is_empty() {
+                if p != "にほんご" {
                     return Err(format!(
-                        "preedit={p:?} != 空（composition が畳まれていない）"
+                        "preedit={p:?} != にほんご（読み編集を維持していない）"
                     ));
                 }
-                if c != "日本語" {
+                if !c.is_empty() {
                     return Err(format!(
-                        "committed={c:?} != 日本語（ライブ変換結果が確定されていない）"
+                        "committed={c:?} != 空（Homeで確定してしまった）"
                     ));
                 }
                 Ok(())
@@ -453,6 +464,7 @@ pub fn all() -> Vec<Scenario> {
                 k.push(ENTER);
                 k.extend(typed("taberu"));
                 k.push(SPACE);
+                k.push(WAIT_CONVERSION);
                 k
             },
             expect: |_c, _f, _p, evs, _eaten_last| {
@@ -546,9 +558,9 @@ pub fn all() -> Vec<Scenario> {
             expect: |c, _f, p, evs, _l| {
                 if !evs.iter().any(|e| {
                     matches!(e, Ev::Commit { text, source }
-                    if text == "ニホンゴ" && source == "live")
+                    if text == "ニホンゴ" && source == "clause")
                 }) {
-                    return Err("ev=commit text=ニホンゴ source=live が出ていない（engine live 結果で上書きされた疑い）".into());
+                    return Err("ev=commit text=ニホンゴ source=clause が出ていない（文節の表示と確定本文の不一致）".into());
                 }
                 if !p.is_empty() {
                     return Err(format!(
@@ -566,13 +578,16 @@ pub fn all() -> Vec<Scenario> {
         // commit_candidate し、画面表示（ニホンゴ）と違う文字列が確定する。
         // 自己証明: (a) Space で候補が出た（candidates_shown — 窓が開いた前提の成立）、
         // (b) committed=="ニホンゴ"（stale 候補でなく表示中の表記が確定）、
-        // (c) ev=commit source=live（candidate 経路でない）、(d) preedit 空。
+        // (c) ev=commit source=live/clause、(d) preedit 空。
         Scenario {
             item: 28,
             name: "f7 while candidates shown closes window; enter commits katakana",
             keys: {
                 let mut k = typed("nihongo");
                 k.push(SPACE);
+                k.push(WAIT_CONVERSION);
+                k.push(SPACE);
+                k.push(WAIT_CONVERSION);
                 k.push(F7);
                 k.push(ENTER);
                 k
@@ -586,9 +601,9 @@ pub fn all() -> Vec<Scenario> {
                 }
                 if !evs.iter().any(|e| {
                     matches!(e, Ev::Commit { text, source }
-                    if text == "ニホンゴ" && source == "live")
+                    if text == "ニホンゴ" && (source == "live" || source == "clause"))
                 }) {
-                    return Err("ev=commit text=ニホンゴ source=live が出ていない（stale 候補の candidate 確定の疑い）".into());
+                    return Err("ev=commit text=ニホンゴ source=live/clause が出ていない（表記変換後の表示と確定本文の不一致）".into());
                 }
                 if evs.iter().any(|e| {
                     matches!(e, Ev::Commit { source, .. }
@@ -1054,6 +1069,9 @@ pub fn all() -> Vec<Scenario> {
             keys: {
                 let mut k = typed("nihongo");
                 k.push(SPACE);
+                k.push(WAIT_CONVERSION);
+                k.push(SPACE);
+                k.push(WAIT_CONVERSION);
                 k.push(SPACE);
                 k
             },
@@ -1063,7 +1081,7 @@ pub fn all() -> Vec<Scenario> {
                 let list = evs.iter().find_map(|e| match e {
                     Ev::CandidatesShown { n, list, .. } if *n >= 2 && list.len() >= 2 => Some(list.clone()),
                     _ => None,
-                }).ok_or("候補が 2 件以上出ていない（2 回目の Space で sel 0→1 に動ける前提が崩れる）")?;
+                }).ok_or("候補が 2 件以上出ていない（3 回目の Space で sel 0→1 に動ける前提が崩れる）")?;
                 // 前提2: 候補 0 と 1 が別文字列であること。同一だと preedit が候補 0 のまま
                 // 固まっていても最終アサートが通り、壊れた実装のまま空振り PASS する。
                 if list[0] == list[1] {
@@ -1075,9 +1093,9 @@ pub fn all() -> Vec<Scenario> {
                 // 選択そのものは動いたか。ここで落ちるなら原因は preedit ではなくキー配線側。
                 if !evs
                     .iter()
-                    .any(|e| matches!(e, Ev::CandidateMove { sel: 1 }))
+                    .any(|e| matches!(e, Ev::CandidateMove { sel: 1 } | Ev::ClausePresented { ready: true, selected: 1 }))
                 {
-                    return Err("2 回目の Space で選択が 0→1 に動いていない（ev=candidate_move sel=1 が無い）".into());
+                    return Err("3 回目の Space で選択が 0→1 に動いていない（ev=candidate_move sel=1 が無い）".into());
                 }
                 if p != list[1] {
                     return Err(format!(
@@ -1088,17 +1106,16 @@ pub fn all() -> Vec<Scenario> {
                 Ok(())
             },
         },
-        // item48: 候補を送ってから Esc で候補窓だけ閉じると、インラインは「閉じた後の Enter が
-        // 確定する文字列」＝ライブ変換結果へ戻る。item47 で preedit が選択へ追随するように
-        // なった結果、Esc がそれを残すと「送った先の候補が見えたままライブ結果が確定される」
-        // ズレが実際に観測できるようになったため、その回帰をここで塞ぐ。
-        // item6 は Esc×2 の取消（文書が空）を見るだけで、1 回目の Esc 直後の表示を見ていない。
+        // 窓を閉じるEscは選択表層を保持する。読み戻し・取消は後続段階。
         Scenario {
             item: 48,
-            name: "esc closes candidates and puts the inline text back to the live conversion",
+            name: "esc closes candidates and preserves the selected inline text",
             keys: {
                 let mut k = typed("nihongo");
                 k.push(SPACE);
+                k.push(WAIT_CONVERSION);
+                k.push(SPACE);
+                k.push(WAIT_CONVERSION);
                 k.push(SPACE);
                 k.push(ESC);
                 k
@@ -1107,7 +1124,7 @@ pub fn all() -> Vec<Scenario> {
                 let list = evs.iter().find_map(|e| match e {
                     Ev::CandidatesShown { n, list, .. } if *n >= 2 && list.len() >= 2 => Some(list.clone()),
                     _ => None,
-                }).ok_or("候補が 2 件以上出ていない（2 回目の Space で sel 0→1 に動ける前提が崩れる）")?;
+                }).ok_or("候補が 2 件以上出ていない（3 回目の Space で sel 0→1 に動ける前提が崩れる）")?;
                 // 前提: 送った先の候補がライブ変換結果と別文字列であること。同一だと preedit が
                 // 候補のまま残っていても下のアサートが通り、壊れた実装のまま空振り PASS する。
                 if list[1] == "日本語" {
@@ -1118,21 +1135,18 @@ pub fn all() -> Vec<Scenario> {
                 }
                 if !evs
                     .iter()
-                    .any(|e| matches!(e, Ev::CandidateMove { sel: 1 }))
+                    .any(|e| matches!(e, Ev::CandidateMove { sel: 1 } | Ev::ClausePresented { ready: true, selected: 1 }))
                 {
-                    return Err("2 回目の Space で選択が 0→1 に動いていない（ev=candidate_move sel=1 が無い）".into());
+                    return Err("3 回目の Space で選択が 0→1 に動いていない（ev=candidate_move sel=1 が無い）".into());
                 }
-                if !evs.iter().any(|e| matches!(e, Ev::CandidatesHidden)) {
-                    return Err("Esc で候補窓が閉じていない（ev=candidates_hidden が無い）".into());
+                if !matches!(evs.iter().rev().find(|event| matches!(event, Ev::ClausePresented { .. })),
+                    Some(Ev::ClausePresented { ready: false, .. })) {
+                    return Err("Esc後の最終表示で候補窓が閉じていない".into());
                 }
-                // item2/item5 が定める "nihongo" のライブ変換結果。Esc 後の Enter はこれを確定する
-                // ので、見えている文字列もこれでなければ「見た目と確定が違う」ことになる。
-                // 直値で固定できるのは、描き戻しがデバウンス（ヘッドレスでは打鍵中に発火しない）
-                // ではなく Esc 内の engine_live_convert で素材を取るため。
-                if p != "日本語" {
+                if p != list[1] {
                     return Err(format!(
-                        "preedit={:?} != 日本語（Esc で候補プレビューが残り、確定される文字列と食い違う）",
-                        p
+                        "preedit={:?} != {:?}（Esc閉窓で選択表層が失われた）",
+                        p, list[1]
                     ));
                 }
                 Ok(())
@@ -1150,10 +1164,11 @@ pub fn all() -> Vec<Scenario> {
                 let mut k = vec![OEM_COMMA];
                 k.extend(typed("nihongo"));
                 k.push(SPACE);
+                k.push(WAIT_CONVERSION);
                 k
             },
             expect: |_c, _f, p, evs, _l| {
-                if !has_candidates_shown(evs) {
+                if !evs.iter().any(|e| matches!(e, Ev::ClausePresented { ready: false, .. })) {
                     return Err("候補が出ていない（句読点開始で変換が始まらない）".into());
                 }
                 let in_cands = evs.iter().any(|e| {
@@ -1226,5 +1241,74 @@ pub fn all() -> Vec<Scenario> {
                 Ok(())
             },
         },
+        // item52: P1(clause-nav)。Space 変換の explicit snapshot 応答待ちに←→連打が来ても
+        // 全文確定（settle）へ劣化しない。応答到着前は待ちを維持したまま dispatch が食い切り、
+        // 到着後（showing）は move_clause 拒否でも no-op 食い切り — Right を打つタイミングが
+        // 応答の前後どちらでも Commit が出ないことを固定する（385da4b7 の接続切れ回帰の
+        // ヘッドレス再現）。pending 解除後の従来動作（settle に戻る）は item53 で固定する。
+        Scenario {
+            item: 52,
+            name: "arrow spam during explicit snapshot wait never settles",
+            keys: {
+                let mut k = typed("nihongo");
+                k.push(SPACE);
+                k.push(RIGHT);
+                k.push(RIGHT);
+                k
+            },
+            expect: |c, _f, p, evs, eaten_last| {
+                let committed_any = evs.iter().any(|e| matches!(e, Ev::Commit { .. }));
+                if committed_any || !c.is_empty() {
+                    return Err(
+                        "←→連打で全文確定（settle）が起きた（P1 の待ち保護が効いていない）"
+                            .into(),
+                    );
+                }
+                if !eaten_last {
+                    return Err(
+                        "最後の Right が素通し（eaten=false）— 保護された食い切りの証明になっていない"
+                            .into(),
+                    );
+                }
+                if p.is_empty() {
+                    return Err("composition が失われた（preedit が空）".into());
+                }
+                Ok(())
+            },
+        },
+        // item53（計画書 P1 の「変換失敗でpending解除→Right の固定」）は未実装:
+        // エンジン kill で待ちを失敗させようとすると crash recovery の再 spawn が先に
+        // snapshot を成功させて showing へ遷移し、決定論的に作れない。計画書どおり
+        // Phase 3 の遅延・失敗注入基盤で固定する（P1 の保護は「待ち成功まで」であり、
+        // 失敗出口は P1 のスコープ外）。
     ]
+}
+
+#[cfg(test)]
+mod clause_expectation_tests {
+    use super::*;
+
+    #[test]
+    fn first_space_requires_closed_conversion_and_rejects_the_old_open_window() {
+        let expect = all().into_iter().find(|scenario| scenario.item == 3).unwrap().expect;
+        let mut events = vec![Ev::ClausePresented { ready: false, selected: 0 }];
+        assert!(expect("", "日本語", "日本語", &events, true).is_ok());
+        assert!(expect("", "日本語", "日本語", &[], true).is_err());
+        events.push(Ev::CandidatesShown { n: 1, sel: 0, list: vec!["日本語".into()] });
+        assert!(expect("", "日本語", "日本語", &events, true).is_err());
+    }
+
+    #[test]
+    fn esc_requires_retained_surface_and_the_final_window_to_be_closed() {
+        let expect = all().into_iter().find(|scenario| scenario.item == 48).unwrap().expect;
+        let mut events = vec![
+            Ev::CandidatesShown { n: 2, sel: 0, list: vec!["日本語".into(), "二本語".into()] },
+            Ev::ClausePresented { ready: true, selected: 1 },
+            Ev::ClausePresented { ready: false, selected: 0 },
+        ];
+        assert!(expect("", "二本語", "二本語", &events, true).is_ok());
+        assert!(expect("", "日本語", "日本語", &events, true).is_err());
+        events.push(Ev::ClausePresented { ready: true, selected: 1 });
+        assert!(expect("", "二本語", "二本語", &events, true).is_err());
+    }
 }
