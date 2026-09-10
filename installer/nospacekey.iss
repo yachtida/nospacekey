@@ -77,6 +77,10 @@ SetupMutex=nospacekey-tip-registration,Global\nospacekey-tip-registration
 DefaultDirName={autopf}\nospacekey
 UsePreviousAppDir=no
 DisableDirPage=yes
+; Deferred-collect postconditions and limited recovery verify shortcuts under a
+; fixed group folder, so a user-renamed group would leave dead shortcuts that no
+; verification path can see. Pin the group like the directory above.
+DisableProgramGroupPage=yes
 DefaultGroupName=nospacekey
 ; TSF TIP registration is per-machine (HKLM) -> elevation required.
 PrivilegesRequired=admin
@@ -229,6 +233,17 @@ var
   UninstallTipWasActive: Boolean;
   UninstallResumeDeleting: Boolean;
   InterruptedDeletingDetected: Boolean;
+  // Deferred uninstall state (uninstall transactions that survive in-use files).
+  DeferredMode: Boolean;
+  DeferredConsented: Boolean;
+  DeferredResumePending: Boolean;
+  DeferredResumeDeleting: Boolean;
+  DeferredResumeReboot: Boolean;
+  DeferredBegun: Boolean;
+  DeferredCompleteNow: Boolean;
+  DeferredNeedsRestart: Boolean;
+  InterruptedDeferredDetected: Boolean;
+  InterruptedInnoDetected: Boolean;
 
 function TestNonReparsePath(const Path: String; ExpectDirectory: Boolean): Boolean;
 var
@@ -873,16 +888,30 @@ var
 begin
   Result := False;
   InterruptedDeletingDetected := False;
-  if FileExists(ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1')) then begin
+  InterruptedDeferredDetected := False;
+  InterruptedInnoDetected := False;
+  // The embedded worker handles an empty journal directory, so gate on either
+  // marker: a journal left without the recovery script (partial external
+  // cleanup) must still be collected instead of silently ignored.
+  if FileExists(ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1')) or
+     DirExists(ExpandConstant('{app}\.nospacekey-uninstall')) then begin
     if not RunEmbeddedCleanupScript(RecoveryPath, '',
-        '-InitializeTaskTransactionArtifacts', False,
+        '-InitializeTaskTransactionArtifacts', True,
         ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
       Exit;
     if not RunEmbeddedCleanupScript(RecoveryPath, '',
-        '-RecoverInterruptedUninstalls', False, ewWaitUntilTerminated, ResultCode) then
+        '-RecoverInterruptedUninstalls', True, ewWaitUntilTerminated, ResultCode) then
       Exit;
     if ResultCode = 3 then begin
       InterruptedDeletingDetected := True;
+      Exit;
+    end;
+    if ResultCode = 4 then begin
+      InterruptedDeferredDetected := True;
+      Exit;
+    end;
+    if ResultCode = 5 then begin
+      InterruptedInnoDetected := True;
       Exit;
     end;
     if ResultCode <> 0 then
@@ -934,6 +963,10 @@ begin
   if not RecoverInterruptedUninstallClaim(RecoveryPath) then begin
     if InterruptedDeletingDetected then
       Result := '中断した同じバージョンのアンインストーラーを再実行して、アンインストールを完了してください。'
+    else if InterruptedInnoDetected then
+      Result := '前回のアンインストールの登録情報、ショートカット、または unins000 ファイルが残っています。元のアンインストーラーを再実行してください。見つからない場合は、復旧記録を残したままサポートへお問い合わせください。'
+    else if InterruptedDeferredDetected then
+      Result := '前回の nospacekey アンインストールは再起動後の削除が完了していません。Windows を再起動してから、もう一度インストールしてください。'
     else
       Result := '中断されたアンインストールを安全に復旧できないため、インストールを中止しました。';
     Exit;
@@ -1099,11 +1132,204 @@ begin
   end;
 end;
 
+function CmdLineAllowsDeferred(): Boolean;
+var
+  Index: Integer;
+begin
+  Result := False;
+  for Index := 1 to ParamCount do
+    if CompareText(ParamStr(Index), '/DEFERREDDELETE') = 0 then
+      Result := True;
+end;
+
+function ConfirmDeferredUninstall(): Boolean;
+begin
+  // Silent uninstalls must opt in explicitly; unattended deferral would delete files
+  // on the next reboot without the user ever having chosen it.
+  if UninstallSilent() then begin
+    if CmdLineAllowsDeferred() then
+      Result := True
+    else begin
+      Log('Silent uninstall refused deferred deletion of in-use files without /DEFERREDDELETE');
+      Result := False;
+    end;
+  end else
+    Result := MsgBox(
+      'nospacekey を使用中のアプリケーションがあるため、ファイルをすぐに削除できません。' + #13#10
+      + 'Windows の再起動後に完全に削除して、アンインストールを完了しますか？',
+      mbConfirmation, MB_YESNO) = IDYES;
+end;
+
+function DeferredConsentParam(): String;
+begin
+  if DeferredConsented then
+    Result := ' -DeferredConsent'
+  else
+    Result := '';
+end;
+
+function ProbeUninstallInUse(): Integer;
+var
+  ResultCode: Integer;
+  RecoveryPath: String;
+begin
+  Result := 12;
+  RecoveryPath := ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1');
+  if not FileExists(RecoveryPath) then
+    Exit;
+  if RunTrustedCleanupScript(RecoveryPath, '',
+      '-ProbeUninstallTargets -UninstallBuild ''{#MyAppVersion}'' -DeadlineMs 60000',
+      False, ewWaitUntilTerminated, ResultCode) then
+    Result := ResultCode;
+end;
+
+function ValidateDeferredUninstallResume(): Integer;
+var
+  ResultCode: Integer;
+  RecoveryPath: String;
+begin
+  // 0 = fresh, 20/21/22 = deferred phases, 30 = legacy, 12 = blocked.
+  Result := 0;
+  RecoveryPath := ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1');
+  if not FileExists(RecoveryPath) then
+    Exit;
+  if not RunTrustedCleanupScript(RecoveryPath, '',
+      '-ValidateDeferredUninstallResume -UninstallBuild ''{#MyAppVersion}''',
+      True, ewWaitUntilTerminated, ResultCode) then begin
+    Result := 12;
+    Exit;
+  end;
+  if (ResultCode <> 0) and (ResultCode <> 20) and (ResultCode <> 21) and
+     (ResultCode <> 22) and (ResultCode <> 30) then
+    Result := 12
+  else
+    Result := ResultCode;
+end;
+
+function BeginDeferredUninstall(): Boolean;
+var
+  ResultCode: Integer;
+  RecoveryPath: String;
+  Tree: String;
+begin
+  Result := False;
+  RecoveryPath := ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1');
+  Tree := ExpandConstant('{app}\versions\{#MyAppVersion}');
+  if not RunTrustedCleanupScript(RecoveryPath, Tree,
+      '-BeginDeferredUninstall -UninstallBuild ''{#MyAppVersion}'' -DeadlineMs 120000' +
+      DeferredConsentParam(),
+      False, ewWaitUntilTerminated, ResultCode) then begin
+    SuppressibleMsgBox('アンインストールの準備を開始できなかったため、アンインストールを中止します。',
+      mbError, MB_OK, IDOK);
+    Exit;
+  end;
+  if ResultCode = 0 then begin
+    Result := True;
+    Exit;
+  end;
+  if ResultCode = 10 then begin
+    // A target became in use after the preflight, or a racing exclusive claim exists.
+    if not ConfirmDeferredUninstall() then
+      Exit;
+    DeferredConsented := True;
+    if RunTrustedCleanupScript(RecoveryPath, Tree,
+        '-BeginDeferredUninstall -UninstallBuild ''{#MyAppVersion}'' -DeadlineMs 120000 -DeferredConsent',
+        False, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+      Result := True
+    else
+      SuppressibleMsgBox('nospacekey を使用中のアプリを削除する準備ができなかったため、アンインストールを中止します。',
+        mbError, MB_OK, IDOK);
+    Exit;
+  end;
+  SuppressibleMsgBox('アンインストールの準備を安全に確認できなかったため、アンインストールを中止します。',
+    mbError, MB_OK, IDOK);
+end;
+
+function AdvanceDeferredUninstall(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  // Runs inside usUninstall, before Inno replays its own deletion log: every tracked
+  // file must already be absent (deleted or renamed away) by the time this returns.
+  Result := False;
+  if not RunTrustedCleanupScript(
+    ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1'),
+    ExpandConstant('{app}\versions\{#MyAppVersion}'),
+    '-AdvanceDeferredUninstall -UninstallBuild ''{#MyAppVersion}'' -DeadlineMs 120000' + DeferredConsentParam(),
+    True, ewWaitUntilTerminated, ResultCode) then
+    Exit;
+  if ResultCode = 10 then begin
+    if not ConfirmDeferredUninstall() then
+      Exit;
+    DeferredConsented := True;
+    if not RunTrustedCleanupScript(
+        ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1'),
+        ExpandConstant('{app}\versions\{#MyAppVersion}'),
+        '-AdvanceDeferredUninstall -UninstallBuild ''{#MyAppVersion}'' -DeadlineMs 120000 -DeferredConsent',
+        True, ewWaitUntilTerminated, ResultCode) then
+      Exit;
+  end;
+  if ResultCode <> 0 then
+    Exit;
+  if not RunTrustedCleanupScript(
+      ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1'), '',
+      '-QueryDeferredUninstallRestart -UninstallBuild ''{#MyAppVersion}''',
+      True, ewWaitUntilTerminated, ResultCode) then
+    Exit;
+  DeferredNeedsRestart := ResultCode = 5;
+  Result := (ResultCode = 0) or DeferredNeedsRestart;
+end;
+
+function UninstallNeedRestart(): Boolean;
+begin
+  // This controls Inno's restart UI only. Automation uses the external
+  // recovery worker's -RunUninstall entry point to receive exit code 3010.
+  Result := DeferredNeedsRestart;
+end;
+
+procedure CompleteDeferredUninstall();
+var
+  ResultCode: Integer;
+begin
+  if not RunTrustedCleanupScript(
+      ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1'),
+      ExpandConstant('{app}\versions\{#MyAppVersion}'),
+      '-CompleteDeferredUninstall -UninstallBuild ''{#MyAppVersion}'' -DeadlineMs 60000',
+      True, ewWaitUntilTerminated, ResultCode) then begin
+    Log('Deferred uninstall completion verification could not run; the record is retained');
+    Exit;
+  end;
+  if ResultCode = 0 then begin
+    DeferredCompleteNow := True;
+    UninstallFinalized := True;
+  end else begin
+    // Residuals remain until reboot, or completion evidence is not verifiable yet.
+    // Both keep the journal and recovery script for the next verification pass.
+    if ResultCode <> 5 then
+      Log('Deferred uninstall completion evidence was not verifiable yet; the record is retained');
+    if DeferredNeedsRestart then
+      SuppressibleMsgBox(
+        'アンインストールを完了しました。使用中だったファイルは Windows の再起動後に完全に削除されます。',
+        mbInformation, MB_OK, IDOK);
+  end;
+end;
+
+function RollbackDeferredUninstall(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := RunTrustedCleanupScript(
+    ExpandConstant('{app}\.nospacekey-uninstall-recovery.ps1'),
+    ExpandConstant('{app}\versions\{#MyAppVersion}'),
+    '-RollbackDeferredUninstall -UninstallBuild ''{#MyAppVersion}'' -DeadlineMs 60000',
+    True, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;
+
 function InitializeUninstall(): Boolean;
 var
   ResumeValidation: Integer;
+  DeferredResume: Integer;
   ResultCode: Integer;
-  SentinelPath: String;
 begin
   Result := False;
   UninstallClaimed := False;
@@ -1111,8 +1337,23 @@ begin
   UninstallStarted := False;
   UninstallFinalized := False;
   UninstallResumeDeleting := False;
-  ResumeValidation := ValidateDeletingUninstallResume();
-  if ResumeValidation = 0 then begin
+  DeferredMode := False;
+  DeferredConsented := False;
+  DeferredResumePending := False;
+  DeferredResumeDeleting := False;
+  DeferredResumeReboot := False;
+  DeferredBegun := False;
+  DeferredCompleteNow := False;
+  DeferredNeedsRestart := False;
+  InterruptedDeferredDetected := False;
+  DeferredResume := ValidateDeferredUninstallResume();
+  if DeferredResume = 30 then begin
+      ResumeValidation := ValidateDeletingUninstallResume();
+      if ResumeValidation <> 0 then begin
+        SuppressibleMsgBox('旧形式の中断状態を復旧するため、インストーラーを再実行してください。',
+          mbError, MB_OK, IDOK);
+        Exit;
+      end;
       if IsCurrentTipActive() then begin
         SuppressibleMsgBox('中断したアンインストールの日本語入力登録が残っているため、アンインストールを中止します。',
           mbError, MB_OK, IDOK);
@@ -1123,60 +1364,50 @@ begin
       Result := True;
       Exit;
   end;
-  if ResumeValidation <> 3 then begin
-    SuppressibleMsgBox('中断したアンインストールの状態を安全に確認できないため、アンインストールを中止します。',
-      mbError, MB_OK, IDOK);
-    Exit;
-  end;
-  UninstallTipWasActive := IsCurrentTipActive();
 
-  if FileExists(ExpandConstant('{app}\versions\{#MyAppVersion}\NospacekeyConfig.exe')) then
-    Exec(ExpandConstant('{app}\versions\{#MyAppVersion}\NospacekeyConfig.exe'),
-      '--stop-engine', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  if UninstallTipWasActive then begin
-    if not Exec(ExpandConstant('{sys}\regsvr32.exe'),
-        '/u /s "' + ExpandConstant('{app}\versions\{#MyAppVersion}\nospacekey_tip.dll') + '"',
-        '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then begin
-      SuppressibleMsgBox('日本語入力の登録解除に失敗したため、アンインストールを中止します。',
+  // Deferred uninstall transactions: resume forward when one exists, otherwise start
+  // fresh with a usage probe so in-use files can be deleted on the next reboot.
+  DeferredMode := True;
+  case DeferredResume of
+    20: DeferredResumePending := True;
+    21: DeferredResumeDeleting := True;
+    22: DeferredResumeReboot := True;
+    12: begin
+      SuppressibleMsgBox('中断したアンインストールの状態を安全に確認できないため、アンインストールを中止します。',
         mbError, MB_OK, IDOK);
       Exit;
     end;
   end;
 
-  if not RunTrustedCleanupScript(
-      ExpandConstant('{app}\versions\{#MyAppVersion}\version-cleanup.ps1'),
-      ExpandConstant('{app}\versions\{#MyAppVersion}'),
-      '-ClaimForUninstall -UninstallBuild ''{#MyAppVersion}'' -DeadlineMs 15000',
-      False, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then begin
-    if UninstallTipWasActive then begin
-      SentinelPath := ExpandConstant('{app}\versions\{#MyAppVersion}\.nospacekey-lifetime');
-      if FileExists(SentinelPath) then begin
-        UninstallClaimed := True;
-        UninstallSentinelRestored := True;
-        if not RestoreUninstallClaim() then
-          Log('Failed to restore TIP registration after uninstall claim failure');
-      end else
-        Log('Uninstall claim failed with no canonical sentinel; refusing to reactivate an interrupted deleting tree');
+  if not (DeferredResumePending or DeferredResumeDeleting or DeferredResumeReboot) then begin
+    case ProbeUninstallInUse() of
+      0: ;
+      10: begin
+        if not ConfirmDeferredUninstall() then
+          Exit;
+        DeferredConsented := True;
+      end;
+      else begin
+        SuppressibleMsgBox('アンインストールの対象を安全に確認できないため、アンインストールを中止します。',
+          mbError, MB_OK, IDOK);
+        Exit;
+      end;
     end;
-    SuppressibleMsgBox('nospacekey を使用中のアプリを閉じてから、もう一度アンインストールしてください。',
-      mbError, MB_OK, IDOK);
-    Exit;
   end;
-  UninstallClaimed := True;
-  UninstallSentinelRestored := False;
-  Result := True;
-end;
 
-function CommitUninstallTasks(): Boolean;
-var
-  ResultCode: Integer;
-begin
-  Result := RunTrustedCleanupScript(
-    ExpandConstant('{app}\versions\{#MyAppVersion}\version-cleanup.ps1'),
-    ExpandConstant('{app}\versions\{#MyAppVersion}'),
-    '-CommitUninstallTasks -UninstallBuild ''{#MyAppVersion}''',
-    False, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+  if FileExists(ExpandConstant('{app}\versions\{#MyAppVersion}\NospacekeyConfig.exe')) then
+    Exec(ExpandConstant('{app}\versions\{#MyAppVersion}\NospacekeyConfig.exe'),
+      '--stop-engine', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  // deleting / reboot-pending resumes have already completed their reversible prefix;
+  // they continue directly at usUninstall.
+  if not (DeferredResumeDeleting or DeferredResumeReboot) then begin
+    DeferredBegun := True;
+    if not BeginDeferredUninstall() then
+      Exit;
+  end;
+  DeferredBegun := True;
+  Result := True;
 end;
 
 function FinalizeUninstallTasks(): Boolean;
@@ -1195,23 +1426,23 @@ begin
   if CurUninstallStep = usUninstall then begin
     if UninstallResumeDeleting and (ValidateDeletingUninstallResume() <> 0) then
       RaiseException('削除直前の安全確認に失敗したため、中断したアンインストールを再開できません。');
-    if (not UninstallResumeDeleting) and (not CommitUninstallTasks()) then begin
-      if FileExists(ExpandConstant('{app}\versions\{#MyAppVersion}\.nospacekey-lifetime')) then begin
-        UninstallSentinelRestored := True;
-        if not RestoreUninstallClaim() then
-          RaiseException('更新タスクの削除失敗後に日本語入力の状態を復旧できませんでした。');
-      end else begin
-        Log('Task commit failed without a fully restored canonical sentinel; retaining the inert uninstall claim');
-        UninstallClaimed := False;
-      end;
-      RaiseException('更新タスクを安全に削除できなかったため、アンインストールを中止します。');
+    if (not UninstallResumeDeleting) and DeferredMode then begin
+      // Every success-critical step (file retreat, reservations, reboot-pending record)
+      // finishes here, before Inno starts its standard file deletion.
+      if not AdvanceDeferredUninstall() then
+        RaiseException('アンインストールのファイル削除を安全に完了できませんでした。もう一度アンインストーラーを実行してください。');
     end;
     UninstallStarted := True;
   end;
   if CurUninstallStep = usDone then begin
-    if not FinalizeUninstallTasks() then
-      RaiseException('アンインストール完了情報を安全に確定できませんでした。');
-    UninstallFinalized := True;
+    if UninstallResumeDeleting then begin
+      if not FinalizeUninstallTasks() then
+        RaiseException('アンインストール完了情報を安全に確定できませんでした。');
+      UninstallFinalized := True;
+    end else if DeferredMode then
+      // Evidence failures keep the record and are re-verified by the next run; the
+      // completion dialog has already been shown, so this never aborts the flow.
+      CompleteDeferredUninstall();
   end;
 end;
 
@@ -1220,6 +1451,25 @@ var
   ResultCode: Integer;
   RecoveryPath: String;
 begin
+  if DeferredMode then begin
+    if DeferredBegun and (not UninstallStarted) then begin
+      // Only a durable pending phase permits rollback. A failed advance may already
+      // have crossed deleting, even though Inno's deletion log never started.
+      ResultCode := ValidateDeferredUninstallResume();
+      if (ResultCode = 20) and (not RollbackDeferredUninstall()) then begin
+        SuppressibleMsgBox('アンインストール中止後に日本語入力の状態を復旧できませんでした。もう一度アンインストーラーを実行してください。',
+          mbError, MB_OK, IDOK);
+        Exit;
+      end;
+      if (ResultCode = 21) or (ResultCode = 22) then
+        Log('Uninstall crossed the irreversible boundary; retaining the forward recovery record');
+      Exit;
+    end;
+    // Reboot-pending (or unverified completion) keeps the journal and recovery script;
+    // they are collected after the reboot by the next installer run.
+    if not DeferredCompleteNow then
+      Exit;
+  end;
   if UninstallClaimed and (not UninstallStarted) and (not RestoreUninstallClaim()) then begin
     SuppressibleMsgBox('アンインストール中止後に日本語入力の状態を復旧できませんでした。',
       mbError, MB_OK, IDOK);

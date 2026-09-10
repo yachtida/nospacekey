@@ -125,7 +125,7 @@ fn installer_keeps_loaded_pairs_in_versioned_directories() {
     );
     assert!(
         !iss.contains("restartreplace") && !iss.contains("uninsrestartdelete"),
-        "versioned binaries must never be overwritten or deleted at reboot"
+        "Inno must not bypass journal ownership checks with automatic replacement/deletion flags"
     );
     assert!(!iss.contains("ignoreversion"));
     assert!(iss.contains("function PrepareToInstall(var NeedsRestart: Boolean): String;"));
@@ -198,24 +198,22 @@ fn installer_keeps_loaded_pairs_in_versioned_directories() {
     ] {
         assert!(tip_registration.contains(restore_case), "{restore_case}");
     }
-    assert!(iss.contains("UninstallTipWasActive := IsCurrentTipActive();"));
     assert!(iss.contains("function InitializeUninstall(): Boolean;"));
     assert!(iss.contains(
         "function RecoverInterruptedUninstallClaim(const RecoveryPath: String): Boolean;"
     ));
-    assert!(iss.contains(
-        "#define PreinstallRecoveryScriptName \"nospacekey-preinstall-recovery.ps1\""
-    ));
+    assert!(
+        iss.contains("#define PreinstallRecoveryScriptName \"nospacekey-preinstall-recovery.ps1\"")
+    );
     assert!(iss.contains("Flags: dontcopy noencryption"));
     assert!(iss.contains("ExtractTemporaryFile('{#PreinstallRecoveryScriptName}')"));
     assert_eq!(iss.matches("RunEmbeddedCleanupScript(").count(), 3);
     assert!(iss.contains("-RecoverUninstallClaim"));
-    assert!(iss.contains("function CommitUninstallTasks(): Boolean;"));
+    assert!(iss.contains("function AdvanceDeferredUninstall(): Boolean;"));
     assert!(iss.contains("function FinalizeUninstallTasks(): Boolean;"));
-    assert!(iss.contains("(not UninstallResumeDeleting) and (not CommitUninstallTasks())"));
+    assert!(iss.contains("if not AdvanceDeferredUninstall() then"));
     assert!(iss.contains("-ValidateDeletingUninstall -UninstallBuild ''{#MyAppVersion}''"));
     assert!(iss.contains("function ValidateDeletingUninstallResume(): Integer;"));
-    assert_eq!(iss.matches("ValidateDeletingUninstallResume()").count(), 3);
     let uninstall_step = iss
         .find("if CurUninstallStep = usUninstall then begin")
         .expect("uninstall deletion callback must exist");
@@ -223,27 +221,28 @@ fn installer_keeps_loaded_pairs_in_versioned_directories() {
         .find("UninstallResumeDeleting and (ValidateDeletingUninstallResume() <> 0)")
         .expect("deleting resume must be revalidated immediately before removal");
     let task_commit = iss
-        .find("(not UninstallResumeDeleting) and (not CommitUninstallTasks())")
-        .expect("normal uninstall task commit must exist");
+        .find("if not AdvanceDeferredUninstall() then")
+        .expect("journal-owned file removal must finish before standard uninstall");
     assert!(
         uninstall_step < immediate_resume_validation && immediate_resume_validation < task_commit
     );
     assert!(iss.contains(
         "#define CleanupScriptSHA256 GetSHA256OfFile(\"..\\scripts\\version-cleanup.ps1\")"
     ));
-    assert_eq!(iss.matches("RunTrustedCleanupScript(").count(), 9);
     assert!(!iss.contains("ExecutionPolicy Bypass -File"));
     assert!(iss.contains("CreateFileW@kernel32.dll"));
     assert!(iss.contains("CleanupOpenReparsePoint"));
     assert!(iss.contains("BuildCleanupBootstrapCommand"));
     assert!(iss.contains("Get-FileHash -InputStream $pin -Algorithm SHA256"));
-    assert!(iss.contains("Test-SemanticallyProtectedDirectory") || iss.contains("function safe($p)"));
+    assert!(
+        iss.contains("Test-SemanticallyProtectedDirectory") || iss.contains("function safe($p)")
+    );
     assert!(iss.contains(
         "Parameters: \"{code:DeferredCleanupParameters}\"; Flags: runhidden nowait; Check: ValidateCurrentCleanupPayload"
     ));
-    assert!(iss.contains(
-        "if (CurStep = ssPostInstall) and (not ValidateCurrentCleanupPayload()) then"
-    ));
+    assert!(
+        iss.contains("if (CurStep = ssPostInstall) and (not ValidateCurrentCleanupPayload()) then")
+    );
     let trusted_runner = iss
         .find("function RunCleanupScript(")
         .expect("cleanup bootstrap must exist");
@@ -260,9 +259,7 @@ fn installer_keeps_loaded_pairs_in_versioned_directories() {
         .find("Result := Exec(ExpandConstant('{sys}\\WindowsPowerShell")
         .expect("trusted cleanup bootstrap must own the elevated launch");
     assert!(
-        non_reparse < script_pin
-            && script_pin < embedded_hash
-            && embedded_hash < elevated_exec
+        non_reparse < script_pin && script_pin < embedded_hash && embedded_hash < elevated_exec
     );
     let powershell_hash = iss
         .find("Get-FileHash -InputStream $pin -Algorithm SHA256")
@@ -290,10 +287,14 @@ fn installer_keeps_loaded_pairs_in_versioned_directories() {
     ));
     assert!(iss.contains("UninstallResumeDeleting := True;"));
     assert!(iss.contains("if IsCurrentTipActive() then begin"));
-    let finalizer = iss
+    let legacy_completion = iss
+        .split("if CurUninstallStep = usDone then begin")
+        .nth(1)
+        .unwrap();
+    let finalizer = legacy_completion
         .find("if not FinalizeUninstallTasks() then")
         .expect("usDone finalizer must exist");
-    let finalized = iss
+    let finalized = legacy_completion
         .find("UninstallFinalized := True")
         .expect("successful finalization marker must exist");
     assert!(finalizer < finalized);
@@ -325,12 +326,37 @@ fn installer_keeps_loaded_pairs_in_versioned_directories() {
         .split("function InitializeUninstall(): Boolean;")
         .nth(1)
         .unwrap()
-        .split("function CommitUninstallTasks(): Boolean;")
+        .split("function FinalizeUninstallTasks(): Boolean;")
         .next()
         .unwrap();
     assert!(!initialize_uninstall.contains("-CommitUninstallTasks"));
     assert!(!initialize_uninstall.contains("Get-ScheduledTask"));
     assert!(!initialize_uninstall.contains("Unregister-ScheduledTask"));
+    let deferred_dispatch = initialize_uninstall
+        .find("DeferredResume := ValidateDeferredUninstallResume()")
+        .unwrap();
+    let legacy_validation = initialize_uninstall
+        .find("ResumeValidation := ValidateDeletingUninstallResume()")
+        .unwrap();
+    assert!(
+        deferred_dispatch < legacy_validation,
+        "schema-4 records must reach their own resume path before the legacy-only validator"
+    );
+    assert!(initialize_uninstall.contains("if DeferredResume = 30 then begin"));
+    assert!(iss.contains("function UninstallNeedRestart(): Boolean;"));
+    assert!(iss.contains("Result := DeferredNeedsRestart;"));
+    assert!(iss.contains("-QueryDeferredUninstallRestart"));
+    let advance = iss
+        .split("function AdvanceDeferredUninstall(): Boolean;")
+        .nth(1)
+        .unwrap()
+        .split("function UninstallNeedRestart()")
+        .next()
+        .unwrap();
+    assert!(advance.contains("if ResultCode = 10 then begin"));
+    assert!(advance.contains("if not ConfirmDeferredUninstall() then"));
+    assert!(advance.contains("-DeferredConsent"));
+    assert!(advance.contains(".nospacekey-uninstall-recovery.ps1"));
     assert!(iss.contains("if UninstallClaimed and (not UninstallStarted) and"));
     assert!(iss.contains("function RestoreUninstallClaim(): Boolean;"));
     assert!(iss.contains("not RestoreUninstallClaim()"));
@@ -339,10 +365,9 @@ fn installer_keeps_loaded_pairs_in_versioned_directories() {
     assert!(config_main
         .find("VersionLease::acquire()")
         .is_some_and(|lease| lease < config_main.find("LaunchIntent::RepairUpdateTask").unwrap()));
-    assert_eq!(
-        iss.matches("'/u /s \"' + ExpandConstant").count(),
-        1,
-        "uninstall must unregister the active TIP once"
+    assert!(
+        !initialize_uninstall.contains("/u /s"),
+        "TIP unregistration belongs to the journaled PowerShell transaction"
     );
 }
 
