@@ -27,14 +27,8 @@ pub fn trim_ws(s: &str) -> &str {
 fn is_trim_ws_char(c: char) -> bool {
     matches!(
         c,
-        '\u{0009}'
-            | '\u{0020}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
+        '\u{0009}' | '\u{0020}' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
     )
 }
 
@@ -60,30 +54,64 @@ pub fn compose_kana(s: &str) -> String {
 
 fn compose_pair(base: char, mark: char) -> Option<char> {
     Some(match (base, mark) {
-        ('か', '\u{3099}') => 'が', ('き', '\u{3099}') => 'ぎ', ('く', '\u{3099}') => 'ぐ',
-        ('け', '\u{3099}') => 'げ', ('こ', '\u{3099}') => 'ご',
-        ('さ', '\u{3099}') => 'ざ', ('し', '\u{3099}') => 'じ', ('す', '\u{3099}') => 'ず',
-        ('せ', '\u{3099}') => 'ぜ', ('そ', '\u{3099}') => 'ぞ',
-        ('た', '\u{3099}') => 'だ', ('ち', '\u{3099}') => 'ぢ', ('つ', '\u{3099}') => 'づ',
-        ('て', '\u{3099}') => 'で', ('と', '\u{3099}') => 'ど',
-        ('は', '\u{3099}') => 'ば', ('ひ', '\u{3099}') => 'び', ('ふ', '\u{3099}') => 'ぶ',
-        ('へ', '\u{3099}') => 'べ', ('ほ', '\u{3099}') => 'ぼ',
-        ('う', '\u{3099}') => 'ゔ', ('ゝ', '\u{3099}') => 'ゞ',
-        ('カ', '\u{3099}') => 'ガ', ('キ', '\u{3099}') => 'ギ', ('ク', '\u{3099}') => 'グ',
-        ('ケ', '\u{3099}') => 'ゲ', ('コ', '\u{3099}') => 'ゴ',
-        ('サ', '\u{3099}') => 'ザ', ('シ', '\u{3099}') => 'ジ', ('ス', '\u{3099}') => 'ズ',
-        ('セ', '\u{3099}') => 'ゼ', ('ソ', '\u{3099}') => 'ゾ',
-        ('タ', '\u{3099}') => 'ダ', ('チ', '\u{3099}') => 'ヂ', ('ツ', '\u{3099}') => 'ヅ',
-        ('テ', '\u{3099}') => 'デ', ('ト', '\u{3099}') => 'ド',
-        ('ハ', '\u{3099}') => 'バ', ('ヒ', '\u{3099}') => 'ビ', ('フ', '\u{3099}') => 'ブ',
-        ('ヘ', '\u{3099}') => 'ベ', ('ホ', '\u{3099}') => 'ボ',
+        ('か', '\u{3099}') => 'が',
+        ('き', '\u{3099}') => 'ぎ',
+        ('く', '\u{3099}') => 'ぐ',
+        ('け', '\u{3099}') => 'げ',
+        ('こ', '\u{3099}') => 'ご',
+        ('さ', '\u{3099}') => 'ざ',
+        ('し', '\u{3099}') => 'じ',
+        ('す', '\u{3099}') => 'ず',
+        ('せ', '\u{3099}') => 'ぜ',
+        ('そ', '\u{3099}') => 'ぞ',
+        ('た', '\u{3099}') => 'だ',
+        ('ち', '\u{3099}') => 'ぢ',
+        ('つ', '\u{3099}') => 'づ',
+        ('て', '\u{3099}') => 'で',
+        ('と', '\u{3099}') => 'ど',
+        ('は', '\u{3099}') => 'ば',
+        ('ひ', '\u{3099}') => 'び',
+        ('ふ', '\u{3099}') => 'ぶ',
+        ('へ', '\u{3099}') => 'べ',
+        ('ほ', '\u{3099}') => 'ぼ',
+        ('う', '\u{3099}') => 'ゔ',
+        ('ゝ', '\u{3099}') => 'ゞ',
+        ('カ', '\u{3099}') => 'ガ',
+        ('キ', '\u{3099}') => 'ギ',
+        ('ク', '\u{3099}') => 'グ',
+        ('ケ', '\u{3099}') => 'ゲ',
+        ('コ', '\u{3099}') => 'ゴ',
+        ('サ', '\u{3099}') => 'ザ',
+        ('シ', '\u{3099}') => 'ジ',
+        ('ス', '\u{3099}') => 'ズ',
+        ('セ', '\u{3099}') => 'ゼ',
+        ('ソ', '\u{3099}') => 'ゾ',
+        ('タ', '\u{3099}') => 'ダ',
+        ('チ', '\u{3099}') => 'ヂ',
+        ('ツ', '\u{3099}') => 'ヅ',
+        ('テ', '\u{3099}') => 'デ',
+        ('ト', '\u{3099}') => 'ド',
+        ('ハ', '\u{3099}') => 'バ',
+        ('ヒ', '\u{3099}') => 'ビ',
+        ('フ', '\u{3099}') => 'ブ',
+        ('ヘ', '\u{3099}') => 'ベ',
+        ('ホ', '\u{3099}') => 'ボ',
         ('ウ', '\u{3099}') => 'ヴ',
-        ('ワ', '\u{3099}') => 'ヷ', ('ヰ', '\u{3099}') => 'ヸ', ('ヱ', '\u{3099}') => 'ヹ',
-        ('ヲ', '\u{3099}') => 'ヺ', ('ヽ', '\u{3099}') => 'ヾ',
-        ('は', '\u{309A}') => 'ぱ', ('ひ', '\u{309A}') => 'ぴ', ('ふ', '\u{309A}') => 'ぷ',
-        ('へ', '\u{309A}') => 'ぺ', ('ほ', '\u{309A}') => 'ぽ',
-        ('ハ', '\u{309A}') => 'パ', ('ヒ', '\u{309A}') => 'ピ', ('フ', '\u{309A}') => 'プ',
-        ('ヘ', '\u{309A}') => 'ペ', ('ホ', '\u{309A}') => 'ポ',
+        ('ワ', '\u{3099}') => 'ヷ',
+        ('ヰ', '\u{3099}') => 'ヸ',
+        ('ヱ', '\u{3099}') => 'ヹ',
+        ('ヲ', '\u{3099}') => 'ヺ',
+        ('ヽ', '\u{3099}') => 'ヾ',
+        ('は', '\u{309A}') => 'ぱ',
+        ('ひ', '\u{309A}') => 'ぴ',
+        ('ふ', '\u{309A}') => 'ぷ',
+        ('へ', '\u{309A}') => 'ぺ',
+        ('ほ', '\u{309A}') => 'ぽ',
+        ('ハ', '\u{309A}') => 'パ',
+        ('ヒ', '\u{309A}') => 'ピ',
+        ('フ', '\u{309A}') => 'プ',
+        ('ヘ', '\u{309A}') => 'ペ',
+        ('ホ', '\u{309A}') => 'ポ',
         _ => return None,
     })
 }
@@ -195,9 +223,18 @@ pub fn canonical_pos(pos: Option<&str>) -> &'static str {
     "名詞"
 }
 
-/// %LOCALAPPDATA%\nospacekey\user_dictionary.json。無ければ None（呼び元は空辞書で劣化）。
+/// %LOCALAPPDATA%\nospacekey\user_dictionary.json。無しおよび空文字なら None
+/// （呼び元は空辞書で劣化）。空文字を通すと CWD 相対パスになり、Swift 側
+/// UserDictionary.resolve の `!base.isEmpty`（nil 劣化）と UI/エンジンの参照先が
+/// 分岐する（巡3 Z1 — settings_path/DL 経路と同じ規律）。
 pub fn dict_path() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("nospacekey").join("user_dictionary.json"))
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            PathBuf::from(d)
+                .join("nospacekey")
+                .join("user_dictionary.json")
+        })
 }
 
 #[derive(Debug, PartialEq)]
@@ -222,13 +259,21 @@ pub struct LoadedDict {
 }
 
 pub fn load_from(path: &Path) -> Result<LoadedDict, DictLoadError> {
-    load_from_with(path, |f, t| std::fs::rename(f, t), |f, t| std::fs::copy(f, t))
+    load_from_with(
+        path,
+        |f, t| std::fs::rename(f, t),
+        |f, t| std::fs::copy(f, t),
+    )
 }
 
 /// 隔離操作（rename/copy）を注入可能にした実体。**別々の引数にする**（1クロージャに畳むと
 /// copy フォールバック未実装でも rename 成功時のテストが全緑になり、フォールバック欠落を
 /// 検出できない偽緑になる）。
-pub(crate) fn load_from_with<R, C>(path: &Path, rename: R, copy: C) -> Result<LoadedDict, DictLoadError>
+pub(crate) fn load_from_with<R, C>(
+    path: &Path,
+    rename: R,
+    copy: C,
+) -> Result<LoadedDict, DictLoadError>
 where
     R: Fn(&Path, &Path) -> std::io::Result<()>,
     C: Fn(&Path, &Path) -> std::io::Result<u64>,
@@ -255,14 +300,22 @@ where
     match serde_json::from_str::<Vec<UserDictEntry>>(&text) {
         Ok(entries) => {
             let (entries, deduped) = dedup_entries(entries);
-            Ok(LoadedDict { entries, deduped, corrupt: DictCorrupt::None })
+            Ok(LoadedDict {
+                entries,
+                deduped,
+                corrupt: DictCorrupt::None,
+            })
         }
         Err(_) => quarantine(path, rename, copy),
     }
 }
 
 fn empty_loaded() -> LoadedDict {
-    LoadedDict { entries: Vec::new(), deduped: 0, corrupt: DictCorrupt::None }
+    LoadedDict {
+        entries: Vec::new(),
+        deduped: 0,
+        corrupt: DictCorrupt::None,
+    }
 }
 
 /// `entry_key`（最初の出現を残す）で重複除去する。同一読み・別語は別キーとして両方残る。
@@ -290,7 +343,11 @@ where
 {
     let dest = quarantine_dest_path(path);
     if rename(path, &dest).is_ok() || copy(path, &dest).is_ok() {
-        return Ok(LoadedDict { entries: Vec::new(), deduped: 0, corrupt: DictCorrupt::Quarantined });
+        return Ok(LoadedDict {
+            entries: Vec::new(),
+            deduped: 0,
+            corrupt: DictCorrupt::Quarantined,
+        });
     }
     Err(DictLoadError::QuarantineFailed)
 }
@@ -319,17 +376,15 @@ pub fn save_to(path: &Path, entries: &[UserDictEntry]) -> std::io::Result<()> {
     crate::save_atomic(path, &json)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Encoding {
     Utf8,
     Utf16Le,
     Utf16Be,
 }
 
-/// 判別規則（確定値。brief 検算済み）: ①BOM(UTF-8/16LE/16BE) ②BOM無しで「NUL バイトが
-/// 2個以上 かつ 全バイトの5%以上」→UTF-16（LE/BE は偶数位置NUL数 vs 奇数位置NUL数の
-/// 多数決） ③それ以外→UTF-8。UTF-16LE の ASCII 文字は上位バイト(NUL)が奇数位置、
-/// UTF-16BE は偶数位置に来るため、多数決で LE/BE を割る。
+/// BOMなしの辞書形式を見分けるため、strict decodeできた候補を構造で比較する。
+/// NUL比率を閾値にする方法は、日本語中心のUTF-16やUTF-8の末尾NULを取り違えるため使わない。
 pub(crate) fn sniff_encoding(bytes: &[u8]) -> Encoding {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return Encoding::Utf8;
@@ -340,13 +395,119 @@ pub(crate) fn sniff_encoding(bytes: &[u8]) -> Encoding {
     if bytes.starts_with(&[0xFE, 0xFF]) {
         return Encoding::Utf16Be;
     }
-    let nul_count = bytes.iter().filter(|&&b| b == 0).count();
-    if nul_count >= 2 && nul_count as f64 >= bytes.len() as f64 * 0.05 {
-        let even_nul = bytes.iter().step_by(2).filter(|&&b| b == 0).count();
-        let odd_nul = bytes.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
-        return if odd_nul > even_nul { Encoding::Utf16Le } else { Encoding::Utf16Be };
+
+    let candidates = [
+        (
+            Encoding::Utf8,
+            std::str::from_utf8(bytes).ok().map(str::to_owned),
+        ),
+        (Encoding::Utf16Le, decode_utf16_strict(bytes, true)),
+        (Encoding::Utf16Be, decode_utf16_strict(bytes, false)),
+    ];
+    let best_score = candidates
+        .iter()
+        .filter_map(|(_, text)| text.as_deref().map(dictionary_structure_score))
+        .max()
+        .unwrap_or(i32::MIN);
+    // 構造的な証拠が無い場合は、従来どおりUTF-8を選ぶ。strict decodeできることだけで
+    // ランダムな偶数バイト列をUTF-16と断定してはいけない。
+    if best_score <= 0 {
+        return Encoding::Utf8;
+    }
+
+    let best: Vec<Encoding> = candidates
+        .iter()
+        .filter_map(|(encoding, text)| {
+            (text.as_deref().map(dictionary_structure_score) == Some(best_score))
+                .then_some(*encoding)
+        })
+        .collect();
+    if best.len() == 1 {
+        return best[0];
+    }
+
+    // NUL parityはLE/BEの構造スコアが同点のときだけ使う。UTF-8が同点に含まれる場合は
+    // 構造だけでは決め切れていないため、UTF-8 fallbackを維持する。
+    if best
+        .iter()
+        .all(|encoding| matches!(encoding, Encoding::Utf16Le | Encoding::Utf16Be))
+    {
+        let parity_bytes = bytes_without_trailing_nuls(bytes);
+        let even_nul = parity_bytes.iter().step_by(2).filter(|&&b| b == 0).count();
+        let odd_nul = parity_bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|&&b| b == 0)
+            .count();
+        if odd_nul > even_nul && best.contains(&Encoding::Utf16Le) {
+            return Encoding::Utf16Le;
+        }
+        if even_nul > odd_nul && best.contains(&Encoding::Utf16Be) {
+            return Encoding::Utf16Be;
+        }
     }
     Encoding::Utf8
+}
+
+fn bytes_without_trailing_nuls(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == 0 {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+/// 辞書らしさのスコア。JSONの配列/オブジェクトと ruby/word、またはTSVの2列以上を
+/// 強い証拠とし、内部C0制御文字（TAB/CR/LFを除く）は減点する。末尾NULだけはここで
+/// 判定用に無視し、実際のdecode結果からは削除しない。
+fn dictionary_structure_score(text: &str) -> i32 {
+    const JSON_CONTAINER: i32 = 100;
+    const JSON_FIELDS: i32 = 100;
+    const TSV_COLUMNS: i32 = 100;
+    const INVALID_C0_PENALTY: i32 = 20;
+
+    let detection_text = text.trim_end_matches('\0');
+    let mut score = 0;
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(detection_text.trim()) {
+        if matches!(
+            &value,
+            serde_json::Value::Array(_) | serde_json::Value::Object(_)
+        ) {
+            score += JSON_CONTAINER;
+            if json_has_ruby_word(&value) {
+                score += JSON_FIELDS;
+            }
+        }
+    }
+    if has_tsv_columns(detection_text) && !detection_text.chars().any(is_invalid_internal_c0) {
+        score += TSV_COLUMNS;
+    }
+    let invalid_c0 = detection_text
+        .chars()
+        .filter(|&c| is_invalid_internal_c0(c))
+        .count() as i32;
+    score - invalid_c0 * INVALID_C0_PENALTY
+}
+
+fn json_has_ruby_word(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            (map.contains_key("ruby") && map.contains_key("word"))
+                || map.values().any(json_has_ruby_word)
+        }
+        serde_json::Value::Array(values) => values.iter().any(json_has_ruby_word),
+        _ => false,
+    }
+}
+
+fn has_tsv_columns(text: &str) -> bool {
+    text.lines()
+        .any(|line| !line.is_empty() && line.split('\t').count() >= 2)
+}
+
+fn is_invalid_internal_c0(c: char) -> bool {
+    ('\u{0000}'..='\u{001F}').contains(&c) && !matches!(c, '\t' | '\r' | '\n')
 }
 
 /// strict デコード（JSON 用）。lossy は禁止 — CP932 等の非対応バイト列を U+FFFD で
@@ -393,21 +554,35 @@ fn utf16_units(bytes: &[u8], le: bool) -> Option<Vec<u16>> {
     Some(
         bytes
             .chunks_exact(2)
-            .map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
+            .map(|c| {
+                if le {
+                    u16::from_le_bytes([c[0], c[1]])
+                } else {
+                    u16::from_be_bytes([c[0], c[1]])
+                }
+            })
             .collect(),
     )
 }
 
 fn decode_utf16_strict(bytes: &[u8], le: bool) -> Option<String> {
     let units = utf16_units(bytes, le)?;
-    char::decode_utf16(units).collect::<Result<String, _>>().ok()
+    char::decode_utf16(units)
+        .collect::<Result<String, _>>()
+        .ok()
 }
 
 fn decode_utf16_lossy(bytes: &[u8], le: bool) -> (String, bool) {
     // 奇数長（対不完全）は末尾1バイトを切り捨てる。TSV インポート専用の lossy 経路なので
     // strict のように None で失敗させず、had_replacement で異常を呼び出し側へ伝える。
     let had_odd_tail = !bytes.len().is_multiple_of(2);
-    let units = bytes.chunks_exact(2).map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) });
+    let units = bytes.chunks_exact(2).map(|c| {
+        if le {
+            u16::from_le_bytes([c[0], c[1]])
+        } else {
+            u16::from_be_bytes([c[0], c[1]])
+        }
+    });
     let mut had_replacement = had_odd_tail;
     let s: String = char::decode_utf16(units)
         .map(|r| match r {
@@ -447,7 +622,10 @@ pub fn parse_tsv(bytes: &[u8]) -> ParsedTsv {
             pos: cols.get(2).map(|s| s.to_string()),
         });
     }
-    ParsedTsv { rows, had_replacement }
+    ParsedTsv {
+        rows,
+        had_replacement,
+    }
 }
 
 pub struct MergeReport {
@@ -461,8 +639,13 @@ pub struct MergeReport {
 /// （`parse_tsv`）の lossy デコード結果を素通しする — U+FFFD が word 側にだけ紛れて
 /// `validate_entry` を通過する行（ruby は無事・word だけ化ける）もあり得るため、
 /// 「invalid 行に U+FFFD」だけでは検知できない文字化けを拾うための保険。
-pub fn merge_imported(existing: &mut Vec<UserDictEntry>, rows: Vec<UserDictEntry>, had_replacement: bool) -> MergeReport {
-    let mut seen: std::collections::HashSet<(String, String)> = existing.iter().map(entry_key).collect();
+pub fn merge_imported(
+    existing: &mut Vec<UserDictEntry>,
+    rows: Vec<UserDictEntry>,
+    had_replacement: bool,
+) -> MergeReport {
+    let mut seen: std::collections::HashSet<(String, String)> =
+        existing.iter().map(entry_key).collect();
     let mut added = 0usize;
     let mut skipped_dup = 0usize;
     let mut skipped_invalid = 0usize;
@@ -482,7 +665,12 @@ pub fn merge_imported(existing: &mut Vec<UserDictEntry>, rows: Vec<UserDictEntry
         existing.push(row);
         added += 1;
     }
-    MergeReport { added, skipped_dup, skipped_invalid, encoding_hint: had_replacement || invalid_had_replacement }
+    MergeReport {
+        added,
+        skipped_dup,
+        skipped_invalid,
+        encoding_hint: had_replacement || invalid_had_replacement,
+    }
 }
 
 pub struct ExportOutput {
@@ -515,7 +703,11 @@ pub fn to_google_tsv(entries: &[UserDictEntry]) -> ExportOutput {
         tsv.push_str("\r\n");
         written += 1;
     }
-    ExportOutput { tsv, written, skipped_control }
+    ExportOutput {
+        tsv,
+        written,
+        skipped_control,
+    }
 }
 
 fn has_control_char(s: &str) -> bool {
@@ -530,11 +722,23 @@ mod tests {
     fn validate_accepts_kana_and_rejects_others() {
         assert!(validate_entry("のーすぺーすきー", "NoSpaceKey").is_ok());
         assert!(validate_entry("ぺこ", r#"m(_ _"m)"#).is_ok()); // 内部空白・記号OK
-        assert_eq!(validate_entry("kanji漢字", "x"), Err(UserDictError::InvalidRuby));
-        assert_eq!(validate_entry("や ちだ", "x"), Err(UserDictError::InvalidRuby)); // 内部空白不可
+        assert_eq!(
+            validate_entry("kanji漢字", "x"),
+            Err(UserDictError::InvalidRuby)
+        );
+        assert_eq!(
+            validate_entry("や ちだ", "x"),
+            Err(UserDictError::InvalidRuby)
+        ); // 内部空白不可
         assert_eq!(validate_entry("", "x"), Err(UserDictError::EmptyField));
-        assert_eq!(validate_entry("あ", "a\tb"), Err(UserDictError::ControlChar));
-        assert_eq!(validate_entry("あ", "a\nb"), Err(UserDictError::ControlChar));
+        assert_eq!(
+            validate_entry("あ", "a\tb"),
+            Err(UserDictError::ControlChar)
+        );
+        assert_eq!(
+            validate_entry("あ", "a\nb"),
+            Err(UserDictError::ControlChar)
+        );
         let long = "あ".repeat(301);
         assert_eq!(validate_entry(&long, "x"), Err(UserDictError::TooLong));
         let emoji299 = format!("{}😀", "x".repeat(298)); // 299 スカラ=OK(JSの.lengthとの食い違い防止)
@@ -565,11 +769,21 @@ mod tests {
     fn canonical_pos_matches_swift_cid_table() {
         // Swift UserDictionary.cid(for:) と同じ分類表(spec §3.4)。変更時は両方直す。
         for (input, want) in [
-            (None, "名詞"), (Some("名詞"), "名詞"), (Some("謎の品詞"), "名詞"),
-            (Some("人名"), "人名"), (Some("人名(姓)"), "姓"), (Some("姓"), "姓"),
-            (Some("名"), "名"), (Some("固有名詞"), "固有名詞"), (Some("組織"), "組織"),
-            (Some("地名"), "地名"), (Some("駅"), "地名"), (Some("数"), "数"),
-        ] { assert_eq!(canonical_pos(input), want, "input={input:?}"); }
+            (None, "名詞"),
+            (Some("名詞"), "名詞"),
+            (Some("謎の品詞"), "名詞"),
+            (Some("人名"), "人名"),
+            (Some("人名(姓)"), "姓"),
+            (Some("姓"), "姓"),
+            (Some("名"), "名"),
+            (Some("固有名詞"), "固有名詞"),
+            (Some("組織"), "組織"),
+            (Some("地名"), "地名"),
+            (Some("駅"), "地名"),
+            (Some("数"), "数"),
+        ] {
+            assert_eq!(canonical_pos(input), want, "input={input:?}");
+        }
     }
 
     // ---- load/save/dedup/破損隔離(spec §3.2, §8) ----
@@ -593,8 +807,17 @@ mod tests {
         let empty = tmpfile("empty", "empty.json", b"");
         let r = load_from(&empty).unwrap();
         assert_eq!(r.corrupt, DictCorrupt::None); // 空は破損でない(隔離なし)
-        assert!(!empty.with_file_name("empty.json").parent().unwrap()
-            .read_dir().unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains(".corrupt.")));
+        assert!(!empty
+            .with_file_name("empty.json")
+            .parent()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt.")));
     }
 
     #[test]
@@ -604,10 +827,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nsk-ud-{}-ioerr", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(load_from(&dir).unwrap_err(), DictLoadError::Unreadable); // dir を read → PermissionDenied
-        assert!(dir.parent().unwrap().read_dir().unwrap()
-            .all(|e| !e.as_ref().unwrap().file_name().to_string_lossy()
-                .starts_with(&format!("nsk-ud-{}-ioerr", std::process::id())) ||
-                !e.unwrap().file_name().to_string_lossy().contains(".corrupt.")));
+        assert!(dir.parent().unwrap().read_dir().unwrap().all(|e| !e
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(&format!("nsk-ud-{}-ioerr", std::process::id()))
+            || !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt.")));
         // ↑自テスト由来の隔離産物に限定して検査(%TEMP% 全走査だと無関係な残骸で偽RED)
     }
 
@@ -622,15 +852,42 @@ mod tests {
     #[test]
     fn load_accepts_bom_and_utf16_like_engine() {
         let json = r#"[{"ruby":"やちだ","word":"谷内田"}]"#;
-        let mut bom = vec![0xEF, 0xBB, 0xBF]; bom.extend(json.as_bytes());
-        assert_eq!(load_from(&tmpfile("enc", "bom.json", &bom)).unwrap().entries.len(), 1);
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend(json.as_bytes());
+        assert_eq!(
+            load_from(&tmpfile("enc", "bom.json", &bom))
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
         let utf16le: Vec<u8> = json.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        let mut le_bom = vec![0xFF, 0xFE]; le_bom.extend(&utf16le);
-        assert_eq!(load_from(&tmpfile("enc", "le.json", &le_bom)).unwrap().entries.len(), 1);
-        assert_eq!(load_from(&tmpfile("enc", "le_nobom.json", &utf16le)).unwrap().entries.len(), 1); // NUL判別
+        let mut le_bom = vec![0xFF, 0xFE];
+        le_bom.extend(&utf16le);
+        assert_eq!(
+            load_from(&tmpfile("enc", "le.json", &le_bom))
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        assert_eq!(
+            load_from(&tmpfile("enc", "le_nobom.json", &utf16le))
+                .unwrap()
+                .entries
+                .len(),
+            1
+        ); // BOM無しJSONの構造判定
         let utf16be: Vec<u8> = json.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
-        let mut be_bom = vec![0xFE, 0xFF]; be_bom.extend(&utf16be);
-        assert_eq!(load_from(&tmpfile("enc", "be.json", &be_bom)).unwrap().entries.len(), 1);
+        let mut be_bom = vec![0xFE, 0xFF];
+        be_bom.extend(&utf16be);
+        assert_eq!(
+            load_from(&tmpfile("enc", "be.json", &be_bom))
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -639,10 +896,11 @@ mod tests {
         let r = load_from(&p).unwrap();
         assert_eq!(r.corrupt, DictCorrupt::Quarantined);
         assert!(!p.exists()); // 原本は .corrupt.* へ退避済み
-        // CP932(Shift-JIS)は strict デコード失敗=隔離(lossy で読めてしまうと mutation で全損 — spec§3.2)
-        let cp932: &[u8] = &[0x5B, 0x7B, 0x22, 0x72, 0x75, 0x62, 0x79, 0x22, 0x3A, 0x22,
-                             0x82, 0xE2, 0x22, 0x2C, 0x22, 0x77, 0x6F, 0x72, 0x64, 0x22,
-                             0x3A, 0x22, 0x92, 0x4A, 0x22, 0x7D, 0x5D]; // [{"ruby":"や","word":"谷"}] の CP932
+                              // CP932(Shift-JIS)は strict デコード失敗=隔離(lossy で読めてしまうと mutation で全損 — spec§3.2)
+        let cp932: &[u8] = &[
+            0x5B, 0x7B, 0x22, 0x72, 0x75, 0x62, 0x79, 0x22, 0x3A, 0x22, 0x82, 0xE2, 0x22, 0x2C,
+            0x22, 0x77, 0x6F, 0x72, 0x64, 0x22, 0x3A, 0x22, 0x92, 0x4A, 0x22, 0x7D, 0x5D,
+        ]; // [{"ruby":"や","word":"谷"}] の CP932
         let p2 = tmpfile("quar", "cp932.json", cp932);
         assert_eq!(load_from(&p2).unwrap().corrupt, DictCorrupt::Quarantined);
     }
@@ -652,7 +910,7 @@ mod tests {
         let json = r#"[{"ruby":"あっぷる","word":"Apple"},{"ruby":"アップル","word":"Apple"},
                        {"ruby":"やちだ","word":"谷内田"},{"ruby":"やちだ","word":"矢地田"}]"#;
         let r = load_from(&tmpfile("dup", "dup.json", json.as_bytes())).unwrap();
-        assert_eq!(r.entries.len(), 3);   // 同一読み別 word は両方残る
+        assert_eq!(r.entries.len(), 3); // 同一読み別 word は両方残る
         assert_eq!(r.deduped, 1);
         assert_eq!(r.entries[0].ruby, "あっぷる"); // 最初の出現
     }
@@ -661,19 +919,28 @@ mod tests {
     fn quarantine_falls_back_to_copy_when_rename_fails() {
         // rename 失敗+copy 成功 → Quarantined(.corrupt.* が copy で生成される)
         let p = tmpfile("qcopy", "broken.json", br#"[{"ruby":"x""#);
-        let r = load_from_with(&p, |_f, _t| Err(std::io::Error::other("locked")),
-                                   |f, t| std::fs::copy(f, t));
+        let r = load_from_with(
+            &p,
+            |_f, _t| Err(std::io::Error::other("locked")),
+            |f, t| std::fs::copy(f, t),
+        );
         assert_eq!(r.unwrap().corrupt, DictCorrupt::Quarantined);
-        assert!(p.parent().unwrap().read_dir().unwrap()
-            .any(|e| e.unwrap().file_name().to_string_lossy().contains(".corrupt.")));
+        assert!(p.parent().unwrap().read_dir().unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".corrupt.")));
     }
 
     #[test]
     fn quarantine_both_fail_refuses_and_preserves_original() {
         // spec§8: 隔離 rename・copy 両方失敗のモック → mutation 拒否で原本が上書きされない
         let p = tmpfile("qfail", "broken.json", br#"[{"ruby":"x""#);
-        let r = load_from_with(&p, |_f, _t| Err(std::io::Error::other("locked")),
-                                   |_f, _t| Err(std::io::Error::other("locked")));
+        let r = load_from_with(
+            &p,
+            |_f, _t| Err(std::io::Error::other("locked")),
+            |_f, _t| Err(std::io::Error::other("locked")),
+        );
         assert_eq!(r.unwrap_err(), DictLoadError::QuarantineFailed);
         assert!(p.exists()); // 原本はそのまま残る
     }
@@ -681,7 +948,11 @@ mod tests {
     #[test]
     fn save_load_roundtrip_preserves_pos_omission() {
         let p = std::env::temp_dir().join(format!("nsk-ud-rt-{}/d.json", std::process::id()));
-        let es = vec![UserDictEntry { ruby: "ぺこ".into(), word: r#"m(_ _"m)"#.into(), pos: None }];
+        let es = vec![UserDictEntry {
+            ruby: "ぺこ".into(),
+            word: r#"m(_ _"m)"#.into(),
+            pos: None,
+        }];
         save_to(&p, &es).unwrap();
         assert_eq!(load_from(&p).unwrap().entries, es);
         assert!(!std::fs::read_to_string(&p).unwrap().contains("pos")); // 省略維持(フォーマット無変更)
@@ -702,7 +973,7 @@ mod tests {
     fn parse_tsv_encodings() {
         let body = "やちだ\t谷内田\t姓";
         let utf16le: Vec<u8> = body.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        assert_eq!(parse_tsv(&utf16le).rows.len(), 1); // BOM無しLE(NUL比率+偶奇)
+        assert_eq!(parse_tsv(&utf16le).rows.len(), 1); // BOM無しLE(TSV構造)
         let utf16be: Vec<u8> = body.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
         let mut be_bom = vec![0xFE, 0xFF];
         be_bom.extend(&utf16be);
@@ -713,24 +984,118 @@ mod tests {
         u8bom.extend(body.as_bytes());
         let r_u8 = parse_tsv(&u8bom);
         assert_eq!(r_u8.rows[0].ruby, "やちだ"); // UTF-8 BOM 付き TSV(Excel 経由)も同様
-        // 1行目が U+3000 開頭でも LE 判定が壊れない(偶奇「多数決」の固定 — 初出1個方式はここで落ちる)
+                                                 // 1行目が U+3000 開頭でも LE 判定が壊れない（複数候補の構造スコアを比較）
         let tricky = "\u{3000}やちだ\t谷内田\tx\nあい\tアイ\tx\n";
-        let le2: Vec<u8> = tricky.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let le2: Vec<u8> = tricky
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
         assert_eq!(parse_tsv(&le2).rows.len(), 2);
-        // BOM 無し UTF-16BE(偶数位置 NUL 多数 → BE 判定。「閾値超なら常に LE」実装はここで落ちる)
-        let be_nobom: Vec<u8> = tricky.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+        // BOM 無し UTF-16BE（BE候補の構造スコアで判定）
+        let be_nobom: Vec<u8> = tricky
+            .encode_utf16()
+            .flat_map(|u| u.to_be_bytes())
+            .collect();
         assert_eq!(parse_tsv(&be_nobom).rows.len(), 2);
-        // 末尾 NUL 1個の UTF-8 は UTF-8 のまま(比率閾値)
+        // 末尾 NUL 1個の UTF-8 は UTF-8 のまま（末尾NULは判定時だけ無視）
         let mut pad = body.as_bytes().to_vec();
         pad.push(0);
         assert_eq!(parse_tsv(&pad).rows.len(), 1);
     }
 
     #[test]
+    fn bomless_utf16_is_selected_by_dictionary_structure() {
+        // 日本語中心の UTF-16 は NUL バイトが少ないため、NUL 比率だけでは判定できない。
+        // JSON/TSV の辞書構造を strict decode 候補の選別に使い、LE/BE 両方を扱う。
+        let json = format!(
+            r#"[{{"ruby":"{}","word":"{}"}}]"#,
+            "長い日本語の読み".repeat(20),
+            "長い日本語の単語".repeat(20),
+        );
+        for (name, bytes) in [
+            (
+                "json-le",
+                json.encode_utf16()
+                    .flat_map(|u| u.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "json-be",
+                json.encode_utf16()
+                    .flat_map(|u| u.to_be_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let decoded = decode_bytes(&bytes).unwrap_or_else(|| panic!("{name} must decode"));
+            assert_eq!(decoded, json, "{name}");
+        }
+
+        let json_object = format!(
+            r#"{{"ruby":"{}","word":"{}"}}"#,
+            "長い日本語の読み".repeat(20),
+            "長い日本語の単語".repeat(20),
+        );
+        for bytes in [
+            json_object
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .collect::<Vec<_>>(),
+            json_object
+                .encode_utf16()
+                .flat_map(|u| u.to_be_bytes())
+                .collect::<Vec<_>>(),
+        ] {
+            assert_eq!(decode_bytes(&bytes).as_deref(), Some(json_object.as_str()));
+        }
+
+        let tsv = format!(
+            "{}\t{}\t名詞\n",
+            "長い日本語の読み".repeat(20),
+            "長い日本語の単語".repeat(20),
+        );
+        for bytes in [
+            tsv.encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .collect::<Vec<_>>(),
+            tsv.encode_utf16()
+                .flat_map(|u| u.to_be_bytes())
+                .collect::<Vec<_>>(),
+        ] {
+            let parsed = parse_tsv(&bytes);
+            assert_eq!(parsed.rows.len(), 1);
+            assert_eq!(parsed.rows[0].ruby, "長い日本語の読み".repeat(20));
+            assert_eq!(parsed.rows[0].word, "長い日本語の単語".repeat(20));
+        }
+    }
+
+    #[test]
+    fn encoding_detection_preserves_utf8_trailing_nuls_and_plain_fallbacks() {
+        let plain = "plain text \u{0100}\u{0200}\u{0300}\u{0400}\u{0500}";
+        for tail in [vec![0], vec![0, 0]] {
+            let mut bytes = plain.as_bytes().to_vec();
+            bytes.extend(&tail);
+            assert_eq!(sniff_encoding(&bytes), Encoding::Utf8);
+            let mut expected = plain.as_bytes().to_vec();
+            expected.extend(&tail);
+            assert_eq!(
+                decode_bytes(&bytes).as_deref(),
+                std::str::from_utf8(&expected).ok()
+            );
+        }
+
+        // 偶数長で UTF-16 strict decode できても、辞書構造が無いランダムな制御列は
+        // UTF-16 と断定せず従来どおり UTF-8 fallback にする。
+        let random_even = [0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00];
+        assert_eq!(sniff_encoding(&random_even), Encoding::Utf8);
+    }
+
+    #[test]
     fn parse_tsv_lossy_marks_replacement_on_invalid_utf8() {
         // had_replacement の**生成側**固定(merge テストはリテラル bool を手渡しするため死角 —
         // false 固定実装だと Shift-JIS 全滅が無言化する)
-        let cp932: &[u8] = &[0x82, 0xE2, 0x82, 0xBF, 0x82, 0xBE, 0x09, 0x92, 0x4A, 0x93, 0xE0, 0x93, 0x63]; // やちだ\t谷内田
+        let cp932: &[u8] = &[
+            0x82, 0xE2, 0x82, 0xBF, 0x82, 0xBE, 0x09, 0x92, 0x4A, 0x93, 0xE0, 0x93, 0x63,
+        ]; // やちだ\t谷内田
         let r = parse_tsv(cp932);
         assert!(r.had_replacement);
         assert!(r.rows.iter().any(|e| e.ruby.contains('\u{FFFD}')));
@@ -739,12 +1104,32 @@ mod tests {
     #[test]
     fn merge_counts_and_hint() {
         // 注: 以下の had_replacement 引数はリテラル(生成側は parse_tsv_lossy_... が固定)
-        let mut existing = vec![UserDictEntry { ruby: "あっぷる".into(), word: "Apple".into(), pos: None }];
+        let mut existing = vec![UserDictEntry {
+            ruby: "あっぷる".into(),
+            word: "Apple".into(),
+            pos: None,
+        }];
         let rows = vec![
-            UserDictEntry { ruby: "アップル".into(), word: "Apple".into(), pos: None }, // dup(正規化キー)
-            UserDictEntry { ruby: "ぎっとはぶ".into(), word: "GitHub".into(), pos: None }, // added
-            UserDictEntry { ruby: "BAD読み".into(), word: "x".into(), pos: None },       // invalid
-            UserDictEntry { ruby: "\u{FFFD}あ".into(), word: "x".into(), pos: None },   // invalid+hint
+            UserDictEntry {
+                ruby: "アップル".into(),
+                word: "Apple".into(),
+                pos: None,
+            }, // dup(正規化キー)
+            UserDictEntry {
+                ruby: "ぎっとはぶ".into(),
+                word: "GitHub".into(),
+                pos: None,
+            }, // added
+            UserDictEntry {
+                ruby: "BAD読み".into(),
+                word: "x".into(),
+                pos: None,
+            }, // invalid
+            UserDictEntry {
+                ruby: "\u{FFFD}あ".into(),
+                word: "x".into(),
+                pos: None,
+            }, // invalid+hint
         ];
         let rep = merge_imported(&mut existing, rows, true);
         assert_eq!((rep.added, rep.skipped_dup, rep.skipped_invalid), (1, 1, 2));
@@ -757,7 +1142,11 @@ mod tests {
         // 負例: U+FFFD 無しの不正行(非かな読み)だけではヒントを出さない
         // (「invalid が1件でもあれば true」実装の偽緑防止 — 正当な UTF-8 への誤警告になる)
         let mut existing = vec![];
-        let rows = vec![UserDictEntry { ruby: "BAD読み".into(), word: "x".into(), pos: None }];
+        let rows = vec![UserDictEntry {
+            ruby: "BAD読み".into(),
+            word: "x".into(),
+            pos: None,
+        }];
         let rep = merge_imported(&mut existing, rows, false);
         assert_eq!(rep.skipped_invalid, 1);
         assert!(!rep.encoding_hint);
@@ -770,7 +1159,11 @@ mod tests {
         // かな検査があるが word は文字種を見ないため、reading 正常・word 化けが invalid
         // に落ちずヒントの死角になる。この分岐だけを削っても他テストは全緑のままなので単独固定)
         let mut existing = vec![];
-        let rows = vec![UserDictEntry { ruby: "あっぷる".into(), word: "Apple".into(), pos: None }];
+        let rows = vec![UserDictEntry {
+            ruby: "あっぷる".into(),
+            word: "Apple".into(),
+            pos: None,
+        }];
         let rep = merge_imported(&mut existing, rows, true);
         assert_eq!(rep.skipped_invalid, 0);
         assert!(rep.encoding_hint);
@@ -779,8 +1172,16 @@ mod tests {
     #[test]
     fn export_roundtrips_and_skips_control() {
         let entries = vec![
-            UserDictEntry { ruby: "ぎっとはぶ".into(), word: "GitHub".into(), pos: Some("謎の品詞".into()) },
-            UserDictEntry { ruby: "あ".into(), word: "a\tb".into(), pos: None }, // 制御文字入り=スキップ
+            UserDictEntry {
+                ruby: "ぎっとはぶ".into(),
+                word: "GitHub".into(),
+                pos: Some("謎の品詞".into()),
+            },
+            UserDictEntry {
+                ruby: "あ".into(),
+                word: "a\tb".into(),
+                pos: None,
+            }, // 制御文字入り=スキップ
         ];
         let out = to_google_tsv(&entries);
         assert_eq!((out.written, out.skipped_control), (1, 1));

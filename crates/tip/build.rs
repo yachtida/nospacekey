@@ -1,6 +1,6 @@
 fn main() {
     // エクスポートは lib.rs の `#[no_mangle] extern "system"` 関数（DllGetClassObject /
-    // DllCanUnloadNow / DllRegisterServer / DllUnregisterServer）を rustc が cdylib から
+    // DllCanUnloadNow / DllRegisterServer / DllUnregisterServer / DllInstall）を rustc が cdylib から
     // 自動エクスポートするため、.def ファイルは不要。
     //
     // 以前は `/DEF:nospacekey_tip.def` を渡していたが、(1) リンカの作業ディレクトリは
@@ -28,15 +28,41 @@ fn main() {
     // 特定可能にする。FileVersion/ProductName 等は winresource が CARGO_PKG_* から
     // 自動設定する。文字列にブランド名リテラルを焼かないのは命名未決定のため
     // （改名時にここを触らずに済ませる — 表示名は installer 側の MyAppName 1 箇所に集約）。
-    #[cfg(windows)]
-    {
+    //
+    // アイコンリソース: タスクバー入力モード表示 (Pure Glyph 案) とプロファイル固定
+    // アイコン (Gapless N 案)。ID は langbar_icon.rs の RES_* 定数が参照し、プロファイル
+    // 登録では対応するゼロ始まり位置へ変換するため**並びを変えると実行時整合が壊れる**。
+    // PE のリソースディレクトリは文字列 ID エントリを数値 ID より先頭に置くため、
+    // 位置 = ID - 1 は「数値 ID の連番のみ」が前提。文字列 ID のアイコンは足さないこと。
+    // ICO の生成元は scripts/gen-ime-icons.ps1（design/icons/ から再生成）。
+    //
+    // cfg(windows) ではなく CARGO_CFG_TARGET_OS を見る — build script はホスト側で走るため、
+    // cfg(windows) だと非 Windows ホストからの Windows クロスビルドでリソース埋込が
+    // 黙って省略され、アイコン無し DLL が配布されてしまう(winresource README 推奨の判断)。
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let ver = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
         let name = std::env::var("CARGO_PKG_NAME").expect("CARGO_PKG_NAME");
         let mut res = winresource::WindowsResource::new();
         res.set("ProductVersion", &format!("{ver}+{git_hash}"));
-        res.set("FileDescription", &format!("{name} (TSF text input processor)"));
+        res.set(
+            "FileDescription",
+            &format!("{name} (TSF text input processor)"),
+        );
+        const ICONS: &[(&str, &str)] = &[
+            ("1", "icons/mode-direct-light.ico"),
+            ("2", "icons/mode-direct-dark.ico"),
+            ("3", "icons/mode-kana-light.ico"),
+            ("4", "icons/mode-kana-dark.ico"),
+            ("5", "icons/mode-ephemeral-light.ico"),
+            ("6", "icons/mode-ephemeral-dark.ico"),
+            ("7", "icons/profile-n.ico"),
+        ];
+        for (id, path) in ICONS {
+            res.set_icon_with_id(path, id);
+            println!("cargo:rerun-if-changed={path}");
+        }
         res.compile()
-            .expect("VERSIONINFO embed failed (check rc.exe / Windows SDK on PATH)");
+            .expect("resource embed failed (check rc.exe / Windows SDK on PATH)");
     }
 }
 

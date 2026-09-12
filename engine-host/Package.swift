@@ -11,15 +11,35 @@ let package = Package(
         // Zenzai trait はその #if ブロックをスキップし split_mode=LAYER(default)のまま→
         // 検証回避でCPUロード成功（n_gpu_layers=0 default のままCPU実行）。
         .package(url: "https://github.com/azooKey/AzooKeyKanaKanjiConverter",
-                 .upToNextMinor(from: "0.11.2"),
+                 revision: "80b8204f1cdfb364bb2ed355cf52c7ebb2519a0c",
                  traits: ["Zenzai"]),
     ],
     targets: [
+        // The product runtime seam is a C module because the patched llama ABI is
+        // exported from the vendor DLL. Linker search order is kept ahead of the
+        // upstream SwiftPM llama import so the Vulkan seam is the one used at run time.
+        .target(
+            name: "NospacekeyLlamaRuntime",
+            path: "Sources/NospacekeyLlamaRuntime",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .unsafeFlags(["-Xlinker", "/LIBPATH:vendor/llama/vulkan",
+                              "-Xlinker", "vendor/llama/vulkan/llama.lib"],
+                             .when(platforms: [.windows]))
+            ]
+        ),
+        .target(
+            name: "NospacekeyLlamaRuntimeAdapter",
+            dependencies: ["NospacekeyLlamaRuntime"],
+            path: "Sources/NospacekeyLlamaRuntimeAdapter",
+            swiftSettings: [.interoperabilityMode(.Cxx)]
+        ),
         // 依存（KanaKanjiConverterModule 等）が Zenzai trait で C++ interop 有効でビルドされるため、
         // それを import する当方の全ターゲットでも C++ interop を有効にする必要がある（無条件＝trait常時ON固定のため）。
         .target(
             name: "NospacekeyEngineCore",
             dependencies: [
+                "NospacekeyLlamaRuntimeAdapter",
                 .product(name: "KanaKanjiConverterModuleWithDefaultDictionary",
                          package: "AzooKeyKanaKanjiConverter"),
             ],
@@ -34,6 +54,7 @@ let package = Package(
             name: "NospacekeyEngineCoreTests",
             dependencies: [
                 "NospacekeyEngineCore",
+                "NospacekeyLlamaRuntimeAdapter",
                 .product(name: "KanaKanjiConverterModuleWithDefaultDictionary",
                          package: "AzooKeyKanaKanjiConverter"),
             ],

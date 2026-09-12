@@ -3,13 +3,39 @@
 //! 確定文字列／preedit／候補ログを観測する。
 
 mod doc_state;
+mod clause_navigation;
+mod live_clause_display;
+mod receipt_relay;
+mod apply_faults;
+#[path = "../../tip/src/commit_session.rs"]
+mod commit_session;
+#[path = "../../tip/src/edit_range.rs"]
+mod edit_range;
+#[allow(dead_code)]
+#[path = "../../tip/src/apply_state.rs"]
+mod apply_state;
+#[allow(dead_code)]
+#[path = "../../tip/src/preedit_apply.rs"]
+mod preedit_apply;
+#[path = "../../tip/src/preedit_session.rs"]
+mod preedit_session;
+// The shared COM session normally holds a DLL lifetime reference. Here it is
+// linked into the executable, which cannot unload while the test is running.
+mod globals {
+    pub(crate) struct ComObjectGuard;
+    impl ComObjectGuard { pub(crate) fn new() -> Self { Self } }
+}
+mod text_service {
+    pub(crate) fn tip_log(message: &str) { crate::text_store::hlog(message); }
+}
+mod driver;
+mod log_parse;
+mod manual_inline_apps;
+mod report;
+mod scenarios;
 mod text_store;
 mod tsf_host;
 mod uielement_sink;
-mod scenarios;
-mod driver;
-mod log_parse;
-mod report;
 
 fn main() {
     // item12 用: TIP が spawn する engine プロセスは testbench の環境を継承するので、
@@ -17,7 +43,7 @@ fn main() {
     // 単一スレッド起動直後・他スレッド未起動の時点で 1 度だけ設定する。
     std::env::set_var("NOSPACEKEY_LLM_ECHO", "1");
     // Task 1 で診断ログは既定OFFになったため、ヘッドレス検証では明示的に有効化する。
-    // log_parse は %TEMP%\nospacekey-tip.log の ev= 行（text=/list=/latin= 含む）を読むため必須。
+    // log_parse は %TEMP%\nospacekey-tip.log の ev= 行を読むため必須。
     // 単一スレッド起動直後・他スレッド未起動の時点で 1 度だけ設定する。
     std::env::set_var("NOSPACEKEY_LOG", "1");
     // item24(バグ#2 回帰)用: iOS 移植の自動確定(fac6315)が有効だと preedit が正当に縮み、
@@ -35,8 +61,31 @@ fn main() {
         std::process::exit(tsf_host::respawn_on_gate_desktop(&args));
     }
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("--stage0");
-    let json_path = args.iter().position(|a| a == "--json").and_then(|i| args.get(i + 1)).cloned();
+    let json_path = args
+        .iter()
+        .position(|a| a == "--json")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let code = match mode {
+        "--apply-faults" => apply_faults::run(),
+        "--clause-navigation" => clause_navigation::run(),
+        "--clause-deferred-commit" => clause_navigation::run_deferred_commit(),
+        "--clause-receipt-delivery-expiry" => clause_navigation::run_receipt_delivery_expiry(),
+        "--clause-learning-clear" => clause_navigation::run_learning_clear(),
+        "--clause-learning-clear-receipt" => clause_navigation::run_learning_clear_receipt(),
+        "--clause-learning-toggle" => clause_navigation::run_learning_toggle(),
+        "--clause-boundary-resize" => clause_navigation::run_boundary_resize(),
+        "--clause-boundary-restart" => clause_navigation::run_boundary_restart(),
+        "--clause-backspace-escape" => clause_navigation::run_backspace_escape(),
+        "--clause-reading-cursor" => clause_navigation::run_reading_cursor(),
+        "--clause-notation-cycle" => clause_navigation::run_notation_cycle(),
+        "--clause-mixed-edit" => clause_navigation::run_mixed_edit(),
+        "--clause-display" => clause_navigation::run_display(),
+        "--clause-mode-toggle-commit" => clause_navigation::run_mode_toggle_commit(),
+        "--clause-receipt-retry" => clause_navigation::run_receipt_retry(),
+        "--clause-receipt-expired" => clause_navigation::run_receipt_expired(),
+        "--clause-rebaseline" => clause_navigation::run_rebaseline(),
+        "--clause-rebaseline-restart" => clause_navigation::run_rebaseline_restart(),
         "--stage0" | "" => tsf_host::stage0_spike(),
         "--canonical" => run_canonical(),
         "--scenarios" => run_scenarios_reported(json_path),
@@ -53,11 +102,1228 @@ fn main() {
         "--item29" => run_item29_mode(),
         "--item30" => run_item30_mode(),
         "--item31" => run_item31_mode(),
+        "--item32" => run_item32_mode(),
+        "--async-stress" => run_async_stress_mode(),
+        "--async-burst" => run_async_burst_mode(),
+        "--live-anchor" => run_live_anchor_mode(),
+        "--live-clause-display" => live_clause_display::run(),
+        "--pair-hold" => run_pair_hold_mode(args.get(2), args.get(3), args.get(4), args.get(5)),
+        "--engine-absence" => run_engine_absence_mode(args.get(2), args.get(3), args.get(4)),
+        "--manual-inline-apps" => manual_inline_apps::run(),
+        "--manual-inline-host-apps" => manual_inline_apps::run_host(),
         "--keymap-smoke" => run_keymap_smoke(),
         "--diag" => tsf_host::diag(),
-        other => { eprintln!("unknown mode: {other}"); 2 }
+        other => {
+            eprintln!("unknown mode: {other}");
+            2
+        }
     };
     std::process::exit(code);
+}
+
+struct EngineAbsenceContract {
+    after_backspace: &'static str,
+    suffix_steps: [(&'static str, &'static str); 2],
+    committed: &'static str,
+}
+
+fn engine_absence_contract() -> EngineAbsenceContract {
+    EngineAbsenceContract {
+        after_backspace: "にほん",
+        suffix_steps: [("g", "にほんg"), ("o", "にほんご")],
+        committed: "にほんご",
+    }
+}
+
+fn run_engine_absence_mode(
+    ready_path: Option<&String>,
+    continue_path: Option<&String>,
+    done_path: Option<&String>,
+) -> i32 {
+    use std::time::{Duration, Instant};
+
+    let (Some(ready_path), Some(continue_path), Some(done_path)) =
+        (ready_path, continue_path, done_path)
+    else {
+        println!("engine-absence : ERROR (marker path missing)");
+        return 2;
+    };
+    let _com = match tsf_host::ComSta::init() {
+        Ok(value) => value,
+        Err(_) => {
+            println!("engine-absence : ERROR (COM initialization failed)");
+            return 2;
+        }
+    };
+    let host = match tsf_host::TsfHost::start() {
+        Ok(value) => value,
+        Err(_) => {
+            println!("engine-absence : ERROR (TSF host start failed)");
+            return 2;
+        }
+    };
+    host.warm_up();
+    host.store.reset();
+    for key in scenarios::typed("nihongo") {
+        if !host.feed_key(key.0) {
+            println!("engine-absence : FAIL (initial text key was not eaten)");
+            return 1;
+        }
+    }
+    host.settle_debounce();
+    if std::fs::write(ready_path, b"ready\n").is_err() {
+        println!("engine-absence : ERROR (ready marker write failed)");
+        return 2;
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !std::path::Path::new(continue_path).is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if !std::path::Path::new(continue_path).is_file() {
+        println!("engine-absence : ERROR (controller marker timeout)");
+        return 2;
+    }
+    let contract = engine_absence_contract();
+    let backspace_eaten = host.feed_key(scenarios::BACK.0);
+    let after_backspace = host.store.preedit();
+    let mut suffix_eaten = true;
+    let mut suffix_exact = true;
+    for (text, expected_preedit) in contract.suffix_steps {
+        for key in scenarios::typed(text) {
+            suffix_eaten &= host.feed_key(key.0);
+        }
+        suffix_exact &= host.store.preedit() == expected_preedit;
+    }
+    let before_enter = host.store.preedit();
+    let enter_eaten = host.feed_key(scenarios::ENTER.0);
+    let committed = host.store.committed();
+    let backspace_exact = after_backspace == contract.after_backspace;
+    let final_preedit_exact = before_enter == contract.suffix_steps[1].1;
+    let commit_exact = committed == contract.committed;
+    let passed = backspace_eaten
+        && suffix_eaten
+        && enter_eaten
+        && backspace_exact
+        && suffix_exact
+        && final_preedit_exact
+        && commit_exact;
+    if std::fs::write(done_path, b"done\n").is_err() {
+        println!("engine-absence : ERROR (done marker write failed)");
+        return 2;
+    }
+    println!(
+        "engine-absence : {} (backspace_eaten={} suffix_eaten={} enter_eaten={} backspace_exact={} suffix_exact={} final_preedit_exact={} commit_exact={})",
+        if passed { "PASS" } else { "FAIL" },
+        backspace_eaten,
+        suffix_eaten,
+        enter_eaten,
+        backspace_exact,
+        suffix_exact,
+        final_preedit_exact,
+        commit_exact
+    );
+    if passed {
+        0
+    } else {
+        1
+    }
+}
+
+fn completed_boundary_has_raw_fallback(preedit: &str) -> bool {
+    preedit.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+#[cfg(test)]
+mod async_stress_tests {
+    use super::{completed_boundary_has_raw_fallback, engine_absence_contract};
+
+    #[test]
+    fn engine_absence_retypes_the_last_syllable_with_two_physical_keys() {
+        let contract = engine_absence_contract();
+
+        assert_eq!(contract.after_backspace, "にほん");
+        assert_eq!(contract.suffix_steps, [("g", "にほんg"), ("o", "にほんご")]);
+        assert_eq!(contract.committed, "にほんご");
+    }
+
+    #[test]
+    fn completed_boundary_classifier_accepts_kana_and_classic_but_rejects_ascii_residue() {
+        assert!(!completed_boundary_has_raw_fallback("にほんご"));
+        assert!(!completed_boundary_has_raw_fallback("日本語"));
+        assert!(completed_boundary_has_raw_fallback("nihongo"));
+        assert!(completed_boundary_has_raw_fallback("にほんg"));
+    }
+}
+
+/// 10,000 physical-key acceptance run for the local typing path.
+///
+/// Each cycle types a complete roman reading, pins the visible notation to
+/// hiragana, and commits it.  The second F6 is deliberate: it makes every
+/// cycle exactly ten keys without changing the displayed material.  Exact
+/// final text proves that no key was dropped or reordered; inspecting the
+/// completed-syllable boundaries detect the reported raw-romaji degradation
+/// without treating legal unfinished suffixes as failures. Timing stops before
+/// the harness-owned pump so the 8 ms gate covers synchronous TIP dispatch.
+fn run_async_stress_mode() -> i32 {
+    const CYCLES: usize = 1_000;
+    const KEYS_PER_CYCLE: usize = 10;
+    const TIP_DISPATCH_P99_BUDGET_US: u128 = 8_000;
+
+    let _com = match tsf_host::ComSta::init() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("async-stress ComSta::init fail: {e:?}");
+            println!("async-stress : ERROR (COM initialization failed)");
+            return 2;
+        }
+    };
+    let host = match tsf_host::TsfHost::start() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("async-stress start fail: {e:?}");
+            println!("async-stress : ERROR (TSF host start failed)");
+            return 2;
+        }
+    };
+
+    host.warm_up();
+    host.store.reset();
+    let mut elapsed_us = Vec::with_capacity(CYCLES * KEYS_PER_CYCLE);
+    let mut raw_romaji_fallbacks = 0usize;
+    let reading = scenarios::typed("nihongo");
+
+    for _ in 0..CYCLES {
+        for (index, key) in reading.iter().enumerate() {
+            let (eaten, elapsed) = host.feed_key_measured(key.0);
+            elapsed_us.push(elapsed.as_micros());
+            if !eaten {
+                println!(
+                    "async-stress : FAIL (text key was not eaten at key={})",
+                    elapsed_us.len()
+                );
+                return 1;
+            }
+            let completed_boundary = matches!(index, 1 | 3 | 6);
+            if completed_boundary && completed_boundary_has_raw_fallback(&host.store.preedit()) {
+                raw_romaji_fallbacks += 1;
+            }
+        }
+
+        for key in [scenarios::F6, scenarios::F6, scenarios::ENTER] {
+            let (eaten, elapsed) = host.feed_key_measured(key.0);
+            elapsed_us.push(elapsed.as_micros());
+            if !eaten {
+                println!(
+                    "async-stress : FAIL (control key was not eaten at key={})",
+                    elapsed_us.len()
+                );
+                return 1;
+            }
+        }
+    }
+
+    elapsed_us.sort_unstable();
+    let p99_index = (elapsed_us.len() * 99).div_ceil(100).saturating_sub(1);
+    let p99_us = elapsed_us[p99_index];
+    let max_us = *elapsed_us.last().unwrap_or(&0);
+    let committed = host.store.committed();
+    let expected = "にほんご".repeat(CYCLES);
+    let exact = committed == expected;
+    let total_keys = elapsed_us.len();
+    let passed = total_keys == 10_000
+        && raw_romaji_fallbacks == 0
+        && exact
+        && p99_us < TIP_DISPATCH_P99_BUDGET_US;
+    println!(
+        "async-stress : {} (keys={} raw_romaji_fallbacks={} exact_order={} committed_utf16={} p99_us={} max_us={})",
+        if passed { "PASS" } else { "FAIL" },
+        total_keys,
+        raw_romaji_fallbacks,
+        exact,
+        committed.encode_utf16().count(),
+        p99_us,
+        max_us
+    );
+    if passed {
+        0
+    } else {
+        1
+    }
+}
+
+const ASYNC_BURST_CASES: &[(&str, &str)] = &[
+    ("nihongon", "にほんごn"),
+    ("nihongonihongoni", "にほんごにほんごに"),
+    (
+        "nihongonihongonihongonihongoniho",
+        "にほんごにほんごにほんごにほんごにほ",
+    ),
+];
+
+/// Deliver text keys without pumping the STA queue, then drain once after each burst.
+///
+/// The pre-pump preedit is the local-kana oracle. After the final debounce pump, F6 restores
+/// hiragana before Enter so the committed document can be compared with that oracle without
+/// depending on the engine's chosen conversion.
+fn run_async_burst_mode() -> i32 {
+    // 実ユーザー設定（default_direct=true 等）のままではかなバーストが始まらない。
+    // keymap-smoke と同じ作法でスクラッチ settings に差し替え、常駐 engine も殺して
+    // 決定論化する。engine 殺しは run-gate の -ReuseExistingEngine 契約と排他になるが、
+    // scratch settings を読ませるには古い env を握る常駐 engine を排除するしかない
+    // (ドライバの kill が失敗した場合の fail-closed は共通ヘルパ側の課題として残る)。
+    driver::kill_engine_processes();
+    let base = std::env::temp_dir().join(format!("nospacekey-async-burst-{}", std::process::id()));
+    let dir = base.join("nospacekey");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("async-burst scratch dir fail: {e:?}");
+        return 2;
+    }
+    if let Err(e) = std::fs::write(dir.join("settings.json"), r#"{"version":1}"#) {
+        eprintln!("async-burst settings fixture fail: {e:?}");
+        let _ = std::fs::remove_dir_all(&base);
+        return 2;
+    }
+    std::env::set_var("LOCALAPPDATA", &base);
+
+    let _com = match tsf_host::ComSta::init() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("async-burst ComSta::init fail: {e:?}");
+            println!("async-burst : ERROR (COM initialization failed)");
+            let _ = std::fs::remove_dir_all(&base);
+            return 2;
+        }
+    };
+
+    let mut passed = true;
+    for (input, expected_preedit) in ASYNC_BURST_CASES {
+        let host = match tsf_host::TsfHost::start() {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("async-burst start fail: {e:?}");
+                println!("async-burst : ERROR (TSF host start failed)");
+                let _ = std::fs::remove_dir_all(&base);
+                return 2;
+            }
+        };
+        // scratch settings は default_direct の「適用」を防ぐだけ。conversion-mode
+        // compartment はセッション持ち越しで、前回 direct のままだと誰も戻さない。
+        // トグル正規化 → 直書きの順で戻し、それでも native にならなければ環境状態
+        // エラー(exit 2)として製品 FAIL と区別する。
+        if !host.normalize_native_mode() && !host.force_native_conversion_mode() {
+            println!("async-burst : ERROR (conversion mode stuck in direct; toggle IME to hiragana and retry)");
+            let _ = std::fs::remove_dir_all(&base);
+            return 2;
+        }
+        host.warm_up();
+        host.store.reset();
+
+        let mut all_eaten = true;
+        for key in scenarios::typed(input) {
+            all_eaten &= host.feed_key_no_pump(key.0);
+        }
+        let preedit_before_pump = host.store.preedit();
+        tsf_host::pump();
+        host.settle_debounce();
+        let preedit_after_settle = host.store.preedit();
+        let hiragana_eaten = host.feed_key(scenarios::F6.0);
+        let enter_eaten = host.feed_key(scenarios::ENTER.0);
+        let committed = host.store.committed();
+        let preedit_exact = preedit_before_pump == *expected_preedit;
+        let commit_exact = committed == *expected_preedit;
+        // settle 後の内容はエンジンの変換結果次第で釣り合わないため一致を要求しないが、
+        // 消滅はライブ snapshot の回帰なので空でないことだけは担保する。
+        let settled_kept = !preedit_after_settle.is_empty();
+        let case_passed = all_eaten
+            && hiragana_eaten
+            && enter_eaten
+            && preedit_exact
+            && commit_exact
+            && settled_kept;
+        passed &= case_passed;
+        println!(
+            "async-burst case={} : {} (keys={} all_eaten={} hiragana_eaten={} enter_eaten={} preedit_exact={} commit_exact={} settled_kept={settled_kept} preedit_before_pump={preedit_before_pump:?} preedit_after_settle={preedit_after_settle:?} committed={committed:?})",
+            input.chars().count(),
+            if case_passed { "PASS" } else { "FAIL" },
+            input.chars().count(),
+            all_eaten,
+            hiragana_eaten,
+            enter_eaten,
+            preedit_exact,
+            commit_exact,
+        );
+    }
+
+    // スクラッチ dir は使い捨て。engine がハンドルを掴んでいると消えないことがある
+    // ため best-effort(残っても %TEMP% の pid 命名で次回実行の妨げにはならない)。
+    let _ = std::fs::remove_dir_all(&base);
+
+    if passed {
+        0
+    } else {
+        1
+    }
+}
+
+/// Live display anchor probe (2026-09 live-conversion flicker fix).
+///
+/// Type `nihongo` with pumps and settle so a stable live snapshot applies and builds the
+/// display anchor. Then deliver `n` and `a` without pumping — before the next snapshot can
+/// arrive — and assert the preedit extends the settled conversion text with local kana
+/// (`<settled>n` then `<settled>な`) instead of rewinding the whole composition to raw kana.
+/// The closing F6+Enter pins the `last_reading` split: the commit must be `にほんごな`
+/// regardless of what the anchor had rendered on screen.
+fn run_live_anchor_mode() -> i32 {
+    driver::kill_engine_processes();
+    let base =
+        std::env::temp_dir().join(format!("nospacekey-live-anchor-{}", std::process::id()));
+    let dir = base.join("nospacekey");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("live-anchor scratch dir fail: {e:?}");
+        return 2;
+    }
+    if let Err(e) = std::fs::write(dir.join("settings.json"), r#"{"version":1}"#) {
+        eprintln!("live-anchor settings fixture fail: {e:?}");
+        let _ = std::fs::remove_dir_all(&base);
+        return 2;
+    }
+    std::env::set_var("LOCALAPPDATA", &base);
+
+    let _com = match tsf_host::ComSta::init() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("live-anchor ComSta::init fail: {e:?}");
+            println!("live-anchor : ERROR (COM initialization failed)");
+            let _ = std::fs::remove_dir_all(&base);
+            return 2;
+        }
+    };
+    let host = match tsf_host::TsfHost::start() {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("live-anchor start fail: {e:?}");
+            println!("live-anchor : ERROR (TSF host start failed)");
+            let _ = std::fs::remove_dir_all(&base);
+            return 2;
+        }
+    };
+    if !host.normalize_native_mode() && !host.force_native_conversion_mode() {
+        println!("live-anchor : ERROR (conversion mode stuck in direct; toggle IME to hiragana and retry)");
+        let _ = std::fs::remove_dir_all(&base);
+        return 2;
+    }
+    host.warm_up();
+    host.store.reset();
+
+    let mut all_eaten = true;
+    for key in scenarios::typed("nihongo") {
+        all_eaten &= host.feed_key(key.0);
+    }
+    // snapshot 適用(=anchor 構築)まで待つ。初回応答が遅れて読みのまま残ることがある
+    // ので、変換済みになるまで settle を数回許す。読みのまま確定した probe は
+    // anchor の有無で結果が変わらず無意味になるため、環境エラーとして区別する。
+    let mut settled = String::new();
+    for _ in 0..3 {
+        host.settle_debounce();
+        settled = host.store.preedit();
+        if !settled.is_empty() && settled != "にほんご" {
+            break;
+        }
+    }
+    if settled.is_empty() || settled == "にほんご" {
+        println!(
+            "live-anchor : ERROR (live snapshot did not apply; settled={settled:?})"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        return 2;
+    }
+
+    let n_key = scenarios::typed("n").into_iter().next().unwrap().0;
+    let a_key = scenarios::typed("a").into_iter().next().unwrap().0;
+    let n_eaten = host.feed_key_no_pump(n_key);
+    let after_n = host.store.preedit();
+    let a_eaten = host.feed_key_no_pump(a_key);
+    let after_a = host.store.preedit();
+    let n_exact = after_n == format!("{settled}n");
+    let a_exact = after_a == format!("{settled}な");
+
+    let hiragana_eaten = host.feed_key(scenarios::F6.0);
+    let enter_eaten = host.feed_key(scenarios::ENTER.0);
+    let committed = host.store.committed();
+    let commit_exact = committed == "にほんごな";
+
+    let case_passed = all_eaten
+        && n_eaten
+        && a_eaten
+        && hiragana_eaten
+        && enter_eaten
+        && n_exact
+        && a_exact
+        && commit_exact;
+    println!(
+        "live-anchor : {} (all_eaten={} n_eaten={} a_eaten={} hiragana_eaten={} enter_eaten={} n_exact={n_exact} a_exact={a_exact} commit_exact={commit_exact} settled={settled:?} after_n={after_n:?} after_a={after_a:?} committed={committed:?})",
+        if case_passed { "PASS" } else { "FAIL" },
+        all_eaten,
+        n_eaten,
+        a_eaten,
+        hiragana_eaten,
+        enter_eaten,
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+    if case_passed {
+        0
+    } else {
+        1
+    }
+}
+
+const PAIR_HOLD_START_RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const PAIR_HOLD_START_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+const PAIR_HOLD_CONVERSION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2500);
+const PAIR_HOLD_CONVERSION_POLL: std::time::Duration = std::time::Duration::from_millis(12);
+const PAIR_HOLD_CONTROLLER_MARKER_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(120);
+const PAIR_HOLD_CONTROLLER_MARKER_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+#[derive(Debug, PartialEq, Eq)]
+enum PairHoldControllerMarkerWait {
+    Released,
+    DeadlineExceeded,
+}
+
+fn wait_for_pair_hold_controller_marker(
+    mut marker_exists: impl FnMut() -> bool,
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut pump: impl FnMut(),
+    mut sleep: impl FnMut(std::time::Duration),
+) -> PairHoldControllerMarkerWait {
+    loop {
+        if elapsed() >= PAIR_HOLD_CONTROLLER_MARKER_DEADLINE {
+            return PairHoldControllerMarkerWait::DeadlineExceeded;
+        }
+        if marker_exists() {
+            return PairHoldControllerMarkerWait::Released;
+        }
+        pump();
+        if elapsed() >= PAIR_HOLD_CONTROLLER_MARKER_DEADLINE {
+            return PairHoldControllerMarkerWait::DeadlineExceeded;
+        }
+        if marker_exists() {
+            return PairHoldControllerMarkerWait::Released;
+        }
+        let remaining = PAIR_HOLD_CONTROLLER_MARKER_DEADLINE.saturating_sub(elapsed());
+        if remaining.is_zero() {
+            return PairHoldControllerMarkerWait::DeadlineExceeded;
+        }
+        sleep(remaining.min(PAIR_HOLD_CONTROLLER_MARKER_POLL));
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PairHoldConversionWait {
+    Ready,
+    CompositionEnded,
+    DeadlineExceeded,
+}
+
+fn wait_for_pair_hold_initial_conversion(
+    mut preedit: impl FnMut() -> String,
+    mut composing: impl FnMut() -> bool,
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut pump: impl FnMut(),
+    mut sleep: impl FnMut(std::time::Duration),
+) -> PairHoldConversionWait {
+    loop {
+        if !composing() {
+            return PairHoldConversionWait::CompositionEnded;
+        }
+        if elapsed() >= PAIR_HOLD_CONVERSION_DEADLINE {
+            return PairHoldConversionWait::DeadlineExceeded;
+        }
+        if preedit() == "日本語" {
+            return PairHoldConversionWait::Ready;
+        }
+        pump();
+        if elapsed() >= PAIR_HOLD_CONVERSION_DEADLINE {
+            return PairHoldConversionWait::DeadlineExceeded;
+        }
+        if !composing() {
+            return PairHoldConversionWait::CompositionEnded;
+        }
+        if preedit() == "日本語" {
+            return PairHoldConversionWait::Ready;
+        }
+        let remaining = PAIR_HOLD_CONVERSION_DEADLINE.saturating_sub(elapsed());
+        if remaining.is_zero() {
+            return PairHoldConversionWait::DeadlineExceeded;
+        }
+        sleep(remaining.min(PAIR_HOLD_CONVERSION_POLL));
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PairHoldStartFailure {
+    DeadlineExceeded,
+    StartFailed,
+}
+
+enum PairHoldStartEvent {
+    Retry {
+        attempt: usize,
+        error_code: windows::core::HRESULT,
+        wait: std::time::Duration,
+    },
+    Started {
+        attempt: usize,
+        elapsed: std::time::Duration,
+    },
+    DeadlineBeforeAttempt {
+        attempt: usize,
+    },
+    LateSuccess {
+        attempt: usize,
+        elapsed: std::time::Duration,
+    },
+    Failed {
+        attempt: usize,
+        error_code: windows::core::HRESULT,
+        deadline_exhausted: bool,
+    },
+}
+
+fn execute_pair_hold_start<T, E>(
+    mut start: impl FnMut() -> Result<T, E>,
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+    mut error_code: impl FnMut(&E) -> windows::core::HRESULT,
+    mut event: impl FnMut(PairHoldStartEvent),
+) -> Result<T, PairHoldStartFailure> {
+    let mut attempt = 0usize;
+    loop {
+        if elapsed() >= PAIR_HOLD_START_RETRY_DEADLINE {
+            event(PairHoldStartEvent::DeadlineBeforeAttempt {
+                attempt: attempt + 1,
+            });
+            return Err(PairHoldStartFailure::DeadlineExceeded);
+        }
+        attempt += 1;
+        match start() {
+            Ok(host) => {
+                let completed = elapsed();
+                if completed >= PAIR_HOLD_START_RETRY_DEADLINE {
+                    event(PairHoldStartEvent::LateSuccess {
+                        attempt,
+                        elapsed: completed,
+                    });
+                    drop(host);
+                    return Err(PairHoldStartFailure::DeadlineExceeded);
+                }
+                event(PairHoldStartEvent::Started {
+                    attempt,
+                    elapsed: completed,
+                });
+                return Ok(host);
+            }
+            Err(error) => {
+                let completed = elapsed();
+                let code = error_code(&error);
+                if code == windows::Win32::Foundation::E_FAIL
+                    && completed < PAIR_HOLD_START_RETRY_DEADLINE
+                {
+                    let wait = (PAIR_HOLD_START_RETRY_DEADLINE - completed)
+                        .min(PAIR_HOLD_START_RETRY_DELAY);
+                    event(PairHoldStartEvent::Retry {
+                        attempt,
+                        error_code: code,
+                        wait,
+                    });
+                    sleep(wait);
+                } else {
+                    let deadline_exhausted = code == windows::Win32::Foundation::E_FAIL;
+                    event(PairHoldStartEvent::Failed {
+                        attempt,
+                        error_code: code,
+                        deadline_exhausted,
+                    });
+                    return Err(if deadline_exhausted {
+                        PairHoldStartFailure::DeadlineExceeded
+                    } else {
+                        PairHoldStartFailure::StartFailed
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pair_hold_retry_tests {
+    use std::{cell::Cell, collections::VecDeque, rc::Rc, time::Duration};
+
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::E_FAIL;
+
+    use super::{
+        execute_pair_hold_start, PairHoldStartFailure, PAIR_HOLD_START_RETRY_DEADLINE,
+        PAIR_HOLD_START_RETRY_DELAY,
+    };
+
+    struct FakeHost(Rc<Cell<usize>>);
+
+    impl Drop for FakeHost {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn pair_hold_retries_e_fail_then_accepts_the_next_timely_host() {
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let starts = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let mut results = VecDeque::from([Err(E_FAIL), Ok(FakeHost(drops.clone()))]);
+        let retry = execute_pair_hold_start(
+            || {
+                starts.set(starts.get() + 1);
+                results.pop_front().unwrap()
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+            |error| *error,
+            |_| {},
+        );
+
+        assert_eq!(starts.get(), 2);
+        assert_eq!(elapsed.get(), PAIR_HOLD_START_RETRY_DELAY);
+        drop(retry.unwrap());
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn pair_hold_does_not_start_again_after_retry_reaches_its_deadline() {
+        let elapsed = Rc::new(Cell::new(
+            PAIR_HOLD_START_RETRY_DEADLINE - Duration::from_millis(25),
+        ));
+        let starts = Rc::new(Cell::new(0));
+        let mut results = VecDeque::<Result<FakeHost, HRESULT>>::from([Err(E_FAIL)]);
+        let retry = execute_pair_hold_start(
+            || {
+                starts.set(starts.get() + 1);
+                results.pop_front().unwrap()
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+            |error| *error,
+            |_| {},
+        );
+
+        assert!(matches!(retry, Err(PairHoldStartFailure::DeadlineExceeded)));
+        assert_eq!(starts.get(), 1);
+    }
+
+    #[test]
+    fn pair_hold_drops_a_host_that_starts_after_its_deadline() {
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let starts = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let retry = execute_pair_hold_start(
+            || {
+                starts.set(starts.get() + 1);
+                elapsed.set(PAIR_HOLD_START_RETRY_DEADLINE);
+                Ok::<_, HRESULT>(FakeHost(drops.clone()))
+            },
+            || elapsed.get(),
+            |_| {},
+            |error| *error,
+            |_| {},
+        );
+
+        assert!(matches!(retry, Err(PairHoldStartFailure::DeadlineExceeded)));
+        assert_eq!(starts.get(), 1);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn pair_hold_stops_after_one_non_e_fail_start_error() {
+        let starts = Rc::new(Cell::new(0));
+        let retry = execute_pair_hold_start(
+            || {
+                starts.set(starts.get() + 1);
+                Err::<FakeHost, _>(HRESULT(0x80070005_u32 as i32))
+            },
+            || Duration::ZERO,
+            |_| {},
+            |error| *error,
+            |_| {},
+        );
+
+        assert!(matches!(retry, Err(PairHoldStartFailure::StartFailed)));
+        assert_eq!(starts.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod pair_hold_controller_marker_tests {
+    use std::{cell::Cell, rc::Rc, time::Duration};
+
+    use super::{
+        wait_for_pair_hold_controller_marker, PairHoldControllerMarkerWait,
+        PAIR_HOLD_CONTROLLER_MARKER_DEADLINE, PAIR_HOLD_CONTROLLER_MARKER_POLL,
+    };
+
+    #[test]
+    fn pair_hold_accepts_a_controller_marker_published_by_pump_without_sleeping() {
+        let pumps = Rc::new(Cell::new(0));
+        let sleeps = Rc::new(Cell::new(0));
+        let result = wait_for_pair_hold_controller_marker(
+            || pumps.get() > 0,
+            || Duration::ZERO,
+            || pumps.set(pumps.get() + 1),
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(result, PairHoldControllerMarkerWait::Released);
+        assert_eq!(pumps.get(), 1);
+        assert_eq!(sleeps.get(), 0);
+    }
+
+    #[test]
+    fn pair_hold_stops_waiting_when_the_controller_marker_exists() {
+        let pumps = Rc::new(Cell::new(0));
+        let sleeps = Rc::new(Cell::new(0));
+        let result = wait_for_pair_hold_controller_marker(
+            || true,
+            || Duration::ZERO,
+            || pumps.set(pumps.get() + 1),
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(result, PairHoldControllerMarkerWait::Released);
+        assert_eq!(pumps.get(), 0);
+        assert_eq!(sleeps.get(), 0);
+    }
+
+    #[test]
+    fn pair_hold_stops_waiting_at_the_controller_marker_deadline() {
+        let pumps = Rc::new(Cell::new(0));
+        let sleeps = Rc::new(Cell::new(0));
+        let result = wait_for_pair_hold_controller_marker(
+            || false,
+            || PAIR_HOLD_CONTROLLER_MARKER_DEADLINE,
+            || pumps.set(pumps.get() + 1),
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(result, PairHoldControllerMarkerWait::DeadlineExceeded);
+        assert_eq!(pumps.get(), 0);
+        assert_eq!(sleeps.get(), 0);
+    }
+
+    #[test]
+    fn pair_hold_accepts_a_marker_published_just_before_the_controller_deadline() {
+        let elapsed = Rc::new(Cell::new(
+            PAIR_HOLD_CONTROLLER_MARKER_DEADLINE - Duration::from_millis(1),
+        ));
+        let marker = Rc::new(Cell::new(false));
+        let marker_after_pump = marker.clone();
+        let pumps = Rc::new(Cell::new(0));
+        let sleeps = Rc::new(Cell::new(0));
+        let result = wait_for_pair_hold_controller_marker(
+            || marker.get(),
+            || elapsed.get(),
+            || {
+                pumps.set(pumps.get() + 1);
+                marker_after_pump.set(true);
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(result, PairHoldControllerMarkerWait::Released);
+        assert_eq!(pumps.get(), 1);
+        assert_eq!(sleeps.get(), 0);
+    }
+
+    #[test]
+    fn pair_hold_rejects_a_marker_published_at_the_controller_deadline() {
+        let elapsed = Rc::new(Cell::new(
+            PAIR_HOLD_CONTROLLER_MARKER_DEADLINE - Duration::from_millis(1),
+        ));
+        let marker = Rc::new(Cell::new(false));
+        let marker_after_pump = marker.clone();
+        let pumps = Rc::new(Cell::new(0));
+        let sleeps = Rc::new(Cell::new(0));
+        let result = wait_for_pair_hold_controller_marker(
+            || marker.get(),
+            || elapsed.get(),
+            || {
+                pumps.set(pumps.get() + 1);
+                elapsed.set(PAIR_HOLD_CONTROLLER_MARKER_DEADLINE);
+                marker_after_pump.set(true);
+            },
+            |wait| {
+                assert!(wait <= PAIR_HOLD_CONTROLLER_MARKER_POLL);
+                sleeps.set(sleeps.get() + 1);
+            },
+        );
+
+        assert_eq!(result, PairHoldControllerMarkerWait::DeadlineExceeded);
+        assert_eq!(pumps.get(), 1);
+        assert_eq!(sleeps.get(), 0);
+    }
+}
+
+#[cfg(test)]
+mod pair_hold_conversion_tests {
+    use std::{cell::Cell, cell::RefCell, rc::Rc, time::Duration};
+
+    use super::{
+        wait_for_pair_hold_initial_conversion, PairHoldConversionWait,
+        PAIR_HOLD_CONVERSION_DEADLINE, PAIR_HOLD_CONVERSION_POLL,
+    };
+
+    #[test]
+    fn pair_hold_accepts_an_initial_exact_conversion_without_polling() {
+        let pumps = Rc::new(Cell::new(0));
+        let sleeps = Rc::new(Cell::new(0));
+        let result = wait_for_pair_hold_initial_conversion(
+            || "日本語".to_owned(),
+            || true,
+            || Duration::ZERO,
+            || pumps.set(pumps.get() + 1),
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(result, PairHoldConversionWait::Ready);
+        assert_eq!(pumps.get(), 0);
+        assert_eq!(sleeps.get(), 0);
+    }
+
+    #[test]
+    fn pair_hold_polls_until_the_exact_conversion_arrives() {
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let pumps = Rc::new(Cell::new(0));
+        let preedit = Rc::new(RefCell::new("にほんご".to_owned()));
+        let preedit_after_pump = preedit.clone();
+        let result = wait_for_pair_hold_initial_conversion(
+            || preedit.borrow().clone(),
+            || true,
+            || elapsed.get(),
+            || {
+                pumps.set(pumps.get() + 1);
+                if pumps.get() == 2 {
+                    *preedit_after_pump.borrow_mut() = "日本語".to_owned();
+                }
+            },
+            |wait| elapsed.set(elapsed.get() + wait),
+        );
+
+        assert_eq!(result, PairHoldConversionWait::Ready);
+        assert_eq!(pumps.get(), 2);
+        assert_eq!(elapsed.get(), PAIR_HOLD_CONVERSION_POLL);
+    }
+
+    #[test]
+    fn pair_hold_stops_polling_when_the_composition_ends() {
+        let pumps = Rc::new(Cell::new(0));
+        let result = wait_for_pair_hold_initial_conversion(
+            || "にほんご".to_owned(),
+            || false,
+            || Duration::ZERO,
+            || pumps.set(pumps.get() + 1),
+            |_| {},
+        );
+
+        assert_eq!(result, PairHoldConversionWait::CompositionEnded);
+        assert_eq!(pumps.get(), 0);
+    }
+
+    #[test]
+    fn pair_hold_stops_polling_at_the_conversion_deadline() {
+        let pumps = Rc::new(Cell::new(0));
+        let result = wait_for_pair_hold_initial_conversion(
+            || "にほんご".to_owned(),
+            || true,
+            || PAIR_HOLD_CONVERSION_DEADLINE,
+            || pumps.set(pumps.get() + 1),
+            |_| {},
+        );
+
+        assert_eq!(result, PairHoldConversionWait::DeadlineExceeded);
+        assert_eq!(pumps.get(), 0);
+    }
+
+    #[test]
+    fn pair_hold_rejects_a_result_that_arrives_after_its_clamped_final_poll() {
+        let elapsed = Rc::new(Cell::new(
+            PAIR_HOLD_CONVERSION_DEADLINE - Duration::from_millis(5),
+        ));
+        let pumps = Rc::new(Cell::new(0));
+        let slept = Rc::new(Cell::new(Duration::ZERO));
+        let preedit = Rc::new(RefCell::new("にほんご".to_owned()));
+        let preedit_after_sleep = preedit.clone();
+        let result = wait_for_pair_hold_initial_conversion(
+            || preedit.borrow().clone(),
+            || true,
+            || elapsed.get(),
+            || pumps.set(pumps.get() + 1),
+            |wait| {
+                slept.set(wait);
+                elapsed.set(elapsed.get() + wait);
+                *preedit_after_sleep.borrow_mut() = "日本語".to_owned();
+            },
+        );
+
+        assert_eq!(result, PairHoldConversionWait::DeadlineExceeded);
+        assert_eq!(pumps.get(), 1);
+        assert_eq!(slept.get(), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn pair_hold_accepts_a_pump_result_just_before_its_deadline_without_sleeping() {
+        let elapsed = Rc::new(Cell::new(
+            PAIR_HOLD_CONVERSION_DEADLINE - Duration::from_millis(1),
+        ));
+        let pumps = Rc::new(Cell::new(0));
+        let sleeps = Rc::new(Cell::new(0));
+        let preedit = Rc::new(RefCell::new("にほんご".to_owned()));
+        let preedit_after_pump = preedit.clone();
+        let result = wait_for_pair_hold_initial_conversion(
+            || preedit.borrow().clone(),
+            || true,
+            || elapsed.get(),
+            || {
+                pumps.set(pumps.get() + 1);
+                *preedit_after_pump.borrow_mut() = "日本語".to_owned();
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(result, PairHoldConversionWait::Ready);
+        assert_eq!(pumps.get(), 1);
+        assert_eq!(sleeps.get(), 0);
+    }
+
+    #[test]
+    fn pair_hold_rejects_a_pump_result_at_its_deadline() {
+        let elapsed = Rc::new(Cell::new(
+            PAIR_HOLD_CONVERSION_DEADLINE - Duration::from_millis(1),
+        ));
+        let pumps = Rc::new(Cell::new(0));
+        let sleeps = Rc::new(Cell::new(0));
+        let preedit = Rc::new(RefCell::new("にほんご".to_owned()));
+        let preedit_after_pump = preedit.clone();
+        let result = wait_for_pair_hold_initial_conversion(
+            || preedit.borrow().clone(),
+            || true,
+            || elapsed.get(),
+            || {
+                pumps.set(pumps.get() + 1);
+                elapsed.set(PAIR_HOLD_CONVERSION_DEADLINE);
+                *preedit_after_pump.borrow_mut() = "日本語".to_owned();
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(result, PairHoldConversionWait::DeadlineExceeded);
+        assert_eq!(pumps.get(), 1);
+        assert_eq!(sleeps.get(), 0);
+    }
+
+    #[test]
+    fn pair_hold_rejects_elapsed_time_that_crosses_the_deadline_before_sleeping() {
+        let elapsed_calls = Rc::new(Cell::new(0));
+        let sleeps = Rc::new(Cell::new(0));
+        let result = wait_for_pair_hold_initial_conversion(
+            || "にほんご".to_owned(),
+            || true,
+            || {
+                let call = elapsed_calls.get();
+                elapsed_calls.set(call + 1);
+                if call < 2 {
+                    PAIR_HOLD_CONVERSION_DEADLINE - Duration::from_millis(1)
+                } else {
+                    PAIR_HOLD_CONVERSION_DEADLINE + Duration::from_millis(1)
+                }
+            },
+            || {},
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(result, PairHoldConversionWait::DeadlineExceeded);
+        assert_eq!(sleeps.get(), 0);
+    }
+}
+
+/// Keep the currently loaded TIP/Engine pair alive across a registration
+/// change performed by the Sandbox controller, then prove that the same host
+/// can still convert. Marker paths are controller-owned synchronization only;
+/// the observable result remains the committed text from the real TSF host.
+fn run_pair_hold_mode(
+    ready_path: Option<&String>,
+    continue_path: Option<&String>,
+    done_path: Option<&String>,
+    exit_path: Option<&String>,
+) -> i32 {
+    use std::time::Instant;
+
+    let Some(ready_path) = ready_path else {
+        println!("pair-hold : ERROR (ready marker path missing)");
+        return 2;
+    };
+    let Some(continue_path) = continue_path else {
+        println!("pair-hold : ERROR (continue marker path missing)");
+        return 2;
+    };
+    let Some(done_path) = done_path else {
+        println!("pair-hold : ERROR (done marker path missing)");
+        return 2;
+    };
+    let Some(exit_path) = exit_path else {
+        println!("pair-hold : ERROR (exit marker path missing)");
+        return 2;
+    };
+    let _com = match tsf_host::ComSta::init() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pair-hold ComSta::init fail: {e:?}");
+            println!("pair-hold : ERROR (COM initialization failed)");
+            return 2;
+        }
+    };
+    let start_retry_began = Instant::now();
+    let host = match execute_pair_hold_start(
+        tsf_host::TsfHost::start,
+        || start_retry_began.elapsed(),
+        std::thread::sleep,
+        |error| error.code(),
+        |event| match event {
+            PairHoldStartEvent::Retry {
+                attempt,
+                error_code,
+                wait,
+            } => eprintln!(
+                "pair-hold start attempt={attempt} hr={:#010x} retry_after_ms={}",
+                error_code.0 as u32,
+                wait.as_millis()
+            ),
+            PairHoldStartEvent::Started { attempt, elapsed } => eprintln!(
+                "pair-hold start attempt={attempt} hr=S_OK elapsed_ms={}",
+                elapsed.as_millis()
+            ),
+            PairHoldStartEvent::DeadlineBeforeAttempt { attempt } => eprintln!(
+                "pair-hold start attempt={attempt} hr=not-attempted retry=deadline-exhausted"
+            ),
+            PairHoldStartEvent::LateSuccess { attempt, elapsed } => eprintln!(
+                "pair-hold start attempt={attempt} hr=S_OK elapsed_ms={} retry=deadline-exhausted",
+                elapsed.as_millis()
+            ),
+            PairHoldStartEvent::Failed {
+                attempt,
+                error_code,
+                deadline_exhausted,
+            } => eprintln!(
+                "pair-hold start attempt={attempt} hr={:#010x} retry={}",
+                error_code.0 as u32,
+                if deadline_exhausted {
+                    "deadline-exhausted"
+                } else {
+                    "not-eligible"
+                }
+            ),
+        },
+    ) {
+        Ok(host) => host,
+        Err(PairHoldStartFailure::DeadlineExceeded) => {
+            println!("pair-hold : ERROR (TSF host start retry deadline exceeded)");
+            return 2;
+        }
+        Err(PairHoldStartFailure::StartFailed) => {
+            println!("pair-hold : ERROR (TSF host start failed)");
+            return 2;
+        }
+    };
+
+    let convert = |host: &tsf_host::TsfHost| {
+        host.store.reset();
+        for key in scenarios::typed("nihongo") {
+            if !host.feed_key(key.0) {
+                return false;
+            }
+        }
+        let conversion_wait_started = Instant::now();
+        host.settle_debounce();
+        if wait_for_pair_hold_initial_conversion(
+            || host.store.preedit(),
+            || host.store.composing(),
+            || conversion_wait_started.elapsed(),
+            tsf_host::pump,
+            std::thread::sleep,
+        ) != PairHoldConversionWait::Ready
+            || !host.feed_key(scenarios::ENTER.0)
+        {
+            return false;
+        }
+        host.store.committed() == "日本語"
+    };
+
+    host.warm_up();
+    if !convert(&host) {
+        println!("pair-hold : FAIL (initial conversion failed)");
+        return 1;
+    }
+    if let Err(e) = std::fs::write(ready_path, format!("ready pid={}\n", std::process::id())) {
+        eprintln!("pair-hold ready marker write failed: {e}");
+        println!("pair-hold : ERROR (ready marker write failed)");
+        return 2;
+    }
+
+    let controller_wait_started = Instant::now();
+    if wait_for_pair_hold_controller_marker(
+        || std::path::Path::new(continue_path).is_file(),
+        || controller_wait_started.elapsed(),
+        tsf_host::pump,
+        std::thread::sleep,
+    ) != PairHoldControllerMarkerWait::Released
+    {
+        println!("pair-hold : ERROR (controller marker timeout)");
+        return 2;
+    }
+    host.reclaim_focus();
+    let passed = convert(&host);
+    if let Err(e) = std::fs::write(
+        done_path,
+        format!(
+            "done pid={} status={}\n",
+            std::process::id(),
+            if passed { "PASS" } else { "FAIL" }
+        ),
+    ) {
+        eprintln!("pair-hold done marker write failed: {e}");
+        println!("pair-hold : ERROR (done marker write failed)");
+        return 2;
+    }
+    let exit_wait_started = Instant::now();
+    if wait_for_pair_hold_controller_marker(
+        || std::path::Path::new(exit_path).is_file(),
+        || exit_wait_started.elapsed(),
+        tsf_host::pump,
+        std::thread::sleep,
+    ) != PairHoldControllerMarkerWait::Released
+    {
+        println!("pair-hold : ERROR (exit marker timeout)");
+        return 2;
+    }
+    println!(
+        "pair-hold : {} (initial=日本語 after_registration={})",
+        if passed { "PASS" } else { "FAIL" },
+        if passed { "日本語" } else { "unexpected" }
+    );
+    if passed {
+        0
+    } else {
+        1
+    }
 }
 
 /// nihongo␣⏎ → committed()==日本語 を 1 本検証する（実エンジン経由）。
@@ -65,11 +1331,17 @@ fn run_canonical() -> i32 {
     // COM(STA) は host より先に束縛し、後に解放する（Drop 逆順／Task 5 ComSta 修正に整合）。
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("CANONICAL FAIL: ComSta::init {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("CANONICAL FAIL: ComSta::init {e:?}");
+            return 2;
+        }
     };
     let host = match tsf_host::TsfHost::start() {
         Ok(h) => h,
-        Err(e) => { eprintln!("CANONICAL FAIL: start {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("CANONICAL FAIL: start {e:?}");
+            return 2;
+        }
     };
     let mut keys = scenarios::typed("nihongo");
     keys.push(scenarios::SPACE);
@@ -77,25 +1349,48 @@ fn run_canonical() -> i32 {
     let obs = driver::run_keys(&host, &keys);
     let committed = host.store.committed();
     for o in &obs {
-        println!("  {:>9} vk={:#04x} eaten={} {}ms preedit={:?}", o.label, o.vk, o.eaten, o.elapsed_ms, o.preedit);
+        println!(
+            "  {:>9} vk={:#04x} eaten={} {}ms preedit={:?}",
+            o.label, o.vk, o.eaten, o.elapsed_ms, o.preedit
+        );
     }
     println!("CANONICAL committed={committed:?}");
-    if committed == "日本語" { println!("CANONICAL PASS"); 0 } else { eprintln!("CANONICAL FAIL"); 1 }
+    if committed == "日本語" {
+        println!("CANONICAL PASS");
+        0
+    } else {
+        eprintln!("CANONICAL FAIL");
+        1
+    }
 }
 
 /// item8: エンジン kill 耐性。ComSta ガードを host より先に束縛してから start。
 fn run_item8_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item8 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item8 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item8(&host, 5000);
-            println!("item8 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item8 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item8 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item8 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -103,31 +1398,81 @@ fn run_item8_mode() -> i32 {
 fn run_item9_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item9 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item9 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(mut host) => {
             let (before, after) = driver::run_item9(&mut host);
             println!("item9 : before_eaten={before} after_eaten={after}");
-            if before && !after { println!("item9 PASS"); 0 } else { eprintln!("item9 FAIL"); 1 }
+            if before && !after {
+                println!("item9 PASS");
+                0
+            } else {
+                eprintln!("item9 FAIL");
+                1
+            }
         }
-        Err(e) => { eprintln!("item9 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item9 start fail: {e:?}");
+            2
+        }
     }
+}
+
+/// Pin only the model/setup conditions needed to observe multiple native clauses.
+/// The settings path is restored after the host is dropped, including on errors.
+fn run_item16_with_classic_fixture() -> Result<driver::Item16Result, String> {
+    struct LocalAppDataGuard(Option<std::ffi::OsString>);
+    impl Drop for LocalAppDataGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("LOCALAPPDATA", value),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+        }
+    }
+    let scratch = tempfile::Builder::new().prefix("nospacekey-item16-").tempdir()
+        .map_err(|error| format!("scratch: {error}"))?;
+    let settings = scratch.path().join("nospacekey");
+    std::fs::create_dir_all(&settings).and_then(|_| std::fs::write(settings.join("settings.json"),
+        r#"{"version":2,"zenzai":{"enabled":false},"learning":{"enabled":false},"default_direct":false,"live_conversion":{"enabled":false}}"#))
+        .map_err(|error| format!("settings: {error}"))?;
+    let _environment = LocalAppDataGuard(std::env::var_os("LOCALAPPDATA"));
+    std::env::set_var("LOCALAPPDATA", scratch.path());
+    let host = tsf_host::TsfHost::start().map_err(|error| format!("start: {error:?}"))?;
+    Ok(driver::run_item16(&host))
 }
 
 /// item12: Tab→外部LLM変換のスレッド配線（echo）。ComSta ガードを host より先に束縛して start。
 fn run_item12_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item12 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item12 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item12(&host);
-            println!("item12 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item12 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item12 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item12 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -135,15 +1480,29 @@ fn run_item12_mode() -> i32 {
 fn run_item13_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item13 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item13 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item13(&host);
-            println!("item13 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item13 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item13 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item13 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -152,15 +1511,29 @@ fn run_item13_mode() -> i32 {
 fn run_item14_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item14 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item14 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item14(&host);
-            println!("item14 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item14 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item14 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item14 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -168,15 +1541,29 @@ fn run_item14_mode() -> i32 {
 fn run_item15_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item15 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item15 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item15(&host);
-            println!("item15 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item15 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item15 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item15 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -184,15 +1571,29 @@ fn run_item15_mode() -> i32 {
 fn run_item17_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item17 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item17 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item17(&host);
-            println!("item17 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item17 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item17 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item17 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -200,15 +1601,29 @@ fn run_item17_mode() -> i32 {
 fn run_item18_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item18 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item18 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item18(&host);
-            println!("item18 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item18 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item18 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item18 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -216,15 +1631,29 @@ fn run_item18_mode() -> i32 {
 fn run_item19_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item19 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item19 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item19(&host);
-            println!("item19 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item19 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item19 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item19 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -233,15 +1662,29 @@ fn run_item19_mode() -> i32 {
 fn run_item24_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item24 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item24 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item24(&host);
-            println!("item24 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item24 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item24 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item24 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -250,15 +1693,29 @@ fn run_item24_mode() -> i32 {
 fn run_item29_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item29 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item29 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item29(&host);
-            println!("item29 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item29 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item29 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item29 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -267,15 +1724,29 @@ fn run_item29_mode() -> i32 {
 fn run_item30_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item30 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item30 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item30(&host);
-            println!("item30 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item30 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item30 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item30 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -284,15 +1755,108 @@ fn run_item30_mode() -> i32 {
 fn run_item31_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("item31 ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("item31 ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
     match tsf_host::TsfHost::start() {
         Ok(host) => {
             let r = driver::run_item31(&host);
-            println!("item31 : {} ({})", if r.passed { "PASS" } else { "FAIL" }, r.detail);
-            if r.passed { 0 } else { 1 }
+            println!(
+                "item31 : {} ({})",
+                if r.passed { "PASS" } else { "FAIL" },
+                r.detail
+            );
+            if r.passed {
+                0
+            } else {
+                1
+            }
         }
-        Err(e) => { eprintln!("item31 start fail: {e:?}"); 2 }
+        Err(e) => {
+            eprintln!("item31 start fail: {e:?}");
+            2
+        }
+    }
+}
+
+/// item32: opt-in inline prediction acceptance test. It uses an isolated settings profile so the
+/// real user setting remains untouched. The evaluated model/runtime paths are supplied by env.
+fn run_item32_mode() -> i32 {
+    driver::kill_engine_processes();
+    struct EngineCleanup;
+    impl Drop for EngineCleanup {
+        fn drop(&mut self) {
+            driver::kill_engine_processes();
+        }
+    }
+    let _engine_cleanup = EngineCleanup;
+    if std::env::var_os("NOSPACEKEY_PREDICTION_MODEL_DIR").is_none() {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let installed = std::path::PathBuf::from(local)
+                .join("Nospacekey")
+                .join("models")
+                .join("inline-prediction");
+            if installed.join("VERIFIED").is_file() {
+                std::env::set_var("NOSPACEKEY_PREDICTION_MODEL_DIR", installed);
+            }
+        }
+    }
+    let Some(model_dir) = std::env::var_os("NOSPACEKEY_PREDICTION_MODEL_DIR") else {
+        eprintln!("item32 requires an installed model or NOSPACEKEY_PREDICTION_MODEL_DIR");
+        return 2;
+    };
+    let model_dir = std::path::PathBuf::from(model_dir);
+    if !model_dir.join("VERIFIED").is_file() || !model_dir.join("tokenizer.json").is_file() {
+        eprintln!(
+            "item32 prediction artifact pair is incomplete: {}",
+            model_dir.display()
+        );
+        return 2;
+    }
+    let scratch = match tempfile::Builder::new()
+        .prefix("nospacekey-item32-")
+        .tempdir()
+    {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("item32 scratch dir fail: {e:?}");
+            return 2;
+        }
+    };
+    std::env::set_var("LOCALAPPDATA", scratch.path());
+    let mut settings = settings::Settings::default();
+    settings.inline_prediction.enabled = true;
+    if let Err(e) = settings::save(&settings) {
+        eprintln!("item32 settings fixture fail: {e:?}");
+        return 2;
+    }
+    let _com = match tsf_host::ComSta::init() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("item32 ComSta::init fail: {e:?}");
+            return 2;
+        }
+    };
+    match tsf_host::TsfHost::start() {
+        Ok(host) => {
+            let result = driver::run_item32(&host);
+            println!(
+                "item32 : {} ({})",
+                if result.passed { "PASS" } else { "FAIL" },
+                result.detail
+            );
+            if result.passed {
+                0
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("item32 start fail: {e:?}");
+            2
+        }
     }
 }
 
@@ -301,7 +1865,7 @@ fn run_item31_mode() -> i32 {
 /// (実ユーザーの settings.json を汚さない)。8 つの自己証明サブシナリオを 1 プロセス内で順に
 /// 走らせる（run_scenarios_reported と同じ作法: ComSta は全体で共有、TsfHost はサブごとに
 /// 作り直す。conversion-mode compartment はプロセス共有だが各サブが必ず自分で
-/// set_native_mode/set_direct_mode するので前サブの持ち越しは問題にならない）。
+/// normalize_native_mode/enter_direct_mode するので前サブの持ち越しは問題にならない）。
 ///
 /// - サブ1: to_katakana を F7→F11 へリマップ（既存）。
 /// - サブ2（Task5 keymap-single-source）: keymap.convert="none" で Space/変換 が composing 中に
@@ -330,7 +1894,10 @@ fn run_keymap_smoke() -> i32 {
 
     let _com = match tsf_host::ComSta::init() {
         Ok(c) => c,
-        Err(e) => { eprintln!("keymap-smoke ComSta::init fail: {e:?}"); return 2; }
+        Err(e) => {
+            eprintln!("keymap-smoke ComSta::init fail: {e:?}");
+            return 2;
+        }
     };
 
     let ok_remap = run_keymap_smoke_to_katakana_remap(&dir);
@@ -342,8 +1909,14 @@ fn run_keymap_smoke() -> i32 {
     let ok_live_off_esc = run_live_off_esc_restores_the_reading(&dir);
     let ok_live_off_settle = run_live_off_settle_commits_the_reading(&dir);
 
-    let passed = ok_remap && ok_convert_none && ok_reconvert_frees_convert && ok_rotate
-        && ok_live_off_enter && ok_live_off_space && ok_live_off_esc && ok_live_off_settle;
+    let passed = ok_remap
+        && ok_convert_none
+        && ok_reconvert_frees_convert
+        && ok_rotate
+        && ok_live_off_enter
+        && ok_live_off_space
+        && ok_live_off_esc
+        && ok_live_off_settle;
     println!(
         "keymap-smoke : {} (to_katakana_remap={ok_remap} convert_none={ok_convert_none} \
          reconvert_frees_convert_key={ok_reconvert_frees_convert} notation_rotate={ok_rotate} \
@@ -351,7 +1924,11 @@ fn run_keymap_smoke() -> i32 {
          live_off_esc={ok_live_off_esc} live_off_settle={ok_live_off_settle})",
         if passed { "PASS" } else { "FAIL" }
     );
-    if passed { 0 } else { 1 }
+    if passed {
+        0
+    } else {
+        1
+    }
 }
 
 /// サブ1: to_katakana を F7→F11 へリマップ。
@@ -370,19 +1947,23 @@ fn run_keymap_smoke_to_katakana_remap(dir: &std::path::Path) -> bool {
     }
     match tsf_host::TsfHost::start() {
         Ok(host) => {
-            let _ = host.set_native_mode();
+            let _ = host.normalize_native_mode();
             host.warm_up();
             host.store.reset();
             let pid = std::process::id();
             let base_evs = log_parse::read_events(pid).len();
 
-            for k in scenarios::typed("nihongo") { let _ = host.feed_key(k.0); }
+            for k in scenarios::typed("nihongo") {
+                let _ = host.feed_key(k.0);
+            }
             let _ = host.feed_key(scenarios::F7.0); // 解放済み: 表記変換しない期待
             let _ = host.feed_key(scenarios::F11.0); // リマップ先: カタカナ表記変換
             let preedit = host.store.preedit();
 
-            let evs: Vec<log_parse::Ev> =
-                log_parse::read_events(pid).into_iter().skip(base_evs).collect();
+            let evs: Vec<log_parse::Ev> = log_parse::read_events(pid)
+                .into_iter()
+                .skip(base_evs)
+                .collect();
             let saw_f11_notation = evs
                 .iter()
                 .any(|e| matches!(e, log_parse::Ev::Notation { vk } if *vk == 0x7a));
@@ -398,7 +1979,10 @@ fn run_keymap_smoke_to_katakana_remap(dir: &std::path::Path) -> bool {
             );
             passed
         }
-        Err(e) => { eprintln!("keymap-smoke:to_katakana_remap start fail: {e:?}"); false }
+        Err(e) => {
+            eprintln!("keymap-smoke:to_katakana_remap start fail: {e:?}");
+            false
+        }
     }
 }
 
@@ -418,34 +2002,51 @@ fn run_keymap_smoke_convert_none(dir: &std::path::Path) -> bool {
     }
     match tsf_host::TsfHost::start() {
         Ok(host) => {
-            let _ = host.set_native_mode();
+            let _ = host.normalize_native_mode();
             host.warm_up();
             host.store.reset();
             let pid = std::process::id();
 
-            for k in scenarios::typed("nihongo") { let _ = host.feed_key(k.0); }
-            host.settle_debounce(); // ライブ変換確定を待つ（item2 と同じ作法）
+            for k in scenarios::typed("nihongo") {
+                let _ = host.feed_key(k.0);
+            }
+            // ライブ変換結果の適用は debounce(30ms)+engine往復+ポール(15ms)で届く。
+            // settle_debounce(60ms+1ポンプ)だけだと初回が間に合わないので読み替えを待つ。
+            let mut preedit = String::new();
+            for _ in 0..300 {
+                tsf_host::pump();
+                preedit = host.store.preedit();
+                if preedit == "日本語" { break; }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             let base_evs = log_parse::read_events(pid).len();
 
             let eaten_space = host.feed_key(scenarios::SPACE.0);
             let eaten_convert = host.feed_key(scenarios::CONVERT.0);
-            let preedit = host.store.preedit();
+            let preedit_after = host.store.preedit();
 
-            let evs: Vec<log_parse::Ev> =
-                log_parse::read_events(pid).into_iter().skip(base_evs).collect();
-            let opened_candidates =
-                evs.iter().any(|e| matches!(e, log_parse::Ev::CandidatesShown { .. }));
+            let evs: Vec<log_parse::Ev> = log_parse::read_events(pid)
+                .into_iter()
+                .skip(base_evs)
+                .collect();
+            let opened_candidates = evs
+                .iter()
+                .any(|e| matches!(e, log_parse::Ev::CandidatesShown { .. }));
 
-            let passed = !eaten_space && !eaten_convert && !opened_candidates && preedit == "日本語";
+            let passed = !eaten_space && !eaten_convert && !opened_candidates
+                && preedit == "日本語" && preedit_after == "日本語";
             println!(
                 "keymap-smoke:convert_none : {} (eaten_space={eaten_space} \
                  eaten_convert={eaten_convert} opened_candidates={opened_candidates} \
-                 preedit={preedit:?})",
+                 preedit={preedit:?} preedit_after={preedit_after:?})",
                 if passed { "PASS" } else { "FAIL" }
             );
             passed
         }
-        Err(e) => { eprintln!("keymap-smoke:convert_none start fail: {e:?}"); false }
+        Err(e) => {
+            eprintln!("keymap-smoke:convert_none start fail: {e:?}");
+            false
+        }
     }
 }
 
@@ -465,17 +2066,22 @@ fn run_keymap_smoke_reconvert_frees_convert_key(dir: &std::path::Path) -> bool {
     }
     match tsf_host::TsfHost::start() {
         Ok(host) => {
-            let _ = host.set_direct_mode();
+            let _ = host.enter_direct_mode();
             host.store.reset();
             let pid = std::process::id();
             let base_evs = log_parse::read_events(pid).len();
 
             let eaten_convert = host.feed_key(scenarios::CONVERT.0);
 
-            let evs: Vec<log_parse::Ev> =
-                log_parse::read_events(pid).into_iter().skip(base_evs).collect();
+            let evs: Vec<log_parse::Ev> = log_parse::read_events(pid)
+                .into_iter()
+                .skip(base_evs)
+                .collect();
             let reconvert_fired = evs.iter().any(|e| {
-                matches!(e, log_parse::Ev::ReconvertShown { .. } | log_parse::Ev::ReconvertSkip { .. })
+                matches!(
+                    e,
+                    log_parse::Ev::ReconvertShown { .. } | log_parse::Ev::ReconvertSkip { .. }
+                )
             });
 
             let passed = !eaten_convert && !reconvert_fired;
@@ -486,7 +2092,10 @@ fn run_keymap_smoke_reconvert_frees_convert_key(dir: &std::path::Path) -> bool {
             );
             passed
         }
-        Err(e) => { eprintln!("keymap-smoke:reconvert_frees_convert_key start fail: {e:?}"); false }
+        Err(e) => {
+            eprintln!("keymap-smoke:reconvert_frees_convert_key start fail: {e:?}");
+            false
+        }
     }
 }
 
@@ -507,13 +2116,15 @@ fn run_keymap_smoke_notation_rotate(dir: &std::path::Path) -> bool {
     }
     match tsf_host::TsfHost::start() {
         Ok(host) => {
-            let _ = host.set_native_mode();
+            let _ = host.normalize_native_mode();
             host.warm_up();
             host.store.reset();
             let pid = std::process::id();
             let base_evs = log_parse::read_events(pid).len();
 
-            for k in scenarios::typed("nihongo") { let _ = host.feed_key(k.0); }
+            for k in scenarios::typed("nihongo") {
+                let _ = host.feed_key(k.0);
+            }
             host.settle_debounce();
             let _ = host.feed_key(scenarios::NONCONVERT.0); // → カタカナ
             let p1 = host.store.preedit();
@@ -522,14 +2133,16 @@ fn run_keymap_smoke_notation_rotate(dir: &std::path::Path) -> bool {
             let _ = host.feed_key(scenarios::NONCONVERT.0); // → ひらがな
             let p3 = host.store.preedit();
 
-            let evs: Vec<log_parse::Ev> =
-                log_parse::read_events(pid).into_iter().skip(base_evs).collect();
-            let rotate_count = evs.iter()
+            let evs: Vec<log_parse::Ev> = log_parse::read_events(pid)
+                .into_iter()
+                .skip(base_evs)
+                .collect();
+            let rotate_count = evs
+                .iter()
                 .filter(|e| matches!(e, log_parse::Ev::Notation { vk } if *vk == 0x1D))
                 .count();
 
-            let passed = rotate_count == 3
-                && p1 == "ニホンゴ" && p2 == "ﾆﾎﾝｺﾞ" && p3 == "にほんご";
+            let passed = rotate_count == 3 && p1 == "ニホンゴ" && p2 == "ﾆﾎﾝｺﾞ" && p3 == "にほんご";
             println!(
                 "keymap-smoke:notation_rotate : {} (rotate_count={rotate_count} \
                  p1={p1:?} p2={p2:?} p3={p3:?})",
@@ -537,7 +2150,10 @@ fn run_keymap_smoke_notation_rotate(dir: &std::path::Path) -> bool {
             );
             passed
         }
-        Err(e) => { eprintln!("keymap-smoke:notation_rotate start fail: {e:?}"); false }
+        Err(e) => {
+            eprintln!("keymap-smoke:notation_rotate start fail: {e:?}");
+            false
+        }
     }
 }
 
@@ -553,7 +2169,10 @@ fn write_live_off_fixture(dir: &std::path::Path, sub: &str) -> bool {
         r#"{"version":2,"live_conversion":{"enabled":false}}"#,
     ) {
         Ok(()) => true,
-        Err(e) => { eprintln!("live-off:{sub} settings fixture fail: {e:?}"); false }
+        Err(e) => {
+            eprintln!("live-off:{sub} settings fixture fail: {e:?}");
+            false
+        }
     }
 }
 
@@ -565,9 +2184,11 @@ fn write_live_off_fixture(dir: &std::path::Path, sub: &str) -> bool {
 /// まさにその劣化——配線が戻っていても LiveConvert が 400ms 超で None に落ちれば、期待値と同じ
 /// 「読み」が確定・描き戻されてしまう（実機で観測済みの Zenzai 高 CPU 条件）。
 fn live_convert_degraded(evs: &[log_parse::Ev]) -> bool {
-    evs.iter().any(|e| matches!(
-        e, log_parse::Ev::Degraded { reason } if reason.starts_with("live_convert")
-    ))
+    evs.iter().any(|e| {
+        matches!(
+            e, log_parse::Ev::Degraded { reason } if reason.starts_with("live_convert")
+        )
+    })
 }
 
 /// サブ5: ライブ変換 OFF なら Enter は「画面に見えている読み」を確定する。
@@ -576,30 +2197,38 @@ fn live_convert_degraded(evs: &[log_parse::Ev]) -> bool {
 /// ライブ確定経路を通った。打鍵を食っていないだけなら committed も空で通ってしまう）と、
 /// LiveConvert の劣化が無いこと（`live_convert_degraded`＝engine を叩いて遅かっただけの偽 PASS 除け）。
 fn run_live_off_enter_commits_the_reading(dir: &std::path::Path) -> bool {
-    if !write_live_off_fixture(dir, "enter_commits_the_reading") { return false; }
+    if !write_live_off_fixture(dir, "enter_commits_the_reading") {
+        return false;
+    }
     match tsf_host::TsfHost::start() {
         Ok(host) => {
-            let _ = host.set_native_mode();
+            let _ = host.normalize_native_mode();
             host.warm_up();
             host.store.reset();
             let pid = std::process::id();
             let base_evs = log_parse::read_events(pid).len();
 
-            for k in scenarios::typed("nihongo") { let _ = host.feed_key(k.0); }
+            for k in scenarios::typed("nihongo") {
+                let _ = host.feed_key(k.0);
+            }
             host.settle_debounce();
             let preedit_before = host.store.preedit();
             let _ = host.feed_key(scenarios::ENTER.0);
             let committed = host.store.committed();
 
-            let evs: Vec<log_parse::Ev> =
-                log_parse::read_events(pid).into_iter().skip(base_evs).collect();
-            let live_commit = evs.iter().any(
-                |e| matches!(e, log_parse::Ev::Commit { source, .. } if source == "live"),
-            );
+            let evs: Vec<log_parse::Ev> = log_parse::read_events(pid)
+                .into_iter()
+                .skip(base_evs)
+                .collect();
+            let live_commit = evs
+                .iter()
+                .any(|e| matches!(e, log_parse::Ev::Commit { source, .. } if source == "live"));
             let no_live_convert = !live_convert_degraded(&evs);
 
-            let passed = preedit_before == "にほんご" && committed == "にほんご"
-                && live_commit && no_live_convert;
+            let passed = preedit_before == "にほんご"
+                && committed == "にほんご"
+                && live_commit
+                && no_live_convert;
             println!(
                 "live-off:enter_commits_the_reading : {} (preedit_before={preedit_before:?} \
                  committed={committed:?} live_commit={live_commit} \
@@ -608,7 +2237,10 @@ fn run_live_off_enter_commits_the_reading(dir: &std::path::Path) -> bool {
             );
             passed
         }
-        Err(e) => { eprintln!("live-off:enter_commits_the_reading start fail: {e:?}"); false }
+        Err(e) => {
+            eprintln!("live-off:enter_commits_the_reading start fail: {e:?}");
+            false
+        }
     }
 }
 
@@ -619,97 +2251,160 @@ fn run_live_off_enter_commits_the_reading(dir: &std::path::Path) -> bool {
 /// （＝OFF fixture が効いている）。Why not(候補と確定だけで足りるとする): その 3 つは ON でも
 /// 同値に成立する（item5 と同じ）ので、fixture が効かず ON で走っていても緑になる。
 /// サブ5/7/8 は期待値そのものが設定で反転するため自己証明済みで、この 1 本だけが素通しだった。
+/// サブ5: ライブ変換 OFF でも Space は変換する。P1-P8 改修後の仕様では
+/// **1回目のSpaceは文節ビューのみで候補窓を開かない**（2回目で開く）、確定は
+/// clause 経路（source=clause）で行う。自己証明: Enter 前の preedit が読みのまま
+/// であること（live が効いていない＝フィクスチャ実効）、Space 後に
+/// ClausePresented{ready:false}（文節ビュー・窓閉）が出て CandidatesShown が
+/// 出ていないこと（窓を開けた旧仕様に戻っていない）、確定が clause 経路で
+/// 「日本語」であること。
 fn run_live_off_space_still_converts(dir: &std::path::Path) -> bool {
-    if !write_live_off_fixture(dir, "space_still_converts") { return false; }
+    if !write_live_off_fixture(dir, "space_still_converts") {
+        return false;
+    }
     match tsf_host::TsfHost::start() {
         Ok(host) => {
-            let _ = host.set_native_mode();
+            let _ = host.normalize_native_mode();
             host.warm_up();
             host.store.reset();
             let pid = std::process::id();
             let base_evs = log_parse::read_events(pid).len();
 
-            for k in scenarios::typed("nihongo") { let _ = host.feed_key(k.0); }
+            for k in scenarios::typed("nihongo") {
+                let _ = host.feed_key(k.0);
+            }
             host.settle_debounce();
             let preedit_before = host.store.preedit();
             let _ = host.feed_key(scenarios::SPACE.0);
+            let clause_evs_start = log_parse::read_events(pid).len();
+            let mut clause_view = false;
+            for _ in 0..300 {
+                tsf_host::pump();
+                clause_view = log_parse::read_events(pid).iter().skip(clause_evs_start)
+                    .any(|e| matches!(e, log_parse::Ev::ClausePresented { ready: false, .. }));
+                if clause_view { break; }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let preedit_after_space = host.store.preedit();
             let _ = host.feed_key(scenarios::ENTER.0);
-            let committed = host.store.committed();
+            let mut committed = String::new();
+            for _ in 0..50 {
+                tsf_host::pump();
+                committed = host.store.committed();
+                if !committed.is_empty() { break; }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
 
-            let evs: Vec<log_parse::Ev> =
-                log_parse::read_events(pid).into_iter().skip(base_evs).collect();
-            let offered_kanji = evs.iter().any(|e| matches!(
-                e, log_parse::Ev::CandidatesShown { list, .. } if list.iter().any(|c| c == "日本語")
-            ));
-            let candidate_commit = evs.iter().any(
-                |e| matches!(e, log_parse::Ev::Commit { source, .. } if source == "candidate"),
+            let evs: Vec<log_parse::Ev> = log_parse::read_events(pid)
+                .into_iter()
+                .skip(base_evs)
+                .collect();
+            let window_stayed_closed = !evs
+                .iter()
+                .any(|e| matches!(e, log_parse::Ev::CandidatesShown { .. }));
+            let clause_commit = evs.iter().any(
+                |e| matches!(e, log_parse::Ev::Commit { source, .. } if source == "clause"),
             );
+            let no_live_convert = !live_convert_degraded(&evs);
 
             let passed = preedit_before == "にほんご"
-                && offered_kanji && candidate_commit && committed == "日本語";
+                && clause_view
+                && window_stayed_closed
+                && preedit_after_space == "日本語"
+                && clause_commit
+                && committed == "日本語"
+                && no_live_convert;
             println!(
                 "live-off:space_still_converts : {} (preedit_before={preedit_before:?} \
-                 offered_kanji={offered_kanji} candidate_commit={candidate_commit} \
+                 clause_view={clause_view} window_stayed_closed={window_stayed_closed} \
+                 preedit_after_space={preedit_after_space:?} clause_commit={clause_commit} \
                  committed={committed:?})",
                 if passed { "PASS" } else { "FAIL" }
             );
             passed
         }
-        Err(e) => { eprintln!("live-off:space_still_converts start fail: {e:?}"); false }
+        Err(e) => {
+            eprintln!("live-off:space_still_converts start fail: {e:?}");
+            false
+        }
     }
 }
 
-/// サブ7: ライブ変換 OFF で候補窓を Esc で閉じると、インラインは読みへ戻る（item48 の OFF 版）。
-/// item48（ON）は同じ打鍵で "日本語" を期待する＝この 2 本が設定で挙動が変わることを固定する。
-/// 自己証明: 選択が実際に動き（ev=candidate_move）候補窓が閉じた（ev=candidates_hidden）ことと、
-/// 送った先の候補が期待値「にほんご」と別文字列であること（item48 の同型ガード）と、LiveConvert の
-/// 劣化が無いこと（`live_convert_degraded`）を見る。preedit だけ見ると「候補が最初から出ていない」
-/// 空振りや「候補プレビューが残ったまま」と区別できない。
+/// サブ7: ライブ変換 OFF でSpace1回目の文節ビューから Esc を押すと読みへ戻る
+/// （item48 の OFF 版。P1-P8 改修後は窓を開かないため、旧「窓を閉じて読みへ戻る」
+/// から「文節ビューを読みへ戻す」に期待値を更新）。
+/// 自己証明: Space 後に ClausePresented{ready:false} が出て preedit が実際に変換済み
+/// になっていたこと（Esc 前に文節ビューにいた＝空振りでない）と、窓が一切開いて
+/// いないこと（旧仕様の窓経路に回っていない）と、Esc 後に読みへ戻り合成が続いて
+/// いること、LiveConvert の劣化が無いことを見る。
 fn run_live_off_esc_restores_the_reading(dir: &std::path::Path) -> bool {
-    if !write_live_off_fixture(dir, "esc_restores_the_reading") { return false; }
+    if !write_live_off_fixture(dir, "esc_restores_the_reading") {
+        return false;
+    }
     match tsf_host::TsfHost::start() {
         Ok(host) => {
-            let _ = host.set_native_mode();
+            let _ = host.normalize_native_mode();
             host.warm_up();
             host.store.reset();
             let pid = std::process::id();
             let base_evs = log_parse::read_events(pid).len();
 
-            for k in scenarios::typed("nihongo") { let _ = host.feed_key(k.0); }
-            let _ = host.feed_key(scenarios::SPACE.0); // 候補窓を開く（sel=0）
-            let list = log_parse::read_events(pid).into_iter().skip(base_evs).find_map(|e| match e {
-                log_parse::Ev::CandidatesShown { n, list, .. } if n >= 2 && list.len() >= 2 => Some(list),
-                _ => None,
-            });
-            // 送り先は「期待値の読みと別文字列の候補」。同一だと sync_preedit_to_selection の残した
-            // 候補プレビューでも最後のアサートが通り、描き戻しが一切走らない実装のまま緑になる。
-            // Why not(item48 と同じく「候補 1 が期待値なら判定不能 FAIL」): item48 の禁止値 "日本語" は
-            // 候補 0（＝ライブ変換結果）なので候補が相異なる限り候補 1 に再出現しえない。こちらの
-            // 期待値は読みのかなで、変換器が上位に出すのは普通なので、index を固定して禁じると
-            // 正しい実装のまま永久 RED になる。当たるまで選択を送って回避する。
-            let target = list.as_ref().and_then(|l| (1..l.len()).find(|&i| l[i] != "にほんご"));
-            for _ in 0..target.unwrap_or(1) { let _ = host.feed_key(scenarios::SPACE.0); }
+            for k in scenarios::typed("nihongo") {
+                let _ = host.feed_key(k.0);
+            }
+            host.settle_debounce();
+            let preedit_before = host.store.preedit();
+            // P1-P8 改修後の仕様: 1回目Spaceは文節ビュー（窓は開かない）。
+            let _ = host.feed_key(scenarios::SPACE.0);
+            let clause_evs_start = log_parse::read_events(pid).len();
+            let mut clause_view = false;
+            let mut preedit_converted = String::new();
+            for _ in 0..300 {
+                tsf_host::pump();
+                clause_view = log_parse::read_events(pid).iter().skip(clause_evs_start)
+                    .any(|e| matches!(e, log_parse::Ev::ClausePresented { ready: false, .. }));
+                preedit_converted = host.store.preedit();
+                if clause_view && preedit_converted == "日本語" { break; }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // 窓を開かずに選択文節（ここでは全文）を読みへ戻すのが新しい Esc の段階挙動。
             let _ = host.feed_key(scenarios::ESC.0);
-            let preedit = host.store.preedit();
+            let mut preedit_restored = String::new();
+            for _ in 0..50 {
+                tsf_host::pump();
+                preedit_restored = host.store.preedit();
+                if preedit_restored == "にほんご" { break; }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
 
-            let evs: Vec<log_parse::Ev> =
-                log_parse::read_events(pid).into_iter().skip(base_evs).collect();
-            let moved = target.is_some_and(|i| evs.iter().any(
-                |e| matches!(e, log_parse::Ev::CandidateMove { sel } if *sel == i),
-            ));
-            let hidden = evs.iter().any(|e| matches!(e, log_parse::Ev::CandidatesHidden));
+            let evs: Vec<log_parse::Ev> = log_parse::read_events(pid)
+                .into_iter()
+                .skip(base_evs)
+                .collect();
+            let window_stayed_closed = !evs
+                .iter()
+                .any(|e| matches!(e, log_parse::Ev::CandidatesShown { .. }));
             let no_live_convert = !live_convert_degraded(&evs);
 
-            let passed = moved && hidden && no_live_convert && preedit == "にほんご";
+            let passed = preedit_before == "にほんご"
+                && clause_view
+                && preedit_converted == "日本語"
+                && window_stayed_closed
+                && no_live_convert
+                && preedit_restored == "にほんご"
+                && host.store.composing();
             println!(
-                "live-off:esc_restores_the_reading : {} (moved={moved} hidden={hidden} \
-                 target={target:?} no_live_convert={no_live_convert} preedit={preedit:?} \
-                 list={list:?})",
+                "live-off:esc_restores_the_reading : {} (clause_view={clause_view} \
+                 preedit_converted={preedit_converted:?} window_stayed_closed={window_stayed_closed} \
+                 no_live_convert={no_live_convert} preedit_restored={preedit_restored:?})",
                 if passed { "PASS" } else { "FAIL" }
             );
             passed
         }
-        Err(e) => { eprintln!("live-off:esc_restores_the_reading start fail: {e:?}"); false }
+        Err(e) => {
+            eprintln!("live-off:esc_restores_the_reading start fail: {e:?}");
+            false
+        }
     }
 }
 
@@ -718,29 +2413,36 @@ fn run_live_off_esc_restores_the_reading(dir: &std::path::Path) -> bool {
 /// 自己証明: ev=commit source=mode_toggle が出ていること（＝settle 経路を通った）と、LiveConvert の
 /// 劣化が無いこと（`live_convert_degraded`）を見る。
 fn run_live_off_settle_commits_the_reading(dir: &std::path::Path) -> bool {
-    if !write_live_off_fixture(dir, "settle_commits_the_reading") { return false; }
+    if !write_live_off_fixture(dir, "settle_commits_the_reading") {
+        return false;
+    }
     match tsf_host::TsfHost::start() {
         Ok(host) => {
-            let _ = host.set_native_mode();
+            let _ = host.normalize_native_mode();
             host.warm_up();
             host.store.reset();
             let pid = std::process::id();
             let base_evs = log_parse::read_events(pid).len();
 
-            for k in scenarios::typed("nihongo") { let _ = host.feed_key(k.0); }
+            for k in scenarios::typed("nihongo") {
+                let _ = host.feed_key(k.0);
+            }
             host.settle_debounce();
             let _ = host.feed_key(scenarios::HANKAKU_ZENKAKU.0);
             let committed = host.store.committed();
             let preedit = host.store.preedit();
 
-            let evs: Vec<log_parse::Ev> =
-                log_parse::read_events(pid).into_iter().skip(base_evs).collect();
+            let evs: Vec<log_parse::Ev> = log_parse::read_events(pid)
+                .into_iter()
+                .skip(base_evs)
+                .collect();
             let settled = evs.iter().any(
                 |e| matches!(e, log_parse::Ev::Commit { source, .. } if source == "mode_toggle"),
             );
             let no_live_convert = !live_convert_degraded(&evs);
 
-            let passed = settled && no_live_convert && preedit.is_empty() && committed == "にほんご";
+            let passed =
+                settled && no_live_convert && preedit.is_empty() && committed == "にほんご";
             println!(
                 "live-off:settle_commits_the_reading : {} (settled={settled} \
                  no_live_convert={no_live_convert} preedit={preedit:?} committed={committed:?})",
@@ -748,7 +2450,10 @@ fn run_live_off_settle_commits_the_reading(dir: &std::path::Path) -> bool {
             );
             passed
         }
-        Err(e) => { eprintln!("live-off:settle_commits_the_reading start fail: {e:?}"); false }
+        Err(e) => {
+            eprintln!("live-off:settle_commits_the_reading start fail: {e:?}");
+            false
+        }
     }
 }
 
@@ -759,11 +2464,15 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(c) => c,
         Err(e) => {
             let rep = HarnessReport {
-                all_pass: false, started: false,
-                start_error: Some(format!("ComSta::init: {e:?}")), items: vec![],
+                all_pass: false,
+                started: false,
+                start_error: Some(format!("ComSta::init: {e:?}")),
+                items: vec![],
             };
             rep.print_table();
-            if let Some(p) = json_path { let _ = rep.write_json(&p); }
+            if let Some(p) = json_path {
+                let _ = rep.write_json(&p);
+            }
             return rep.exit_code();
         }
     };
@@ -772,62 +2481,36 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
     // item1–7,10: シナリオ毎に新しい TsfHost（TIP の composition/engine 状態は store.reset() で消えない）。
     // item8/9 は専用ドライバ（engine kill / deactivate）が要るので下で個別実行する。
     for sc in scenarios::all() {
-        if sc.item == 8 || sc.item == 9 { continue; } // item8/9 は下で個別実行
+        if sc.item == 8 || sc.item == 9 {
+            continue;
+        } // item8/9 は下で個別実行
         match tsf_host::TsfHost::start() {
             Ok(host) => {
                 let r = driver::run_scenario(&host, &sc);
                 items.push(ItemReport {
-                    item: r.item, name: r.name.into(),
+                    item: r.item,
+                    name: r.name.into(),
                     status: if r.passed { "pass" } else { "fail" }.into(),
-                    detail: r.detail, max_elapsed_ms: r.max_elapsed_ms,
+                    detail: r.detail,
+                    max_elapsed_ms: r.max_elapsed_ms,
                 });
-                // conversion-mode compartment はプロセス共有（host を作り直しても残る）なので、
-                // シナリオが direct/NATIVE を変えたまま終わると後続の全 item が偽 FAIL する。
-                // 「汚す item だけ列挙して戻す」方式は取らない: item34→36→37/38 と追加のたびに
-                // ここへ番号を書き足す運用は記載漏れ＝原因不明の偽 FAIL という footgun だった。
-                // native 着地シナリオには no-op なので、全シナリオ後に無条件で揃える。
-                if !host.set_native_mode() {
-                    eprintln!("warn: item{} 後の set_native_mode 失敗（後続 item が偽 FAIL する恐れ）", sc.item);
-                }
+                // conversion-mode はプロセス共有（host を作り直しても残る）＆ TIP の
+                // モード所有状態(direct_mode_owned/langbar Cell)も同一インスタンスに残る
+                // ので、シナリオが direct を残したまま終わると後続の全 item が偽 FAIL する。
+                // 「汚す item だけ列挙して戻す」方式は取らない: item34→36→37/38 と追加の
+                // たびにここへ番号を書き足す運用は記載漏れ＝原因不明の偽 FAIL という
+                // footgun だった。native 着地シナリオには no-op なので、全シナリオ後に
+                // 無条件で揃える（normalize は TIP 自身のトグル経路も踏む）。
+                host.normalize_native_mode();
             }
             Err(e) => items.push(ItemReport {
-                item: sc.item, name: sc.name.into(), status: "error".into(),
-                detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+                item: sc.item,
+                name: sc.name.into(),
+                status: "error".into(),
+                detail: format!("start fail: {e:?}"),
+                max_elapsed_ms: 0,
             }),
         }
-    }
-
-    // item8: エンジン kill 耐性（新しい host）。
-    match tsf_host::TsfHost::start() {
-        Ok(host) => {
-            let r8 = driver::run_item8(&host, 5000);
-            items.push(ItemReport {
-                item: 8, name: "engine kill resilience".into(),
-                status: if r8.passed { "pass" } else { "fail" }.into(),
-                detail: r8.detail, max_elapsed_ms: 0,
-            });
-        }
-        Err(e) => items.push(ItemReport {
-            item: 8, name: "engine kill resilience".into(), status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
-        }),
-    }
-
-    // item9: 解除後 eaten=false。必ず最後（解除はスレッド状態を変えるため）。
-    match tsf_host::TsfHost::start() {
-        Ok(mut host) => {
-            let (before, after) = driver::run_item9(&mut host);
-            let pass9 = before && !after;
-            items.push(ItemReport {
-                item: 9, name: "deactivate returns to normal".into(),
-                status: if pass9 { "pass" } else { "fail" }.into(),
-                detail: format!("before={before} after={after}"), max_elapsed_ms: 0,
-            });
-        }
-        Err(e) => items.push(ItemReport {
-            item: 9, name: "deactivate returns to normal".into(), status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
-        }),
     }
 
     // item12: Tab→外部LLM変換のスレッド配線（worker→ポーリング→preedit 反映）を echo 検証。
@@ -836,14 +2519,19 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(host) => {
             let r12 = driver::run_item12(&host);
             items.push(ItemReport {
-                item: 12, name: "tab->llm convert wiring (echo)".into(),
+                item: 12,
+                name: "tab->llm convert wiring (echo)".into(),
                 status: if r12.passed { "pass" } else { "fail" }.into(),
-                detail: r12.detail, max_elapsed_ms: 0,
+                detail: r12.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 12, name: "tab->llm convert wiring (echo)".into(), status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            item: 12,
+            name: "tab->llm convert wiring (echo)".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
@@ -853,14 +2541,19 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(host) => {
             let r13 = driver::run_item13(&host);
             items.push(ItemReport {
-                item: 13, name: "reconvert (direct mode, headless)".into(),
+                item: 13,
+                name: "reconvert (direct mode, headless)".into(),
                 status: if r13.passed { "pass" } else { "fail" }.into(),
-                detail: r13.detail, max_elapsed_ms: 0,
+                detail: r13.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 13, name: "reconvert (direct mode, headless)".into(), status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            item: 13,
+            name: "reconvert (direct mode, headless)".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
@@ -871,14 +2564,19 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(host) => {
             let r14 = driver::run_item14(&host);
             items.push(ItemReport {
-                item: 14, name: "candidate uielement advertise (headless)".into(),
+                item: 14,
+                name: "candidate uielement advertise (headless)".into(),
                 status: if r14.passed { "pass" } else { "fail" }.into(),
-                detail: r14.detail, max_elapsed_ms: 0,
+                detail: r14.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 14, name: "candidate uielement advertise (headless)".into(), status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            item: 14,
+            name: "candidate uielement advertise (headless)".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
@@ -888,31 +2586,39 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(host) => {
             let r15 = driver::run_item15(&host);
             items.push(ItemReport {
-                item: 15, name: "live-conversion caret follows to end".into(),
+                item: 15,
+                name: "live-conversion caret follows to end".into(),
                 status: if r15.passed { "pass" } else { "fail" }.into(),
-                detail: r15.detail, max_elapsed_ms: 0,
+                detail: r15.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 15, name: "live-conversion caret follows to end".into(), status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            item: 15,
+            name: "live-conversion caret follows to end".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
-    // item16: 前方一致候補の部分確定でデータロスしない（"日本"確定→残り読み"ご"が継続）。専用ドライバ
-    // （nihongo+Space で候補→日本 を Behavior 確定→committed/preedit/ログ観測）が要るので個別実行。新 host で。
-    match tsf_host::TsfHost::start() {
-        Ok(host) => {
-            let r16 = driver::run_item16(&host);
+    // item16: first-clause replacement preserves all later clauses through finalization.
+    match run_item16_with_classic_fixture() {
+        Ok(r16) => {
             items.push(ItemReport {
-                item: 16, name: "prefix-candidate partial commit keeps remainder".into(),
+                item: 16,
+                name: "first-clause replacement commits all following clauses".into(),
                 status: if r16.passed { "pass" } else { "fail" }.into(),
-                detail: r16.detail, max_elapsed_ms: 0,
+                detail: r16.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 16, name: "prefix-candidate partial commit keeps remainder".into(), status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            item: 16,
+            name: "first-clause replacement commits all following clauses".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
@@ -922,14 +2628,19 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(host) => {
             let r17 = driver::run_item17(&host);
             items.push(ItemReport {
-                item: 17, name: "reconvert kana selection (headless)".into(),
+                item: 17,
+                name: "reconvert kana selection (headless)".into(),
                 status: if r17.passed { "pass" } else { "fail" }.into(),
-                detail: r17.detail, max_elapsed_ms: 0,
+                detail: r17.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 17, name: "reconvert kana selection (headless)".into(), status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            item: 17,
+            name: "reconvert kana selection (headless)".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
@@ -939,14 +2650,19 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(host) => {
             let r18 = driver::run_item18(&host);
             items.push(ItemReport {
-                item: 18, name: "focus loss resets stale engine session".into(),
+                item: 18,
+                name: "focus loss resets stale engine session".into(),
                 status: if r18.passed { "pass" } else { "fail" }.into(),
-                detail: r18.detail, max_elapsed_ms: 0,
+                detail: r18.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 18, name: "focus loss resets stale engine session".into(), status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            item: 18,
+            name: "focus loss resets stale engine session".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
@@ -957,14 +2673,19 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(host) => {
             let r19 = driver::run_item19(&host);
             items.push(ItemReport {
-                item: 19, name: "direct mode passes latin via keydown-only host path".into(),
+                item: 19,
+                name: "direct mode passes latin via keydown-only host path".into(),
                 status: if r19.passed { "pass" } else { "fail" }.into(),
-                detail: r19.detail, max_elapsed_ms: 0,
+                detail: r19.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 19, name: "direct mode passes latin via keydown-only host path".into(), status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            item: 19,
+            name: "direct mode passes latin via keydown-only host path".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
@@ -975,14 +2696,19 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(host) => {
             let r24 = driver::run_item24(&host);
             items.push(ItemReport {
-                item: 24, name: "long uncommitted input survives live-convert timeout".into(),
+                item: 24,
+                name: "long uncommitted input survives live-convert timeout".into(),
                 status: if r24.passed { "pass" } else { "fail" }.into(),
-                detail: r24.detail, max_elapsed_ms: 0,
+                detail: r24.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 24, name: "long uncommitted input survives live-convert timeout".into(), status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            item: 24,
+            name: "long uncommitted input survives live-convert timeout".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
@@ -993,15 +2719,19 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(host) => {
             let r29 = driver::run_item29(&host);
             items.push(ItemReport {
-                item: 29, name: "keyboard-disabled context passes keys through (Edge password)".into(),
+                item: 29,
+                name: "keyboard-disabled context passes keys through (Edge password)".into(),
                 status: if r29.passed { "pass" } else { "fail" }.into(),
-                detail: r29.detail, max_elapsed_ms: 0,
+                detail: r29.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 29, name: "keyboard-disabled context passes keys through (Edge password)".into(),
+            item: 29,
+            name: "keyboard-disabled context passes keys through (Edge password)".into(),
             status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
@@ -1012,15 +2742,19 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(host) => {
             let r30 = driver::run_item30(&host);
             items.push(ItemReport {
-                item: 30, name: "commit-undo round trip (Ctrl+Backspace then Esc restores)".into(),
+                item: 30,
+                name: "commit-undo round trip (Ctrl+Backspace then Esc restores)".into(),
                 status: if r30.passed { "pass" } else { "fail" }.into(),
-                detail: r30.detail, max_elapsed_ms: 0,
+                detail: r30.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 30, name: "commit-undo round trip (Ctrl+Backspace then Esc restores)".into(),
+            item: 30,
+            name: "commit-undo round trip (Ctrl+Backspace then Esc restores)".into(),
             status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
@@ -1030,23 +2764,77 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Ok(host) => {
             let r31 = driver::run_item31(&host);
             items.push(ItemReport {
-                item: 31, name: "commit-undo disarms after further keystroke/settle".into(),
+                item: 31,
+                name: "commit-undo disarms after further keystroke/settle".into(),
                 status: if r31.passed { "pass" } else { "fail" }.into(),
-                detail: r31.detail, max_elapsed_ms: 0,
+                detail: r31.detail,
+                max_elapsed_ms: 0,
             });
         }
         Err(e) => items.push(ItemReport {
-            item: 31, name: "commit-undo disarms after further keystroke/settle".into(),
+            item: 31,
+            name: "commit-undo disarms after further keystroke/settle".into(),
             status: "error".into(),
-            detail: format!("start fail: {e:?}"), max_elapsed_ms: 0,
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
         }),
     }
 
     // 実行順（…,10,8,9,12,13,14,15,16,17,18,19,24）ではなく item 番号昇順で表示・出力する。
+    // item8: エンジン kill 耐性（新しい host）。
+    match tsf_host::TsfHost::start() {
+        Ok(host) => {
+            let r8 = driver::run_item8(&host, 5000);
+            items.push(ItemReport {
+                item: 8,
+                name: "engine kill resilience".into(),
+                status: if r8.passed { "pass" } else { "fail" }.into(),
+                detail: r8.detail,
+                max_elapsed_ms: 0,
+            });
+        }
+        Err(e) => items.push(ItemReport {
+            item: 8,
+            name: "engine kill resilience".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
+        }),
+    }
+
+    // item9: 解除後 eaten=false。必ず最後（解除はスレッド状態を変えるため）。
+    match tsf_host::TsfHost::start() {
+        Ok(mut host) => {
+            let (before, after) = driver::run_item9(&mut host);
+            let pass9 = before && !after;
+            items.push(ItemReport {
+                item: 9,
+                name: "deactivate returns to normal".into(),
+                status: if pass9 { "pass" } else { "fail" }.into(),
+                detail: format!("before={before} after={after}"),
+                max_elapsed_ms: 0,
+            });
+        }
+        Err(e) => items.push(ItemReport {
+            item: 9,
+            name: "deactivate returns to normal".into(),
+            status: "error".into(),
+            detail: format!("start fail: {e:?}"),
+            max_elapsed_ms: 0,
+        }),
+    }
+
     items.sort_by_key(|i| i.item);
     let all_pass = items.iter().all(|i| i.status == "pass");
-    let rep = HarnessReport { all_pass, started: true, start_error: None, items };
+    let rep = HarnessReport {
+        all_pass,
+        started: true,
+        start_error: None,
+        items,
+    };
     rep.print_table();
-    if let Some(p) = json_path { let _ = rep.write_json(&p); }
+    if let Some(p) = json_path {
+        let _ = rep.write_json(&p);
+    }
     rep.exit_code()
 }

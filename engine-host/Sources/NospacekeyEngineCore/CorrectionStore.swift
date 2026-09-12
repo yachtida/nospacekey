@@ -7,7 +7,7 @@ import Foundation
 /// クラス doc のロック規律一覧参照。ForTesting 系観測窓のみ無ロック)。
 /// vendor の学習メモリに相乗りしない理由: 学習 value は Zenzai 経路で順位から捨てられるため、
 /// 「必ず 1 位」の保証はエンジン側の独立テーブルでしか作れない。
-final class CorrectionStore {
+final class CorrectionStore: @unchecked Sendable {
     static let maxEntries = 1000
 
     struct Entry: Codable, Equatable {
@@ -23,6 +23,7 @@ final class CorrectionStore {
     /// 誤登録が永久に消えなくなる。訂正(record)だけが寿命を更新する。
     private var entries: [Entry] = []
     private var dirty = false
+    private var generation: UInt64 = 0
     private var loaded = false
     private let fileURL: URL?
 
@@ -53,6 +54,7 @@ final class CorrectionStore {
         entries.insert(Entry(reading: key, surface: surface), at: 0)
         if entries.count > Self.maxEntries { entries.removeLast(entries.count - Self.maxEntries) }
         dirty = true
+        generation &+= 1
     }
 
     /// un-learn: モデル1位の明示選択(=昇格の拒否)で呼ぶ。record と同じ正規化キーで消す。
@@ -66,6 +68,7 @@ final class CorrectionStore {
         entries.removeAll { $0.reading == key }
         guard entries.count != before else { return false }
         dirty = true
+        generation &+= 1
         return true
     }
 
@@ -75,23 +78,58 @@ final class CorrectionStore {
         return entries.first { $0.reading == key }?.surface
     }
 
-    func clear() {
+    /// RAM だけを消す。disk は ConversionService の learning-root preflight を通してから
+    /// seam 経由で消すため、clearLearning の partial deletion を防ぐ。
+    func clearMemory() {
         entries = []
         dirty = false
         loaded = true
-        if let url = fileURL { try? FileManager.default.removeItem(at: url) }
+    }
+
+    /// 単体利用時の clear。CorrectionStore 自身でも regular non-reparse file を確認し、
+    /// corrections.json が directory/symlink/junction のときは fail-closed（void API のため
+    /// no-op）にする。ConversionService は clearMemory()+共通 preflight を使用する。
+    func clear() {
+        clearMemory()
+        guard let url = fileURL else { return }
+        let metadata: LearningPathMetadata?
+        do {
+            metadata = try learningPathMetadata(for: url)
+        } catch {
+            return
+        }
+        guard let metadata, metadata.isRegularFile,
+              !metadata.isDirectory, !metadata.isReparsePoint else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     /// dirty 時のみ atomic write。非 throw(失敗は次の flush 契機で自然再試行)。
     /// replaceItemAt を使わないのは置換対象の存在が前提の API で、corrections.json 未作成の
     /// 初回 flush が必ず throw するため。`.atomic` は内部で temp+rename を行い対象不在でも成功する。
     func flush() {
-        guard dirty, let url = fileURL else { return }
+        guard let snapshot = persistenceSnapshot() else { return }
+        if Self.persist(snapshot) { acknowledgePersistence(snapshot) }
+    }
+
+    struct PersistenceSnapshot: @unchecked Sendable {
+        fileprivate let generation: UInt64
+        fileprivate let url: URL
+        fileprivate let data: Data
+    }
+
+    func persistenceSnapshot() -> PersistenceSnapshot? {
+        guard dirty, let url = fileURL else { return nil }
         let payload = FileFormat(version: 1, entries: entries)
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        if (try? data.write(to: url, options: .atomic)) != nil {
-            dirty = false
-        }
+        guard let data = try? JSONEncoder().encode(payload) else { return nil }
+        return PersistenceSnapshot(generation: generation, url: url, data: data)
+    }
+
+    static func persist(_ snapshot: PersistenceSnapshot) -> Bool {
+        (try? snapshot.data.write(to: snapshot.url, options: .atomic)) != nil
+    }
+
+    func acknowledgePersistence(_ snapshot: PersistenceSnapshot) {
+        if generation == snapshot.generation { dirty = false }
     }
 
     private func loadIfNeeded() {

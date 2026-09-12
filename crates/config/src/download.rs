@@ -4,8 +4,8 @@
 //! `%LOCALAPPDATA%\nospacekey\models\` に保存する。自前ホストしない＝本アプリは CC-BY-SA-4.0 の
 //! 再配布者にならない（取得を仲介するだけ）。
 //!
-//! Swift/エンジンの改修は不要: 保存後に `settings.zenzai.weight_path` を書けば、TIP の
-//! `resolve_env_map` が `NOSPACEKEY_ZENZAI_WEIGHT` としてエンジンへ渡す既存経路でモデルが読まれる。
+//! モデル解決はエンジン側 `ZenzaiConfig.resolve`（engine-host）と同一の3段表
+//! 「明示 weight_path → per-user → exeDir\models」で行う（UIバグ8。両側を同時に触ること）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +27,8 @@ const PROGRESS_EVENT: &str = "zenzai-download-progress";
 
 /// 同時ダウンロードの排他フラグ。
 static DOWNLOADING: AtomicBool = AtomicBool::new(false);
-/// キャンセル要求フラグ（`cancel_zenzai_download` が立て、受信ループが各チャンクで見る）。
+/// キャンセル要求フラグ（`cancel_zenzai_download` が立て、DL 処理の各チェックポイントが
+/// 見る — 受信ループの各チャンク・send()/受信の Err 到達時・rename 前の再判定）。
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// `DOWNLOADING` を必ず戻すガード。early return / `?` / panic のいずれでも解除する
@@ -36,6 +37,34 @@ struct DownloadGuard;
 impl Drop for DownloadGuard {
     fn drop(&mut self) {
         DOWNLOADING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// rename 完了前の `.part` を best-effort で掃除する。rename 後に disarm することで、
+/// 後続の settings save 失敗時にも完成済みの本名ファイルを誤って削除しない。
+struct PartCleanup {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl PartCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PartCleanup {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -66,6 +95,8 @@ pub fn progress_percent(received: u64, total: Option<u64>) -> Option<u8> {
 
 /// モデルの実在探索。エンジンの解決順（weight_path → per-user → exeDir\models）に対応し、
 /// 最初に実在した場所を `(path, source)` で返す。`source` は UI 表示用のラベル。
+/// エンジン側 `ZenzaiConfig.resolve`（engine-host）も同一の解決表を持つ — この対応が
+/// 崊れると UI の「導入済み」表示とエンジンの実解決が食い違う（UIバグ8。両側を同時に触ること）。
 pub fn detect_model(
     weight_path: &str,
     user_models_file: &Path,
@@ -109,8 +140,11 @@ struct Progress {
 }
 
 /// %LOCALAPPDATA%\nospacekey\models\<file>（無ければ空 PathBuf）。
+/// 空文字で定義された LOCALAPPDATA も「無い」扱い — Swift 側 ZenzaiConfig.resolve の
+/// `!localAppData.isEmpty` と対にし、相対パス候補で UI/エンジン解決表が分岐するのを防ぐ（巡1 G3-A）。
 fn user_model_path_from_env() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
+        .filter(|d| !d.is_empty())
         .map(|d| user_model_path(Path::new(&d)))
         .unwrap_or_default()
 }
@@ -124,7 +158,8 @@ fn exe_model_path() -> PathBuf {
 }
 
 /// モデルが（どの解決経路であれ）実在するかを返す。UI の「導入済み/未導入」表示に使う。
-#[tauri::command]
+// (async): settings::load + ファイル存在確認の I/O をメインスレッドから外す（UIバグ9）。
+#[tauri::command(async)]
 pub fn zenzai_model_status() -> ModelStatus {
     let weight_path = settings::load().zenzai.weight_path;
     match detect_model(
@@ -146,7 +181,9 @@ pub fn zenzai_model_status() -> ModelStatus {
     }
 }
 
-/// 進行中ダウンロードのキャンセルを要求する（受信ループが次チャンクで気づいて中断・掃除する）。
+/// 進行中ダウンロードのキャンセルを要求する（DL 処理の各チェックポイント — 次チャンク、
+/// read_timeout 発の send()/受信 Err、受信ループ後・rename 前の再判定 — で気づいて
+/// 中断・掃除する）。
 #[tauri::command]
 pub fn cancel_zenzai_download() {
     CANCEL_REQUESTED.store(true, Ordering::SeqCst);
@@ -155,7 +192,10 @@ pub fn cancel_zenzai_download() {
 /// Zenzai モデルを原典からダウンロードし per-user 領域へ配置、設定を更新してエンジンを再起動する。
 /// 進捗は `PROGRESS_EVENT` イベントで通知。戻り値の文字列は UI 表示用のメッセージ。
 #[tauri::command]
-pub async fn download_zenzai_model(app: tauri::AppHandle) -> Result<String, String> {
+pub async fn download_zenzai_model(
+    app: tauri::AppHandle,
+    lock: tauri::State<'_, crate::logic::SettingsLock>,
+) -> Result<String, String> {
     use futures_util::StreamExt;
     use sha2::{Digest, Sha256};
     use std::io::Write;
@@ -168,8 +208,12 @@ pub async fn download_zenzai_model(app: tauri::AppHandle) -> Result<String, Stri
     CANCEL_REQUESTED.store(false, Ordering::SeqCst);
 
     let localappdata = std::env::var_os("LOCALAPPDATA")
+        .filter(|d| !d.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| "LOCALAPPDATA が解決できません。".to_string())?;
+    // 空文字も「無い」扱い（巡2 D7 — 検出経路 user_model_path_from_env と Swift 側
+    // ZenzaiConfig.resolve の !localAppData.isEmpty と対にし、DL 先がカレントディレクトリ
+    // 基準の相対パスへ落ちて UI/エンジンの解決表が分岐するのを防ぐ）。
     let dest = user_model_path(&localappdata);
     let dir = dest
         .parent()
@@ -177,6 +221,7 @@ pub async fn download_zenzai_model(app: tauri::AppHandle) -> Result<String, Stri
     std::fs::create_dir_all(dir).map_err(|e| format!("保存先フォルダを作成できません: {e}"))?;
     // 完成前のファイルを本名で観測させない（＝中断された半端ファイルをエンジンに掴ませない）。
     let part = dir.join(format!("{MODEL_FILENAME}.part"));
+    let mut part_cleanup = PartCleanup::new(part.clone());
 
     // UA 明示（無 UA を弾く CDN があるため）。TLS は native-tls（schannel）。
     // read_timeout は「バイトが来ない状態が続いたら諦める」上限。全体 timeout にしない理由:
@@ -189,11 +234,20 @@ pub async fn download_zenzai_model(app: tauri::AppHandle) -> Result<String, Stri
         .read_timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("HTTP クライアントの初期化に失敗: {e}"))?;
-    let resp = client
-        .get(MODEL_URL)
-        .send()
-        .await
-        .map_err(|e| format!("接続に失敗しました（ネットワークを確認してください）: {e}"))?;
+    let resp = match client.get(MODEL_URL).send().await {
+        Ok(c) => c,
+        Err(e) => {
+            // 巡6(同型拡張): ヘッダ待ちのストールも read_timeout の Err として現れる —
+            // 受信ループ(巡5 M-2)と同じく、キャンセルが立っているならキャンセル扱いにする。
+            // この時点では .part 未作成なので scrub は不要。
+            if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+                return Err("キャンセルしました。".into());
+            }
+            return Err(format!(
+                "接続に失敗しました（ネットワークを確認してください）: {e}"
+            ));
+        }
+    };
     if !resp.status().is_success() {
         return Err(format!(
             "ダウンロードに失敗しました（HTTP {}）。",
@@ -212,26 +266,22 @@ pub async fn download_zenzai_model(app: tauri::AppHandle) -> Result<String, Stri
     let mut last_emit_bytes: u64 = 0;
     let mut stream = resp.bytes_stream();
 
-    // 失敗時に半端 .part を残さないための後始末クロージャ。
-    let scrub = |file: std::fs::File, part: &Path| {
-        drop(file);
-        let _ = std::fs::remove_file(part);
-    };
-
     while let Some(item) = stream.next().await {
         if CANCEL_REQUESTED.load(Ordering::SeqCst) {
-            scrub(file, &part);
             return Err("キャンセルしました。".into());
         }
         let chunk = match item {
             Ok(c) => c,
             Err(e) => {
-                scrub(file, &part);
+                // 巡5 M-2: ストール中のキャンセルは read_timeout の Err として現れる —
+                // キャンセルが立っているなら「失敗」でなくキャンセル扱いにする。
+                if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+                    return Err("キャンセルしました。".into());
+                }
                 return Err(format!("受信中にエラーが発生しました: {e}"));
             }
         };
         if let Err(e) = file.write_all(&chunk) {
-            scrub(file, &part);
             return Err(format!(
                 "書き込みに失敗しました（ディスクの空き容量を確認してください）: {e}"
             ));
@@ -246,11 +296,26 @@ pub async fn download_zenzai_model(app: tauri::AppHandle) -> Result<String, Stri
         if should_emit {
             last_emit_pct = pct;
             last_emit_bytes = received;
-            let _ = app.emit(PROGRESS_EVENT, Progress { received, total, percent: pct });
+            let _ = app.emit(
+                PROGRESS_EVENT,
+                Progress {
+                    received,
+                    total,
+                    percent: pct,
+                },
+            );
         }
     }
     let _ = file.flush();
     drop(file);
+
+    // 巡3 Q9: 受信ループ後（ハッシュ計算・エンジン停止・rename の前）にキャンセルを再判定
+    // する — 最終チャンク直後の数秒窓で押されたキャンセルが無視され、DL が成立してしまう
+    // のを防ぐ。part を削除してキャンセル扱いで抜ける。
+    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_file(&part);
+        return Err("キャンセルしました。".into());
+    }
 
     // 整合性チェック（既知 good の SHA256 と照合）。不一致は破棄して明快に失敗。
     let actual = hex::encode(hasher.finalize());
@@ -266,18 +331,62 @@ pub async fn download_zenzai_model(app: tauri::AppHandle) -> Result<String, Stri
     // （＝再DLが毎回失敗する）。graceful 停止（学習 flush 済み）で mmap を解放させてから置き換える。
     // 停止後は次の打鍵で新 settings により再 spawn され新モデルを読む。stop_engine はブロッキング
     // （最大 3s ポーリング）なので blocking スレッドへ逃がす。
-    let _ = tauri::async_runtime::spawn_blocking(crate::commands::stop_engine).await;
+    let stop_code = match tauri::async_runtime::spawn_blocking(crate::commands::stop_engine).await {
+        Ok(code) => code,
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!("エンジン停止処理を完了できませんでした: {e}"));
+        }
+    };
+    if stop_code != 0 {
+        let _ = std::fs::remove_file(&part);
+        return Err("エンジンの停止を確認できませんでした。少し待って再試行してください。".into());
+    }
+
+    // connect失敗だけで code=0 になる起動窓と、停止確認直後のTIPによる再spawnを同時に塞ぐ。
+    // Clear Learning の直接削除と同じ singleton object を新規作成できた場合だけ配置へ進み、
+    // rename + settings保存が終わるまで保持する。既存/作成失敗は旧engineとの混在を避けて中止。
+    let pipe = ipc::client::stable_pipe_name();
+    let _engine_absence_lease = match crate::commands::EngineAbsenceLease::acquire(&pipe) {
+        Ok(lease) => lease,
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!("エンジンの停止を確認できませんでした: {e}"));
+        }
+    };
+
+    // 巡4 B2 + 巡5 M-3: stop_engine 待ち（最悪約4s）の直後・rename 前にキャンセルを再判定 —
+    // この窓で押されたキャンセルが無視され DL が成立して settings まで更新されるのを防ぐ。
+    // 注: rename 後〜settings 保存の数十ms にはまだ窓が残る（保存後は DL 完了が確定するため
+    // 「完全閉塞」ではなく主要窓の閉塞と位置づける）。
+    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_file(&part);
+        return Err("キャンセルしました。".into());
+    }
+
+    // 設定を更新する前に安全な mutation loader を通す。読み取り拒否/I/O 失敗時に
+    // 既定値を保存して既存設定（特に DPAPI blob）を消さない。
+    // read-modify-save は SettingsLock で適用(apply_settings)と直列化する。
+    let _guard = lock
+        .0
+        .lock()
+        .map_err(|_| "設定ロックを取得できませんでした".to_string())?;
+    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        return Err("キャンセルしました。".into());
+    }
+    let mut s = settings::load_for_mutation()
+        .map_err(crate::commands::settings_mutation_error_for_download)?;
+    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        return Err("キャンセルしました。".into());
+    }
+    s.zenzai.weight_path = dest.to_string_lossy().to_string();
+    s.zenzai.enabled = true;
 
     // 本名へ原子的に置き換え（同一ボリューム内 rename）。エンジン停止済みなので dest はロックされない。
     if let Err(e) = std::fs::rename(&part, &dest) {
-        let _ = std::fs::remove_file(&part);
         return Err(format!("モデルの配置に失敗しました: {e}"));
     }
-
-    // 設定を更新: weight_path を指し、Zenzai を有効化して永続化。次の打鍵の respawn がこれを読む。
-    let mut s = settings::load();
-    s.zenzai.weight_path = dest.to_string_lossy().to_string();
-    s.zenzai.enabled = true;
+    part_cleanup.disarm();
     settings::save(&s).map_err(|e| format!("設定の保存に失敗しました: {e}"))?;
 
     Ok("モデルを導入し、Zenzai を有効化しました（次の入力から反映されます）。".into())
@@ -290,7 +399,10 @@ mod tests {
     #[test]
     fn sha_compare_is_case_insensitive() {
         assert!(sha256_hex_matches("ABCDef", "abcdEF"));
-        assert!(sha256_hex_matches(MODEL_SHA256, &MODEL_SHA256.to_uppercase()));
+        assert!(sha256_hex_matches(
+            MODEL_SHA256,
+            &MODEL_SHA256.to_uppercase()
+        ));
         assert!(!sha256_hex_matches("abcd", "abce"));
     }
 
@@ -340,5 +452,23 @@ mod tests {
         // weight_path が設定されていても実在しなければスキップして per-user へ落ちる。
         let got = detect_model(wp, user, exe, |p| p == user);
         assert_eq!(got.unwrap().1, "user");
+    }
+
+    #[test]
+    fn part_cleanup_removes_uncommitted_part_but_not_committed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("model.part");
+        std::fs::write(&part, b"partial").unwrap();
+        {
+            let _cleanup = PartCleanup::new(part.clone());
+        }
+        assert!(!part.exists());
+
+        std::fs::write(&part, b"complete").unwrap();
+        {
+            let mut cleanup = PartCleanup::new(part.clone());
+            cleanup.disarm();
+        }
+        assert_eq!(std::fs::read(&part).unwrap(), b"complete");
     }
 }

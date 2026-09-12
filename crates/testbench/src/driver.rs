@@ -1,8 +1,10 @@
 //! シナリオ（VK 列）を TsfHost に流し、各ステップで store と ev= ログを観測する。
 
-use std::time::Instant;
 use crate::scenarios::{typed, Vk};
 use crate::tsf_host::TsfHost;
+use ipc::client::{stable_pipe_name, EngineClient};
+use ipc::protocol::{Request, Response};
+use std::time::{Duration, Instant};
 
 /// 1 シナリオの観測結果。
 pub struct StepObs {
@@ -20,11 +22,22 @@ pub struct StepObs {
 pub fn run_keys(host: &TsfHost, keys: &[Vk]) -> Vec<StepObs> {
     let mut obs = Vec::new();
     for k in keys {
+        if k.0 == crate::scenarios::WAIT_CONVERSION.0 {
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < deadline {
+                crate::tsf_host::pump();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            continue;
+        }
         let t0 = Instant::now();
         let eaten = host.feed_key(k.0);
         let elapsed_ms = t0.elapsed().as_millis();
         obs.push(StepObs {
-            label: k.1, vk: k.0, eaten, elapsed_ms,
+            label: k.1,
+            vk: k.0,
+            eaten,
+            elapsed_ms,
             committed: host.store.committed(),
             preedit: host.store.preedit(),
             full: host.store.full(),
@@ -49,14 +62,31 @@ pub struct ScenarioResult {
 pub fn run_scenario(host: &TsfHost, sc: &Scenario) -> ScenarioResult {
     // 測定打鍵の前にエンジン＋合成を温める（初打鍵合成の即終了による孤児文字を吸収する）。
     // item1 は打鍵が無い（activation のみ）ので不要。warm_up の残骸は直後の reset で消える。
-    if !sc.keys.is_empty() { host.warm_up(); }
+    if !sc.keys.is_empty() {
+        host.warm_up();
+    }
+
+    // item34–38 は「直接入力からの ephemeral/reconvert」が前提。compartment 直書きでは
+    // TIP の direct_mode_owned/langbar Cell と食い違うため、warm-up を native で済ませてから
+    // TIP 自身のトグル経路で direct へ入る。遷移失敗は前提崩壊として fail-closed にする。
+    if (34..=38).contains(&sc.item) && !host.enter_direct_mode() {
+        return ScenarioResult {
+            item: sc.item,
+            name: sc.name,
+            passed: false,
+            detail: "enter_direct_mode 失敗（TIP のモードトグルで direct へ遷移できない）".into(),
+            max_elapsed_ms: 0,
+        };
+    }
     host.store.reset();
     let base = read_events(std::process::id()).len(); // 実行前の ev 数（warm_up 後に取る）
     let obs = run_keys(host, &sc.keys);
     // SP3: ライブ変換は毎打鍵ではなくデバウンスタイマ（UI スレッド, ~30ms）で行われる。
     // ヘッドレスでは feed_key が即 pump するためタイマが発火しない。打ち終えてから
     // タイマを発火させ、preedit を最終形（漢字かな交じり）へ確定させてから観測する。
-    if !sc.keys.is_empty() { host.settle_debounce(); }
+    if !sc.keys.is_empty() {
+        host.settle_debounce();
+    }
     // 毎キー計測を stderr へ（verify-console.log に残る）。確定後キャレット位置や
     // 合成範囲と buffer のズレ（余分文字の発生箇所）を後追いするための診断ログ。
     for o in &obs {
@@ -69,7 +99,11 @@ pub fn run_scenario(host: &TsfHost, sc: &Scenario) -> ScenarioResult {
     if !sc.keys.is_empty() {
         eprintln!(
             "[trace] item{}  <settle> full={:?} preedit={:?} committed={:?} sel={:?}",
-            sc.item, host.store.full(), host.store.preedit(), host.store.committed(), host.store.selection()
+            sc.item,
+            host.store.full(),
+            host.store.preedit(),
+            host.store.committed(),
+            host.store.selection()
         );
     }
     let evs_all = read_events(std::process::id());
@@ -88,115 +122,171 @@ pub fn run_scenario(host: &TsfHost, sc: &Scenario) -> ScenarioResult {
         Ok(()) => (true, "ok".to_string()),
         Err(e) => (false, e),
     };
-    ScenarioResult { item: sc.item, name: sc.name, passed, detail, max_elapsed_ms }
+    ScenarioResult {
+        item: sc.item,
+        name: sc.name,
+        passed,
+        detail,
+        max_elapsed_ms,
+    }
 }
 
-pub struct Item8Result { pub passed: bool, pub detail: String }
+pub struct Item8Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
-/// nihongo を打ってエンジンを起こし → engine_spawn pid を kill → さらに打鍵 → 確定。
-/// 期待: 各 key が閾値内に返る AND 最終 commit が source=reading（劣化）。
+/// 入力でエンジンを起こし、接続先パイプのserver PIDを停止してから残りを入力・確定する。
+/// 期待: 生存中のengineを停止でき、各keyが閾値内に返り、全読みまたは再変換結果を確定する。
 pub fn run_item8(host: &TsfHost, threshold_ms: u128) -> Item8Result {
+    host.warm_up();
+    if host.store.composing() || !host.normalize_native_mode() {
+        return Item8Result { passed: false, detail: "engine-kill setup: composition or native mode not ready".into() };
+    }
     host.store.reset();
     let pid = std::process::id();
+    let event_base = read_events(pid).len();
 
     // 1) 最初の打鍵でエンジンを起こす。
-    let _ = run_keys(host, &crate::scenarios::typed("ni"));
-    // 2) engine_spawn pid を取得して kill。
-    let evs = read_events(pid);
-    let engine_pid = evs.iter().rev().find_map(|e| match e {
-        Ev::EngineSpawn { pid, ok: true } => Some(*pid), _ => None,
-    });
-    if let Some(epid) = engine_pid {
-        kill_pid(epid);
-    } else {
-        return Item8Result { passed: false, detail: "ev=engine_spawn pid= が見つからない".into() };
+    let initial = run_keys(host, &crate::scenarios::typed("ni"));
+    let accepted = initial.iter().all(|step| step.eaten);
+    if !accepted || !host.store.composing() || host.store.preedit() != "に"
+        || host.store.full() != "に" || !host.store.committed().is_empty() {
+        return Item8Result { passed: false, detail: format!(
+            "engine-kill setup: eaten={accepted} composing={} preedit={:?} committed={:?} full={:?}",
+            host.store.composing(), host.store.preedit(), host.store.committed(), host.store.full()) };
     }
+    // A historical spawn can already be dead, or the TIP may reuse an existing host.
+    let connected = match EngineClient::connect_to(&stable_pipe_name(), Duration::from_secs(3)) {
+        Ok(client) => client,
+        Err(error) => return Item8Result { passed: false, detail: format!("engine connection before termination: {error}") },
+    };
+    let engine_pid = match connected.server_process_id() {
+        Ok(pid) => pid,
+        Err(error) => return Item8Result { passed: false, detail: format!("connected engine PID: {error}") },
+    };
+    if let Err(error) = kill_pid(engine_pid) {
+        return Item8Result { passed: false, detail: format!("engine termination not verified: {error}") };
+    }
+    drop(connected);
 
     // 3) kill 後も継続打鍵 → 変換 → 確定。各 key の経過時間を測る。
     let mut rest = crate::scenarios::typed("hongo");
     rest.push(crate::scenarios::SPACE);
     rest.push(crate::scenarios::ENTER);
+    rest.push(crate::scenarios::WAIT_CONVERSION);
     let obs = run_keys(host, &rest);
     let max_ms = obs.iter().map(|o| o.elapsed_ms).max().unwrap_or(0);
 
     // 4) 判定。
-    let evs2 = read_events(pid);
-    let last_commit_reading = evs2.iter().rev().find_map(|e| match e {
-        Ev::Commit { source, .. } => Some(source == "reading"), _ => None,
-    }).unwrap_or(false);
+    let evs2: Vec<_> = read_events(pid).into_iter().skip(event_base).collect();
+    let last_commit = evs2
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            Ev::Commit { text, source } => Some((text.as_str(), source.as_str())),
+            _ => None,
+        });
     let responsive = max_ms < threshold_ms;
+    let keys_eaten = obs.iter().all(|step| step.eaten);
     let committed = host.store.committed();
-    let passed = responsive && (last_commit_reading || !committed.is_empty());
+    let full = host.store.full();
+    let preedit = host.store.preedit();
+    let passed = responsive && keys_eaten && matches!(committed.as_str(), "にほんご" | "日本語")
+        && full == committed && preedit.is_empty()
+        && last_commit.is_some_and(|(text, _)| text == committed);
     Item8Result {
         passed,
-        detail: format!("max_elapsed={max_ms}ms (<{threshold_ms}?{responsive}) commit_reading={last_commit_reading} committed={committed:?}"),
+        detail: format!("terminated_engine={engine_pid} keys_eaten={keys_eaten} max_elapsed={max_ms}ms (<{threshold_ms}?{responsive}) commit={last_commit:?} committed={committed:?} full={full:?} preedit={preedit:?}"),
     }
 }
 
-pub struct Item12Result { pub passed: bool, pub detail: String }
-
-/// item12: Shift+Tab→外部LLM変換のスレッド配線（worker→ポーリングタイマ→preedit 反映）を
-/// echo モードで headless 検証する（リスク R2）。
-///
-/// 流れ: "nihongo" を打って合成（ライブ変換 日本語）→ **Shift+Tab** で start_llm_convert
-/// （Tab 割当変更＝Tab 単体は修正変換 TypoConvert に割当済みのため、外部LLM変換は Shift+Tab へ
-/// 移動した。EngineClient を別スレッドへ move し LlmConvert を投げ、preedit を「🌐変換中…」にして
-/// 50ms ポーリングタイマを arm）→ settle_llm でワーカ完了＋WM_TIMER 発火を待つ→
-/// preedit が echo マーカ "LLM:"+reading（=LLM:にほんご）へ全置換される。
-///
-/// 自己証明: TIP ログに ev=llm_request（要求が出た）と ev=llm_applied（UI スレッドが
-/// 結果を反映した）が出ていることを確認し、Shift+Tab が素通しされただけの偽 PASS を防ぐ。
-/// echo モードは main で NOSPACEKEY_LLM_ECHO=1 を設定済み（spawn される engine が継承）。
+pub struct Item12Result {
+    pub passed: bool,
+    pub detail: String,
+}
+/// LLM echo through real TSF: Editing, converted closed window, Ready window,
+/// and Initial snapshot pending. Require an exact correction and exact Enter
+/// commit, with no old candidate/status window or stale snapshot overwrite.
+/// NOSPACEKEY_LLM_ECHO=1 is set by the testbench entry point.
 pub fn run_item12(host: &TsfHost) -> Item12Result {
     host.warm_up();
-    host.store.reset();
     let pid = std::process::id();
-    let base = read_events(pid).len();
-
-    // 1) "nihongo" を打ってライブ変換まで進める（合成中・preedit=日本語）。
-    let _ = run_keys(host, &crate::scenarios::typed("nihongo"));
-    host.settle_debounce();
-    let composing_before = host.store.composing();
-    let preedit_live = host.store.preedit();
-
-    // 2) Shift+Tab → 外部LLM変換起動。eaten を確認（idle ではなく合成中なので食うはず）。
-    // Tab 単体は修正変換(TypoConvert)に割当変更済みのため Shift 修飾で注入する。
-    let tab_eaten = host.feed_key_with_shift(crate::scenarios::TAB.0);
-
-    // 3) ワーカ IPC ＋ ポーリングタイマ（50ms）を落ち着かせる。
-    host.settle_llm();
-    let preedit_after = host.store.preedit();
-
-    // 4) ev 自己証明: llm_request と llm_applied が出ているか。
-    let evs: Vec<Ev> = read_events(pid).into_iter().skip(base).collect();
-    let has_request = evs.iter().any(|e| matches!(e, Ev::LlmRequest { .. }));
-    let has_applied = evs.iter().any(|e| matches!(e, Ev::LlmApplied { .. }));
-
-    let detail = format!(
-        "composing_before={composing_before} live={preedit_live:?} tab_eaten={tab_eaten} \
-         after={preedit_after:?} ev_request={has_request} ev_applied={has_applied}"
-    );
-
-    // 判定: 合成中に Tab を食い、要求が出て（ev_request）、UI スレッドが結果を反映し（ev_applied）、
-    // preedit が echo マーカ "LLM:" 始まりへ置換されていること。
-    let passed = composing_before
-        && tab_eaten
-        && has_request
-        && has_applied
-        && preedit_after.starts_with("LLM:");
-    Item12Result { passed, detail }
+    let mut passed = true;
+    let mut details = Vec::new();
+    for spaces in 0..=3 {
+        // 3 means first Space immediately followed by LLM, before snapshot delivery.
+        let converting = spaces > 0 && spaces < 3;
+        host.store.reset();
+        let base = read_events(pid).len();
+        let samples = run_keys(host, &crate::scenarios::typed("nihongo"));
+        host.settle_debounce();
+        let mut all_eaten = samples.iter().all(|sample| sample.eaten);
+        let conversion_base = read_events(pid).len();
+        if converting {
+            all_eaten &= host.feed_key(crate::scenarios::SPACE.0);
+            run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
+        }
+        let converting_ready = !converting || read_events(pid).iter().skip(conversion_base)
+            .any(|event| matches!(event, Ev::ClausePresented { ready: false, .. }));
+        let mut candidates_ready = true;
+        let mut candidate_attempts = 0;
+        if spaces == 2 {
+            // A calculation may expire under GPU load. This case tests leaving an
+            // actual Ready window, so allow bounded user retries during setup only.
+            candidates_ready = false;
+            for _ in 0..3 {
+                candidate_attempts += 1;
+                all_eaten &= host.feed_key(crate::scenarios::SPACE.0);
+                run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
+                candidates_ready = host.candidate_strings().len() >= 2;
+                if candidates_ready { break; }
+            }
+        }
+        let composing_before = host.store.composing();
+        let supersede_base = tip_log_count("ev=llm_supersede_pending");
+        if spaces == 3 { all_eaten &= host.feed_key_no_pump(crate::scenarios::SPACE.0); }
+        let tab_eaten = host.feed_key_with_shift(crate::scenarios::TAB.0);
+        let pending_superseded = spaces != 3 || tip_log_count("ev=llm_supersede_pending") == supersede_base + 1;
+        let window_closed_at_start = host.candidate_strings().is_empty();
+        host.settle_llm();
+        run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
+        let preedit_after = host.store.preedit();
+        let corrected = host.store.composing()
+            && preedit_after == "LLM:にほんご"
+            && host.candidate_strings().is_empty()
+            && host.store.committed().is_empty()
+            && host.store.full() == preedit_after;
+        let evs: Vec<Ev> = read_events(pid).into_iter().skip(base).collect();
+        let has_request = evs.iter().any(|e| matches!(e, Ev::LlmRequest { .. }));
+        let has_applied = evs.iter().any(|e| matches!(e, Ev::LlmApplied { .. }));
+        let enter_eaten = host.feed_key(crate::scenarios::ENTER.0);
+        run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
+        let committed = host.store.committed();
+        let commit_ok = committed == "LLM:にほんご" && host.store.full() == committed
+            && host.store.preedit().is_empty() && !host.store.composing();
+        passed &= all_eaten && pending_superseded && candidates_ready && window_closed_at_start && converting_ready && composing_before && tab_eaten && has_request && has_applied
+            && corrected && enter_eaten && commit_ok;
+        details.push(format!("spaces={spaces} candidate_attempts={candidate_attempts} pending_superseded={pending_superseded} candidates_ready={candidates_ready} window_closed_at_start={window_closed_at_start} converting={converting} converting_ready={converting_ready} all_eaten={all_eaten} composing_before={composing_before} tab_eaten={tab_eaten} after={preedit_after:?} ev_request={has_request} ev_applied={has_applied} enter_eaten={enter_eaten} committed={committed:?} commit_ok={commit_ok}"));
+        if !commit_ok { break; }
+    }
+    Item12Result { passed, detail: details.join("; ") }
 }
 
-pub struct Item13Result { pub passed: bool, pub detail: String }
+pub struct Item13Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
 /// item13 経路 C のイベント位置照合（純ロジック、TSF 不要でテスト可能）。
 ///
-/// 「最初の reconvert_shown(latin) より **後ろ** に reconvert_cancel が出ているか」を返す。
+/// 「対象文字数が一致する最初の reconvert_shown より **後ろ** に reconvert_cancel が出ているか」を返す。
 /// トグルが reconvert を畳んだ証跡を「素通しの偶発キャンセル」と区別するための核。
-/// latin が見つからない／キャンセルが先に出ている／どちらも無い場合は false。
-fn cancel_followed_shown(evs: &[Ev], latin: &str) -> bool {
+/// shown が見つからない／キャンセルが先に出ている／どちらも無い場合は false。
+fn cancel_followed_shown(evs: &[Ev], expected_chars: usize) -> bool {
     let shown = evs.iter().position(|e| {
-        matches!(e, Ev::ReconvertShown { latin: l, .. } if l == latin)
+        matches!(e, Ev::ReconvertShown { kind, chars, .. }
+            if kind == "latin" && *chars == expected_chars)
     });
     let cancel = evs.iter().rposition(|e| matches!(e, Ev::ReconvertCancel));
     matches!((shown, cancel), (Some(s), Some(c)) if c > s)
@@ -209,11 +299,11 @@ fn cancel_followed_shown(evs: &[Ev], latin: &str) -> bool {
 ///
 /// ```text
 /// 1) 文書へ既存確定テキスト "React nihongo" をシード（キャレット末尾）。
-/// 2) conversion-mode を半角英数(直接)へ（set_direct_mode）→ is_direct_mode()==true。
+/// 2) conversion-mode を半角英数(直接)へ（enter_direct_mode）→ is_direct_mode()==true。
 /// 3) 変換キー（VK_CONVERT 0x1C）を注入。PreserveKey(0x1C) は OS に拒否され preserved key に
 ///    ならない（実バグ）ため、msctf は通常キーとして OnTestKeyDown/OnKeyDown へ配送 →
 ///    VK_CONVERT arm → start_reconvert。ReconvertStart が末尾ラテン run "nihongo" を range 読み戻しし
-///    （ev=reconvert_shown latin=nihongo）、その range で非空 StartComposition（store の
+///    （ev=reconvert_shown chars=7）、その range で非空 StartComposition（store の
 ///    OnStartComposition → composing=true）、g1 リプレイで候補（日本語…）を preedit へ。
 /// 4-A) Esc → cancel_reconvert → RestoreText で元ラテンを書き戻し composition を閉じる
 ///      → 文書が "React nihongo" へ復元（ev=reconvert_cancel）。
@@ -225,7 +315,7 @@ fn cancel_followed_shown(evs: &[Ev], latin: &str) -> bool {
 ///
 /// 自己証明（偽 PASS 防止）:
 ///   - preserved-key が食われた（reconvert_eaten=true）こと。
-///   - ev=reconvert_shown が出て latin=nihongo（range 読み戻しが効いた）こと。
+///   - ev=reconvert_shown が出て chars=7（range 読み戻しが効いた）こと。
 ///   - 再変換中に composing=true（非空 StartComposition が成立した）こと。
 ///
 /// これらが無いと「0x1C が素通ししただけで文書はもとから React nihongo のまま」でも
@@ -244,11 +334,11 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
     host.store.reset();
 
     // ---- 前提セットアップ: モードを直接入力へ。失敗なら item13 は不能（誤 PASS を出さない）。
-    let direct_set = host.set_direct_mode();
+    let direct_set = host.enter_direct_mode();
     if !direct_set {
         return Item13Result {
             passed: false,
-            detail: "set_direct_mode 失敗（ITfCompartmentMgr 経由で conversion-mode を設定できない）".into(),
+            detail: "enter_direct_mode 失敗（TIP のモードトグルを確認できない）".into(),
         };
     }
 
@@ -265,7 +355,7 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
 
     let evs_a: Vec<Ev> = read_events(pid).into_iter().skip(base_a).collect();
     let shown = evs_a.iter().find_map(|e| match e {
-        Ev::ReconvertShown { n, latin, .. } => Some((*n, latin.clone())),
+        Ev::ReconvertShown { n, chars, .. } => Some((*n, *chars)),
         _ => None,
     });
 
@@ -284,13 +374,13 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
     host.store.seed_committed("React nihongo");
     let base_b = read_events(pid).len();
     let _ = host.feed_key(0x1C); // 再変換
-    // 実機フレーク防御: 別アプリの TIP 活性化（pid 59912 等）で前面が奪われ、再変換合成が
-    // pump 中に msctf へ terminate されることがある。合成が消えていたらフォーカスを取り戻し
-    // direct を再確認して再変換し直す（warm_up の生存パターンと同思想。VM では合成が生き残る
-    // ので skip される）。さもないと続く Enter が showing=false で食われず candidate 確定が出ない。
+                                 // 実機フレーク防御: 別アプリの TIP 活性化（pid 59912 等）で前面が奪われ、再変換合成が
+                                 // pump 中に msctf へ terminate されることがある。合成が消えていたらフォーカスを取り戻し
+                                 // direct を再確認して再変換し直す（warm_up の生存パターンと同思想。VM では合成が生き残る
+                                 // ので skip される）。さもないと続く Enter が showing=false で食われず candidate 確定が出ない。
     if !host.store.composing() {
         host.reclaim_focus();
-        host.set_direct_mode();
+        host.enter_direct_mode();
         host.store.reset();
         host.store.seed_committed("React nihongo");
         let _ = host.feed_key(0x1C);
@@ -314,16 +404,16 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
     // 先に cancel_reconvert（ev=reconvert_cancel ＋ RestoreText 復元 ＋ ラッチクリア）する。
     //
     // 自己証明（C1 修正を revert すると落ちる）:
-    //   - C-2: トグル前に必ず reconvert_shown(latin=nihongo) が出る（候補が確実に上がっている）。
+    //   - C-2: トグル前に必ず reconvert_shown(chars=7) が出る（候補が確実に上がっている）。
     //   - C-3a: トグル後に reconvert_cancel が「その reconvert_shown より後ろの位置」で出る
     //           （cancel_reconvert がトグルに連動して呼ばれた＝ラッチが畳まれた証跡）。
     //           ＋文書が "React nihongo" へ復元（RestoreText が走った＝composition も閉じた）。
-    //   - C-4: 再度（direct へ戻して）再変換すると **2 本目の** reconvert_shown(latin=nihongo)
+    //   - C-4: 再度（direct へ戻して）再変換すると **2 本目の** reconvert_shown(chars=7)
     //          が出る。バグ版はラッチが true のまま残り再入ガードで return するので 2 本目は
     //          絶対に出ない＝この存在チェックが偽 PASS を許さない。
     host.store.reset();
     host.reclaim_focus(); // 実機フレーク防御: 経路 B で別アプリ活性化に奪われた配送/フォーカスを取り戻す。
-    let direct_c = host.set_direct_mode(); // 経路 B の確定でモードは不変のはずだが念のため再確認。
+    let direct_c = host.enter_direct_mode(); // 経路 B の確定でモードは不変のはずだが念のため再確認。
     host.store.seed_committed("React nihongo");
     let base_c = read_events(pid).len();
 
@@ -332,9 +422,9 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
     let composing_c1 = host.store.composing();
     let evs_c1: Vec<Ev> = read_events(pid).into_iter().skip(base_c).collect();
     // この経路で最初に出た reconvert_shown の位置（base_c 起点の相対 index）。
-    let shown1_pos = evs_c1.iter().position(|e| {
-        matches!(e, Ev::ReconvertShown { latin, .. } if latin == "nihongo")
-    });
+    let shown1_pos = evs_c1
+        .iter()
+        .position(|e| matches!(e, Ev::ReconvertShown { chars: 7, .. }));
 
     // C-2) 候補表示中にモードトグル（VK_NONCONVERT 0x1D）。C1 修正なら cancel_reconvert→toggle。
     let toggle_eaten_c = host.feed_key(0x1D); // VK_NONCONVERT
@@ -343,26 +433,28 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
     let evs_c2: Vec<Ev> = read_events(pid).into_iter().skip(base_c).collect();
     // トグルに連動した reconvert_cancel が、最初の reconvert_shown より後ろに出ているか
     //（純ロジック cancel_followed_shown でテスト可能。cancel_pos は診断表示用に別途取る）。
-    let cancel_pos = evs_c2.iter().rposition(|e| matches!(e, Ev::ReconvertCancel));
-    let cancel_after_shown = cancel_followed_shown(&evs_c2, "nihongo");
+    let cancel_pos = evs_c2
+        .iter()
+        .rposition(|e| matches!(e, Ev::ReconvertCancel));
+    let cancel_after_shown = cancel_followed_shown(&evs_c2, 7);
 
     // C-3) 機能がブリックしていないことの証明: direct へ戻して再シード → もう一度再変換 →
-    //      2 本目の reconvert_shown(latin=nihongo) が出る（ラッチが残っていたら出ない）。
+    //      2 本目の reconvert_shown(chars=7) が出る（ラッチが残っていたら出ない）。
     host.reclaim_focus(); // 実機フレーク防御: 奪われた配送/フォーカスを取り戻してから再変換する。
-    let direct_c2 = host.set_direct_mode(); // トグルで native へ移ったので direct へ戻す。
+    let direct_c2 = host.enter_direct_mode(); // トグルで native へ移ったので direct へ戻す。
     host.store.seed_committed("React nihongo");
     let mid_c = read_events(pid).len(); // 2 本目の reconvert_shown 計数のための再カウント基点。
     let recon_eaten_c2 = host.feed_key(0x1C); // 2 回目の再変換
     let composing_c2 = host.store.composing();
     let evs_c3: Vec<Ev> = read_events(pid).into_iter().skip(mid_c).collect();
-    let second_shown = evs_c3.iter().any(|e| {
-        matches!(e, Ev::ReconvertShown { latin, .. } if latin == "nihongo")
-    });
+    let second_shown = evs_c3
+        .iter()
+        .any(|e| matches!(e, Ev::ReconvertShown { chars: 7, .. }));
     // 後片付け（2 本目の候補を閉じて次 item / Drop へ綺麗な状態で渡す）。
     let _ = host.feed_key(0x1B); // Esc
-    // conversion-mode compartment はプロセス共有で direct のまま残るので、後続 scenario が
-    // ネイティブ前提でも壊れないよう native へ戻す（item14 側でも明示復帰するが二重の保険）。
-    let _ = host.set_native_mode();
+                                 // conversion-mode compartment はプロセス共有で direct のまま残るので、後続 scenario が
+                                 // ネイティブ前提でも壊れないよう native へ戻す（item14 側でも明示復帰するが二重の保険）。
+    let _ = host.normalize_native_mode();
 
     // ---- 判定 ----
     let detail = format!(
@@ -375,9 +467,9 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
          recon_eaten_c2={recon_eaten_c2} composing_c2={composing_c2} second_shown={second_shown}"
     );
 
-    // 経路 A 必須: preserved-key 発火（食われ）＋ reconvert_shown（latin=nihongo）＋ 合成成立
+    // 経路 A 必須: preserved-key 発火（食われ）＋ reconvert_shown（chars=7）＋ 合成成立
     //              ＋ Esc 復元（文書が "React nihongo" へ戻る）＋ ev=reconvert_cancel。
-    let shown_ok = matches!(&shown, Some((n, latin)) if *n >= 1 && latin == "nihongo");
+    let shown_ok = matches!(&shown, Some((n, chars)) if *n >= 1 && *chars == 7);
     // 復元後キャレットが復元文字列の末尾にあること（"nihongo" は文書末なので文書末 == 末尾）。
     // RestoreText が末尾へ SetSelection しないと先頭（合成開始位置）へ戻り、この条件が落ちる。
     let restored_end = restored.encode_utf16().count() as i32;
@@ -395,7 +487,7 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
         && committed_b != "React nihongo";
 
     // 経路 C 必須（C1 修正のロック）:
-    //   - 1 本目の reconvert_shown(latin=nihongo) が出た（トグル前に候補が確実に上がっていた）。
+    //   - 1 本目の reconvert_shown(chars=7) が出た（トグル前に候補が確実に上がっていた）。
     //   - トグル後に reconvert_cancel が「その shown より後ろ」で出た（=トグルが畳んだ）。
     //   - 文書が "React nihongo" へ復元され、トグル後は合成中でない（composition が閉じた）。
     //   - 2 本目の reconvert_shown が出た（ラッチが残らず再変換が再び発火＝ブリックしていない）。
@@ -412,10 +504,16 @@ pub fn run_item13(host: &TsfHost) -> Item13Result {
         && recon_eaten_c2
         && second_shown;
 
-    Item13Result { passed: path_a_ok && path_b_ok && path_c_ok, detail }
+    Item13Result {
+        passed: path_a_ok && path_b_ok && path_c_ok,
+        detail,
+    }
 }
 
-pub struct Item17Result { pub passed: bool, pub detail: String }
+pub struct Item17Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
 /// item17: SP5 step-6 — 非空かな選択の再変換（半角英数モード）。
 /// 正常系: 確定済み "にほんご" を選択 → 変換キー(0x1C) → kind=surface の reconvert_shown が出る
@@ -434,11 +532,11 @@ pub fn run_item17(host: &TsfHost) -> Item17Result {
 
     // ---- 前提セットアップ: モードを直接入力へ。失敗なら item17 は不能（誤 PASS を出さない）。
     host.store.reset();
-    let direct_set = host.set_direct_mode();
+    let direct_set = host.enter_direct_mode();
     if !direct_set {
         return Item17Result {
             passed: false,
-            detail: "set_direct_mode 失敗（ITfCompartmentMgr 経由で conversion-mode を設定できない）".into(),
+            detail: "enter_direct_mode 失敗（TIP のモードトグルを確認できない）".into(),
         };
     }
 
@@ -450,7 +548,9 @@ pub fn run_item17(host: &TsfHost) -> Item17Result {
     let base = read_events(pid).len();
     host.feed_key(0x1C); // VK_CONVERT
     let evs = read_events(pid);
-    let surface_shown = evs[base..].iter().any(|e| matches!(e, Ev::ReconvertShown { kind, latin, .. } if kind == "surface" && latin == "にほんご"));
+    let surface_shown = evs[base..]
+        .iter()
+        .any(|e| matches!(e, Ev::ReconvertShown { kind, chars: 4, .. } if kind == "surface"));
 
     // Esc → 復元
     host.feed_key(0x1B); // VK_ESCAPE
@@ -462,14 +562,18 @@ pub fn run_item17(host: &TsfHost) -> Item17Result {
     host.store.reset();
     host.store.seed_committed("日本語");
     // 経路 B の後はモードが変わっている可能性があるので direct を再確認（run_item13 経路 C と同じ）。
-    host.set_direct_mode();
+    host.enter_direct_mode();
     let kanji_len = "日本語".encode_utf16().count() as i32; // = 3
     host.store.set_selection(0, kanji_len);
     let base2 = read_events(pid).len();
     host.feed_key(0x1C);
     let evs = read_events(pid);
-    let skipped = evs[base2..].iter().any(|e| matches!(e, Ev::ReconvertSkip { reason } if reason == "non_kana"));
-    let no_shown = !evs[base2..].iter().any(|e| matches!(e, Ev::ReconvertShown { .. }));
+    let skipped = evs[base2..]
+        .iter()
+        .any(|e| matches!(e, Ev::ReconvertSkip { reason } if reason == "non_kana"));
+    let no_shown = !evs[base2..]
+        .iter()
+        .any(|e| matches!(e, Ev::ReconvertShown { .. }));
     let intact = host.store.full() == "日本語";
 
     let passed = surface_shown && restored && skipped && no_shown && intact;
@@ -479,33 +583,15 @@ pub fn run_item17(host: &TsfHost) -> Item17Result {
     Item17Result { passed, detail }
 }
 
-pub struct Item14Result { pub passed: bool, pub detail: String }
+pub struct Item14Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
-/// item14 (SP6a): requires regsvr32-registered DLL (VM/admin). Asserts UIElement advertise +
-/// candidate data + Behavior finalize.
-///
-/// SP6a は候補リストを TSF UI Element 化した。TIP の CandidatePresenter は候補表示時に
-/// ITfUIElementMgr::BeginUIElement で `ITfCandidateListUIElementBehavior`（ITfUIElement 派生）を
-/// ホストへ提示し、ホストが返す *pbShow で「自前描画(TRUE)」「データ公開のみ(FALSE=イマーシブ)」を
-/// 分岐する。本 item は testbench の ITfUIElementSink でこの advertise を観測し、GetUIElement で
-/// 候補データ（ITfCandidateListUIElement::GetCount/GetString/GetSelection）を実 msctf 経由で
-/// 読み戻し、さらに ITfCandidateListUIElementBehavior::SetSelection/Finalize でホスト発の
-/// 選択＋確定（マウス/タッチ相当）を模擬して、既存 commit 経路に流れることを確認する。
-///
-/// CRITICAL: 非管理者シェルでは TIP DLL を regsvr32 登録できないため、本 item は item1–13 同様
-/// この場では RUN できない（VM/admin 必須）。下のアサートは型検査・配線検証のために書かれ、
-/// 実走は VM レビューに委ねる（verify-sp6a.ps1 参照）。
-///
-/// 流れ（item3/5 の変換駆動を再利用: "nihongo" + Space で候補を出す）:
-///   0) pbShow=FALSE を設定（イマーシブ模擬。BeginUIElement で sink がこの値を書き戻す）。
-///   1) warm_up → reset → "nihongo" を打って Space で候補確定窓を出す（CandidatePresenter::show
-///      → BeginUIElement 発火 → sink.begun に id が入る）。
-///   2) アサート(a): ui_log().begun が非空（advertise が起きた）。
-///   3) アサート(b): candidate_strings() が非空かつ "日本語" を含む（item3 が候補に "日本語" を
-///      要求するのと同じ照合。GetUIElement→GetCount/GetString が実 element からデータを返す）。
-///   4) アサート(c): candidate_selection()==0（初期選択は先頭）。
-///   5) Behavior: behavior_select_and_finalize(1)（2 番目を選び Finalize）→ pump/settle →
-///      store が 2 番目の候補を確定したこと（committed が候補[1] と一致）。
+/// item14: real TSF UIElement advertisement and host-driven selection/finalization.
+/// First Space converts with the window closed; the next Space opens candidates.
+/// pbShow=FALSE exercises host-rendered UI. Select a different surface through
+/// Behavior and require that exact committed document with no remaining preedit.
 pub fn run_item14(host: &TsfHost) -> Item14Result {
     // 0) イマーシブ模擬: BeginUIElement で *pbShow=FALSE を書き戻させる（ホストが描く宣言）。
     //    advert 自体は pbShow に依らず発火するので、begun の観測には必須ではないが、
@@ -515,128 +601,128 @@ pub fn run_item14(host: &TsfHost) -> Item14Result {
     // 0b) item13 が conversion-mode compartment を直接入力(0)のまま残す（プロセス共有なので host を
     //     作り直しても残る）。item14 はネイティブ前提なので明示的に戻す。さもないと TIP がキーを
     //     食わず候補が出ず begun=[] で FAIL する。
-    let _ = host.set_native_mode();
+    if !host.normalize_native_mode() {
+        return Item14Result { passed: false, detail: "native mode setup failed".into() };
+    }
 
-    // 1) 変換を駆動して候補を出す（item3/5 と同じ "nihongo" + Space）。
+    // Initial Space converts with the window closed; the next Space opens candidates.
     host.warm_up();
     host.store.reset();
+    let begun_base = host.ui_log().begun.borrow().len();
     let mut keys = crate::scenarios::typed("nihongo");
     keys.push(crate::scenarios::SPACE);
-    let _ = run_keys(host, &keys);
-    host.settle_debounce();
+    keys.push(crate::scenarios::WAIT_CONVERSION);
+    keys.push(crate::scenarios::SPACE);
+    keys.push(crate::scenarios::WAIT_CONVERSION);
+    let keys_eaten = run_keys(host, &keys).iter().all(|key| key.eaten);
 
     // 2) advertise が起きたか（BeginUIElement → sink.begun）。
-    let begun = host.ui_log().begun.borrow().clone();
+    let begun: Vec<_> = host.ui_log().begun.borrow().iter().skip(begun_base).copied().collect();
     let begun_nonempty = !begun.is_empty();
 
     // 3) 候補データを実 element 経由で読み戻す。
     let strings = host.candidate_strings();
-    let strings_nonempty = !strings.is_empty();
+    let strings_valid = (2..=9).contains(&strings.len());
     let has_nihongo = strings.iter().any(|s| s == "日本語");
 
-    // 4) 初期選択は先頭（0）であること。
+    // Opening the window retains the current surface, even if its rank changed.
     let sel = host.candidate_selection();
+    let selected_matches_document = strings.get(sel as usize) == Some(&host.store.preedit());
 
-    // 5) Behavior 経由でホスト選択＋確定（2 番目）を模擬し、commit 経路へ流れることを確認する。
-    let expected_second = strings.get(1).cloned().unwrap_or_default();
-    let beh_reached = host.behavior_select_and_finalize(1);
+    // A different surface makes a no-op SetSelection observable even when ranking changes.
+    let visible = host.store.preedit();
+    let target = strings.iter().enumerate().find(|(index, surface)|
+        *index != sel as usize && **surface != visible).map(|(index, surface)| (index, surface.clone()));
+    let expected_candidate = target.as_ref().map(|(_, surface)| surface.clone()).unwrap_or_default();
+    let beh_reached = target.as_ref().is_some_and(|(index, _)| host.behavior_select_and_finalize(*index as u32));
     // Finalize は notify→text_service の outbox drain（既存 commit/cancel 経路）を経て確定する。
     // ヘッドレスでは notify が UI スレッドへ post する想定なので settle で落ち着かせる。
-    host.settle_debounce();
-    pump_settle(host);
+    run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
     let committed = host.store.committed();
-    // 2 番目の候補（strings[1]）が確定したか。緩いフォールバックは置かない＝厳密一致を VM の合格線とする。
-    // overall pass は strings_nonempty を要求するので、実合格時 strings[1]=expected_second は非空であり、
-    // 「commit が 2 番目の候補に正確に一致する」ことが無条件の合格条件になる。
-    let committed_is_second = committed == expected_second;
+    let committed_matches_target = !expected_candidate.is_empty() && committed == expected_candidate
+        && host.store.full() == expected_candidate && host.store.preedit().is_empty();
 
     let detail = format!(
         "begun={begun:?} strings={strings:?} has_nihongo={has_nihongo} sel={sel} \
-         beh_reached={beh_reached} expected_second={expected_second:?} committed={committed:?}"
+         keys_eaten={keys_eaten} selected_matches_document={selected_matches_document} target={target:?} \
+         beh_reached={beh_reached} expected_candidate={expected_candidate:?} committed={committed:?}"
     );
 
     // 判定（VM 実走で評価される。compile/型検査＋配線は本セッションで担保）:
     //   (a) advertise が起きた、(b) 候補データが実 element から読め "日本語" を含む、
-    //   (c) 初期選択 0、(d) Behavior へ到達し 2 番目を確定できた。
-    let passed = begun_nonempty
-        && strings_nonempty
+    //   (c) 選択候補と本文の一致、(d) Behaviorで別候補を確定できた。
+    let passed = keys_eaten && begun_nonempty
+        && strings_valid
         && has_nihongo
-        && sel == 0
+        && selected_matches_document
         && beh_reached
-        && committed_is_second;
+        && committed_matches_target;
     Item14Result { passed, detail }
 }
 
-pub struct Item16Result { pub passed: bool, pub detail: String }
+pub struct Item16Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
-/// item16: 前方一致候補の部分確定でデータロスしないこと（実機 VM で評価。compile/型検査＋配線は本セッションで担保）。
-/// 再現: "nihongo"(にほんご) を Space で変換 → 前方一致候補「日本」(にほん) を選んで確定 →
-/// 「日本」が確定し、消費されなかった残り読み「ご」が新しい composition として継続する（捨てない）。
-/// バグ時は「日本」確定後に composition が全リセットされ「ご」が消失していた。
-///
-/// 合格条件（すべて満たす）:
-///   (a) 候補列に「日本」がある（前方一致候補の存在）、
-///   (b) Behavior（マウス/タッチ模擬）で「日本」を選択＋Finalize できた、
-///   (c) committed が「日本」と一致（前方分を確定）、
-///   (d) preedit が非空＝残り読みが composition として継続（「ご」を捨てていない）、
-///   (e) ev=commit text=日本 source=candidate_prefix（部分確定マーカ）がログに出た。
+/// Changing the first clause and finalizing must retain every following clause.
+/// The former prefix-only commit expectation predates the full-coverage contract.
 pub fn run_item16(host: &TsfHost) -> Item16Result {
-    // item13/14 が conversion-mode を direct のまま残しうるのでネイティブへ明示復帰（さもないと候補が出ない）。
-    let _ = host.set_native_mode();
+    if !host.normalize_native_mode() {
+        return Item16Result { passed: false, detail: "native mode setup failed".into() };
+    }
     host.warm_up();
     host.store.reset();
     let pid = std::process::id();
-
-    // 1) "nihongo"(にほんご) を打って Space で候補を出す。
-    let mut keys = crate::scenarios::typed("nihongo");
+    let base = read_events(pid).len();
+    let mut keys = crate::scenarios::typed("kyouhaiitenkidesu");
     keys.push(crate::scenarios::SPACE);
-    let _ = run_keys(host, &keys);
-    host.settle_debounce();
-
-    // 2) 候補列から前方一致候補「日本」(にほん) の index を探す。
-    let strings = host.candidate_strings();
-    let idx_nihon = strings.iter().position(|s| s == "日本");
-
-    // 3) 「日本」を選択＋Finalize（マウス/タッチ Behavior 経由＝drain_behavior→commit_candidate）。
-    let beh_reached = match idx_nihon {
-        Some(i) => host.behavior_select_and_finalize(i as u32),
-        None => false,
-    };
-    host.settle_debounce();
-    pump_settle(host);
-
-    // 4) 観測: 「日本」が確定し、残り読み「ご」が composition として継続（preedit 非空）。
+    keys.push(crate::scenarios::WAIT_CONVERSION);
+    let mut all_eaten = run_keys(host, &keys).iter().all(|sample| sample.eaten);
+    let initial = host.store.preedit();
+    let initial_closed = host.store.composing() && !initial.is_empty()
+        && host.store.committed().is_empty() && host.store.full() == initial
+        && host.candidate_strings().is_empty()
+        && read_events(pid).iter().skip(base)
+            .any(|event| matches!(event, Ev::ClausePresented { ready: false, .. }));
+    all_eaten &= host.feed_key(crate::scenarios::SPACE.0);
+    run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
+    let candidates = host.candidate_strings();
+    let selected = host.candidate_selection() as usize;
+    let target = candidates.get(selected).and_then(|surface| {
+        if surface.is_empty() { return None; }
+        let suffix = initial.strip_prefix(surface)?;
+        if suffix.is_empty() { return None; }
+        candidates.iter().enumerate().find(|(index, candidate)|
+            *index != selected && !candidate.is_empty() && *candidate != surface)
+            .map(|(index, candidate)| (index, format!("{candidate}{suffix}"), suffix.to_string()))
+    });
+    let setup = initial_closed && (2..=9).contains(&candidates.len())
+        && host.store.preedit() == initial && host.store.full() == initial
+        && host.store.committed().is_empty() && target.is_some();
+    let finalized = setup && target.as_ref().is_some_and(|(index, _, _)|
+        host.behavior_select_and_finalize(*index as u32));
+    run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
     let committed = host.store.committed();
-    let preedit = host.store.preedit();
-
-    // 5) ログ: 部分確定マーカ ev=commit text=日本 source=candidate_prefix。
-    let evs = read_events(pid);
-    let has_partial_commit = evs.iter().any(|e| matches!(e,
-        Ev::Commit { text, source } if text == "日本" && source == "candidate_prefix"));
-
-    // 6) 残り読みセッションが生きていること: 続けて Space で残り読み(ご)を変換し候補が出るか。
-    //    部分確定が自分の do_commit→OnCompositionTerminated でセッションを畳んでいる(セッション0)と、
-    //    この convert は劣化して候補ゼロになる（codex P1 の回帰ガード）。
-    let _ = run_keys(host, &[crate::scenarios::SPACE]);
-    host.settle_debounce();
-    let remainder_cands = host.candidate_strings();
-    let remainder_session_alive = !remainder_cands.is_empty();
-
-    let detail = format!(
-        "strings={strings:?} idx_nihon={idx_nihon:?} beh_reached={beh_reached} \
-         committed={committed:?} preedit={preedit:?} has_partial_commit={has_partial_commit} \
-         remainder_cands={remainder_cands:?} remainder_session_alive={remainder_session_alive}"
-    );
-    let passed = idx_nihon.is_some()
-        && beh_reached
-        && committed == "日本"
-        && !preedit.is_empty()
-        && has_partial_commit
-        && remainder_session_alive;
-    Item16Result { passed, detail }
+    let commit_ok = target.as_ref().is_some_and(|(_, expected, _)| &committed == expected)
+        && !committed.is_empty() && host.store.full() == committed
+        && host.store.preedit().is_empty() && !host.store.composing()
+        && read_events(pid).iter().skip(base).any(|event|
+            matches!(event, Ev::Commit { text, source } if text == &committed && source == "clause"));
+    let mut next_input_ok = false;
+    if commit_ok {
+        all_eaten &= host.feed_key(crate::scenarios::ch('a').0);
+        next_input_ok = host.store.composing() && host.store.committed() == committed
+            && host.store.preedit() == "あ" && host.store.full() == format!("{committed}あ");
+    }
+    let passed = all_eaten && setup && finalized && commit_ok && next_input_ok;
+    Item16Result { passed, detail: format!("all_eaten={all_eaten} initial_closed={initial_closed} initial={initial:?} candidates={candidates:?} selected={selected} target={target:?} finalized={finalized} committed={committed:?} commit_ok={commit_ok} next_input_ok={next_input_ok}") }
 }
 
-pub struct Item15Result { pub passed: bool, pub detail: String }
+pub struct Item15Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
 /// item15: ライブ変換中、キャレットが preedit（合成文字列）の末尾に来ること
 /// （実機で発覚した「ライブ変換中カーソルが先頭に居座る」バグの回帰）。
@@ -667,29 +753,44 @@ pub fn run_item15(host: &TsfHost) -> Item15Result {
     // 末尾位置 = 合成文字列の UTF-16 長。合成中（未確定）は文書全体が preedit なのでバッファ長に等しい。
     let end = full.encode_utf16().count() as i32;
 
-    let detail = format!(
-        "composing={composing} preedit={preedit:?} full={full:?} sel=({s},{e}) end={end}"
-    );
-    let passed = composing
-        && !preedit.is_empty()
-        && end > 0
-        && (s, e) == (end, end)
-        && (s, e) != (0, 0);
+    let detail =
+        format!("composing={composing} preedit={preedit:?} full={full:?} sel=({s},{e}) end={end}");
+    let passed =
+        composing && !preedit.is_empty() && end > 0 && (s, e) == (end, end) && (s, e) != (0, 0);
     Item15Result { passed, detail }
 }
 
-pub struct Item18Result { pub passed: bool, pub detail: String }
+pub struct Item18Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
 /// %TEMP%\nospacekey-tip.log の **このプロセス**の行に `needle` を含むものがあるか。
 /// ログは追記式で実行間に消えないため、`[pid N]` プレフィックスで現プロセス行に限定する
 /// （連続実行で前回の行を誤って拾わないように）。
 fn tip_log_has(needle: &str) -> bool {
-    let path = std::path::Path::new(&std::env::var("TEMP").unwrap_or_default())
-        .join("nospacekey-tip.log");
+    let path =
+        std::path::Path::new(&std::env::var("TEMP").unwrap_or_default()).join("nospacekey-tip.log");
     let pid_tag = format!("[pid {}]", std::process::id());
     std::fs::read_to_string(path)
-        .map(|s| s.lines().any(|l| l.contains(&pid_tag) && l.contains(needle)))
+        .map(|s| {
+            s.lines()
+                .any(|l| l.contains(&pid_tag) && l.contains(needle))
+        })
         .unwrap_or(false)
+}
+
+fn tip_log_count(needle: &str) -> usize {
+    let path =
+        std::path::Path::new(&std::env::var("TEMP").unwrap_or_default()).join("nospacekey-tip.log");
+    let pid_tag = format!("[pid {}]", std::process::id());
+    std::fs::read_to_string(path)
+        .map(|s| {
+            s.lines()
+                .filter(|l| l.contains(&pid_tag) && l.contains(needle))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// item18: 別ウィンドウへのフォーカス喪失でエンジンセッションの読みが居残らない
@@ -704,59 +805,48 @@ fn tip_log_has(needle: &str) -> bool {
 /// 移して戻し、続けて "aiueo" を打つ。修正版は `ITfThreadMgrEventSink::OnSetFocus` がセッションを
 /// 畳むので、新規入力は新しいセッションで始まり preedit に前の読み（にほん/日本）が混ざらない。
 pub fn run_item18(host: &TsfHost) -> Item18Result {
-    // conversion-mode compartment はプロセス共有で、--scenarios では直前の item17 が
-    // do-no-harm 経路で direct(半角英数)を残す。direct のままだと will_handle が A-Z を
-    // パススルーし、harness はパススルー字を store に入れないので "nihongo" が合成を始めず
-    // フォーカス放棄経路を踏めない（偽 PASS）。item14/16 と同じく native へ戻してから打つ。
-    let _ = host.set_native_mode();
+    if !host.normalize_native_mode() {
+        return Item18Result { passed: false, detail: "focus-loss setup: native mode unavailable".into() };
+    }
     host.warm_up();
     host.store.reset();
 
-    // 1) ライブ変換中まで打つ（engine セッション＋合成が生きている＝放棄対象がある）。
-    let _ = run_keys(host, &crate::scenarios::typed("nihongo"));
-    host.settle_debounce();
+    let applied_before = tip_log_count("ev=live_snapshot_applied");
+    let mut first = crate::scenarios::typed("nihongo");
+    first.push(crate::scenarios::WAIT_CONVERSION);
+    let first_obs = run_keys(host, &first);
+    let first_eaten = first_obs.iter().all(|step| step.eaten);
     let before = host.store.preedit();
+    let engine_converted = tip_log_count("ev=live_snapshot_applied") > applied_before;
+    let initial_composition = host.store.composing() && !before.is_empty()
+        && host.store.committed().is_empty() && host.store.full() == before;
 
-    // 2) 別ウィンドウへフォーカスが移って戻る（実機の別窓クリック相当）。OnSetFocus が発火するはず。
     let focus_ok = host.lose_and_regain_focus().is_ok();
-
-    // 3) 続けて別語を打つ。読みが居残っていれば にほんご へ連結される。
-    let _ = run_keys(host, &crate::scenarios::typed("aiueo"));
-    host.settle_debounce();
+    let mut second = crate::scenarios::typed("aiueo");
+    second.push(crate::scenarios::WAIT_CONVERSION);
+    let second_obs = run_keys(host, &second);
+    let second_eaten = second_obs.iter().all(|step| step.eaten);
     let after = host.store.preedit();
     let full = host.store.full();
-
-    // engine が実際に動いて変換した証拠: before がライブ変換結果(日本語)＝engine セッションが
-    // 生きていた。engine 不起動だと TIP が raw preedit(にほんご)へ劣化し、focus_abandon も no_stale も
-    // 真になって本来検証すべき「engine セッションの読み居残り」経路を踏まずに偽 PASS する（Codex P2）。
-    // before に漢字変換(日本)が出ていることを必須条件にし、engine 経路を確実に踏ませる。
-    let engine_converted = before.contains("日本");
-    // OnSetFocus（doc フォーカス変化）が放棄リセットを焚いたか＝ITfThreadMgrEventSink 経路の配線ガード。
+    let committed = host.store.committed();
+    // In-process focus changes may terminate through OnCompositionTerminated;
+    // actual cross-process OnKillThreadFocus delivery remains real-app acceptance.
     let abandoned = tip_log_has("ev=focus_abandon");
-    // ITfThreadFocusSink（クロスプロセス前面喪失の OnKillThreadFocus）の advise 配線が生きているか。
-    // 実配送はヘッドレスでは焚けない（別スレッド/プロセスの前面化が必要）ので、ここでは advise の
-    // 成否だけを検証する（退行で AdviseSink を落とすと thread_advised=false になり item18 が落ちる）。
-    // 実際の OnKillThreadFocus 配送＋リセットは実機の手動再現（log src=killthreadfocus）で確認する。
     let thread_sink_advised = tip_log_has("thread_advised=true");
-    // 新規入力に前の読みが混ざっていない（フォーカス喪失データ残留が無い＝実挙動）。
-    let no_stale = !after.contains("日本") && !after.contains("にほん");
-
-    // `abandoned`(ev=focus_abandon) はヘッドレスでは構造的に観測できないので合否条件から外す。
-    // 実 msctf は in-process の空 docmgr への SetFocus では ITfThreadMgrEventSink::OnSetFocus を
-    // sink へ配送せず（全 run で OnSetFocus/ev=focus_abandon は 0 件）、フォーカス喪失の後始末を
-    // ITfCompositionSink::OnCompositionTerminated 経由で行う（reset_abandoned_composition→
-    // engine_end_session が走り、読み残留は消える）。よって「実際にデータ残留が無い」(no_stale)＋
-    // sink 配線(thread_sink_advised) で判定し、abandoned は診断用に detail へ残すのみ。
-    // 実機の OnSetFocus/OnKillThreadFocus 発火は SP3 手動受入で別途確認済み
-    // （ev=focus_abandon src=setfocus / src=killthreadfocus）。
-    let passed = focus_ok && engine_converted && thread_sink_advised && no_stale;
+    let no_stale = host.store.composing() && after == "あいうえお"
+        && committed == before && full == format!("{before}{after}");
+    let passed = first_eaten && second_eaten && initial_composition && focus_ok
+        && engine_converted && thread_sink_advised && no_stale;
     let detail = format!(
-        "before={before:?} after={after:?} full={full:?} focus_ok={focus_ok} engine_converted={engine_converted} abandoned={abandoned}(diag-only) thread_sink_advised={thread_sink_advised} no_stale={no_stale}"
+        "before={before:?} after={after:?} committed={committed:?} full={full:?} first_eaten={first_eaten} second_eaten={second_eaten} initial_composition={initial_composition} focus_ok={focus_ok} engine_converted={engine_converted} abandoned={abandoned}(diag-only) thread_sink_advised={thread_sink_advised} no_stale={no_stale}"
     );
     Item18Result { passed, detail }
 }
 
-pub struct Item19Result { pub passed: bool, pub detail: String }
+pub struct Item19Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
 /// item19 (SP5 実機バグ回帰): direct(半角英数)モードで、ホストが OnTestKeyDown を経ず
 /// OnKeyDown を直接呼ぶ経路（feed_key_keydown_only）でも A–Z が **かな化されず素通し** される。
@@ -777,7 +867,7 @@ pub struct Item19Result { pub passed: bool, pub detail: String }
 ///   - VK_CONVERT(0x1C) は direct でも **eaten=true**（再変換トリガは食う＝item13 と非回帰）。
 pub fn run_item19(host: &TsfHost) -> Item19Result {
     // 共有 compartment が前シナリオから direct を残しうるので、まず native で温める。
-    let _ = host.set_native_mode();
+    let _ = host.normalize_native_mode();
     host.warm_up();
     host.store.reset();
 
@@ -787,8 +877,11 @@ pub fn run_item19(host: &TsfHost) -> Item19Result {
     host.store.reset();
 
     // ---- 本体: モードを direct へ。失敗なら不能（誤 PASS を出さない）。
-    if !host.set_direct_mode() {
-        return Item19Result { passed: false, detail: "set_direct_mode 失敗（compartment 設定不可）".into() };
+    if !host.enter_direct_mode() {
+        return Item19Result {
+            passed: false,
+            detail: "enter_direct_mode 失敗（TIP トグル遷移不可）".into(),
+        };
     }
 
     // direct + keydown-only（＝実機の OnTestKeyDown 非経由）で `abc` を注入。
@@ -808,10 +901,11 @@ pub fn run_item19(host: &TsfHost) -> Item19Result {
     let _ = host.feed_key_keydown_only(0x1B);
 
     // 後始末: native へ戻す（compartment はプロセス共有）。
-    let _ = host.set_native_mode();
+    let _ = host.normalize_native_mode();
 
     let pass_through = !a_eaten && !b_eaten && !c_eaten;
-    let no_kana = preedit_a.is_empty() && !composing_a && full_after.is_empty() && committed_after.is_empty();
+    let no_kana =
+        preedit_a.is_empty() && !composing_a && full_after.is_empty() && committed_after.is_empty();
     let passed = native_a_eaten && pass_through && no_kana && conv_eaten && saw_keydown_direct;
     let detail = format!(
         "native_a_eaten={native_a_eaten} a/b/c_eaten={a_eaten}/{b_eaten}/{c_eaten} preedit_a={preedit_a:?} composing_a={composing_a} full_after={full_after:?} committed_after={committed_after:?} conv_eaten={conv_eaten} keydown_direct={saw_keydown_direct}"
@@ -819,7 +913,10 @@ pub fn run_item19(host: &TsfHost) -> Item19Result {
     Item19Result { passed, detail }
 }
 
-pub struct Item24Result { pub passed: bool, pub detail: String }
+pub struct Item24Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
 /// item24: 未確定のまま 25 打鍵しても preedit が全打鍵を保持する（実機発見バグ #2
 /// 「22文字目以降ドロップ」の再現/回帰）。
@@ -840,7 +937,7 @@ pub fn run_item24(host: &TsfHost) -> Item24Result {
     // (item8 が engine kill を行うのと同じ作法。常駐 engine はユーザーの次打鍵で自動
     // respawn する — A7 で受入済みの自己修復)。
     kill_engine_processes();
-    let _ = host.set_native_mode();
+    let _ = host.normalize_native_mode();
     host.warm_up();
     host.store.reset();
 
@@ -856,7 +953,13 @@ pub fn run_item24(host: &TsfHost) -> Item24Result {
         let eaten = host.feed_key(0x41); // VK_A
         let preedit = host.store.preedit();
         let n = preedit.chars().count();
-        eprintln!("[trace] item24 key#{:02} eaten={} preedit_len={} preedit={:?}", i + 1, eaten, n, preedit);
+        eprintln!(
+            "[trace] item24 key#{:02} eaten={} preedit_len={} preedit={:?}",
+            i + 1,
+            eaten,
+            n,
+            preedit
+        );
         if n != i + 1 && first_bad.is_none() {
             first_bad = Some((i + 1, n, eaten, preedit));
         }
@@ -893,7 +996,10 @@ pub fn run_item24(host: &TsfHost) -> Item24Result {
         let n = b_last.chars().count();
         eprintln!(
             "[trace] item24B key#{:02} eaten={} preedit_len={} preedit={:?}",
-            i + 1, eaten, n, b_last
+            i + 1,
+            eaten,
+            n,
+            b_last
         );
         if b_prev_len >= 6 && n < b_prev_len / 2 && b_collapse.is_none() {
             b_collapse = Some((i + 1, b_prev_len, n, b_last.clone()));
@@ -930,7 +1036,10 @@ pub fn run_item24(host: &TsfHost) -> Item24Result {
     Item24Result { passed, detail }
 }
 
-pub struct Item29Result { pub passed: bool, pub detail: String }
+pub struct Item29Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
 /// item29: 実機発見バグ #1「Edge(Chromium) パスワード欄で IS_PASSWORD 検知不発」の再現/回帰。
 ///
@@ -951,7 +1060,7 @@ pub struct Item29Result { pub passed: bool, pub detail: String }
 ///   C(復帰): compartment=0 ＋ フォーカス遷移で再び食われる — B の素通しが compartment
 ///     起因であること、および無効状態が居残らないことの証明。
 pub fn run_item29(host: &TsfHost) -> Item29Result {
-    let _ = host.set_native_mode();
+    let _ = host.normalize_native_mode();
     host.warm_up();
     host.store.reset();
 
@@ -967,11 +1076,14 @@ pub fn run_item29(host: &TsfHost) -> Item29Result {
     let refocus_ok = host.lose_and_regain_focus().is_ok();
     let mut b_eaten_any = false;
     for _ in 0..3 {
-        if host.feed_key(0x41) { b_eaten_any = true; }
+        if host.feed_key(0x41) {
+            b_eaten_any = true;
+        }
     }
     let b_preedit = host.store.preedit();
     let b_committed = host.store.committed();
-    let b_ok = set_ok && refocus_ok && !b_eaten_any && b_preedit.is_empty() && b_committed.is_empty();
+    let b_ok =
+        set_ok && refocus_ok && !b_eaten_any && b_preedit.is_empty() && b_committed.is_empty();
 
     // ---- フェーズ C(復帰): compartment を戻せば再び合成される ----
     let unset_ok = host.set_context_keyboard_disabled(false);
@@ -992,64 +1104,63 @@ pub fn run_item29(host: &TsfHost) -> Item29Result {
     Item29Result { passed, detail }
 }
 
-pub struct Item30Result { pub passed: bool, pub detail: String }
+pub struct Item30Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
-/// item30（Task4 確定取消 headless 回帰・往路）: `nihongo → Space → Enter → Ctrl+Backspace → Esc`。
-///
-/// 確定取消（Ctrl+Backspace）→Esc の往復が無傷に成立することの回帰。Ctrl+Backspace で
-/// 直前確定「日本語」を再変換候補化し、Esc で `reconvert_original`（=確定文字列）を
-/// RestoreText 経由で書き戻す（Task 3 start_commit_undo 本体、既存 Esc 経路の再利用）。
-///
-/// 自己証明（偽 PASS 防止）:
-///   - `Ev::Commit{source:"candidate"}` が出ている（Space で候補確定した前提の成立）。
-///   - `Ev::CommitUndoShown` が出ている（Ctrl+Backspace が実際に再変換候補を出した）。
-///   - Ctrl+Backspace 直後の preedit が非空（候補が復活＝素通しでないことの直接観測）。
-///   - 最終 full == "日本語"（Esc の RestoreText で確定文字列が一字一句無傷復元）。
-/// これらが無いと「Ctrl+Backspace が素通ししただけで文書はもとから日本語のまま」でも
-/// 最終状態アサートだけでは PASS してしまう。
+/// Commit the local clause, undo it into reconversion, then restore the exact committed text.
 pub fn run_item30(host: &TsfHost) -> Item30Result {
     let pid = std::process::id();
-    let _ = host.set_native_mode();
+    if !host.normalize_native_mode() {
+        return Item30Result { passed: false, detail: "commit-undo setup: native mode unavailable".into() };
+    }
     host.warm_up();
     host.store.reset();
     let base = read_events(pid).len();
-
-    for k in typed("nihongo") { let _ = host.feed_key(k.0); }
-    host.settle_debounce();
-    let _ = host.feed_key(0x20); // Space: 候補表示
-    let _ = host.feed_key(0x0D); // Enter: 候補確定（source=candidate）
-    let committed_full = host.store.full();
-
+    let mut keys_eaten = true;
+    for key in typed("nihongo") { keys_eaten &= host.feed_key(key.0); }
+    keys_eaten &= host.feed_key_no_pump(crate::scenarios::SPACE.0);
+    keys_eaten &= host.feed_key_no_pump(crate::scenarios::ENTER.0);
+    run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
+    let committed_full = host.store.committed();
     let evs_commit: Vec<Ev> = read_events(pid).into_iter().skip(base).collect();
-    let saw_candidate_commit = evs_commit.iter().any(|e| {
-        matches!(e, Ev::Commit { source, .. } if source == "candidate")
+    let last_commit = evs_commit.iter().rev().find_map(|event| match event {
+        Ev::Commit { text, source } => Some((text, source)),
+        _ => None,
     });
+    let saw_clause_commit = last_commit.is_some_and(|(text, source)| source == "clause" && *text == committed_full);
+    if !keys_eaten || !saw_clause_commit || committed_full.is_empty()
+        || host.store.full() != committed_full || !host.store.preedit().is_empty() {
+        return Item30Result { passed: false, detail: format!(
+            "commit-undo prerequisite: keys_eaten={keys_eaten} committed={committed_full:?} full={:?} preedit={:?} commit={last_commit:?}",
+            host.store.full(), host.store.preedit()) };
+    }
 
-    // Ctrl+Backspace: 確定取消。
     let undo_base = read_events(pid).len();
-    let undo_eaten = host.feed_key_with_ctrl(0x08); // VK_BACK
+    let undo_eaten = host.feed_key_with_ctrl(0x08);
+    run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
     let preedit_after_undo = host.store.preedit();
-    let evs_undo: Vec<Ev> = read_events(pid).into_iter().skip(undo_base).collect();
-    let saw_undo_shown = evs_undo.iter().any(|e| matches!(e, Ev::CommitUndoShown { .. }));
-
-    // Esc: reconvert_original（=確定文字列）を RestoreText で書き戻す既存経路。
-    let _ = host.feed_key(0x1B); // VK_ESCAPE
+    let composing_after_undo = host.store.composing();
+    let saw_undo_shown = read_events(pid).iter().skip(undo_base)
+        .any(|event| matches!(event, Ev::CommitUndoShown { .. }));
+    let esc_eaten = host.feed_key(crate::scenarios::ESC.0);
+    run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
     let restored_full = host.store.full();
-
-    let passed = saw_candidate_commit
-        && undo_eaten
-        && saw_undo_shown
-        && !preedit_after_undo.is_empty()
-        && restored_full == "日本語";
+    let restored = restored_full == committed_full && host.store.committed() == committed_full
+        && host.store.preedit().is_empty() && !host.store.composing();
+    let passed = undo_eaten && saw_undo_shown && composing_after_undo
+        && !preedit_after_undo.is_empty() && esc_eaten && restored;
     let detail = format!(
-        "committed_full={committed_full:?} saw_candidate_commit={saw_candidate_commit} \
-         undo_eaten={undo_eaten} saw_undo_shown={saw_undo_shown} \
-         preedit_after_undo={preedit_after_undo:?} restored_full={restored_full:?}"
+        "committed_full={committed_full:?} saw_clause_commit={saw_clause_commit} undo_eaten={undo_eaten} saw_undo_shown={saw_undo_shown} composing_after_undo={composing_after_undo} preedit_after_undo={preedit_after_undo:?} esc_eaten={esc_eaten} restored_full={restored_full:?} restored={restored}"
     );
     Item30Result { passed, detail }
 }
 
-pub struct Item31Result { pub passed: bool, pub detail: String }
+pub struct Item31Result {
+    pub passed: bool,
+    pub detail: String,
+}
 
 /// item31（Task4 確定取消 headless 回帰・disarm）: 確定後の打鍵で武装が解除されること。
 ///
@@ -1068,7 +1179,7 @@ pub struct Item31Result { pub passed: bool, pub detail: String }
 ///   - 続く Ctrl+Backspace は not_armed → eaten=false AND CommitUndoShown なし。
 pub fn run_item31(host: &TsfHost) -> Item31Result {
     let pid = std::process::id();
-    let _ = host.set_native_mode();
+    let _ = host.normalize_native_mode();
     host.warm_up();
     host.store.reset();
 
@@ -1084,7 +1195,9 @@ pub fn run_item31(host: &TsfHost) -> Item31Result {
 
     // ---- 亜種: nihongo → Space → Enter(候補確定) → Home(disarm) → Ctrl+Backspace ----
     host.store.reset();
-    for k in typed("nihongo") { let _ = host.feed_key(k.0); }
+    for k in typed("nihongo") {
+        let _ = host.feed_key(k.0);
+    }
     host.settle_debounce();
     let _ = host.feed_key(0x20); // Space: 候補表示
     let _ = host.feed_key(0x0D); // Enter: 候補確定(source=candidate)
@@ -1094,7 +1207,7 @@ pub fn run_item31(host: &TsfHost) -> Item31Result {
     let evs2: Vec<Ev> = read_events(pid).into_iter().skip(base2).collect();
     let shown2 = evs2.iter().any(|e| matches!(e, Ev::CommitUndoShown { .. }));
     let part2_ok = !eaten2 && !shown2;
-    let _ = host.set_native_mode(); // 後続 item のため compartment を明示的に戻す(冪等)
+    let _ = host.normalize_native_mode(); // 後続 item のため TIP 所有状態ごと戻す（冪等）
 
     let passed = part1_ok && part2_ok;
     let detail = format!(
@@ -1104,22 +1217,217 @@ pub fn run_item31(host: &TsfHost) -> Item31Result {
     Item31Result { passed, detail }
 }
 
-/// 溜まった WM_TIMER / post を drain する小ヘルパ（Behavior の notify→確定反映を確実にする）。
-/// settle_debounce は内部で sleep + pump するので、それを数回繰り返してホスト発の確定 post を捌く。
-fn pump_settle(host: &TsfHost) {
-    for _ in 0..5 {
-        host.settle_debounce();
-        if !host.store.committed().is_empty() { break; }
-    }
+pub struct Item32Result {
+    pub passed: bool,
+    pub detail: String,
 }
 
-fn kill_pid(pid: u32) {
-    use std::os::windows::process::CommandExt;
-    // taskkill /F /PID。失敗は無視（既に死んでいる等）。
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string()])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .status();
+fn wait_for_prediction_preedit(host: &TsfHost) -> String {
+    for _ in 0..30 {
+        host.settle_debounce();
+        let preedit = host.store.preedit();
+        if !preedit.is_empty() {
+            return preedit;
+        }
+    }
+    String::new()
+}
+
+fn commit_prediction_context(host: &TsfHost, romanized: &str) -> bool {
+    let before = host.store.committed().chars().count();
+    for _ in 0..4 {
+        for key in typed(romanized) {
+            let _ = host.feed_key(key.0);
+        }
+        host.settle_debounce();
+        let _ = host.feed_key(0x20); // Space: explicit candidate selection
+        let _ = host.feed_key(0x0D); // Enter: explicit full commit
+        if host
+            .store
+            .committed()
+            .chars()
+            .count()
+            .saturating_sub(before)
+            >= 8
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn wait_for_prediction_runtime_ready() -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let pipe = stable_pipe_name();
+    let mut client = loop {
+        match EngineClient::connect_to(&pipe, Duration::from_millis(500)) {
+            Ok(client) => break client,
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("engine connect failed: {:?}", error.kind())),
+        }
+    };
+    let session = match client.request(&Request::StartSession) {
+        Ok(Response::Session { session, .. }) => session,
+        Ok(_) => return Err("engine returned an unexpected StartSession response".into()),
+        Err(error) => return Err(format!("StartSession failed: {:?}", error.kind())),
+    };
+    let token_ids = vec![
+        1, 46_275, 30_751, 55_574, 31_120, 29_314, 30_857, 78_564, 78_466, 66_700, 99_248,
+    ];
+    let result = loop {
+        let request = Request::Predict {
+            session,
+            seq: 1,
+            token_ids: token_ids.clone(),
+        };
+        match client.request(&request) {
+            Ok(Response::Prediction { .. }) => break Ok(()),
+            Ok(Response::PredictionUnavailable { state, .. }) if state == "loading" => {
+                if Instant::now() >= deadline {
+                    break Err("prediction runtime readiness timed out".into());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(Response::PredictionUnavailable { state, .. }) => {
+                break Err(format!("prediction runtime unavailable: {state}"));
+            }
+            Ok(_) => break Err("prediction runtime returned an unexpected response".into()),
+            Err(error) => {
+                break Err(format!(
+                    "prediction readiness request failed: {:?}",
+                    error.kind()
+                ))
+            }
+        }
+    };
+    let _ = client.request(&Request::EndSession { session });
+    result
+}
+
+/// item32: real TSF composition path for inline prediction: show, accept, dismiss and focus-stale.
+/// This explicit mode needs the pinned model/runtime and opt-in setting, so it is not part of the
+/// model-free default scenario suite.
+pub fn run_item32(host: &TsfHost) -> Item32Result {
+    let pid = std::process::id();
+    let _ = host.normalize_native_mode();
+    host.warm_up();
+    if let Err(error) = wait_for_prediction_runtime_ready() {
+        return Item32Result {
+            passed: false,
+            detail: error,
+        };
+    }
+    host.store.reset();
+    let base = read_events(pid).len();
+
+    let first_context_ready = commit_prediction_context(host, "kyouhaasakaraame");
+    let committed_before = host.store.committed();
+    let first_ghost = wait_for_prediction_preedit(host);
+    let accepted_eaten = host.feed_key(0x27); // Right
+    let committed_after = host.store.committed();
+
+    let second_ghost = wait_for_prediction_preedit(host); // accept re-arms prediction
+    let dismissed_eaten = host.feed_key(0x1B); // Esc
+    host.settle_debounce();
+    let empty_after_dismiss = host.store.preedit().is_empty();
+
+    // A pending/re-armed result must not survive a document focus transition.
+    let focus_ok = host.lose_and_regain_focus().is_ok();
+    for _ in 0..10 {
+        host.settle_debounce();
+    }
+    let empty_after_focus = host.store.preedit().is_empty();
+
+    // Force the prediction-only TSF edit session to be rejected after a valid explicit commit.
+    // The field must stay empty and ordinary IME input must remain usable after the lock clears.
+    let rejection_context_ready = commit_prediction_context(host, "ashitamokaigi");
+    host.store.force_lock_rejection(true);
+    for _ in 0..10 {
+        host.settle_debounce();
+    }
+    host.store.force_lock_rejection(false);
+    let empty_after_error = host.store.preedit().is_empty();
+    let input_after_error = host.feed_key(0x41); // A: prediction failure must not disable IME input.
+    let normal_input_after_error = input_after_error && !host.store.preedit().is_empty();
+    let _ = host.feed_key(0x1B);
+    let events: Vec<Ev> = read_events(pid).into_iter().skip(base).collect();
+    let log =
+        std::path::Path::new(&std::env::var("TEMP").unwrap_or_default()).join("nospacekey-tip.log");
+    let pid_tag = format!("[pid {pid}]");
+    let log_text = std::fs::read_to_string(log).unwrap_or_default();
+    let accepted_logged = log_text
+        .lines()
+        .any(|line| line.contains(&pid_tag) && line.contains("ev=prediction_accept"));
+    let dismissed_logged = log_text
+        .lines()
+        .any(|line| line.contains(&pid_tag) && line.contains("ev=prediction_dismiss"));
+
+    let passed = first_context_ready
+        && rejection_context_ready
+        && !committed_before.is_empty()
+        && !first_ghost.is_empty()
+        && accepted_eaten
+        && committed_after.chars().count() > committed_before.chars().count()
+        && !second_ghost.is_empty()
+        && dismissed_eaten
+        && empty_after_dismiss
+        && focus_ok
+        && empty_after_focus
+        && empty_after_error
+        && normal_input_after_error
+        && accepted_logged
+        && dismissed_logged
+        && events
+            .iter()
+            .any(|event| matches!(event, Ev::Commit { source, .. } if source == "candidate"));
+    let detail = format!(
+        "first_context_ready={first_context_ready} rejection_context_ready={rejection_context_ready} \
+         committed_before_len={} first_ghost_len={} accepted_eaten={accepted_eaten} \
+         committed_after_len={} second_ghost_len={} dismissed_eaten={dismissed_eaten} \
+         empty_after_dismiss={empty_after_dismiss} focus_ok={focus_ok} \
+         empty_after_focus={empty_after_focus} empty_after_error={empty_after_error} \
+         normal_input_after_error={normal_input_after_error} \
+         accept_log={accepted_logged} dismiss_log={dismissed_logged}",
+        committed_before.chars().count(), first_ghost.chars().count(),
+        committed_after.chars().count(), second_ghost.chars().count(),
+    );
+    Item32Result { passed, detail }
+}
+
+fn kill_pid(pid: u32) -> Result<(), String> {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW,
+        TerminateProcess, WaitForSingleObject, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+    // Keep the same process object through validation and termination; PID reuse
+    // must not turn a stale spawn log into a successful fault injection.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) }
+        .map_err(|error| format!("OpenProcess({pid}): {error}"))?;
+    let result = (|| {
+        if unsafe { WaitForSingleObject(handle, 0) } != WAIT_TIMEOUT {
+            return Err(format!("pid {pid} is not alive"));
+        }
+        let mut path = vec![0u16; 32768];
+        let mut length = path.len() as u32;
+        unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32,
+            windows::core::PWSTR(path.as_mut_ptr()), &mut length) }
+            .map_err(|error| format!("process image: {error}"))?;
+        let path = String::from_utf16_lossy(&path[..length as usize]);
+        if !std::path::Path::new(&path).file_name().is_some_and(|name|
+            name.to_string_lossy().eq_ignore_ascii_case("NospacekeyEngineHost.exe")) {
+            return Err(format!("pid {pid} is not EngineHost"));
+        }
+        unsafe { TerminateProcess(handle, 1) }.map_err(|error| format!("TerminateProcess: {error}"))?;
+        if unsafe { WaitForSingleObject(handle, 1000) } != WAIT_OBJECT_0 {
+            return Err(format!("pid {pid} termination did not complete"));
+        }
+        Ok(())
+    })();
+    let _ = unsafe { CloseHandle(handle) };
+    result
 }
 
 /// 常駐 engine（NospacekeyEngineHost.exe）を全て kill する。失敗（不在等）は無視。
@@ -1139,7 +1447,9 @@ pub(crate) fn kill_engine_processes() {
 pub fn run_item9(host: &mut TsfHost) -> (bool, bool) {
     let before = host.feed_key(0x41); // VK_A
     host.store.reset();
-    if let Err(e) = host.deactivate() { eprintln!("item9 deactivate err: {e:?}"); }
+    if let Err(e) = host.deactivate() {
+        eprintln!("item9 deactivate err: {e:?}");
+    }
     let after = host.feed_key(0x41);
     (before, after)
 }
@@ -1148,8 +1458,16 @@ pub fn run_item9(host: &mut TsfHost) -> (bool, bool) {
 mod tests {
     use super::{cancel_followed_shown, Ev};
 
-    fn shown(latin: &str) -> Ev { Ev::ReconvertShown { n: 3, kind: "latin".into(), latin: latin.into() } }
-    fn cancel() -> Ev { Ev::ReconvertCancel }
+    fn shown(chars: usize) -> Ev {
+        Ev::ReconvertShown {
+            n: 3,
+            kind: "latin".into(),
+            chars,
+        }
+    }
+    fn cancel() -> Ev {
+        Ev::ReconvertCancel
+    }
 
     // item13 経路 C の核ロジック cancel_followed_shown の純テスト（TSF 不要）。
     // 「トグルが reconvert を畳んだ」＝reconvert_shown の **後ろ** に reconvert_cancel が
@@ -1159,41 +1477,41 @@ mod tests {
     #[test]
     fn cancel_after_matching_shown_is_true() {
         // shown(nihongo) → cancel の順。トグルが畳んだ正常系。
-        let evs = vec![shown("nihongo"), cancel()];
-        assert!(cancel_followed_shown(&evs, "nihongo"));
+        let evs = vec![shown(7), cancel()];
+        assert!(cancel_followed_shown(&evs, 7));
     }
 
     #[test]
     fn cancel_before_shown_is_false() {
         // cancel が先、shown が後（前経路の残骸など）。トグル連動とは認めない。
-        let evs = vec![cancel(), shown("nihongo")];
-        assert!(!cancel_followed_shown(&evs, "nihongo"));
+        let evs = vec![cancel(), shown(7)];
+        assert!(!cancel_followed_shown(&evs, 7));
     }
 
     #[test]
     fn shown_without_cancel_is_false() {
         // C1 修正を revert したバグ版を模す: トグルしても cancel が出ない。
-        let evs = vec![shown("nihongo")];
-        assert!(!cancel_followed_shown(&evs, "nihongo"));
+        let evs = vec![shown(7)];
+        assert!(!cancel_followed_shown(&evs, 7));
     }
 
     #[test]
     fn cancel_without_matching_shown_is_false() {
-        // latin が一致する shown が無ければ false（別 latin の候補だけ＋cancel）。
-        let evs = vec![shown("react"), cancel()];
-        assert!(!cancel_followed_shown(&evs, "nihongo"));
+        // 文字数が一致する shown が無ければ false（別対象の候補だけ＋cancel）。
+        let evs = vec![shown(5), cancel()];
+        assert!(!cancel_followed_shown(&evs, 7));
     }
 
     #[test]
     fn empty_is_false() {
-        assert!(!cancel_followed_shown(&[], "nihongo"));
+        assert!(!cancel_followed_shown(&[], 7));
     }
 
     #[test]
     fn uses_first_shown_and_last_cancel() {
         // 1 本目 shown → cancel（トグル畳み）→ 2 本目 shown（再変換が再び発火）。
         // 最初の shown(0) より後ろに cancel(1) が居るので true。
-        let evs = vec![shown("nihongo"), cancel(), shown("nihongo")];
-        assert!(cancel_followed_shown(&evs, "nihongo"));
+        let evs = vec![shown(7), cancel(), shown(7)];
+        assert!(cancel_followed_shown(&evs, 7));
     }
 }

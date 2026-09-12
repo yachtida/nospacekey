@@ -30,6 +30,7 @@ fn quoted_after<'a>(source: &'a str, marker: &str) -> &'a str {
 fn installer_model_constants_match_download_rs() {
     let rs = read("src/download.rs");
     let iss = read("../../installer/nospacekey.iss");
+    let cleanup = read("../../scripts/version-cleanup.ps1");
     assert_eq!(
         quoted_after(&iss, "#define ModelFileName"),
         quoted_after(&rs, "const MODEL_FILENAME"),
@@ -44,5 +45,15 @@ fn installer_model_constants_match_download_rs() {
         quoted_after(&iss, "#define ModelSHA256"),
         quoted_after(&rs, "const MODEL_SHA256"),
         "モデル SHA256 が .iss と download.rs で不一致"
+    );
+    assert_eq!(
+        quoted_after(&cleanup, "$InstallerModelFileName"),
+        quoted_after(&rs, "const MODEL_FILENAME"),
+        "モデルファイル名が cleanup と download.rs で不一致"
+    );
+    assert_eq!(
+        quoted_after(&cleanup, "$InstallerModelSha256"),
+        quoted_after(&rs, "const MODEL_SHA256"),
+        "モデル SHA256 が cleanup と download.rs で不一致"
     );
 }

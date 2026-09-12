@@ -1,0 +1,5 @@
+module NospacekeyLlamaRuntime [system] {
+    header "nospacekey_llama_runtime.h"
+    link "llama"
+    export *
+}

@@ -138,14 +138,18 @@ final class ProtocolTests: XCTestCase {
     func testEncodeResponseNeverEmpty() {
         let cases: [Response] = [
             .pong,
-            .session(7, proto: nil),
+            .session(7, proto: nil, boot: nil, engineEpoch: "fixture-engine", learningGeneration: 0),
             .reading(""),                                   // 空読みでもフレーム本体は非空
             .candidates([]),                                // 空候補でもフレーム本体は非空
             .ok,
             .error("no session"),
             .liveResult(seq: 1, text: "", reading: "", committed: nil),
             .llmResult(seq: 2, text: ""),
+            .prediction(seq: 3, text: ""),
+            .predictionUnavailable(seq: 4, state: "loading"),
             .committed(text: "", reading: ""),              // 全消費（残り読み空）でもフレーム本体は非空
+            .zenzaiStatus(state: "classic", backend: nil, device: nil, reason: nil,
+                          liveLatency: nil, convertLatency: nil),
         ]
         for c in cases {
             XCTAssertFalse(encodeResponse(c).isEmpty, "encodeResponse must never be empty for \(c)")
@@ -178,6 +182,61 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(try decode(#"{"method":"EndSession","params":{"session":7}}"#).sessionId, 7)
         XCTAssertEqual(try decode(#"{"method":"LiveConvert","params":{"session":7,"seq":1}}"#).sessionId, 7)
         XCTAssertEqual(try decode(#"{"method":"LlmConvert","params":{"session":7,"seq":1}}"#).sessionId, 7)
+        XCTAssertEqual(try decode(#"{"method":"Predict","params":{"session":7,"seq":2,"token_ids":[1,2]}}"#).sessionId, 7)
+    }
+
+    func testDecodePredictionRequest() throws {
+        let json = #"{"method":"Predict","params":{"session":7,"seq":42,"token_ids":[1,50014,28998,65484,29282]}}"#
+        let req = try JSONDecoder().decode(Request.self, from: Data(json.utf8))
+        guard case .predict(let session, let seq, let tokenIDs) = req else {
+            return XCTFail("not predict: \(req)")
+        }
+        XCTAssertEqual(session, 7)
+        XCTAssertEqual(seq, 42)
+        XCTAssertEqual(tokenIDs, [1, 50_014, 28_998, 65_484, 29_282])
+    }
+
+    func testEncodePredictionResponses() throws {
+        let prediction = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(Response.prediction(seq: 42, text: "会議です"))) as! [String: Any]
+        XCTAssertEqual(prediction["result"] as? String, "Prediction")
+        XCTAssertEqual(prediction["seq"] as? Int, 42)
+        XCTAssertEqual(prediction["text"] as? String, "会議です")
+
+        let unavailable = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(Response.predictionUnavailable(seq: 43, state: "loading"))) as! [String: Any]
+        XCTAssertEqual(unavailable["result"] as? String, "PredictionUnavailable")
+        XCTAssertEqual(unavailable["seq"] as? Int, 43)
+        XCTAssertEqual(unavailable["state"] as? String, "loading")
+    }
+
+    func testSnapshotAutoCommitBumpsProtocolGeneration() {
+        XCTAssertEqual(ProtocolVersion.current, 9)
+    }
+
+    func testSnapshotAutoCommitProposalAndReceiptWireContract() throws {
+        let response = Response.snapshotResult(
+            composition: 8, revision: 13, configurationGeneration: 2,
+            connectionGeneration: 5, text: "語", candidates: nil,
+            candidateRemaining: nil, baseline: 41,
+            autoCommit: AutoCommitProposal(
+                proposal: 17, text: "日本", consumedReading: "にほん", remaining: "ご"),
+            clauseData: SnapshotClauseData(reading: "ご", conversion_revision: 0, request_id: 1,
+                clauses: [WireClause(id: 1, reading_start: 0, reading_end: 1, state: .converted, surface: "語", candidate_token: "fixture-candidate")], sentence_token: nil))
+        let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(response)) as! [String: Any]
+        let proposal = object["auto_commit"] as! [String: Any]
+        XCTAssertEqual(proposal["proposal"] as? Int, 17)
+        XCTAssertEqual(proposal["consumed_reading"] as? String, "にほん")
+        XCTAssertEqual(proposal["remaining"] as? String, "ご")
+
+        let json = #"{"method":"AutoCommitReceipt","params":{"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"proposal":17}}"#
+        let request = try JSONDecoder().decode(Request.self, from: Data(json.utf8))
+        guard case .autoCommitReceipt(let composition, let revision, _, _, let id) = request else {
+            return XCTFail("not receipt")
+        }
+        XCTAssertEqual(composition, 8)
+        XCTAssertEqual(revision, 13)
+        XCTAssertEqual(id, 17)
     }
 
     // ---- Shift英語モード: Insert style（Rust protocol.rs のテストと wire 形一致）----
@@ -204,6 +263,52 @@ final class ProtocolTests: XCTestCase {
         XCTAssertNil(req.sessionId)
     }
 
+    func testDecodeZenzaiStatusOperationsHaveNoSession() throws {
+        let query = try JSONDecoder().decode(
+            Request.self, from: Data(#"{"method":"QueryZenzaiStatus"}"#.utf8))
+        let retry = try JSONDecoder().decode(
+            Request.self, from: Data(#"{"method":"RetryZenzai"}"#.utf8))
+        guard case .queryZenzaiStatus = query else { return XCTFail("not QueryZenzaiStatus") }
+        guard case .retryZenzai = retry else { return XCTFail("not RetryZenzai") }
+        XCTAssertNil(query.sessionId)
+        XCTAssertNil(retry.sessionId)
+    }
+
+    func testEncodeZenzaiStatusOmitsSensitiveAndOptionalFields() throws {
+        let response = Response.zenzaiStatus(
+            state: "classic", backend: nil, device: nil, reason: "backend_unavailable",
+            liveLatency: nil, convertLatency: nil)
+        let object = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(response)) as! [String: Any]
+        XCTAssertEqual(object["result"] as? String, "ZenzaiStatus")
+        XCTAssertEqual(object["state"] as? String, "classic")
+        XCTAssertEqual(object["reason"] as? String, "backend_unavailable")
+        for key in ["path", "input", "candidates", "generation", "model_load_attempts",
+                    "context_init_attempts", "decode_attempts"] {
+            XCTAssertNil(object[key], "runtime status must not expose \(key)")
+        }
+    }
+
+    /// 集約速度統計は載せるが、nil なら wire から丸ごと省略する（旧エンジン互換）。
+    /// Rust 側 `zenzai_status_response_encodes_latency_tiers` と一字一致で対にする。
+    func testEncodeZenzaiStatusIncludesLatencyTiersWhenPresent() throws {
+        let tier = ZenzaiLatencyTierStats(
+            sampleCount: 100, p50Ms: 51.7, p95Ms: 62.6, maxMs: 72.2, timeoutCount: 2)
+        let response = Response.zenzaiStatus(
+            state: "gpu_active", backend: "Vulkan", device: "AMD Radeon(TM) 890M Graphics",
+            reason: nil, liveLatency: tier, convertLatency: nil)
+        let object = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(response)) as! [String: Any]
+        let live = object["latency_live"] as? [String: Any]
+        XCTAssertNotNil(live, "latency_live must be present when supplied")
+        XCTAssertEqual(live?["count"] as? Int, 100)
+        XCTAssertEqual(live?["p50_ms"] as? Double, 51.7)
+        XCTAssertEqual(live?["p95_ms"] as? Double, 62.6)
+        XCTAssertEqual(live?["max_ms"] as? Double, 72.2)
+        XCTAssertEqual(live?["timeout_count"] as? Int, 2)
+        XCTAssertNil(object["latency_convert"], "absent tier must be omitted entirely")
+    }
+
     func testDecodeRecordCorrection() throws {
         // Rust 側 protocol.rs の serialize 出力と一字一句一致(record_correction_request_roundtrips と対)。
         // session を伴わない(確定済み訂正はどのセッションにも属さない — ClearLearning と同じ共有資源扱い)。
@@ -217,19 +322,21 @@ final class ProtocolTests: XCTestCase {
 
     func testEncodeSessionCarriesProto() throws {
         // 新エンジン: Session 応答に proto を載せる。dict 比較（キー順非保証のためバイト一致比較はしない）。
-        let res = Response.session(7, proto: 2)
+        let res = Response.session(7, proto: 9, boot: BuildInfo.version, engineEpoch: "fixture-engine", learningGeneration: 6)
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
         XCTAssertEqual(obj["session"] as? Int, 7)
-        XCTAssertEqual(obj["proto"] as? Int, 2)
+        XCTAssertEqual(obj["proto"] as? Int, 9)
+        XCTAssertEqual(obj["boot"] as? String, BuildInfo.version)
     }
 
     func testEncodeSessionWithoutProtoOmitsKey() throws {
         // proto=nil はキー自体を省略＝handshake 導入前と wire 形一致（旧TIP互換。Rust 側 Option と対）。
-        let res = Response.session(7, proto: nil)
+        let res = Response.session(7, proto: nil, boot: nil, engineEpoch: "fixture-engine", learningGeneration: 0)
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
         XCTAssertEqual(obj["session"] as? Int, 7)
         XCTAssertNil(obj["proto"])
+        XCTAssertNil(obj["boot"])
     }
 }

@@ -247,6 +247,7 @@ final class ClauseNavigationTests: XCTestCase {
         let learned = cands[1]
         XCTAssertEqual(try XCTUnwrap(svc.commit(session: sid, index: 1)).text, learned)
         svc.endSession(session: sid)
+        svc.flushMaintenanceForTesting()
         // 候補順位は訂正昇格(CorrectionStore)でも動くため、vendor 学習の生死は
         // ファイル生成で判定する — .nothing 残置だと save() が needUpdateMemory guard で
         // skip されファイルが作られない(昇格と無関係な決定的判別子)。

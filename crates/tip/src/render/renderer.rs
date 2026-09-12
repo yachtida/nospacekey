@@ -10,7 +10,9 @@
 
 use windows::core::{Interface, Result};
 use windows::Win32::Foundation::{HMODULE, HWND};
-use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT,
+};
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1DeviceContext, ID2D1Factory1, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
     D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
@@ -283,17 +285,27 @@ mod tests {
     #[test]
     fn is_device_lost_matches_known_hresults() {
         // デバイスロスト由来の 3 つの HRESULT は true。
-        assert!(is_device_lost(&Error::from_hresult(HRESULT(0x887A0005_u32 as i32)))); // DEVICE_REMOVED
-        assert!(is_device_lost(&Error::from_hresult(HRESULT(0x887A0007_u32 as i32)))); // DEVICE_RESET
-        assert!(is_device_lost(&Error::from_hresult(HRESULT(0x8899000C_u32 as i32)))); // RECREATE_TARGET
+        assert!(is_device_lost(&Error::from_hresult(HRESULT(
+            0x887A0005_u32 as i32
+        )))); // DEVICE_REMOVED
+        assert!(is_device_lost(&Error::from_hresult(HRESULT(
+            0x887A0007_u32 as i32
+        )))); // DEVICE_RESET
+        assert!(is_device_lost(&Error::from_hresult(HRESULT(
+            0x8899000C_u32 as i32
+        )))); // RECREATE_TARGET
     }
 
     #[test]
     fn is_device_lost_rejects_other_errors() {
         // 通常のフレーム失敗（例: E_FAIL / E_INVALIDARG）はロスト扱いにしない
         // （窓の作り直しを巻き込まないため）。
-        assert!(!is_device_lost(&Error::from_hresult(HRESULT(0x80004005_u32 as i32)))); // E_FAIL
-        assert!(!is_device_lost(&Error::from_hresult(HRESULT(0x80070057_u32 as i32)))); // E_INVALIDARG
+        assert!(!is_device_lost(&Error::from_hresult(HRESULT(
+            0x80004005_u32 as i32
+        )))); // E_FAIL
+        assert!(!is_device_lost(&Error::from_hresult(HRESULT(
+            0x80070057_u32 as i32
+        )))); // E_INVALIDARG
         assert!(!is_device_lost(&Error::from_hresult(HRESULT(0)))); // S_OK
     }
 }

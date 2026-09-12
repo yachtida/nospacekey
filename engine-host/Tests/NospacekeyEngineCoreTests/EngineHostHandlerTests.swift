@@ -14,6 +14,25 @@ private final class ReplyBox: @unchecked Sendable {
 }
 
 final class EngineHostHandlerTests: XCTestCase {
+    func testEndSessionAcknowledgesBeforeDeferredConverterCleanupCompletes() throws {
+        let service = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1))
+        let session = service.startSession(connection: 17)
+        let release = service.beginConverterLockHoldForTesting()
+        let handler = makeEngineHandler(service: service, serviceLock: NSLock())
+        let request = Data(#"{"method":"EndSession","params":{"session":\#(session)}}"#.utf8)
+
+        let finished = DispatchSemaphore(value: 0)
+        let reply = ReplyBox()
+        Thread.detachNewThread {
+            reply.data = handler(17, request).reply
+            finished.signal()
+        }
+        XCTAssertEqual(finished.wait(timeout: .now() + .milliseconds(100)), .success,
+                       "EndSession acknowledgement must not wait for converter maintenance")
+        XCTAssertEqual(resultTag((reply.data ?? Data(), false)), "Ok")
+        release()
+        service.flushMaintenanceForTesting()
+    }
     /// 応答 JSON の "result" タグを取り出す（Response は Encodable のみなので生 JSON で検証する）。
     /// handler は (reply, exitAfterReply) を返すので outcome を直接受けて reply を検証する。
     func resultTag(_ outcome: (reply: Data, exitAfterReply: Bool)) -> String? {
@@ -35,13 +54,70 @@ final class EngineHostHandlerTests: XCTestCase {
         XCTAssertEqual(resultTag(resp), "Pong")
     }
 
+    func testPingDoesNotWaitForTheConversionServiceLock() {
+        let serviceLock = NSLock()
+        let handler = makeEngineHandler(service: makeService(), serviceLock: serviceLock)
+        serviceLock.lock()
+        defer { serviceLock.unlock() }
+        let reply = ReplyBox()
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            reply.data = handler(1, Data(#"{"method":"Ping"}"#.utf8)).reply
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(resultTag((reply.data ?? Data(), false)), "Pong")
+    }
+
+    func testZenzaiStatusQueryDoesNotWaitForConverterLock() throws {
+        let service = ConversionService(
+            config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1,
+                                 disabledReason: .userDisabled))
+        let handler = makeEngineHandler(service: service, serviceLock: NSLock())
+        let release = service.beginConverterLockHoldForTesting()
+        defer { release() }
+        let reply = ReplyBox()
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            reply.data = handler(1, Data(#"{"method":"QueryZenzaiStatus"}"#.utf8)).reply
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 2), .success,
+                       "status query must use the non-blocking snapshot")
+        let object = try JSONSerialization.jsonObject(with: reply.data ?? Data()) as! [String: Any]
+        XCTAssertEqual(object["result"] as? String, "ZenzaiStatus")
+        XCTAssertEqual(object["state"] as? String, "disabled")
+        XCTAssertEqual(object["reason"] as? String, "user_disabled")
+        XCTAssertNil(object["path"])
+        XCTAssertNil(object["input"])
+        XCTAssertNil(object["candidates"])
+        XCTAssertNil(object["latency_live"], "absent stats must be omitted on the wire")
+    }
+
+    func testZenzaiRetryIsAcknowledgedBeforeConverterLockIsAvailable() {
+        let service = makeService()
+        let handler = makeEngineHandler(service: service, serviceLock: NSLock())
+        let release = service.beginConverterLockHoldForTesting()
+        defer { release() }
+        let reply = ReplyBox()
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            reply.data = handler(1, Data(#"{"method":"RetryZenzai"}"#.utf8)).reply
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 2), .success,
+                       "retry acknowledgement must not wait for native warm-up")
+        XCTAssertEqual(resultTag((reply.data ?? Data(), false)), "Ok")
+    }
+
     // version handshake: 新エンジンは StartSession 応答に proto=PROTO_VERSION を載せる。
     func testStartSessionCarriesProtoVersion() throws {
         let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
         let obj = try JSONSerialization.jsonObject(
             with: handler(1, Data(#"{"method":"StartSession"}"#.utf8)).reply) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
-        XCTAssertEqual(obj["proto"] as? Int, 2)
+        XCTAssertEqual(obj["proto"] as? Int, 9)
+        XCTAssertEqual(obj["boot"] as? String, BuildInfo.version)
     }
 
     // graceful 停止: Shutdown は Ok を返し、かつ「応答後に exit」を要求する（実際の exit(0) は
@@ -65,6 +141,89 @@ final class EngineHostHandlerTests: XCTestCase {
         XCTAssertEqual(resultTag(handler(1, Data("not json".utf8))), "Error")
     }
 
+    func testPredictionUsesOwnedSessionAndPreservesSequence() throws {
+        let predictor = PredictionService(availability: .ready) { _, _ in "会議です" }
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
+                                        predictionService: predictor)
+        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
+            return XCTFail("no session")
+        }
+        let body = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":42,"token_ids":[1,50014,28998,65484,29282]}}"#.utf8)
+        let obj = try JSONSerialization.jsonObject(with: handler(10, body).reply) as! [String: Any]
+        XCTAssertEqual(obj["result"] as? String, "Prediction")
+        XCTAssertEqual(obj["seq"] as? Int, 42)
+        XCTAssertEqual(obj["text"] as? String, "会議です")
+    }
+
+    func testPredictionRejectsAnotherConnectionsSession() {
+        let predictor = PredictionService(availability: .ready) { _, _ in "漏れてはいけない" }
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
+                                        predictionService: predictor)
+        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
+            return XCTFail("no session")
+        }
+        let body = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":1,"token_ids":[1,2]}}"#.utf8)
+        XCTAssertEqual(resultTag(handler(11, body)), "Error")
+    }
+
+    func testReloadConfigDisablesPredictionImmediately() throws {
+        let predictor = PredictionService(availability: .ready) { _, _ in "表示しない" }
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
+                                        predictionService: predictor)
+        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
+            return XCTFail("no session")
+        }
+        let reload = Data(#"{"method":"ReloadConfig","params":{"llm_enabled":false,"llm_api_key":"","llm_endpoint":"","llm_model":"","llm_prompt":"","llm_timeout_ms":15000,"zenzai_enabled":false,"zenzai_weight":"","inline_prediction_enabled":false}}"#.utf8)
+        XCTAssertEqual(resultTag(handler(10, reload)), "Ok")
+        let predict = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":7,"token_ids":[1,2]}}"#.utf8)
+        let object = try JSONSerialization.jsonObject(with: handler(10, predict).reply) as! [String: Any]
+        XCTAssertEqual(object["result"] as? String, "PredictionUnavailable")
+        XCTAssertEqual(object["state"] as? String, "disabled")
+    }
+
+    func testNormalOperationCancelsInFlightPredictionButPingDoesNot() throws {
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let predictor = PredictionService(availability: .ready) { _, _ in
+            started.signal()
+            _ = release.wait(timeout: .now() + 2)
+            return "候補です"
+        }
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
+                                        predictionService: predictor)
+        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
+            return XCTFail("no session")
+        }
+        let predict = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":8,"token_ids":[1,2]}}"#.utf8)
+
+        let pingReply = ReplyBox()
+        let pingDone = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            pingReply.data = handler(10, predict).reply
+            pingDone.signal()
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(resultTag(handler(10, Data(#"{"method":"Ping"}"#.utf8))), "Pong")
+        release.signal()
+        XCTAssertEqual(pingDone.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(resultTag((pingReply.data ?? Data(), false)), "Prediction")
+
+        let operationReply = ReplyBox()
+        let operationDone = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            operationReply.data = handler(10, predict).reply
+            operationDone.signal()
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
+        let insert = Data(#"{"method":"Insert","params":{"session":\#(sid),"text":"a"}}"#.utf8)
+        XCTAssertEqual(resultTag(handler(10, insert)), "Reading")
+        release.signal()
+        XCTAssertEqual(operationDone.wait(timeout: .now() + 2), .success)
+        let object = try JSONSerialization.jsonObject(with: operationReply.data ?? Data()) as! [String: Any]
+        XCTAssertEqual(object["result"] as? String, "PredictionUnavailable")
+        XCTAssertEqual(object["state"] as? String, "stale")
+    }
+
     // UU-5: ReloadConfig は session を伴わずに Ok を返す（decode→dispatch→反映のスモーク）。
     func testReloadConfigDispatchesToOk() {
         let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
@@ -86,6 +245,110 @@ final class EngineHostHandlerTests: XCTestCase {
         XCTAssertEqual(resultTag(handler(1, Data(#"{"method":"ClearLearning"}"#.utf8))), "Ok")
     }
 
+    func testClearLearningFailureIsReturnedAsIpcError() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nospacekey-clear-error-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileSystem = LearningFileSystem(
+            list: { _ in throw NSError(domain: "EngineHostHandlerTests", code: 1) },
+            remove: { _ in }
+        )
+        let svc = ConversionService(
+            config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+            learning: LearningSettings(enabled: false, memoryDir: dir),
+            fileSystem: fileSystem)
+        let handler = makeEngineHandler(service: svc, serviceLock: NSLock())
+
+        let outcome = handler(1, Data(#"{"method":"ClearLearning"}"#.utf8))
+        XCTAssertEqual(resultTag(outcome), "Error")
+    }
+
+    func testBlockedClearDoesNotHoldTheGlobalRequestLockAndConcurrentClearFailsFast() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nospacekey-clear-concurrent-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let persistenceStarted = DispatchSemaphore(value: 0)
+        let releasePersistence = DispatchSemaphore(value: 0)
+        let clearStarted = DispatchSemaphore(value: 0)
+        let service = ConversionService(
+            config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+            learning: LearningSettings(enabled: true, memoryDir: dir),
+            autoCommit: .ultrastrong, autoCommitMaxReading: 8,
+            fileSystem: .live,
+            learningPersistenceForTesting: { _ in
+                persistenceStarted.signal()
+                releasePersistence.wait()
+            },
+            learningClearStartedForTesting: { clearStarted.signal() })
+        guard let (key, proposal) = firstSnapshotProposal(service) else {
+            return XCTFail("representative input must propose an auto commit")
+        }
+        XCTAssertTrue(service.applySnapshotAutoCommitReceipt(
+            connection: 1, key: key, proposal: proposal.proposal))
+        XCTAssertEqual(persistenceStarted.wait(timeout: .now() + 2), .success)
+
+        let handler = makeEngineHandler(service: service, serviceLock: NSLock())
+        let leaderDone = DispatchSemaphore(value: 0)
+        let leaderReply = ReplyBox()
+        Thread.detachNewThread {
+            leaderReply.data = handler(1, Data(#"{"method":"ClearLearning"}"#.utf8)).reply
+            leaderDone.signal()
+        }
+        XCTAssertEqual(clearStarted.wait(timeout: .now() + 2), .success)
+
+        XCTAssertEqual(resultTag(handler(2, Data(#"{"method":"StartSession"}"#.utf8))), "Session",
+                       "ClearLearning must not hold the global request lock while persistence drains")
+        XCTAssertEqual(resultTag(handler(3, Data(#"{"method":"ClearLearning"}"#.utf8))), "Error",
+                       "concurrent ClearLearning must not consume another fixed pipe worker")
+        XCTAssertEqual(leaderDone.wait(timeout: .now() + .milliseconds(20)), .timedOut)
+        releasePersistence.signal()
+        XCTAssertEqual(leaderDone.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(resultTag((leaderReply.data ?? Data(), false)), "Ok")
+    }
+
+    func testSnapshotReceiptAcceptsNonzeroRequestStampAndRejectsWrongIdentity() throws {
+        let service = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+            learning: LearningSettings(enabled: false, memoryDir: nil),
+            autoCommit: .ultrastrong, autoCommitMaxReading: 8)
+        let handler = makeEngineHandler(service: service, serviceLock: NSLock())
+        var raw = ""
+        for (offset, character) in "watashiha,gakkouheikimasu".enumerated() {
+            raw.append(character)
+            let revision = offset + 1
+            let request = Data(#"{"method":"LiveSnapshot","params":{"composition":700,"revision":\#(revision),"configuration_generation":2,"connection_generation":5,"conversion_revision":3,"request_id":\#(revision + 100),"segments":[{"text":"\#(raw)"}]}}"#.utf8)
+            let response = try XCTUnwrap(try JSONSerialization.jsonObject(with: handler(1, request).reply) as? [String: Any])
+            guard let proposal = response["auto_commit"] as? [String: Any],
+                  let id = proposal["proposal"] as? NSNumber else { continue }
+            func receipt(_ generation: Int) -> Data {
+                Data(#"{"method":"AutoCommitReceipt","params":{"composition":700,"revision":\#(revision),"configuration_generation":\#(generation),"connection_generation":5,"proposal":\#(id.uint64Value)}}"#.utf8)
+            }
+            XCTAssertEqual(resultTag(handler(1, receipt(9))), "Error")
+            XCTAssertEqual(resultTag(handler(2, receipt(2))), "Error")
+            XCTAssertEqual(resultTag(handler(1, receipt(2))), "Ok")
+            XCTAssertEqual(resultTag(handler(1, receipt(2))), "Ok")
+            return
+        }
+        XCTFail("representative input must propose an auto commit")
+    }
+
+    private func firstSnapshotProposal(_ service: ConversionService)
+        -> (ConversionService.SnapshotEnhancementKey, ConversionService.SnapshotAutoCommitProposal)? {
+        var raw = ""
+        for (offset, character) in "watashiha,gakkouheikimasu".enumerated() {
+            raw.append(character)
+            let key = ConversionService.SnapshotEnhancementKey(
+                composition: 700, revision: UInt64(offset + 1),
+                configurationGeneration: 2, connectionGeneration: 5)
+            let result = service.snapshot(
+                [SnapshotSegment(text: raw, style: nil)], explicit: false,
+                enhancementKey: key, snapshotConnection: 1)
+            if let proposal = result.autoCommit { return (key, proposal) }
+        }
+        return nil
+    }
+
     // 訂正昇格: RecordCorrection の decode→dispatch→反映。reading/surface は switch の
     // 位置バインドなので、入れ替えバグはこの end-to-end 観測でしか検出できない
     // （reading をかな・surface を漢字にして、入れ替わると かなフィルタで棄却され lookup が nil になる）。
@@ -101,9 +364,9 @@ final class EngineHostHandlerTests: XCTestCase {
         // ひらがな literal 候補("にほんご"自身)は除外する: reading==surface だと
         // 入れ替えバグでも同じアサートが通り、テストの検出力がハッシュ順次第で消える。
         guard let surface = { () -> String? in
-            _ = svc.reconvert(session: s, surface: "にほんご")
+            let modelTop = svc.reconvert(session: s, surface: "にほんご")?.first
             return svc.recordableSurfacesForTesting(reading: "にほんご")
-                .first(where: { $0 != "にほんご" })
+                .sorted().first(where: { $0 != "にほんご" && $0 != modelTop })
         }() else {
             svc.endSession(session: s)
             return XCTFail("no recordable surface")
@@ -182,6 +445,31 @@ final class EngineHostHandlerTests: XCTestCase {
         XCTAssertEqual(resultTag((reply.data ?? Data(), false)), "Ok")
     }
 
+    // 巡3 Z8/D5: ReloadConfig は converterLock が warm-up/変換中で取れないとき busy を
+    // Error("reload busy ...") で返す — 無条件 .ok を返す成功詐称（旧実装）への回帰固定。
+    // beginConverterLockHoldForTesting で busy 条件を決定的に作る（ReloadDictionary 版と同型）。
+    func testReloadConfigBusyReturnsErrorNotOk() {
+        let svc = makeService()
+        let handler = makeEngineHandler(service: svc, serviceLock: NSLock())
+        let release = svc.beginConverterLockHoldForTesting()
+        defer { release() }
+        let reply = ReplyBox()
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            let out = handler(1, Data(#"{"method":"ReloadConfig","params":{"llm_enabled":false,"llm_api_key":"","llm_endpoint":"","llm_model":"","llm_prompt":"","llm_timeout_ms":15000,"zenzai_enabled":false,"zenzai_weight":""}}"#.utf8))
+            reply.data = out.reply
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 2), .success,
+                       "ReloadConfig ハンドラが converterLock を待っている（非ブロックのはず）")
+        let data = reply.data ?? Data()
+        XCTAssertEqual(resultTag((data, false)), "Error")
+        let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let message = obj?["message"] as? String ?? ""
+        XCTAssertTrue(message.hasPrefix("reload busy"),
+                      "busy の Error であるべき（actual: \(message)）— .ok に戻すデグレ")
+    }
+
     func testCrossConnectionSessionAccessIsDeniedAsNoSession() {
         let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
         // conn 1 がセッションを作る。
@@ -199,5 +487,82 @@ final class EngineHostHandlerTests: XCTestCase {
         XCTAssertEqual(resultTag(handler(1, end)), "Ok")
         // 終了後は所有者でも no session（未知セッションへの正規化と同型）。
         XCTAssertEqual(resultTag(handler(1, insert)), "Error")
+    }
+
+    func testLiveSnapshotRebuildsStyledInputAndEchoesIdentity() throws {
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
+        let request = Data(#"{"method":"LiveSnapshot","params":{"conversion_revision":0,"request_id":1,"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"segments":[{"text":"nihongo"},{"text":"GPU","style":"direct"}]}}"#.utf8)
+        let outcome = handler(4, request)
+        let object = try JSONSerialization.jsonObject(with: outcome.reply) as! [String: Any]
+        XCTAssertEqual(object["result"] as? String, "SnapshotResult")
+        XCTAssertEqual(object["composition"] as? Int, 8)
+        XCTAssertEqual(object["revision"] as? Int, 13)
+        XCTAssertEqual(object["configuration_generation"] as? Int, 2)
+        XCTAssertEqual(object["connection_generation"] as? Int, 5)
+        XCTAssertNotNil(object["baseline"] as? NSNumber)
+        XCTAssertEqual(object["reading"] as? String, "にほんごGPU")
+        XCTAssertEqual(object["conversion_revision"] as? Int, 0)
+        XCTAssertEqual(object["request_id"] as? Int, 1)
+        let clauses = try JSONDecoder().decode(SnapshotClauseData.self, from: outcome.reply)
+        try ClauseCoordinates.validate(reading: clauses.reading, clauses: clauses.clauses,
+            start: 0, end: UInt32(clauses.reading.unicodeScalars.count), text: object["text"] as! String)
+        XCTAssertNil(object["candidates"])
+    }
+
+    func testSnapshotEnhancementPollIsTerminalWhenGPUIsUnavailable() throws {
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
+        let classic = handler(1, Data(#"{"method":"LiveSnapshot","params":{"conversion_revision":0,"request_id":1,"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"segments":[{"text":"nihongo"}]}}"#.utf8))
+        let object = try JSONSerialization.jsonObject(with: classic.reply) as! [String: Any]
+        let baseline = try XCTUnwrap(object["baseline"] as? NSNumber).uint64Value
+        let poll = Data("{\"method\":\"PollSnapshotEnhancement\",\"params\":{\"conversion_revision\":0,\"request_id\":1,\"composition\":8,\"revision\":13,\"configuration_generation\":2,\"connection_generation\":5,\"baseline\":\(baseline)}}".utf8)
+        XCTAssertEqual(resultTag(handler(1, poll)), "SnapshotEnhancementUnavailable")
+    }
+
+    func testSnapshotEnhancementPollDoesNotWaitForConversionServiceLock() {
+        let serviceLock = NSLock()
+        let handler = makeEngineHandler(service: makeService(), serviceLock: serviceLock)
+        serviceLock.lock()
+        defer { serviceLock.unlock() }
+        let reply = ReplyBox()
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            reply.data = handler(1, Data(#"{"method":"PollSnapshotEnhancement","params":{"conversion_revision":0,"request_id":1,"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"baseline":42}}"#.utf8)).reply
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(resultTag((reply.data ?? Data(), false)), "SnapshotEnhancementUnavailable")
+    }
+
+    func testExplicitSnapshotReturnsClassicCandidatesWithTheSameIdentity() throws {
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
+        let request = Data(#"{"method":"LiveSnapshot","params":{"conversion_revision":0,"request_id":1,"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"segments":[{"text":"nihongo"}],"explicit":true}}"#.utf8)
+        let outcome = handler(4, request)
+        let object = try JSONSerialization.jsonObject(with: outcome.reply) as! [String: Any]
+        XCTAssertEqual(object["result"] as? String, "SnapshotResult")
+        XCTAssertEqual(object["composition"] as? Int, 8)
+        XCTAssertEqual(object["revision"] as? Int, 13)
+        let candidates = object["candidates"] as? [String]
+        XCTAssertFalse(candidates?.isEmpty ?? true)
+        let remaining = object["candidate_remaining"] as? [String]
+        XCTAssertEqual(remaining?.count, candidates?.count)
+    }
+
+    func testSnapshotReconstructionMatchesPinnedRepresentativeReadings() {
+        for (roman, expected) in [
+            ("nihongo", "にほんご"),
+            ("gakkou", "がっこう"),
+            ("xya", "ゃ"),
+            ("nn", "ん"),
+        ] {
+            let composing = ConversionService.makeSnapshotComposing([
+                SnapshotSegment(text: roman, style: nil)
+            ])
+            XCTAssertEqual(composing.convertTarget, expected, roman)
+        }
+        let styled = ConversionService.makeSnapshotComposing([
+            SnapshotSegment(text: "kyou", style: nil),
+            SnapshotSegment(text: "GPU", style: "direct")
+        ])
+        XCTAssertEqual(styled.convertTarget, "きょうGPU")
     }
 }

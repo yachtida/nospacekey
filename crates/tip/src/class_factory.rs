@@ -1,11 +1,11 @@
 //! IClassFactory 実装。COM ランタイムが DllGetClassObject 経由で取得し、
 //! CreateInstance で TextService を生成して要求 IID にキャストして返す。
 
-use std::ffi::c_void;
-use windows::core::{implement, IUnknown, IUnknownImpl, Interface, Ref, Result, GUID, BOOL};
-use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl, CoLockObjectExternal};
-use crate::text_service::TextService;
 use crate::globals::ComObjectGuard;
+use crate::text_service::TextService;
+use std::ffi::c_void;
+use windows::core::{implement, IUnknown, IUnknownImpl, Interface, Ref, Result, BOOL, GUID};
+use windows::Win32::System::Com::{CoLockObjectExternal, IClassFactory, IClassFactory_Impl};
 
 #[implement(IClassFactory)]
 pub struct ClassFactory {
@@ -16,12 +16,19 @@ pub struct ClassFactory {
 
 impl ClassFactory {
     pub fn new() -> Self {
-        Self { _guard: ComObjectGuard::new() }
+        Self {
+            _guard: ComObjectGuard::new(),
+        }
     }
 }
 
 impl IClassFactory_Impl for ClassFactory_Impl {
-    fn CreateInstance(&self, _outer: Ref<'_, IUnknown>, riid: *const GUID, ppv: *mut *mut c_void) -> Result<()> {
+    fn CreateInstance(
+        &self,
+        _outer: Ref<'_, IUnknown>,
+        riid: *const GUID,
+        ppv: *mut *mut c_void,
+    ) -> Result<()> {
         // TextService を作り IUnknown として保持してから要求 IID へ query する。
         let unknown: IUnknown = TextService::new().into();
         unsafe { unknown.query(riid, ppv).ok() }

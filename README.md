@@ -57,29 +57,35 @@ macOS のライブ変換に慣れた人が Windows で恋しくなる、あれ�
 - **モードレス再変換** — 半角英数で打ったローマ字を、選んで後から日本語化
 - **修正変換(Tab)** — 打ち間違いを修復し、誤読みも学習
 - **Shift+英字** — 文中に英単語を混ぜるときは Shift を押しながら打つだけ
-- **Zenzai ニューラル変換(opt-in)** — GGUF モデルを置くと文脈を読む変換をローカル CPU で。無ければ古典 LOUDS 変換で軽快に動作
+- **Zenzai ニューラル変換** — Vulkan 対応 GPU と GGUF モデルがある場合だけ、文脈を読む変換をローカルで実行。使えない環境では古典 LOUDS 変換で動作
+- **インライン予測(alpha・既定OFF)** — 明示確定後に続きをローカル CPU で予測し、右矢印/End で受理
+- **自動アップデート確認(既定OFF)** — 有効にしたユーザーだけが新しいリリースのメタデータを確認。自動ダウンロード・自動インストールはしません
 - **設定 GUI** — キーマップのリバインド、句読点・記号の全角半角、起動時の入力モードなど
 - **プライバシーファースト** — 変換・学習・ログはすべてローカル完結、既定で外部送信ゼロ([PRIVACY.md](PRIVACY.md))。パスワード欄では変換も学習もしません
 
 ## インストール
 
-1. [Releases](https://github.com/yachtida/nospacekey/releases/latest) から `nospacekey-setup-<version>.exe` をダウンロード
+現在の安定版は **v1.5.0** です。
+
+1. [Releases](https://github.com/yachtida/nospacekey/releases/latest) から `nospacekey-setup-1.5.0-devsigned.exe` をダウンロード
 2. 実行してインストール(IME の登録はマシン単位のため、管理者権限を求められます)
 3. <kbd>Win</kbd> + <kbd>Space</kbd> で「nospacekey」を選択
 
 対応環境: Windows 11 x64
 
 > [!NOTE]
-> 現在の版は開発用の自己署名で配布しているため、初回実行時に SmartScreen の警告が表示されます。
+> v1.5.0 は開発用の自己署名(dev署名)で配布しているため、初回実行時に Windows SmartScreen の警告が表示されます。
 > 「詳細情報」→「実行」で続行できます。ダウンロードしたファイルは各リリース添付の
 > `SHA256SUMS.txt` で検証できます。
 
 ### Zenzai(ニューラル変換)を有効にする
 
-Zenzai はオプトインです。設定画面のダウンロード機能を使うか、
+インストーラの「Zenzai(ニューラル変換)を使用する」タスクは既定で選択されています。
+不要な場合はインストール時に解除できます。モデルは
 [zenz-v3.1-small](https://huggingface.co/Miwa-Keita/zenz-v3.1-small-gguf)(CC-BY-SA-4.0)の
-`ggml-model-Q5_K_M.gguf` を `C:\Program Files\nospacekey\models\` に配置すると、
-次回起動時から自動で有効になります。
+`ggml-model-Q5_K_M.gguf` で、インストール後に設定画面から取得することもできます。
+Vulkan 対応 GPU、driver、runtime、モデルの準備がそろった場合だけ有効になり、
+利用できない環境では自動で古典変換へフォールバックします。
 
 ### アンインストール
 

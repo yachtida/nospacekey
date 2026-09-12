@@ -1,7 +1,6 @@
-//! エンジン host (NospacekeyEngineHost.exe) が起動している前提の結合テスト。
-//! 事前に `engine-host` をビルドして起動しておくこと。CI では `#[ignore]`。
+//! EngineHost を一意な一時layoutへstageして起動する結合テスト。CI では `#[ignore]`。
 //!
-//! 実行: `cargo test -p ipc --test integration -- --ignored --nocapture`
+//! 実行: `cargo test -p ipc --test integration tip_like -- --ignored --nocapture`
 
 use ipc::client::EngineClient;
 use ipc::protocol::{Request, Response};
@@ -15,8 +14,19 @@ fn convert_nihongo_returns_kanji() {
         Response::Session { session, .. } => session,
         other => panic!("expected Session, got {:?}", other),
     };
-    c.request(&Request::Insert { session: sid, text: "nihongo".into(), style: None }).unwrap();
-    let cands = match c.request(&Request::Convert { session: sid, left_context: None }).unwrap() {
+    c.request(&Request::Insert {
+        session: sid,
+        text: "nihongo".into(),
+        style: None,
+    })
+    .unwrap();
+    let cands = match c
+        .request(&Request::Convert {
+            session: sid,
+            left_context: None,
+        })
+        .unwrap()
+    {
         Response::Candidates { candidates } => candidates,
         other => panic!("expected Candidates, got {:?}", other),
     };
@@ -34,11 +44,11 @@ fn convert_nihongo_returns_kanji() {
 fn tip_like_per_char_over_unique_pipe() {
     use std::process::Command;
 
-    let exe = engine_exe_path();
-    assert!(exe.exists(), "engine exe not built: {}", exe.display());
-    let pipe = format!(r"\\.\pipe\nospacekey-engine-itest-{}", std::process::id());
+    let engine = IsolatedEngine::stage();
+    let exe = engine.exe();
+    let pipe = isolated_pipe("itest");
 
-    let _child = ChildGuard(Command::new(&exe).arg(&pipe).spawn().expect("spawn engine"));
+    let _child = start_engine(Command::new(&exe).arg(&pipe));
     // 専用パイプへ接続（最大5s）。
     let mut c = match EngineClient::connect_to(&pipe, Duration::from_secs(5)) {
         Ok(c) => c,
@@ -51,9 +61,20 @@ fn tip_like_per_char_over_unique_pipe() {
     };
     // TIP と同じく1文字ずつ送る。
     for ch in "nihongo".chars() {
-        c.request(&Request::Insert { session: sid, text: ch.to_string(), style: None }).unwrap();
+        c.request(&Request::Insert {
+            session: sid,
+            text: ch.to_string(),
+            style: None,
+        })
+        .unwrap();
     }
-    let cands = match c.request(&Request::Convert { session: sid, left_context: None }).unwrap() {
+    let cands = match c
+        .request(&Request::Convert {
+            session: sid,
+            left_context: None,
+        })
+        .unwrap()
+    {
         Response::Candidates { candidates } => candidates,
         other => panic!("expected Candidates, got {:?}", other),
     };
@@ -66,10 +87,10 @@ fn tip_like_per_char_over_unique_pipe() {
 #[ignore]
 fn live_convert_returns_kanji_per_char() {
     use std::process::Command;
-    let exe = engine_exe_path();
-    assert!(exe.exists(), "engine exe not built: {}", exe.display());
-    let pipe = format!(r"\\.\pipe\nospacekey-engine-live-{}", std::process::id());
-    let _child = ChildGuard(Command::new(&exe).arg(&pipe).spawn().expect("spawn engine"));
+    let engine = IsolatedEngine::stage();
+    let exe = engine.exe();
+    let pipe = isolated_pipe("live");
+    let _child = start_engine(Command::new(&exe).arg(&pipe));
     let mut c = match EngineClient::connect_to(&pipe, Duration::from_secs(5)) {
         Ok(c) => c,
         Err(e) => panic!("connect_to({pipe}) failed: {e}"),
@@ -80,9 +101,27 @@ fn live_convert_returns_kanji_per_char() {
     };
     let mut last = String::new();
     for (i, ch) in "nihongo".chars().enumerate() {
-        c.request(&Request::Insert { session: sid, text: ch.to_string(), style: None }).unwrap();
-        match c.request(&Request::LiveConvert { session: sid, seq: i as u64, left_context: None, auto_commit: false }).unwrap() {
-            Response::LiveResult { seq, text, reading, committed: _ } => {
+        c.request(&Request::Insert {
+            session: sid,
+            text: ch.to_string(),
+            style: None,
+        })
+        .unwrap();
+        match c
+            .request(&Request::LiveConvert {
+                session: sid,
+                seq: i as u64,
+                left_context: None,
+                auto_commit: false,
+            })
+            .unwrap()
+        {
+            Response::LiveResult {
+                seq,
+                text,
+                reading,
+                committed: _,
+            } => {
                 assert_eq!(seq, i as u64, "seq echoed");
                 assert!(!reading.is_empty(), "reading non-empty at len {}", i + 1);
                 last = text;
@@ -90,21 +129,26 @@ fn live_convert_returns_kanji_per_char() {
             other => panic!("expected LiveResult, got {:?}", other),
         }
     }
-    assert_eq!(last, "日本語", "final live text should be 日本語, got {last}");
+    assert_eq!(
+        last, "日本語",
+        "final live text should be 日本語, got {last}"
+    );
 }
 
 /// echo モード: engine が "LLM:"+reading を即返すことを確認（スレッド配線の決定的検証用）。
-/// 実行: NOSPACEKEY_LLM_ECHO=1 cargo test -p ipc --test integration llm_convert_echo -- --ignored --nocapture
+/// 実行: cargo test -p ipc --test integration llm_convert_echo -- --ignored --nocapture
 #[test]
 #[ignore]
 fn llm_convert_echo_returns_marker() {
     use std::process::Command;
-    let exe = engine_exe_path();
-    assert!(exe.exists(), "engine exe not built: {}", exe.display());
-    let pipe = format!(r"\\.\pipe\nospacekey-engine-llm-{}", std::process::id());
-    let _child = ChildGuard(Command::new(&exe).arg(&pipe)
-        .env("NOSPACEKEY_LLM_ECHO", "1")
-        .spawn().expect("spawn engine"));
+    let engine = IsolatedEngine::stage();
+    let exe = engine.exe();
+    let pipe = isolated_pipe("llm");
+    let _child = start_engine(
+        Command::new(&exe)
+            .arg(&pipe)
+            .env("NOSPACEKEY_LLM_ECHO", "1"),
+    );
     let mut c = match EngineClient::connect_to(&pipe, Duration::from_secs(5)) {
         Ok(c) => c,
         Err(e) => panic!("connect_to({pipe}) failed: {e}"),
@@ -114,10 +158,25 @@ fn llm_convert_echo_returns_marker() {
         other => panic!("expected Session, got {:?}", other),
     };
     for ch in "nihongo".chars() {
-        c.request(&Request::Insert { session: sid, text: ch.to_string(), style: None }).unwrap();
+        c.request(&Request::Insert {
+            session: sid,
+            text: ch.to_string(),
+            style: None,
+        })
+        .unwrap();
     }
-    let text = match c.request(&Request::LlmConvert { session: sid, seq: 1, left_context: None }).unwrap() {
-        Response::LlmResult { seq, text } => { assert_eq!(seq, 1); text }
+    let text = match c
+        .request(&Request::LlmConvert {
+            session: sid,
+            seq: 1,
+            left_context: None,
+        })
+        .unwrap()
+    {
+        Response::LlmResult { seq, text } => {
+            assert_eq!(seq, 1);
+            text
+        }
         other => panic!("expected LlmResult, got {:?}", other),
     };
     assert!(text.starts_with("LLM:"), "echo marker expected, got {text}");
@@ -132,12 +191,99 @@ impl Drop for ChildGuard {
     }
 }
 
-/// ワークスペース直下の engine-host のビルド済み exe パス（debug）。
-fn engine_exe_path() -> std::path::PathBuf {
+fn start_engine(command: &mut std::process::Command) -> ChildGuard {
+    let mut child = command.spawn().expect("spawn engine");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        child.try_wait().expect("query engine"),
+        None,
+        "engine exited before listening"
+    );
+    ChildGuard(child)
+}
+
+struct IsolatedEngine {
+    root: std::path::PathBuf,
+    exe: std::path::PathBuf,
+}
+
+fn isolated_pipe(label: &str) -> String {
+    format!(
+        r"\\.\pipe\nospacekey-engine-{label}-{}.s{}",
+        std::process::id(),
+        ipc::client::current_session_id()
+    )
+}
+
+impl IsolatedEngine {
+    fn stage() -> Self {
+        let source = engine_build_dir();
+        let source_exe = source.join("NospacekeyEngineHost.exe");
+        assert!(
+            source_exe.is_file(),
+            "engine exe not built: {}",
+            source_exe.display()
+        );
+        let root = std::env::temp_dir().join(format!(
+            "nospacekey-ipc-integration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).expect("create isolated engine layout");
+        for entry in std::fs::read_dir(&source).expect("read engine build layout") {
+            let entry = entry.expect("read engine entry");
+            let path = entry.path();
+            let name = entry.file_name();
+            if path.is_file()
+                && (path.extension().is_some_and(|extension| extension == "dll")
+                    || name == "NospacekeyEngineHost.exe")
+            {
+                std::fs::copy(&path, root.join(&name)).expect("copy engine artifact");
+            } else if path.is_dir() && name.to_string_lossy().ends_with(".resources") {
+                copy_tree(&path, &root.join(&name));
+            }
+        }
+        std::fs::write(
+            root.join(".nospacekey-lifetime"),
+            b"nospacekey version lifetime sentinel\n",
+        )
+        .expect("write lifetime sentinel");
+        let exe = root.join("NospacekeyEngineHost.exe");
+        Self { root, exe }
+    }
+
+    fn exe(&self) -> &std::path::Path {
+        &self.exe
+    }
+}
+
+impl Drop for IsolatedEngine {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::create_dir(destination).expect("create resource directory");
+    for entry in std::fs::read_dir(source).expect("read resource directory") {
+        let entry = entry.expect("read resource entry");
+        let target = destination.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy resource file");
+        }
+    }
+}
+
+fn engine_build_dir() -> std::path::PathBuf {
     // CARGO_MANIFEST_DIR = <workspace>/crates/ipc
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("workspace root")
-        .join(r"engine-host\.build\x86_64-unknown-windows-msvc\debug\NospacekeyEngineHost.exe")
+        .join(r"engine-host\.build\x86_64-unknown-windows-msvc\debug")
 }

@@ -7,20 +7,28 @@
 //! 設計上の唯一の真実は `OnKeyDown`。`OnTestKeyDown` は `will_handle` で同じ述語を反復し、
 //! 「このキーを実際に食うか」を返すだけにする。
 
-use windows::core::{Ref, Result, GUID, BOOL};
+use std::cell::Cell;
+use std::time::Instant;
+use windows::core::{Ref, Result, BOOL, GUID};
 use windows::Win32::Foundation::{FALSE, LPARAM, TRUE, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState, ToUnicode};
 use windows::Win32::UI::TextServices::{ITfContext, ITfKeyEventSink_Impl};
 
 use crate::candidate_window::{visible_range, CandidateUI, MAX_VISIBLE_ROWS};
+use crate::input_module::{
+    BackgroundIntent as ModuleIntent, EngineCommitOutcome as ModuleCommitOutcome,
+    EngineResult as ModuleEngineResult, ImmediateOperation as ModuleOperation,
+    InputEvent as ModuleEvent, InputSegment as ModuleInputSegment, KeyEvent as ModuleKeyEvent,
+    ReplayMode as ModuleReplayMode, RequestId as ModuleRequestId, TextStyle as ModuleTextStyle,
+};
 use crate::input_state::{
-    needs_session_reseed, plan_commit, plan_live_enter, should_widen_digits, to_hankaku_ascii,
-    to_hankaku_kana, to_kana_reading_char, to_katakana, to_zenkaku_ascii, to_zenkaku_digits,
-    CommitPlan, InsertStyle, LiveEnterPlan,
+    plan_live_enter, should_widen_digits, to_kana_reading_char,
+    to_zenkaku_digits, CommitPlan, InsertStyle, LiveEnterPlan,
+};
+use crate::text_service::{
+    tip_log, PendingEndKeySignature, PendingEndTestDecision, TextService_Impl,
 };
 use settings::symbol::zenkaku_symbol;
-use crate::text_service::TextService_Impl;
-use crate::text_service::tip_log;
 
 /// 仮想キーコード。
 const VK_BACK: u32 = 0x08;
@@ -36,16 +44,108 @@ const VK_LEFT: u32 = 0x25;
 const VK_UP: u32 = 0x26;
 const VK_RIGHT: u32 = 0x27;
 const VK_DOWN: u32 = 0x28;
+
+/// P1(clause-nav): explicit snapshot 待ちを維持するキー（←→文節移動）。Space 変換の
+/// 応答待ちに←→が来ても待ちをキャンセルしない — キャンセルすると composing-only の
+/// ←→は settle（全文確定）へ劣化する（385da4b7 で Space が snapshot 経路へ移行した際、
+/// ←→が旧同期経路に取り残されて接続切れになった）。poll は継続し、OnKeyDown の
+/// dispatch 側で pending 中なら食い切る。
+#[cfg(test)]
+fn exempts_explicit_snapshot_wait(vk: u32) -> bool {
+    matches!(vk, VK_LEFT | VK_RIGHT)
+}
+
+#[cfg(test)]
+fn cancel_explicit_wait_for_actual_keydown(vk: u32, cancel: impl FnOnce()) {
+    if !is_pure_modifier_vk(vk) && !exempts_explicit_snapshot_wait(vk) {
+        cancel();
+    }
+}
+
+fn apply_and_complete_module_operation(
+    operation: &ModuleOperation,
+    apply: impl FnOnce() -> bool,
+    complete: impl FnOnce(&ModuleOperation, bool),
+) -> bool {
+    let applied = apply();
+    complete(operation, applied);
+    applied
+}
+
+fn queued_digit_selects_candidate(barrier: bool, window_open: bool) -> bool { !barrier && window_open }
+
+fn queued_reading_char(ch: char, symbol_key: bool, punctuation: bool, overlay: bool,
+    chars: settings::symbol::SymbolCharSet) -> char {
+    if symbol_key { zenkaku_symbol(ch, punctuation, overlay, chars).unwrap_or(ch) }
+    else { to_kana_reading_char(ch) }
+}
+
+fn queued_nonalpha(ch: char, latin: bool, symbol_key: bool, punctuation: bool, overlay: bool,
+    chars: settings::symbol::SymbolCharSet) -> (char, ModuleTextStyle) {
+    if latin { (ch, ModuleTextStyle::Direct) }
+    else { (queued_reading_char(ch, symbol_key, punctuation, overlay, chars), ModuleTextStyle::Kana) }
+}
+
+fn apply_accepted_text(text: &str, mut apply: impl FnMut(char) -> bool) -> usize {
+    text.chars().take_while(|ch| apply(*ch)).count()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitSessionCleanup {
+    EndMainAndCloseBackground,
+    DropMainOnly,
+}
+
+fn commit_session_cleanup_plan(end_engine_session: bool) -> CommitSessionCleanup {
+    if end_engine_session {
+        CommitSessionCleanup::EndMainAndCloseBackground
+    } else {
+        CommitSessionCleanup::DropMainOnly
+    }
+}
+
+fn resolve_candidate_commit(
+    snapshot_candidate: bool,
+    resolved_text: &str,
+    snapshot_remaining: Option<&str>,
+    engine_commit: impl FnOnce() -> Option<(String, String)>,
+) -> ModuleCommitOutcome {
+    if snapshot_candidate {
+        return ModuleCommitOutcome::Applied {
+            text: resolved_text.to_string(),
+            remaining: snapshot_remaining.unwrap_or_default().to_string(),
+        };
+    }
+    match engine_commit() {
+        Some((text, remaining)) => ModuleCommitOutcome::Applied { text, remaining },
+        None => ModuleCommitOutcome::Fallback {
+            text: resolved_text.to_string(),
+        },
+    }
+}
+
+fn reseed_background(
+    close: impl FnOnce(),
+    snapshot: impl FnOnce() -> ModuleIntent,
+    submit: impl FnOnce(ModuleRequestId, Vec<ModuleInputSegment>) -> bool,
+) -> bool {
+    close();
+    match snapshot() {
+        ModuleIntent::Insert { request, segments } => submit(request, segments),
+        _ => unreachable!("background reseed must produce insert"),
+    }
+}
 const VK_DELETE: u32 = 0x2E;
 const VK_1: u32 = 0x31;
 const VK_9: u32 = 0x39;
 const VK_A: u32 = 0x41;
 const VK_Z: u32 = 0x5A;
+const VK_OEM_102: u32 = 0xE2;
 const VK_SHIFT: i32 = 0x10;
 const VK_CONTROL: i32 = 0x11;
 const VK_MENU: i32 = 0x12; // Alt
-// 確定取消（Ctrl+Backspace）: 「純粋な修飾キー単体」の判定に使う左右個別 VK 群
-// （is_pure_modifier_vk 専用 — 0x10-0x12 は上の総称 VK と重複するので再掲しない）。
+                           // 確定取消（Ctrl+Backspace）: 「純粋な修飾キー単体」の判定に使う左右個別 VK 群
+                           // （is_pure_modifier_vk 専用 — 0x10-0x12 は上の総称 VK と重複するので再掲しない）。
 const VK_LSHIFT: u32 = 0xA0;
 const VK_RSHIFT: u32 = 0xA1;
 const VK_LCONTROL: u32 = 0xA2;
@@ -75,7 +175,8 @@ fn is_text_vk(vk: u32) -> bool {
         0x60..=0x69 |   // テンキー 0–9
         0x6A..=0x6F |   // テンキー * + , - . /
         0xBA..=0xC0 |   // OEM_1..OEM_3: ; = , - . / `（レイアウト依存）
-        0xDB..=0xDF     // OEM_4..OEM_7 + OEM_8: [ \ ] ' 等
+        0xDB..=0xDF |   // OEM_4..OEM_7 + OEM_8: [ \ ] ' 等
+        VK_OEM_102      // VK_OEM_102: < > |（レイアウト依存）
     )
 }
 
@@ -86,7 +187,8 @@ fn is_text_vk(vk: u32) -> bool {
 fn is_oem_symbol_vk(vk: u32) -> bool {
     matches!(vk,
         0xBA..=0xC0 |   // OEM_1..OEM_3: ; = , - . / `（レイアウト依存）
-        0xDB..=0xDF     // OEM_4..OEM_7 + OEM_8: [ \ ] ' 等
+        0xDB..=0xDF |   // OEM_4..OEM_7 + OEM_8: [ \ ] ' 等
+        VK_OEM_102      // VK_OEM_102: < > |（レイアウト依存）
     )
 }
 
@@ -139,13 +241,19 @@ pub enum AzRoute {
 /// - 無修飾かつ非 latin_mode: 従来のかな経路（AltGr 等の非英字レイアウト文字は尊重、
 ///   素の A–Z は小文字へ正規化。CapsLock で大文字が来ても shift 無しなら小文字正規化）。
 pub fn resolve_az_char(
-    vk: u32, shift: bool, key_char: Option<char>, compose: bool, latin_mode: bool,
+    vk: u32,
+    shift: bool,
+    key_char: Option<char>,
+    compose: bool,
+    latin_mode: bool,
 ) -> AzRoute {
     let lower = (b'a' + (vk - VK_A) as u8) as char;
     if compose && (shift || latin_mode) {
-        return AzRoute::Latin(
-            key_char.unwrap_or(if shift { lower.to_ascii_uppercase() } else { lower }),
-        );
+        return AzRoute::Latin(key_char.unwrap_or(if shift {
+            lower.to_ascii_uppercase()
+        } else {
+            lower
+        }));
     }
     if shift {
         return AzRoute::DirectCommit(key_char.unwrap_or(lower.to_ascii_uppercase()));
@@ -181,12 +289,18 @@ fn mods_now() -> (bool, bool, bool) {
     }
 }
 
+/// TestKeyDown/KeyDown の physical-pair 署名に使う修飾キー mask。両入口で同じ OS 状態を
+/// 読むが、署名の一部として保存して同じ VK の別打鍵を予約 replay しない。
+pub(crate) fn current_modifier_mask() -> u8 {
+    let (ctrl, shift, alt) = mods_now();
+    (ctrl as u8) | ((shift as u8) << 1) | ((alt as u8) << 2)
+}
+
 /// 確定取消（Ctrl+Backspace）: この `source`（remember_last_commit/commit_and_reset に渡る
 /// ev=commit の source ラベル）の確定が undo_armed を武装してよいかを判定する純粋関数。
 /// 対象は「読みを使い切って composition を畳んだ全確定」の candidate/live/clause のみ
-/// （設計ロック⑤）。candidate_prefix/live_prefix は composition が残るためガードで自然に除外され、
-/// live_auto は全消費時のみ commit_and_reset を通るが「iOS 由来の自動確定」を undo 対象にしない
-/// 方針（M-2）で source ゲート側から明示的に除外する。mode_toggle/navigate（settle 系）は
+/// （設計ロック⑤）。candidate_prefix/live_prefix は composition が残るためガードで自然に除外される。
+/// mode_toggle/navigate（settle 系）は
 /// 対象外（C-1: settle は候補確定を経由すると source="candidate"/"clause" になるため、armed を
 /// 残さないよう settle_active_input/on_preserved_key_impl 側で disarm_undo を必ず呼ぶ）。
 /// clause（文節ナビゲーションの Enter 確定）は candidate と同じ「明示選択の全確定」なので武装する。
@@ -194,18 +308,140 @@ pub fn arms_undo(source: &str) -> bool {
     matches!(source, "candidate" | "live" | "clause")
 }
 
+#[cfg(test)]
+mod queue_recovery_tests {
+    use super::*;
+    #[test]
+    fn idle_recovery_admits_escape_and_enter_without_admitting_shortcuts() {
+        for vk in [VK_ESCAPE, VK_RETURN] {
+            assert!(queue_recovery_claims(vk, false, false, true, false));
+            assert!(queue_recovery_claims(vk, false, false, false, true));
+            assert!(!queue_recovery_claims(vk, true, true, true, true));
+        }
+        assert!(queue_recovery_claims(VK_A, false, true, true, true));
+        assert!(queue_recovery_claims(VK_A, false, false, true, true));
+        assert!(!queue_recovery_claims(VK_A, true, false, true, true));
+        assert!(!queue_recovery_claims(VK_A, false, false, false, false));
+    }
+}
+
+fn queue_recovery_claims(vk: u32, command_modifier: bool, owner_lost: bool, failed: bool, barrier: bool) -> bool {
+    !command_modifier && (((failed || barrier) && matches!(vk, VK_RETURN | VK_ESCAPE))
+        || ((owner_lost || failed) && (is_text_vk(vk) || matches!(vk, VK_A..=VK_Z | 0x30..=0x39 |
+            0x20 | 0x09 | VK_BACK | VK_DELETE | VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN
+            | VK_HOME | VK_END | VK_RETURN | VK_ESCAPE | 0x75..=0x79))))
+}
+
+fn prediction_commit_source(
+    source: &str,
+    suppressed: bool,
+    direct: bool,
+    ephemeral: bool,
+) -> Option<crate::prediction_state::CommitSource> {
+    if suppressed || direct || ephemeral {
+        return None;
+    }
+    match source {
+        "live" => Some(crate::prediction_state::CommitSource::Enter),
+        "candidate" => Some(crate::prediction_state::CommitSource::Candidate),
+        "clause" => Some(crate::prediction_state::CommitSource::Clause),
+        _ => None,
+    }
+}
+
+struct ScopedCellFlag<'a> {
+    cell: &'a Cell<bool>,
+    previous: bool,
+}
+
+impl<'a> ScopedCellFlag<'a> {
+    fn set(cell: &'a Cell<bool>) -> Self {
+        let previous = cell.replace(true);
+        Self { cell, previous }
+    }
+}
+
+impl Drop for ScopedCellFlag<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
+    }
+}
+
+/// 巡13(round13): 空 text の確定（空 BS cancel 拒否巻き戻し中の Enter=cancel 代わり）は
+/// 確定書類（remember_last_commit / undo 武装）を残さない — ゲートの純関数化（単体テスト固定）。
+/// cancel 成功経路も書類を残さず対称。
+pub fn commit_keeps_records(text: &str) -> bool {
+    !text.is_empty()
+}
+
+/// A successful SetText may leave the TSF composition open even after the
+/// logical input state has been reset.  Every path that must settle before a
+/// mode boundary or direct insertion has to count that close-only retry as
+/// active input too.
+fn input_needs_settle(composing: bool, showing: bool, end_pending: bool) -> bool {
+    composing || showing || end_pending
+}
+
 /// 確定取消の armed 状態機械: このキーが「純粋な修飾キー単体」（Shift/Ctrl/Alt/Win の
 /// 左右いずれか）かを判定する純粋関数。Ctrl+Backspace は打鍵として Ctrl 押下→Backspace 押下の
 /// 順で到達するため、Ctrl 単体の押下（＝OnKeyDown への到達）で armed を解除してしまうと
 /// Ctrl+Backspace 自体が成立しなくなる。これらのキーの単体到達だけは disarm の対象外とする。
 pub fn is_pure_modifier_vk(vk: u32) -> bool {
-    matches!(
-        vk as i32,
-        VK_SHIFT | VK_CONTROL | VK_MENU
-    ) || matches!(
-        vk,
-        VK_LSHIFT | VK_RSHIFT | VK_LCONTROL | VK_RCONTROL | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN
-    )
+    matches!(vk as i32, VK_SHIFT | VK_CONTROL | VK_MENU)
+        || matches!(
+            vk,
+            VK_LSHIFT
+                | VK_RSHIFT
+                | VK_LCONTROL
+                | VK_RCONTROL
+                | VK_LMENU
+                | VK_RMENU
+                | VK_LWIN
+                | VK_RWIN
+        )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PredictionKeyAction {
+    None,
+    Accept,
+    Dismiss,
+    InvalidateAndContinue,
+}
+
+fn should_invalidate_hidden_prediction(vk: u32, ghost_visible: bool, request_active: bool) -> bool {
+    request_active && !ghost_visible && !is_pure_modifier_vk(vk)
+}
+
+fn prediction_key_action(
+    vk: u32,
+    ghost_visible: bool,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+) -> PredictionKeyAction {
+    if !ghost_visible || is_pure_modifier_vk(vk) {
+        return PredictionKeyAction::None;
+    }
+    if ctrl || shift || alt {
+        return PredictionKeyAction::InvalidateAndContinue;
+    }
+    match vk {
+        VK_RIGHT | VK_END => PredictionKeyAction::Accept,
+        VK_ESCAPE => PredictionKeyAction::Dismiss,
+        _ => PredictionKeyAction::InvalidateAndContinue,
+    }
+}
+
+fn should_defer_preserved_until_prediction_cleanup(
+    action: PreservedAction,
+    cleanup_failed: bool,
+) -> bool {
+    cleanup_failed && action != PreservedAction::ToggleMode && action != PreservedAction::None
+}
+
+fn newer_preserved_action_supersedes_deferred(action: PreservedAction) -> bool {
+    action != PreservedAction::None
 }
 
 /// 押された物理キー＋現在のキーボード状態(Shift等)＋レイアウトから入力文字を求める。
@@ -234,7 +470,11 @@ fn key_to_char(vk: u32, lparam: LPARAM) -> Option<char> {
     let n = unsafe { ToUnicode(vk, scancode, Some(&state), &mut buf, TU_NO_KEYSTATE_CHANGE) };
     if n == 1 {
         let ch = char::from_u32(buf[0] as u32)?;
-        if ch.is_control() { None } else { Some(ch) }
+        if ch.is_control() {
+            None
+        } else {
+            Some(ch)
+        }
     } else {
         None
     }
@@ -242,7 +482,13 @@ fn key_to_char(vk: u32, lparam: LPARAM) -> Option<char> {
 
 /// 現在の状態でこの VK を IME が食う（TRUE を返す）かどうかの述語。
 /// `direct`=true は半角英数(直接入力)モード（SP5 boiled-egg）。`OnTestKeyDown`/`OnKeyDown` で共有。
-pub fn will_handle(vk: u32, composing: bool, showing: bool, cmd_modifier: bool, direct: bool) -> bool {
+pub fn will_handle(
+    vk: u32,
+    composing: bool,
+    showing: bool,
+    cmd_modifier: bool,
+    direct: bool,
+) -> bool {
     // Ctrl/Alt 併用キー（Ctrl+C/V/X/A/Z…, Alt+メニュー）はアプリのアクセラレータ。
     // どの VK でも食わずアプリへ通す。AltGr(=Ctrl+Alt 同時)・無修飾は通常入力として下の match へ。
     if cmd_modifier {
@@ -255,6 +501,7 @@ pub fn will_handle(vk: u32, composing: bool, showing: bool, cmd_modifier: bool, 
     if direct {
         return match vk {
             // Space/変換 の食う判定は resolve_action(Convert/Reconvert)へ一本化した（ここには無い）。
+            VK_BACK => showing,
             VK_RETURN | VK_ESCAPE | VK_UP | VK_DOWN => showing,
             // UU-6: Home/End/PageUp/PageDown/Delete も候補表示中は食う（選択候補を確定して
             // 畳む）。非表示 direct では本文操作なので食わない（下の showing 判定で false）。
@@ -278,9 +525,12 @@ pub fn will_handle(vk: u32, composing: bool, showing: bool, cmd_modifier: bool, 
         // 一般的な日本語IMEに倣い、食って開いている入力を確定（settle）してから畳む。
         // idle では素通し（本文のキャレット移動/前方削除はアプリに任せる）。
         // ←→ も食う条件は同じ（composing||showing）だが処理が違う: 候補表示中は文節移動
-        // （MS-IME の文節ナビゲーション。劣化時は settle）、composition のみは「確定して畳む」
-        // （打鍵作法 Task2 — InputState にカーソル概念が無く読み内移動は実装できないため）。
-        VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_DELETE | VK_LEFT | VK_RIGHT => composing || showing,
+        // （MS-IME の文節ナビゲーション。失敗時は no-op 食い切り=P1）、composition のみは
+        // 「確定して畳む」（打鍵作法 Task2 — InputState にカーソル概念が無く読み内移動は
+        // 実装できないため）。
+        VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_DELETE | VK_LEFT | VK_RIGHT => {
+            composing || showing
+        }
         // OEM 記号: idle でも食う（全角化して composition を開始する — 2026-08-03、旧 Task3 の
         // 直接確定を廃止）。composition 中は従来どおり食ってエンジンへ送る（このアームは常に
         // true なので包含）。VK 単位で宣言する理由: will_handle は COM 非依存純関数で ToUnicode を
@@ -291,6 +541,35 @@ pub fn will_handle(vk: u32, composing: bool, showing: bool, cmd_modifier: bool, 
         // 0/記号/テンキー: composition 中だけ食ってエンジンへ送る（idle は素通し）。
         vk if is_text_vk(vk) => composing,
         _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackspaceRoute {
+    /// 再変換/確定取消の候補を元本文へ復元して閉じる。
+    CancelReconvert,
+    /// 候補窓を閉じるだけの防御的な退避。本文には触れない。
+    HideStaleCandidates,
+    /// 通常の composing Backspace 経路。
+    Compose,
+    /// idle の本文 Backspace へ渡す。
+    Pass,
+}
+
+/// Backspace の実処理経路。再変換と確定取消は共有尾部で
+/// `showing=true/reconverting=true` になる一方、InputState は composing にならない。
+/// `showing && !composing` の非再変換状態も、候補を残したまま本文へ流さず閉じる。
+fn backspace_route(composing: bool, showing: bool, reconverting: bool) -> BackspaceRoute {
+    if showing && !composing {
+        if reconverting {
+            BackspaceRoute::CancelReconvert
+        } else {
+            BackspaceRoute::HideStaleCandidates
+        }
+    } else if composing {
+        BackspaceRoute::Compose
+    } else {
+        BackspaceRoute::Pass
     }
 }
 
@@ -306,14 +585,28 @@ pub fn will_handle(vk: u32, composing: bool, showing: bool, cmd_modifier: bool, 
 /// 誤分類され dispatch 前に abort される穴も、gated 経由なら carve-out がそのまま効く。
 #[allow(clippy::too_many_arguments)]
 pub fn ephemeral_idle_abort(
-    vk: u32, cmd_modifier: bool, shift: bool, symbol_overlay: bool,
-    ephemeral: bool, composing: bool, showing: bool,
+    vk: u32,
+    cmd_modifier: bool,
+    shift: bool,
+    symbol_overlay: bool,
+    ephemeral: bool,
+    composing: bool,
+    showing: bool,
     action: crate::keymap::KeyAction,
 ) -> bool {
     ephemeral
         && !composing
         && !showing
-        && !will_handle_gated(vk, composing, showing, cmd_modifier, false, shift, symbol_overlay, action)
+        && !will_handle_gated(
+            vk,
+            composing,
+            showing,
+            cmd_modifier,
+            false,
+            shift,
+            symbol_overlay,
+            action,
+        )
 }
 
 /// 設定 settings.shift_latin.mode → compose か。"commit" 以外は compose 扱い —
@@ -396,7 +689,16 @@ pub fn will_handle_awaiting(
     if awaiting_llm {
         return true;
     }
-    will_handle_gated(vk, composing, showing, cmd_modifier, direct, shift, symbol_overlay, action)
+    will_handle_gated(
+        vk,
+        composing,
+        showing,
+        cmd_modifier,
+        direct,
+        shift,
+        symbol_overlay,
+        action,
+    )
 }
 
 /// Bug 4: 候補窓の可視ページ内で数字キー(0 始まりの `digit`)が指す **絶対** index を返す。
@@ -418,7 +720,13 @@ fn page_candidate_index(selected: usize, count: usize, digit: usize) -> Option<u
 /// - `cand_n`: 確定時点の候補総数（候補確定時のみ非0。ライブ確定は 0）。
 /// - `reading`: 読み（かな）。`text`: 確定文字列。長さはバイトでなく **chars 数**。
 /// - `direct`: 半角英数(直接入力)モードか（`is_direct_mode()` を渡す）。
-pub fn commit_fields(sel: Option<usize>, cand_n: usize, reading: &str, text: &str, direct: bool) -> String {
+pub fn commit_fields(
+    sel: Option<usize>,
+    cand_n: usize,
+    reading: &str,
+    text: &str,
+    direct: bool,
+) -> String {
     let sel_i: i64 = sel.map(|s| s as i64).unwrap_or(-1);
     format!(
         "sel={sel_i} cand_n={cand_n} rlen={} tlen={} mode={}",
@@ -428,9 +736,52 @@ pub fn commit_fields(sel: Option<usize>, cand_n: usize, reading: &str, text: &st
     )
 }
 
+fn commit_event(
+    redact_text: bool,
+    text: &str,
+    source: &str,
+    remaining: Option<&str>,
+    fields: &str,
+) -> String {
+    if redact_text {
+        let remaining = remaining
+            .map(|value| format!(" remaining_len={}", value.chars().count()))
+            .unwrap_or_default();
+        format!(
+            "ev=commit len={} source={source}{remaining} {fields}",
+            text.chars().count()
+        )
+    } else {
+        let remaining = remaining
+            .map(|value| format!(" remaining={value}"))
+            .unwrap_or_default();
+        format!("ev=commit text={text} source={source}{remaining} {fields}")
+    }
+}
+
+fn clause_commit_event(redact_text: bool, text: &str) -> String {
+    if redact_text {
+        format!("ev=clause_commit len={}", text.chars().count())
+    } else {
+        format!("ev=clause_commit text={text}")
+    }
+}
+
+fn candidates_event(prediction_enabled: bool, event: &str, candidates: &[String]) -> String {
+    if prediction_enabled {
+        format!("ev={event} n={} sel=0", candidates.len())
+    } else {
+        format!(
+            "ev={event} n={} sel=0 list={}",
+            candidates.len(),
+            candidates.join("|")
+        )
+    }
+}
+
 /// preserved key の GUID を「どのアクションか」へ分類する純関数（COM 不要でテスト可能）。
 /// JIS キー（無変換/変換）と US キー（Alt+`/Alt+/）の両 GUID を同一アクションへ束ねる。
-#[derive(PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PreservedAction {
     ToggleMode,
     Reconvert,
@@ -441,9 +792,8 @@ pub enum PreservedAction {
 
 pub fn classify_preserved_key(guid: &GUID) -> PreservedAction {
     use crate::globals::{
-        GUID_PRESERVEDKEY_FEEDBACK, GUID_PRESERVEDKEY_FEEDBACK_US,
-        GUID_PRESERVEDKEY_MODE_TOGGLE, GUID_PRESERVEDKEY_MODE_TOGGLE_HZ,
-        GUID_PRESERVEDKEY_MODE_TOGGLE_US,
+        GUID_PRESERVEDKEY_FEEDBACK, GUID_PRESERVEDKEY_FEEDBACK_US, GUID_PRESERVEDKEY_MODE_TOGGLE,
+        GUID_PRESERVEDKEY_MODE_TOGGLE_HZ, GUID_PRESERVEDKEY_MODE_TOGGLE_US,
         GUID_PRESERVEDKEY_RECONVERT, GUID_PRESERVEDKEY_RECONVERT_US,
     };
     if *guid == GUID_PRESERVEDKEY_MODE_TOGGLE
@@ -471,19 +821,18 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<BOOL> {
-        catch_com("OnTestKeyDown", || self.on_test_key_down_impl(_pic, wparam, _lparam))
+        catch_com("OnTestKeyDown", || {
+            self.on_test_key_down_impl(_pic, wparam, _lparam)
+        })
     }
 
-    fn OnKeyDown(
-        &self,
-        pic: Ref<'_, ITfContext>,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> Result<BOOL> {
+    fn OnKeyDown(&self, pic: Ref<'_, ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
         // UU-4: guarded で包み、show()/move_selection() 等が presenter 経由でホストへ同期
         // コールアウト中にホストが Behavior で再入しても、借用衝突 panic ではなく保留→安全点
         // flush で処理させる（確定ロスト防止）。
-        catch_com("OnKeyDown", || self.guarded(|| self.on_key_down_impl(pic, wparam, lparam)))
+        catch_com("OnKeyDown", || {
+            self.guarded(|| self.on_key_down_impl(pic, wparam, lparam))
+        })
     }
 
     fn OnTestKeyUp(
@@ -495,18 +844,15 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         Ok(FALSE)
     }
 
-    fn OnKeyUp(
-        &self,
-        _pic: Ref<'_, ITfContext>,
-        _wparam: WPARAM,
-        _lparam: LPARAM,
-    ) -> Result<BOOL> {
+    fn OnKeyUp(&self, _pic: Ref<'_, ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         Ok(FALSE)
     }
 
     fn OnPreservedKey(&self, pic: Ref<'_, ITfContext>, rguid: *const GUID) -> Result<BOOL> {
         // UU-4: settle→commit→候補 show でホスト再入しうるので guarded で包む（OnKeyDown と同様）。
-        catch_com("OnPreservedKey", || self.guarded(|| self.on_preserved_key_impl(pic, rguid)))
+        catch_com("OnPreservedKey", || {
+            self.guarded(|| self.on_preserved_key_impl(pic, rguid))
+        })
     }
 }
 
@@ -517,8 +863,13 @@ impl TextService_Impl {
         let (ctrl, shift, alt) = mods_now();
         let composing = self.state.borrow().composing;
         let ai = crate::keymap::ActionInput {
-            vk, ctrl, shift, alt,
-            composing, showing: self.showing.get(), direct: self.is_direct_mode(),
+            vk,
+            ctrl,
+            shift,
+            alt,
+            composing,
+            showing: self.showing.get(),
+            direct: self.is_direct_mode(),
             undo_armed: self.undo_armed.get(),
             ephemeral_enabled: self.ephemeral_enabled.get(),
             typo_enabled: self.typo_enabled.get(),
@@ -531,17 +882,75 @@ impl TextService_Impl {
         &self,
         pic: Ref<'_, ITfContext>,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
-        let vk = crate::keymap::normalize_vk(wparam.0 as u32);
-        // Spec2 パスワードゲート（on_key_down_impl と対）。ctx が取れなければ従来判定へ続行
-        // （誤って direct 化しない安全側）。TestKeyDown も対にして、行儀よいホストが
-        // OnKeyDown 前に「食うか」を問い合わせても password 欄では素通し(FALSE)を返す。
-        if let Ok(c) = pic.ok() {
-            let ctx: ITfContext = c.clone();
-            if self.is_password_context(&ctx) {
+        self.consume_started_composition();
+        self.flush_deferred_prediction_preserved_keys_if_ready();
+        let raw_vk = wparam.0 as u32;
+        let vk = crate::keymap::normalize_vk(raw_vk);
+        if !is_pure_modifier_vk(vk) {
+            self.cancel_deferred_prediction_preserved_on_input();
+        }
+        if should_invalidate_hidden_prediction(
+            vk,
+            self.prediction_ghost_actionable(),
+            self.prediction_state.borrow().has_activity(),
+        ) {
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
+        }
+        // Context identity/password gate must precede reservation. A failed/secret context
+        // invalidates any old slot so a later same-VK event cannot replay it.
+        let ctx: ITfContext = match pic.ok() {
+            Ok(c) => c.clone(),
+            Err(_) => {
+                self.invalidate_pending_end_test_reservation();
                 return Ok(FALSE);
             }
+        };
+        if self.is_password_context(&ctx) {
+            self.invalidate_pending_end_test_reservation();
+            return Ok(FALSE);
+        }
+        let signature = match PendingEndKeySignature::from_context(
+            &ctx,
+            raw_vk,
+            vk,
+            lparam.0,
+            current_modifier_mask(),
+        ) {
+            Some(signature) => signature,
+            None => {
+                self.invalidate_pending_end_test_reservation();
+                return Ok(FALSE);
+            }
+        };
+        // Test→Key の間に callback/timer が close を完了しても、正確な physical pair だけを
+        // 一度維持する。occupied slot への同じ/別 Test は Busy(FALSE) とし、通常述語へ落とさない。
+        match self.pending_end_test_decision(signature) {
+            PendingEndTestDecision::Reserve => return Ok(TRUE),
+            PendingEndTestDecision::Busy => return Ok(FALSE),
+            PendingEndTestDecision::Normal => {}
+        }
+        if self.prediction_cleanup_in_progress() && !is_pure_modifier_vk(vk) {
+            self.retry_prediction_cleanup_on_input();
+        }
+        let (prediction_ctrl, prediction_shift, prediction_alt) = mods_now();
+        match prediction_key_action(
+            vk,
+            self.prediction_ghost_actionable(),
+            prediction_ctrl,
+            prediction_shift,
+            prediction_alt,
+        ) {
+            PredictionKeyAction::Accept | PredictionKeyAction::Dismiss => return Ok(TRUE),
+            PredictionKeyAction::InvalidateAndContinue => {
+                // 素通しキーは OnKeyDown が呼ばれないホストがあるため、Test 側で先に除去する。
+                // 除去に失敗しても本来の IME/host 判定へ進め、cleanup timer を再武装する。
+                if !self.dismiss_prediction_ghost(false) {
+                    self.retry_prediction_cleanup_on_input();
+                }
+            }
+            PredictionKeyAction::None => {}
         }
         // keymap 役割解決は password gate の直後・disarm 判定より前に 1 回計算し、両入口で共有する。
         let action = self.resolve_action_now(vk);
@@ -559,20 +968,36 @@ impl TextService_Impl {
         // 前に direct へ復帰しておく（投機的 exit。OnKeyDown を呼ばない行儀よいホストでもここで
         // 検知しないと、TestKeyDown=FALSE のまま押し忘れの言語モード居残りになる。exit は冪等）。
         if ephemeral_idle_abort(
-            vk, cmd_modifier_down(), shift_down(), self.symbol_overlay.get(),
-            self.ephemeral_kana.get(), composing, showing, action,
+            vk,
+            cmd_modifier_down(),
+            shift_down(),
+            self.symbol_overlay.get(),
+            self.ephemeral_kana.get(),
+            composing,
+            showing,
+            action,
         ) {
-            let ctx: Option<ITfContext> = pic.ok().ok().cloned();
-            self.exit_ephemeral_to_direct(ctx.as_ref());
+            self.exit_ephemeral_to_direct(Some(&ctx));
         }
         // direct は exit の**後**に読む。exit は compartment を direct へ倒すので、先に読むと
         // 「もう native ではない」のに native として食う判定を出し、実処理と eaten が食い違う。
         let direct = self.is_direct_mode();
         // Bug 3: 待機ロック(AwaitingLlm)まで含めて実処理と同じ述語で判定する。TestKeyDown を
         // 先に呼ぶ行儀よいホストでも、待機中は実処理が全キーを食うのと eaten 判定を一致させる。
-        let handled = will_handle_awaiting(
-            vk, composing, showing, cmd_modifier_down(), direct,
-            shift_down(), self.state.borrow().awaiting_llm(), self.symbol_overlay.get(), action,
+        let recovery = {
+            let queue = self.conversion_queue.borrow();
+            queue_recovery_claims(vk, cmd_modifier_down(), queue.owner_lost, queue.commit_failed, queue.has_commit())
+        };
+        let handled = recovery || ((self.local_converting() || self.explicit_snapshot_pending.get()) && !cmd_modifier_down() && matches!(vk, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_HOME | VK_END | VK_DELETE)) || will_handle_awaiting(
+            vk,
+            composing,
+            showing,
+            cmd_modifier_down(),
+            direct,
+            shift_down(),
+            self.state.borrow().awaiting_llm(),
+            self.symbol_overlay.get(),
+            action,
         );
         // 診断: A–Z 打鍵時に is_direct が実際に何を読むかを残す（toggle で direct にしたのに
         // 入力がひらがなになる件の切り分け。direct=false なら compartment が direct を保持していない）。
@@ -590,33 +1015,152 @@ impl TextService_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
+        self.consume_started_composition();
+        self.flush_deferred_prediction_preserved_keys_if_ready();
         let raw_vk = wparam.0 as u32;
         let vk = crate::keymap::normalize_vk(raw_vk);
+        if !is_pure_modifier_vk(vk) {
+            self.cancel_deferred_prediction_preserved_on_input();
+        }
+        if should_invalidate_hidden_prediction(
+            vk,
+            self.prediction_ghost_actionable(),
+            self.prediction_state.borrow().has_activity(),
+        ) {
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
+        }
         // 半角/全角の実配送 VK/修飾の実機診断(spec §3)。正規化前の生値を残す。
         if matches!(raw_vk, 0x19 | 0xF3 | 0xF4) {
             let (c, s, a) = mods_now();
-            tip_log(&format!("ev=vk_raw vk={raw_vk:#04x} ctrl={c} shift={s} alt={a}"));
+            tip_log(&format!(
+                "ev=vk_raw vk={raw_vk:#04x} ctrl={c} shift={s} alt={a}"
+            ));
         }
+        // Context identity/password gate must precede reservation consumption.  A vanished or
+        // password context invalidates the old pair and any close-only barrier.
+        let ctx: ITfContext = match pic.ok() {
+            Ok(c) => c.clone(),
+            Err(_) => {
+                self.invalidate_pending_end_test_reservation();
+                return Ok(FALSE);
+            }
+        };
+        if self.is_password_context(&ctx) {
+            self.invalidate_pending_end_test_reservation();
+            if self.composition_end_pending.get() {
+                self.abandon_pending_composition_end("keydown_password_context");
+            }
+            return Ok(FALSE);
+        }
+        let signature = match PendingEndKeySignature::from_context(
+            &ctx,
+            raw_vk,
+            vk,
+            lparam.0,
+            current_modifier_mask(),
+        ) {
+            Some(signature) => signature,
+            None => {
+                self.invalidate_pending_end_test_reservation();
+                return Ok(FALSE);
+            }
+        };
         // keymap 役割解決は cmd_modifier ゲートより前に 1 回計算する（両入口で同じ値を共有し、
         // 「食うか」と実処理の一致を保つ）。armed Ctrl+BS や Ctrl 併用チョードは cmd_modifier=true
         // として届くため、carve-out（action != None）で cmd ゲートを通す必要がある。composing/showing/
         // direct は resolve_action_now が ctx 未使用の純粋な状態参照として内部で読む。
+        #[cfg(feature = "tsf-test-hooks")]
+        if crate::commit_test_hook::take_display_exhaustion() { self.preedit_apply.force_near_capacity(); }
+        self.end_display_at_capacity(&ctx);
         let action = self.resolve_action_now(vk);
+        // Consume the slot for every KeyDown.  Only exact signature+pair generation gets the
+        #[cfg(feature = "tsf-test-hooks")]
+        if let Some(model) = self.local_clauses.borrow_mut().as_mut() {
+            if crate::commit_test_hook::take_clause_exhaustion() { model.revision = u64::MAX; }
+        }
+        // one-shot reservation; mismatch/stale is discarded so a future same-VK event cannot eat it.
+        let pending_test_reserved = self.take_pending_end_test(signature);
+        let recovery = {
+            let queue = self.conversion_queue.borrow();
+            queue_recovery_claims(vk, cmd_modifier_down(), queue.owner_lost, queue.commit_failed, queue.has_commit())
+        };
+        if recovery && self.handle_conversion_wait_key(&ctx, vk, lparam, action) { return Ok(TRUE); }
+
+        let pending_at_entry = self.composition_end_pending.get();
+        if self.prediction_cleanup_in_progress() && !is_pure_modifier_vk(vk) {
+            self.retry_prediction_cleanup_on_input();
+        }
+        let (prediction_ctrl, prediction_shift, prediction_alt) = mods_now();
+        match prediction_key_action(
+            vk,
+            self.prediction_ghost_actionable(),
+            prediction_ctrl,
+            prediction_shift,
+            prediction_alt,
+        ) {
+            PredictionKeyAction::Accept => {
+                // Test 側で claim 済み。同期 edit session が拒否された場合は discard retry へ
+                // 降格するため、入力順序を逆転させず eaten は TRUE に揃える。
+                let _ = self.accept_prediction_ghost();
+                return Ok(TRUE);
+            }
+            PredictionKeyAction::Dismiss => {
+                let _ = self.dismiss_prediction_ghost(true);
+                return Ok(TRUE);
+            }
+            PredictionKeyAction::InvalidateAndContinue => {
+                // クリーンアップ失敗時も通常入力を失わない。
+                if !self.dismiss_prediction_ghost(false) {
+                    self.retry_prediction_cleanup_on_input();
+                }
+            }
+            PredictionKeyAction::None => {}
+        }
         // Ctrl/Alt 併用キー（Ctrl+C/V 等のアクセラレータ）は食わずアプリへ通す。
         // 本来 OnTestKeyDown が FALSE を返せば OnKeyDown は呼ばれないが、同じ判定をここにも
         // 置いて防御する（リファクタ耐性・意図の明示）。keymap action（confirm undo/ephemeral/
         // Ctrl 併用チョード）だけはこのゲートを通す（実処理へ進ませる — carve-out invariant）。
-        if cmd_modifier_down() && action == crate::keymap::KeyAction::None {
+        if cmd_modifier_down()
+            && action == crate::keymap::KeyAction::None
+            && !pending_test_reserved
+            && !pending_at_entry
+        {
             return Ok(FALSE);
         }
-        // A7: スリープ復帰の世代カウンタをキースレッドで刈り取る（ctx 借用より前 — 復帰検知は
-        // このキー自体の処理内容に関係なく先に済ませる）。
+        // A7: スリープ復帰の世代カウンタをキースレッドで刈り取る。
         self.poll_power_events();
-        // ctx を借りる。取れなければパススルー。
-        let ctx: ITfContext = match pic.ok() {
-            Ok(c) => c.clone(),
-            Err(_) => return Ok(FALSE),
-        };
+
+        // pending close は direct-mode gate より先に回収する。retry 成否にかかわらず、この
+        // 1打鍵は TRUE で食う（失敗時は再押下で再試行、成功時は次打鍵から通常判定）。これにより
+        // direct A-Z が FALSE で素通りし続け、古い composition が回収不能になる状態を作らない。
+        if pending_test_reserved || pending_at_entry {
+            if vk == VK_ESCAPE && !cmd_modifier_down() && self.composition_end_caret.borrow().is_some() {
+                self.clear_conversion_queue();
+                if self.do_cancel(&ctx) {
+                    self.state.borrow_mut().reset();
+                    self.clear_clause_nav();
+                }
+                self.show_conversion_queue_notice(&ctx, "後続の未処理入力を取り消しました。確定済みの文字は残します");
+                return Ok(TRUE);
+            }
+            if self.composition_end_pending.get() && !self.finish_pending_composition(&ctx) {
+                tip_log("ev=keydown skip=pending_end");
+                return Ok(TRUE);
+            }
+            if self.state.borrow().composing {
+                // ユーザ打鍵は timer 上限後にも与えられる新しい回復機会。回数を戻して
+                // 張り直しを試し、成功時は残り読みの live debounce も再開する。
+                self.partial_preedit_redraw_retries.set(0);
+                if self.redraw_partial_preedit_if_needed(&ctx) {
+                    self.arm_debounce();
+                } else {
+                    self.arm_partial_preedit_redraw_retry();
+                }
+            } else if !self.showing.get() {
+                self.exit_ephemeral_to_direct(Some(&ctx));
+            }
+            return Ok(TRUE);
+        }
 
         // Spec2: パスワード欄（IS_PASSWORD）は IME 丸ごと無効（完全 direct 化・全キー素通し）。
         // 秘匿入力を composition/候補窓/学習/診断ログのどこにも乗せない。direct ゲートと同じく
@@ -624,10 +1168,6 @@ impl TextService_Impl {
         // パスワード欄内で composition は始まらない（全キー素通しのため）。合成中に外から
         // パスワード欄へフォーカス移動した場合の旧 composition はホストの
         // OnCompositionTerminated / フォーカス遷移 settle が既存機構で畳む。
-        if self.is_password_context(&ctx) {
-            return Ok(FALSE);
-        }
-
         // ephemeral かなモード開始トリガ: direct+idle でトリガキー（既定 F8）が来たら
         // compartment を NATIVE へ切替えて ephemeral かなへ入る。パスワード欄より後（欄内で
         // トリガキーを食わない）・direct 早期 return より前（トリガキー自体は素通しでなく消費する）。
@@ -679,8 +1219,14 @@ impl TextService_Impl {
         // ephemeral かな: idle で「かなが食わない（素通しする）キー」が来たら、この打鍵を
         // 消費する前に direct へ復帰しておく（キーは素通しのまま — 押し忘れの言語モード居残り防止）。
         if ephemeral_idle_abort(
-            vk, cmd_modifier_down(), shift_down(), self.symbol_overlay.get(),
-            self.ephemeral_kana.get(), composing, showing, action,
+            vk,
+            cmd_modifier_down(),
+            shift_down(),
+            self.symbol_overlay.get(),
+            self.ephemeral_kana.get(),
+            composing,
+            showing,
+            action,
         ) {
             self.exit_ephemeral_to_direct(Some(&ctx));
         }
@@ -693,8 +1239,100 @@ impl TextService_Impl {
                 "ev=keydown vk={vk:#04x} direct={direct} composing={composing} showing={showing}"
             ));
         }
-        if direct && !will_handle_gated(vk, composing, showing, cmd_modifier_down(), true, shift_down(), self.symbol_overlay.get(), action) {
+        if direct
+            && !will_handle_gated(
+                vk,
+                composing,
+                showing,
+                cmd_modifier_down(),
+                true,
+                shift_down(),
+                self.symbol_overlay.get(),
+                action,
+            )
+        {
             return Ok(FALSE);
+        }
+
+        if self.handle_conversion_wait_key(&ctx, vk, lparam, action) { return Ok(TRUE); }
+        if self.mixed_editing() && action == crate::keymap::KeyAction::Convert {
+            self.convert_edited_interval(&ctx);
+            return Ok(TRUE);
+        }
+        if self.mixed_editing() && vk == VK_RETURN && !cmd_modifier_down() {
+            if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.mode = crate::clause_conversion::OperationMode::Converting; }
+            self.queue_local_clause_commit(&ctx, false);
+            return Ok(TRUE);
+        }
+        if !matches!(action, crate::keymap::KeyAction::Notation(_) | crate::keymap::KeyAction::NotationRotate) {
+            if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.reset_notation_cycle(); }
+        }
+        if self.local_converting() && action == crate::keymap::KeyAction::Convert {
+            self.local_clause_space(&ctx);
+            return Ok(TRUE);
+        }
+        if self.local_converting() && !cmd_modifier_down() {
+            match vk {
+                VK_LEFT | VK_RIGHT => {
+                    let direction = if vk == VK_RIGHT { 1 } else { -1 };
+                    if shift_down() {
+                        if self.bind_conversion_queue_context(&ctx) {
+                            let admitted = self.conversion_queue.borrow_mut().push(crate::conversion_queue::ConversionAction::ResizeClause(direction));
+                            if admitted == crate::conversion_queue::QueueAdmission::Accepted { self.drain_conversion_actions(&ctx); }
+                            else { self.show_conversion_queue_notice(&ctx, "入力を受け付けられません。Enterで再試行、Escで取消"); }
+                        }
+                    } else {
+                        if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.move_clause(direction); }
+                        self.render_local_edit(&ctx);
+                    }
+                    return Ok(TRUE);
+                }
+                VK_UP | VK_DOWN => {
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.advance_candidate(if vk == VK_DOWN { 1 } else { -1 }); }
+                    self.render_local_edit(&ctx);
+                    return Ok(TRUE);
+                }
+                VK_RETURN => { self.queue_local_clause_commit(&ctx, false); return Ok(TRUE); }
+                VK_HOME | VK_END => {
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() {
+                        if let crate::clause_conversion::CandidateWindow::Ready { candidates, .. } = &model.window {
+                            let index = if vk == VK_HOME { 0 } else { candidates.len() - 1 };
+                            model.select_candidate(index);
+                        } else { model.move_clause(if vk == VK_HOME { i32::MIN } else { i32::MAX }); }
+                    }
+                    self.render_local_edit(&ctx);
+                    return Ok(TRUE);
+                }
+                VK_1..=VK_9 if !shift_down() && self.local_clauses.borrow().as_ref().is_some_and(|m| !matches!(m.window, crate::clause_conversion::CandidateWindow::Closed)) => {
+                    let selected = {
+                        let mut state = self.local_clauses.borrow_mut();
+                        let model = state.as_mut().unwrap();
+                        if let crate::clause_conversion::CandidateWindow::Ready { selected, .. } = &model.window {
+                            let index = selected / 9 * 9 + (vk - VK_1) as usize;
+                            model.select_candidate(index)
+                        } else { false }
+                    };
+                    if selected { self.queue_local_clause_commit(&ctx, false); }
+                    return Ok(TRUE);
+                }
+                VK_ESCAPE => {
+                    self.local_clause_escape(&ctx);
+                    return Ok(TRUE);
+                }
+                VK_BACK => {
+                    if self.bind_conversion_queue_context(&ctx) {
+                        let admitted = self.conversion_queue.borrow_mut().push(crate::conversion_queue::ConversionAction::Backspace);
+                        if admitted == crate::conversion_queue::QueueAdmission::Accepted {
+                            self.drain_conversion_actions(&ctx);
+                        } else {
+                            self.show_conversion_queue_notice(&ctx, "入力を受け付けられません。Enterで再試行、Escで取消");
+                        }
+                    }
+                    return Ok(TRUE);
+                }
+                VK_DELETE => return Ok(TRUE),
+                _ => {}
+            }
         }
 
         // keymap コマンドのディスパッチ（文脈ゲートは resolve_action が判定済み — 相互排他の
@@ -715,7 +1353,9 @@ impl TextService_Impl {
                 return Ok(TRUE);
             }
             crate::keymap::KeyAction::Notation(kind) => return self.apply_notation(&ctx, vk, kind),
-            crate::keymap::KeyAction::NotationRotate => return self.dispatch_notation_rotate(&ctx, vk),
+            crate::keymap::KeyAction::NotationRotate => {
+                return self.dispatch_notation_rotate(&ctx, vk)
+            }
             crate::keymap::KeyAction::Convert => {
                 // 文節モード中の変換キー(Space)は候補送り＝SelectClauseCandidate の同期 IPC。
                 // 自動リピートは ←/→ と同じ理由で IPC を発行せず食い切る(is_autorepeat 注記)。
@@ -749,7 +1389,13 @@ impl TextService_Impl {
                 // 経路決定は resolve_az_char（純関数）が唯一の真実。
                 let compose = self.shift_latin_compose.get();
                 let latin_mode = self.state.borrow().latin_mode();
-                match resolve_az_char(vk, shift_down(), key_to_char(vk, lparam), compose, latin_mode) {
+                match resolve_az_char(
+                    vk,
+                    shift_down(),
+                    key_to_char(vk, lparam),
+                    compose,
+                    latin_mode,
+                ) {
                     AzRoute::DirectCommit(ch) => self.commit_char_direct(&ctx, ch),
                     AzRoute::Latin(ch) => self.input_char(&ctx, ch, InsertStyle::Direct),
                     AzRoute::Kana(ch) => self.input_char(&ctx, ch, InsertStyle::Kana),
@@ -792,44 +1438,38 @@ impl TextService_Impl {
                 // 確定文字列の唯一の真実源は cand_state（drain_behavior と同じ読み元）。
                 // 選択 index も cand_state から読み、空なら先頭へフォールバック（index と文字列は一致）。
                 let cand_pick = if showing {
-                    let st = self.cand_state.borrow();
-                    st.resolve_commit(st.selected())
+                    self.module_candidate_commit(None)
                 } else {
                     None
                 };
-                if let Some((index, text)) = cand_pick {
+                if let Some((request, index, text)) = cand_pick {
                     // 候補確定: 前方一致候補ならエンジンが残り読みを返すので部分確定して継続する。
-                    self.commit_candidate(&ctx, index, &text);
+                    self.commit_candidate(&ctx, request, index, &text);
                 } else {
-                    // 候補非表示: ライブ変換結果（無ければ読み）を確定する。
-                    // Spec2: エンジンが生きていれば Commit(0) に通して学習に乗せる
-                    // （liveConvert が先頭候補をキャッシュ済み）。劣化時は従来どおり文字列直確定
-                    // （学習されないだけで確定は必ず成功）。前方一致候補なら candidate_prefix と
-                    // 同じ部分確定継続（source=live_prefix）— 従来は残り読みが暗黙に捨てられていた。
-                    // ライブ変換 OFF / F6-F10 表記固定中は engine のライブ変換を参照しない
-                    // （None=劣化枝と同じ DirectCommit へ）— 表示中の live_text をそのまま確定する。
-                    let live = if self.should_consult_live_engine() {
-                        let seq = self.state.borrow_mut().bump_live_seq();
-                        // auto_commit=false: この直後の Commit{0} が全読みを確定する前提のため、
-                        // エンジンに読みを消費させてはいけない（protocol.rs の LiveConvert 参照）。
-                        self.engine_live_convert(seq, false).map(|(t, _, _)| t)
-                    } else {
-                        None
+                    let module_output = self
+                        .state
+                        .borrow_mut()
+                        .handle(ModuleEvent::Key(ModuleKeyEvent::Enter));
+                    let local_operation = module_output
+                        .immediate
+                        .expect("composing Enter must produce a local commit operation");
+                    debug_assert!(module_output.background.is_none());
+                    let local_fallback = match &local_operation {
+                        ModuleOperation::Commit { text, .. } => text.clone(),
+                        _ => unreachable!("composing Enter must commit"),
                     };
                     let live_text = self.live_text.borrow().clone();
-                    let last_reading = self.last_reading.borrow().clone();
-                    // Why not(ライブ変換 OFF 専用の source を作る): `arms_undo` は
-                    // `matches!(source, "candidate" | "live")` の**列挙**なので、別名にすると
-                    // Ctrl+Backspace の確定取消が OFF のときだけ静かに武装しなくなる
-                    // （`should_widen_digits` は逆に除外列挙なので別名でも幅は変わらない）。
-                    match plan_live_enter(live, &live_text, &last_reading) {
-                        LiveEnterPlan::EngineCommit { text } => {
-                            let plan = plan_commit(self.engine_commit(0), &text);
-                            self.apply_commit_plan(&ctx, plan, "live", "live_prefix", None);
-                        }
-                        LiveEnterPlan::DirectCommit { text } => {
-                            self.commit_and_reset(&ctx, &text, "live", None);
-                        }
+                    let text = match plan_live_enter(None, &live_text, &local_fallback) {
+                        LiveEnterPlan::EngineCommit { text }
+                        | LiveEnterPlan::DirectCommit { text } => text,
+                    };
+                    let applied = apply_and_complete_module_operation(
+                        &local_operation,
+                        || self.commit_local_and_reset(&ctx, &text, "live"),
+                        |operation, applied| self.state.borrow_mut().complete(operation, applied),
+                    );
+                    if applied {
+                        self.background_input.try_commit_and_close();
                     }
                 }
                 Ok(TRUE)
@@ -866,13 +1506,13 @@ impl TextService_Impl {
                         let st = self.cand_state.borrow();
                         let digit = (vk - VK_1) as usize; // 0 始まりのページ内行
                         page_candidate_index(st.selected(), st.count(), digit)
-                            .and_then(|abs| st.resolve_commit(abs))
-                    };
+                    }
+                    .and_then(|absolute| self.module_candidate_commit(Some(absolute)));
                     match picked {
-                        Some((index, text)) => {
+                        Some((request, index, text)) => {
                             tip_log(&format!("ev=candidate_move sel={index}"));
                             // 候補確定: 前方一致候補なら部分確定して残り読みを継続する。
-                            self.commit_candidate(&ctx, index, &text);
+                            self.commit_candidate(&ctx, request, index, &text);
                             Ok(TRUE)
                         }
                         // 可視ページの行数を超える数字は no-op（誤った候補を選ばない）。候補表示中は
@@ -945,10 +1585,24 @@ impl TextService_Impl {
                     Ok(TRUE)
                 } else if self.state.borrow().composing {
                     self.disarm_debounce();
-                    self.do_cancel(&ctx);
+                    let cancel = self
+                        .state
+                        .borrow_mut()
+                        .handle(ModuleEvent::Key(ModuleKeyEvent::Escape))
+                        .immediate
+                        .expect("composing Escape must produce a cancel operation");
+                    // 巡4 T4: セッション拒否時は TIP 側状態を畳まない（composition が文書に
+                    // 残るため「Esc が効かなかった」扱いにする）。do_cancel 内の left_context
+                    // 清算は実行済み。
+                    if !self.do_cancel(&ctx) {
+                        self.state.borrow_mut().complete(&cancel, false);
+                        tip_log("ev=cancel_rejected source=escape");
+                        return Ok(TRUE);
+                    }
+                    self.state.borrow_mut().complete(&cancel, true);
                     self.reading_monitor.borrow_mut().hide();
-                    self.state.borrow_mut().on_escape();
                     self.engine_end_session();
+                    self.background_input.request_close();
                     // ephemeral かな: composition を破棄した以上、開始状態へ戻す＝direct へ復帰する。
                     self.exit_ephemeral_to_direct(Some(&ctx));
                     self.live_text.borrow_mut().clear();
@@ -961,43 +1615,30 @@ impl TextService_Impl {
 
             // ---- Backspace: 1 文字削り、読みを表示してデバウンス再変換 ----
             VK_BACK => {
-                if !self.state.borrow().composing {
-                    return Ok(FALSE);
-                }
-                if self.showing.get() {
-                    self.candidate_ui.borrow_mut().hide();
-                    self.showing.set(false);
-                    self.clear_clause_nav();
-                }
-                self.state.borrow_mut().on_backspace();
-                // mark_good は Some アーム内限定 — match 後の共通行に置くと劣化出力まで
-                // 良好素材として記録され「エンジン由来の表示」という前提が崩れる。
-                let reading = match self.engine_backspace() {
-                    Some(r) => {
-                        self.state.borrow_mut().mark_good(&r);
-                        *self.last_reading.borrow_mut() = r.clone();
-                        r
+                let composing = self.state.borrow().composing;
+                match backspace_route(composing, self.showing.get(), self.reconverting.get()) {
+                    BackspaceRoute::CancelReconvert => {
+                        // RestoreText の成否にかかわらずこの打鍵は消費する。拒否時は
+                        // cancel_reconvert が候補/原文/ラッチを保持するため、再押下で再試行できる。
+                        let _ = self.cancel_reconvert(&ctx);
+                        return Ok(TRUE);
                     }
-                    None => {
-                        let degraded = self.state.borrow_mut().degraded_reading();
-                        *self.last_reading.borrow_mut() = degraded.clone();
-                        degraded
+                    BackspaceRoute::HideStaleCandidates => {
+                        // showing&&!composing&&!reconverting は通常生成されないが、候補を残したまま
+                        // 本文 Backspace へ流すと OnTestKeyDown と実処理が分岐する。本文を変更せず、
+                        // stale な候補表示だけを閉じて消費する。
+                        self.candidate_ui.borrow_mut().hide();
+                        self.reading_monitor.borrow_mut().hide();
+                        self.showing.set(false);
+                        self.clear_clause_nav();
+                        *self.current_context.borrow_mut() = None;
+                        self.live_text.borrow_mut().clear();
+                        return Ok(TRUE);
                     }
-                };
-                if reading.is_empty() {
-                    self.disarm_debounce();
-                    self.do_cancel(&ctx);
-                    self.reading_monitor.borrow_mut().hide();
-                    self.state.borrow_mut().reset();
-                    self.live_text.borrow_mut().clear();
-                    *self.current_context.borrow_mut() = None;
-                } else {
-                    *self.current_context.borrow_mut() = Some(ctx.clone());
-                    *self.live_text.borrow_mut() = reading.clone();
-                    self.run_preedit(&ctx, &self.widen_display_text(&reading));
-                    self.arm_debounce();
+                    BackspaceRoute::Pass => return Ok(FALSE),
+                    BackspaceRoute::Compose => {}
                 }
-                Ok(TRUE)
+                self.backspace_reading(&ctx)
             }
 
             // 変換キー(0x1C) は KeyAction::Reconvert（direct+idle）/ Convert（composing・showing）
@@ -1024,7 +1665,10 @@ impl TextService_Impl {
                     } else {
                         match key_to_char(vk, lparam) {
                             // 英字＝ローマ字合成、テンキー `-`→ー（to_kana_reading_char 維持）、テンキー `.` は literal。
-                            Some(ch) => self.input_char(&ctx, to_kana_reading_char(ch), InsertStyle::Kana),
+                            Some(ch) => {
+                                let folded = to_kana_reading_char(ch);
+                                self.input_char_with_original(&ctx, folded, InsertStyle::Kana, (folded != ch).then_some(ch))
+                            }
                             // L-3: 合成中の印字不能キー（デッドキー/合字）は食って無視（stray char 漏れ防止）。
                             None => Ok(TRUE),
                         }
@@ -1051,13 +1695,19 @@ impl TextService_Impl {
 
             // ---- ←/→: 候補表示中は文節移動（MS-IME の文節ナビゲーション）----
             // 変換候補の表示中に選択文節を左右へ動かし、候補窓を「選択文節の候補」へ差し替える。
-            // 劣化は 2 段: 文節モードに**入れない**（旧エンジン非対応/被覆候補無し/再変換中）は
-            // 従来どおり「確定して畳む」、**確立後**の失敗（一時的な IPC タイムアウト等）は
-            // no-op で食い切る — settle へ落とすと移動のつもりの矢印 1 打が合成の全確定になる
-            // （マージ後敵対レビュー④。両者は move_clause=false からは区別できない）。
-            // composition のみ（候補窓なし）も従来どおり settle — 読み内カーソル移動は据え置き。
+            // move_clause の失敗（文節モード確立前・確立後を問わず）は no-op で食い切る —
+            // settle へ落とすと移動のつもりの矢印 1 打が合成の全確定になる（マージ後敵対
+            // レビュー④ + P1。両者は move_clause=false からは区別できないため in_nav 前提を
+            // 撤去した）。文節モードに入れない理由（旧エンジン非対応/被覆候補無し）は
+            // ユーザーの再試行（Esc/Space/Enter）で解決される。
+            // explicit snapshot 応答待ち中も食い切る（待ちは cancel せず維持 — 冒頭の
+            // exempt と対）。結果到着後の移動適用は P4e の保留キューで導入するまで捨てる。
+            // 読み編集中は合成を維持して読み上のカーソルを動かす。
             // eaten 契約（composing||showing で食い切る）は不変（will_handle_gated と一致）。
             VK_LEFT | VK_RIGHT => {
+                if self.explicit_snapshot_pending.get() {
+                    return Ok(TRUE);
+                }
                 if self.showing.get() && !self.reconverting.get() {
                     let in_nav = self.clause_nav.borrow().is_some();
                     // 自動リピート中の文節モードは IPC を発行せず食い切る(is_autorepeat 注記。
@@ -1068,12 +1718,14 @@ impl TextService_Impl {
                     if self.move_clause(&ctx, if vk == VK_RIGHT { 1 } else { -1 }) {
                         return Ok(TRUE);
                     }
-                    if in_nav {
-                        return Ok(TRUE);
-                    }
+                    return Ok(TRUE);
                 }
-                if self.state.borrow().composing || self.showing.get() {
-                    self.settle_active_input(Some(&ctx), "navigate");
+                if self.state.borrow().composing && !self.showing.get() {
+                    self.edit_reading(&ctx, ModuleKeyEvent::MoveReading(if vk == VK_RIGHT { 1 } else { -1 }))
+                } else if self.showing.get() {
+                    // 巡5 GLM M-2: settle の成否は受けるが navigate は再試行可能 — 拒否時も
+                    // TRUE で食いてユーザの再押下に任せる（モードトグルと違い状態を壊さない）。
+                    let _ = self.settle_active_input(Some(&ctx), "navigate");
                     Ok(TRUE)
                 } else {
                     Ok(FALSE)
@@ -1087,8 +1739,16 @@ impl TextService_Impl {
             // 食い切る（Test/実の eaten 判定を一致させる）。idle では上の gate に到達せず
             // will_handle=false で OnKeyDown 自体が呼ばれない（呼ばれてもここで FALSE を返す）。
             VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_DELETE => {
-                if self.state.borrow().composing || self.showing.get() {
-                    self.settle_active_input(Some(&ctx), "navigate");
+                if self.state.borrow().composing && !self.showing.get()
+                    && matches!(vk, VK_HOME | VK_END | VK_DELETE) {
+                    self.edit_reading(&ctx, match vk {
+                        VK_HOME => ModuleKeyEvent::ReadingHome,
+                        VK_END => ModuleKeyEvent::ReadingEnd,
+                        _ => ModuleKeyEvent::Delete,
+                    })
+                } else if self.state.borrow().composing || self.showing.get() {
+                    // 巡5 GLM M-2: 矢印と同じ（成否を受けるが TRUE で食く）。
+                    let _ = self.settle_active_input(Some(&ctx), "navigate");
                     Ok(TRUE)
                 } else {
                     Ok(FALSE)
@@ -1107,64 +1767,534 @@ impl TextService_Impl {
     /// stale 候補リストを操作し、画面表示と違う文字列を確定してしまう。
     /// レビュー M-2（既知の限界）: raw は「打鍵の生入力」だが、部分確定後の reseed では残り読みの
     /// **かな**になる。その状態の全角/半角英数はかなベース表示になる（元ローマ字は復元不能で許容）。
-    fn apply_notation(&self, ctx: &ITfContext, vk: u32, kind: crate::keymap::Notation) -> Result<BOOL> {
-        use crate::keymap::Notation;
+    fn handle_conversion_wait_key(&self, ctx: &ITfContext, vk: u32, lparam: LPARAM, action: crate::keymap::KeyAction) -> bool {
+        use crate::conversion_queue::{ConversionAction as A, OperationTarget, QueueAdmission};
+        if self.conversion_queue.borrow().owner_lost {
+            if vk == VK_ESCAPE && !cmd_modifier_down() {
+                self.clear_conversion_queue();
+                self.hide_explicit_snapshot_status();
+                self.show_conversion_queue_notice(ctx, "後続の未処理入力を取り消しました。確定済みの文字は残します");
+            } else {
+                self.show_conversion_queue_notice(ctx, "元の入力先が終了しました。未処理入力を保持しています。Escで取消");
+            }
+            return true;
+        }
+
+        // After a queued F-key changes mode, its display retry may yield before
+        // the next Insert can run. Materialize that head's Commit before later
+        // admissions can reuse the slot freed by the F-key.
+        if self.local_converting() && matches!(self.conversion_queue.borrow().front(), Some(A::Insert { .. })) {
+            if !self.conversion_queue.borrow_mut().prepend_commit_for_insert() {
+                self.conversion_queue.borrow_mut().commit_failed = true;
+                self.show_conversion_queue_notice(ctx, "入力を反映できません。Enterで再試行、Escで取消");
+                return true;
+            }
+        }
+        let barrier = self.conversion_queue.borrow().has_commit();
+        let initial = self.explicit_snapshot_pending.get();
+        let candidates_loading = self.local_clause_loading();
+        let boundary_loading = self.local_clauses.borrow().as_ref().is_some_and(|model| model.boundary_loading());
+        if !initial && !candidates_loading && !barrier && !self.local_clause_redraw_pending.get()
+            && !self.conversion_queue.borrow().commit_failed { return false; }
+        if !self.bind_conversion_queue_context(ctx) { return true; }
+        let target = self.local_clauses.borrow().as_ref().and_then(|m| m.clauses.get(m.selected).map(|c| OperationTarget {
+            clause: Some(c.id), start: c.start, end: c.end, candidate_window: !matches!(m.window, crate::clause_conversion::CandidateWindow::Closed),
+        })).unwrap_or_else(|| OperationTarget { clause: None, start: ipc::clause::ReadingPosition(0),
+            end: ipc::clause::ReadingPosition(self.state.borrow().canonical_reading().chars().count() as u32),
+            candidate_window: self.conversion_queue.borrow().logical_window_open() });
+        let target = OperationTarget { candidate_window: if boundary_loading {
+            self.conversion_queue.borrow().logical_window_open()
+        } else { target.candidate_window }, ..target };
+        let semantic = if action == crate::keymap::KeyAction::Convert { Some(A::Candidate(1)) }
+        else if let crate::keymap::KeyAction::Notation(kind) = action { Some(A::Transform { kind, target: target.clone() }) }
+        else if action == crate::keymap::KeyAction::NotationRotate { Some(A::RotateNotation(target.clone())) }
+        else if !cmd_modifier_down() {
+            match vk {
+                VK_LEFT | VK_RIGHT if self.mixed_editing() => Some(A::MoveReading(if vk == VK_RIGHT { 1 } else { -1 })),
+                VK_HOME if self.mixed_editing() => Some(A::ReadingHome),
+                VK_END if self.mixed_editing() => Some(A::ReadingEnd),
+                VK_LEFT | VK_RIGHT => Some(if shift_down() { A::ResizeClause(if vk == VK_RIGHT { 1 } else { -1 }) } else { A::MoveClause(if vk == VK_RIGHT { 1 } else { -1 }) }),
+                VK_UP | VK_DOWN => {
+                    if !target.candidate_window { return true; }
+                    Some(A::Candidate(if vk == VK_DOWN { 1 } else { -1 }))
+                }
+                VK_RETURN => Some(A::Commit), VK_ESCAPE => Some(A::Cancel),
+                VK_BACK => Some(A::Backspace), VK_DELETE => Some(A::Delete),
+                VK_HOME => Some(A::Home(target.clone())), VK_END => Some(A::End(target.clone())),
+                VK_1..=VK_9 if (queued_digit_selects_candidate(barrier, target.candidate_window) || (boundary_loading && !barrier)) && !shift_down() => return true,
+                VK_A..=VK_Z => {
+                    let latin = !barrier && self.state.borrow().latin_mode();
+                    let (ch, style, direct_commit) = match resolve_az_char(vk, shift_down(), key_to_char(vk, lparam), self.shift_latin_compose.get(), latin) {
+                        AzRoute::Kana(ch) => (ch, ModuleTextStyle::Kana, false),
+                        AzRoute::Latin(ch) => (ch, ModuleTextStyle::Direct, false),
+                        AzRoute::DirectCommit(ch) => (ch, ModuleTextStyle::Direct, true),
+                    };
+                    Some(A::Insert { text: ch.to_string(), original: None, style, direct_commit })
+                }
+                _ => key_to_char(vk, lparam).map(|ch| {
+                    let original = ch;
+                    let (ch, style) = queued_nonalpha(ch, !barrier && self.state.borrow().latin_mode(),
+                        is_symbol_keystroke(vk, shift_down(), self.symbol_overlay.get()), self.punctuation_full_width.get(),
+                        self.symbol_overlay.get(), self.symbol_chars.get());
+                    A::Insert { text: ch.to_string(), original: (ch != original).then(|| original.to_string()), style, direct_commit: false }
+                }),
+            }
+        } else { None };
+        let Some(semantic) = semantic else { return barrier; };
+        if candidates_loading {
+            use crate::conversion_queue::{candidate_wait_disposition, CandidateWaitDisposition as D};
+            let disposition = if boundary_loading && matches!(semantic, A::MoveClause(_) | A::ResizeClause(_)) {
+                D::Defer
+            } else { candidate_wait_disposition(&semantic, barrier) };
+            match disposition {
+                D::Defer => {}
+                D::Noop => return true,
+                D::Commit | D::CommitThenInsert => {
+                    self.clear_conversion_queue();
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+                    if matches!(semantic, A::Insert { .. }) { self.conversion_queue.borrow_mut().push(A::Commit); }
+                }
+                D::Immediate | D::Close => {
+                    self.clear_conversion_queue();
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+                    if matches!(semantic, A::Cancel) { self.render_local_edit(ctx); return true; }
+                    return false;
+                }
+            }
+        }
+        if self.conversion_queue.borrow().commit_failed && matches!(semantic, A::Cancel) {
+            self.show_conversion_queue_notice(ctx, "確定を取り消し、後続の未処理入力を破棄しました");
+            self.clear_conversion_queue();
+            if self.do_cancel(ctx) { self.state.borrow_mut().reset(); self.clear_clause_nav(); }
+            return true;
+        }
+        if initial && !barrier && matches!(semantic, A::Insert { .. } | A::Backspace | A::Delete | A::Cancel) {
+            self.cancel_explicit_snapshot_wait();
+            self.clear_conversion_queue();
+            if matches!(semantic, A::Cancel) {
+                let reading = self.state.borrow().canonical_reading().to_string();
+                *self.live_text.borrow_mut() = reading.clone();
+                self.run_preedit(ctx, &reading);
+                return true;
+            }
+            self.conversion_queue.borrow_mut().push(semantic);
+            self.drain_conversion_actions(ctx);
+            return true;
+        }
+        if self.conversion_queue.borrow().commit_failed && matches!(semantic, A::Commit) {
+            if !self.finish_pending_composition(ctx) { return true; }
+            self.conversion_queue.borrow_mut().commit_failed = false;
+            self.hide_explicit_snapshot_status();
+            self.drain_conversion_actions(ctx);
+            return true;
+        }
+        let admit = || {
+            let needs_commit = self.local_converting() && !self.conversion_queue.borrow().has_commit();
+            if let A::Insert { ref text, ref original, style, direct_commit } = semantic {
+                if needs_commit {
+                    return self.conversion_queue.borrow_mut().push_commit_then_mapped_insert(text.clone(), original.clone(), style, direct_commit);
+                }
+            }
+            if self.mixed_editing() {
+                self.conversion_queue.borrow_mut().push_reserving_commit(semantic.clone())
+            } else {
+                self.conversion_queue.borrow_mut().push(semantic.clone())
+            }
+        };
+        let admission = admit();
+        if admission == QueueAdmission::Full {
+            self.fail_conversion_wait(ctx);
+            self.drain_conversion_actions(ctx);
+            if admit() != QueueAdmission::Accepted {
+                tip_log("ev=conversion_input_rejected reason=queue_full");
+                self.show_conversion_queue_notice(ctx, "入力を受け付けられません。Enterで確定を再試行、Escで取消");
+            }
+        } else if admission == QueueAdmission::TooLarge {
+            tip_log("ev=conversion_input_rejected reason=payload_limit");
+            self.show_conversion_queue_notice(ctx, "入力が長すぎるため受け付けられません");
+        }
+        if !self.explicit_snapshot_pending.get() { self.drain_conversion_actions(ctx); }
+        true
+    }
+
+    pub(crate) fn fail_conversion_wait(&self, ctx: &ITfContext) {
+        if self.pending_commit.borrow().is_some() {
+            // A full queue must not replay or cancel a still-running TSF body.
+            self.poll_pending_commit(ctx);
+            return;
+        }
+        self.cancel_explicit_snapshot_wait();
+        self.conversion_queue.borrow_mut().fail_wait();
+        if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+        self.drain_conversion_actions(ctx);
+    }
+
+    pub(crate) fn drain_conversion_actions(&self, ctx: &ITfContext) {
+        use crate::conversion_queue::ConversionAction as A;
+        if self.replaying_conversion_queue.get() { return; }
+        if !self.bind_conversion_queue_context(ctx) { return; }
+        let _replay = ScopedCellFlag::set(&self.replaying_conversion_queue);
+        loop {
+            if self.conversion_queue.borrow().owner_lost || self.conversion_queue.borrow().waiting || self.conversion_queue.borrow().commit_failed { return; }
+            if !self.retry_local_clause_redraw(ctx) { return; }
+            let action = self.conversion_queue.borrow().front().cloned();
+            let Some(action) = action else {
+                self.release_idle_conversion_queue_context();
+                return;
+            };
+            if matches!(action, A::Insert { .. }) && self.local_converting() {
+                if self.conversion_queue.borrow_mut().prepend_commit_for_insert() { continue; }
+                self.conversion_queue.borrow_mut().commit_failed = true;
+                self.show_conversion_queue_notice(ctx, "入力を反映できません。Enterで再試行、Escで取消");
+                return;
+            }
+            let was_commit = matches!(action, A::Commit);
+            if !matches!(action, A::Transform { .. } | A::RotateNotation(_)) {
+                if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.reset_notation_cycle(); }
+            }
+            let success = match action {
+                A::MoveReading(direction) => { self.replay_reading_navigation(ctx, ModuleKeyEvent::MoveReading(direction)); true }
+                A::ReadingHome => { self.replay_reading_navigation(ctx, ModuleKeyEvent::ReadingHome); true }
+                A::ReadingEnd => { self.replay_reading_navigation(ctx, ModuleKeyEvent::ReadingEnd); true }
+                A::MoveClause(direction) => {
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.move_clause(direction); }
+                    self.render_local_edit(ctx); true
+                }
+                A::Candidate(direction) => {
+                    if self.local_converting() {
+                        if direction > 0 { self.local_clause_space(ctx); }
+                        else {
+                            if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.advance_candidate(direction); }
+                            self.render_local_edit(ctx);
+                        }
+                        if self.local_clause_loading() { self.conversion_queue.borrow_mut().begin(Instant::now(), None); }
+                    } else if self.mixed_editing() { self.convert_edited_interval(ctx); }
+                    else { self.trigger_convert(ctx); }
+                    true
+                }
+                A::Commit => {
+                    let suppress_prediction = self.conversion_queue.borrow().suppress_commit_prediction;
+                    let _prediction_guard = suppress_prediction.then(|| ScopedCellFlag::set(&self.prediction_commit_suppressed));
+                    let fallback = self.conversion_queue.borrow().initial_reading.clone();
+                    let text = if self.state.borrow().notation_fixed.is_some() {
+                        self.live_text.borrow().clone()
+                    } else {
+                        fallback.unwrap_or_else(|| self.state.borrow().canonical_reading().to_string())
+                    };
+                    let ok = if self.local_clauses.borrow().is_some() { self.commit_local_clauses(ctx) }
+                        else if self.state.borrow().composing { self.commit_and_reset(ctx, &text, "clause", None) }
+                        else { true };
+                    if self.conversion_queue.borrow().owner_lost { return; }
+                    if !ok {
+                        if self.pending_commit_waiting() {
+                            self.conversion_queue.borrow_mut().waiting = true;
+                            self.arm_clause_poll();
+                            if self.live_result_timer.get() == 0 {
+                                let pending = self.pending_commit.borrow().clone();
+                                if let Some(pending) = pending { pending.request.state.begin(false); }
+                                self.poll_pending_commit(ctx);
+                            }
+                        } else {
+                            self.conversion_queue.borrow_mut().commit_failed = true;
+                            tip_log("ev=conversion_commit_failed retry=enter cancel=escape");
+                            self.show_conversion_queue_notice(ctx, "確定できません。Enterで再試行、Escで取消");
+                        }
+                    }
+                    ok
+                }
+                A::Insert { text, original, style, direct_commit } => {
+                    let mut originals = original.as_deref().unwrap_or(&text).chars();
+                    let applied = apply_accepted_text(&text, |ch| {
+                        if !self.finish_pending_composition(ctx) { return false; }
+                        if self.local_converting() { return false; }
+                        let needs_settle = direct_commit && input_needs_settle(self.state.borrow().composing, self.showing.get(), self.composition_end_pending.get());
+                        if needs_settle && !self.settle_active_input(Some(ctx), "shift_latin") { return false; }
+                        let result = if direct_commit { self.commit_char_direct(ctx, ch) }
+                            else { self.input_char_with_original(ctx, ch, if style == ModuleTextStyle::Direct { InsertStyle::Direct } else { InsertStyle::Kana }, originals.next().filter(|original| *original != ch)) };
+                        result.is_ok_and(|eaten| eaten.as_bool())
+                    });
+                    if matches!(self.conversion_queue.borrow().front(), Some(A::Commit)) { continue; }
+                    self.conversion_queue.borrow_mut().consume_front_insert_prefix(applied);
+                    let success = applied == text.chars().count();
+                    if !success {
+                        self.conversion_queue.borrow_mut().commit_failed = true;
+                        self.show_conversion_queue_notice(ctx, "入力を反映できません。Enterで再試行、Escで取消");
+                    }
+                    success
+                }
+                A::Cancel => {
+                    if self.local_converting() { self.local_clause_escape(ctx); true }
+                    else if !self.state.borrow().composing { true }
+                    else if self.do_cancel(ctx) { self.state.borrow_mut().reset(); self.clear_clause_nav(); true }
+                    else { false }
+                }
+                A::Backspace => {
+                    if self.local_converting() {
+                        let ok = self.local_clause_backspace(ctx);
+                        if !ok { self.conversion_queue.borrow_mut().commit_failed = true; }
+                        ok
+                    } else if self.state.borrow().composing { self.backspace_reading(ctx).is_ok_and(|eaten| eaten.as_bool()) }
+                    else { true }
+                }
+                A::Home(ref target) | A::End(ref target) => {
+                    let end = matches!(action, A::End(_));
+                    if let Some(model) = self.local_clauses.borrow_mut().as_mut() {
+                        let target_current = target.clause.is_none() || model.clauses.iter()
+                            .any(|clause| Some(clause.id) == target.clause && clause.start == target.start && clause.end == target.end);
+                        if target_current {
+                            if target.candidate_window {
+                                if let crate::clause_conversion::CandidateWindow::Ready { candidates, .. } = &model.window {
+                                    let index = if end { candidates.len() - 1 } else { 0 };
+                                    model.select_candidate(index);
+                                }
+                            } else { model.move_clause(if end { i32::MAX } else { i32::MIN }); }
+                        } else { tip_log("ev=conversion_action_ignored reason=retired_target"); }
+                    }
+                    self.render_local_edit(ctx);
+                    true
+                }
+                A::Transform { ref target, .. } | A::RotateNotation(ref target) => {
+                    if self.local_clauses.borrow().as_ref().is_some_and(|model| model.revision == u64::MAX) {
+                        self.conversion_queue.borrow_mut().commit_exhausted_action();
+                        continue;
+                    }
+                    // Resolve rotation after earlier accepted transforms have taken effect.
+                    let kind = match &action {
+                        A::Transform { kind, .. } => *kind,
+                        _ => crate::keymap::next_notation(self.state.borrow().notation_fixed),
+                    };
+                    let changed = {
+                        let mut state = self.local_clauses.borrow_mut();
+                        state.as_mut().is_some_and(|model| {
+                            if target.clause.is_some_and(|id| !model.clauses.iter().any(|c|
+                                c.id == id && c.start == target.start && c.end == target.end)) {
+                                tip_log("ev=conversion_action_ignored reason=retired_target");
+                                return false;
+                            }
+                            let original = self.state.borrow().original_input(target.start, target.end);
+                            model.transform_notation(target.start, target.end, kind, original.as_deref())
+                        })
+                    };
+                    if changed {
+                        self.state.borrow_mut().set_notation(kind);
+                        self.disarm_debounce();
+                        self.render_local_edit(ctx);
+                    } else if self.local_clauses.borrow().is_none() && self.state.borrow().composing {
+                        // Esc may have completed its retained all-reading redraw
+                        // before this accepted notation action reaches the head.
+                        let _ = self.apply_notation(ctx, 0, kind);
+                    }
+                    true
+                }
+                A::ResizeClause(direction) => {
+                    let outcome = self.local_clauses.borrow_mut().as_mut().map(|model| model.resize_selected(direction));
+                    if outcome == Some(crate::clause_conversion::LocalEditOutcome::Exhausted) {
+                        self.conversion_queue.borrow_mut().commit_exhausted_action();
+                        continue;
+                    } else { self.render_local_edit(ctx); true }
+                }
+                A::Delete => { if self.mixed_editing() { self.edit_reading(ctx, ModuleKeyEvent::Delete).is_ok_and(|eaten| eaten.as_bool()) } else { true } },
+            };
+            if !success || self.conversion_queue.borrow().owner_lost { return; }
+            if !was_commit && matches!(self.conversion_queue.borrow().front(), Some(A::Commit)) {
+                // Exhaustion replaced this semantic operation with a barrier.
+                // Execute it before acknowledging the head or its suffix.
+                continue;
+            }
+            self.conversion_queue.borrow_mut().complete_front();
+            if self.composition_end_pending.get() {
+                // The Commit action's body has been acknowledged and removed.
+                // Keep accepting subsequent text into the queue while only its
+                // presentation/close is pending; never replay the Commit body.
+                self.conversion_queue.borrow_mut().commit_failed = true;
+                self.show_conversion_queue_notice(ctx, "確定後の表示を修復できません。Enterで再試行、Escで後続入力を取消");
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn backspace_reading(&self, ctx: &ITfContext) -> Result<BOOL> {
+        self.edit_reading(ctx, ModuleKeyEvent::Backspace)
+    }
+
+    fn edit_reading(&self, ctx: &ITfContext, key: ModuleKeyEvent) -> Result<BOOL> {
+        if self.mixed_editing() { return self.edit_mixed_reading(ctx, key, None); }
         if self.showing.get() {
             self.candidate_ui.borrow_mut().hide();
             self.showing.set(false);
             self.clear_clause_nav();
         }
-        self.disarm_debounce();
-        let reading = self.last_reading.borrow().clone();
-        let raw = self.state.borrow().raw.clone();
-        let shown = match kind {
-            Notation::Hiragana => reading,
-            Notation::Katakana => to_katakana(&reading),
-            Notation::HankakuKana => to_hankaku_kana(&reading),
-            // どちらも raw をそのまま素材にしない: 句読点/記号は合成時に全角へ畳み込まれて
-            // raw に積まれる(symbol_keydown)ため、まず逆写像で打鍵の半角へ戻す。全角英数は
-            // その上で機械全角化(「、。」→",."→"，．")。戻さないと 、。 が「英数記号」表記に
-            // ならず素通りする(F10 側と同型の非対称 — 敵対レビュー M-1)。
-            Notation::ZenkakuEisu => to_zenkaku_ascii(&to_hankaku_ascii(&raw)),
-            Notation::HankakuEisu => to_hankaku_ascii(&raw),
+        let module_output = self
+            .state
+            .borrow_mut()
+            .handle(ModuleEvent::Key(key));
+        if module_output.immediate.is_none() { return Ok(TRUE); }
+        let local_reading = match module_output.immediate.as_ref() {
+            Some(ModuleOperation::SetPreedit { text }) => Some(text.clone()),
+            Some(ModuleOperation::Cancel) => None,
+            other => unreachable!(
+                "backspace must produce local preedit or cancel, got {other:?}"
+            ),
         };
-        {
-            let mut st = self.state.borrow_mut();
-            st.notation_fixed = Some(kind);
-            st.mark_good(&shown);
+        let operation = module_output
+            .immediate
+            .clone()
+            .expect("backspace must produce an immediate operation");
+        let background = match module_output.background {
+            Some(ModuleIntent::Reseed { request, segments }) => Some((request, segments)),
+            None => None,
+            _ => unreachable!("reading edit must reseed"),
+        };
+        let local_applied = local_reading.as_ref().is_some_and(|text| {
+            *self.last_reading.borrow_mut() = text.clone();
+            *self.live_text.borrow_mut() = text.clone();
+            self.apply_preedit_with_target(ctx, &self.widen_display_text(text), None).fully_applied()
+        });
+        // A surface deletion can preserve the same text while changing whether its
+        // trailing ASCII is frozen or still composable. A stateful engine Backspace
+        // cannot carry that distinction, so the next worker state starts from the
+        // canonical styled replay instead.
+        if let Some((background_request, background_segments)) = background.filter(|_| local_reading.is_some()) {
+            reseed_background(
+                || self.background_input.request_close(),
+                || ModuleIntent::Insert {
+                    request: background_request,
+                    segments: background_segments,
+                },
+                |request, segments| self.background_input.try_reseed(request, segments),
+            );
+        } else if local_reading.is_none() {
+            self.background_input.request_close();
         }
-        // 表示だけ全角化する（input_char と同じ規律）。live_text/mark_good を半角 canonical の
-        // まま置くのは、それが劣化確定・リプレイでエンジンへ戻る素材だから。
-        // widen は notation_fixed を書いた**後**で呼ぶ — 先だと F10/半角カナが半角指定として
-        // 効かず、機能名と真逆に数字が全角化される。
-        *self.live_text.borrow_mut() = shown.clone();
-        *self.current_context.borrow_mut() = Some(ctx.clone());
-        self.run_preedit(ctx, &self.widen_display_text(&shown));
-        tip_log(&format!("ev=notation vk={vk:#04x} text={shown}"));
+        match operation {
+            operation @ ModuleOperation::Cancel => {
+                self.disarm_debounce();
+                let applied = apply_and_complete_module_operation(
+                    &operation,
+                    || self.do_cancel(&ctx),
+                    |operation, applied| {
+                        self.state.borrow_mut().complete(operation, applied)
+                    },
+                );
+                if !applied {
+                    tip_log("ev=cancel_rejected source=backspace_empty");
+                    return Ok(TRUE);
+                }
+                self.last_reading.borrow_mut().clear();
+                self.reading_monitor.borrow_mut().hide();
+                self.live_text.borrow_mut().clear();
+                *self.current_context.borrow_mut() = None;
+                self.background_input.request_close();
+            }
+            ModuleOperation::SetPreedit { .. } => {
+                *self.current_context.borrow_mut() = Some(ctx.clone());
+                if !local_applied {
+                    self.partial_preedit_redraw_pending.set(true);
+                    self.partial_preedit_redraw_retries.set(0);
+                    self.arm_partial_preedit_redraw_retry();
+                }
+                self.arm_debounce();
+            }
+            other => {
+                unreachable!("backspace result cannot produce {other:?}");
+            }
+        }
         Ok(TRUE)
+    }
+
+    fn apply_notation(
+        &self,
+        ctx: &ITfContext,
+        vk: u32,
+        kind: crate::keymap::Notation,
+    ) -> Result<BOOL> {
+        if self.local_clauses.borrow().as_ref().is_some_and(|model| model.revision == u64::MAX) {
+            self.queue_local_clause_commit(ctx, false);
+            return Ok(TRUE);
+        }
+        if self.local_clauses.borrow().is_none() {
+            let model = {
+                let state = self.state.borrow();
+                crate::clause_conversion::ClauseConversion::from_reading(
+                    state.clause_identity(self.acknowledged_configuration_generation.get(), self.background_input.connection_generation()),
+                    state.canonical_reading().to_owned())
+            };
+            if model.is_none() { return Ok(TRUE); }
+            self.clear_clause_nav();
+            *self.local_clauses.borrow_mut() = model;
+        }
+        {
+            let changed = {
+                let mut state = self.local_clauses.borrow_mut();
+                state.as_mut().is_some_and(|model| {
+                    let Some(clause) = model.clauses.get(model.selected) else { return false; };
+                    let original = self.state.borrow().original_input(clause.start, clause.end);
+                    model.transform_notation(clause.start, clause.end, kind, original.as_deref())
+                })
+            };
+            self.disarm_debounce();
+            if changed {
+                self.state.borrow_mut().set_notation(kind);
+                *self.current_context.borrow_mut() = Some(ctx.clone());
+                self.render_local_edit(ctx);
+            }
+            tip_log(&format!("ev=notation vk={vk:#04x} changed={changed}"));
+            Ok(TRUE)
+        }
     }
 
     /// NotationRotate(無変換連打)のディスパッチ。現在表記(notation_fixed)から次を導出して
     /// apply_notation へ。OnKeyDown の KeyAction::NotationRotate と OnPreservedKey の
     /// ToggleMode 委譲(受理配送ホスト)の両経路が共有し、二重実装のズレを防ぐ(spec §6.3)。
     fn dispatch_notation_rotate(&self, ctx: &ITfContext, vk: u32) -> Result<BOOL> {
+        if self.handle_conversion_wait_key(ctx, vk, LPARAM(0), crate::keymap::KeyAction::NotationRotate) {
+            return Ok(TRUE);
+        }
         let next = crate::keymap::next_notation(self.state.borrow().notation_fixed);
         self.apply_notation(ctx, vk, next)
     }
 
     fn on_preserved_key_impl(&self, pic: Ref<'_, ITfContext>, rguid: *const GUID) -> Result<BOOL> {
+        self.flush_deferred_prediction_preserved_keys_if_ready();
         // A7: スリープ復帰の世代カウンタをキースレッドで刈り取る（classify_preserved_key より前）。
         self.poll_power_events();
         let guid = unsafe { *rguid };
         let ctx = pic.ok().ok().cloned();
         // JIS キー（無変換/変換）と US キー（Alt+`/Alt+/）の両 GUID を同一アクションへ束ねる。
         let action = classify_preserved_key(&guid);
-        // C-1: トグル/再変換/feedback 鍵は OnPreservedKey 経由（OnKeyDown を通らない）ため、
-        // ここが preserved key 経路唯一の disarm 点。awaiting_llm/password の早期 return より前で
-        // 解除する（トグル等がガードで握り潰されても armed だけは必ず落ちる）。
+        if newer_preserved_action_supersedes_deferred(action) {
+            // 旧 Reconvert/Feedback より新しい preserved 操作がユーザー順序上の真実。
+            // stale 操作を cleanup 後に再生して新しいモード／文脈へ割り込ませない。
+            self.cancel_deferred_prediction_preserved_on_input();
+        }
+        // preserved key は host が既に消費済み。cleanup 待ちへ回す場合も、この時点で
+        // 直前確定 undo の武装を必ず落とし、後発 Ctrl+Backspace の誤発火を防ぐ。
         if action != PreservedAction::None {
             self.disarm_undo();
         }
+        if action != PreservedAction::None {
+            let reason = if action == PreservedAction::ToggleMode {
+                crate::prediction_state::Invalidation::ModeChanged
+            } else {
+                crate::prediction_state::Invalidation::Input
+            };
+            self.invalidate_prediction(reason);
+            let cleanup_failed =
+                self.prediction_ghost_visible() && !self.dismiss_prediction_ghost(false);
+            if cleanup_failed {
+                if should_defer_preserved_until_prediction_cleanup(action, cleanup_failed) {
+                    // 再変換/feedback は欄の文脈へ依存するので cleanup 後へ延期する。
+                    // 後続の通常入力が来た場合は stale として上の key entry で取消す。
+                    self.defer_prediction_preserved_key(ctx.clone(), guid);
+                    return Ok(TRUE);
+                }
+                // mode toggle は後続キーの解決条件そのもの。物理 ghost の discard retry と
+                // 独立に、この preserved callback 内で論理モードを即時反映する。
+            }
+        }
+        // C-1: トグル/再変換/feedback 鍵は OnPreservedKey 経由（OnKeyDown を通らない）ため、
+        // ここが preserved key 経路唯一の disarm 点。awaiting_llm/password の早期 return より前で
+        // 解除する（トグル等がガードで握り潰されても armed だけは必ず落ちる）。
         // Bug 3: LLM 変換待機(AwaitingLlm)中はモードトグル/再変換も抑止する。待機中に
         // モードや composition を触ると入力ロック（preedit 保護）が破れる（OnKeyDown が
         // 待機中に全キーを食うのと対）。preserved key はホストが既に消費しているので、
@@ -1200,12 +2330,17 @@ impl TextService_Impl {
                 // 条件の二重実装をしない。ctx=None は apply_notation 不能 → 従来の toggle へ。
                 let mode_toggle_delivers_bare_1d = match self.keymap.get().mode_toggle {
                     settings::keymap::Binding::Default => true,
-                    settings::keymap::Binding::Chord(c) => c.vk == 0x1D && !c.ctrl && !c.shift && !c.alt,
+                    settings::keymap::Binding::Chord(c) => {
+                        c.vk == 0x1D && !c.ctrl && !c.shift && !c.alt
+                    }
                     settings::keymap::Binding::Disabled => false,
                 };
-                if guid == crate::globals::GUID_PRESERVEDKEY_MODE_TOGGLE && mode_toggle_delivers_bare_1d {
+                if guid == crate::globals::GUID_PRESERVEDKEY_MODE_TOGGLE
+                    && mode_toggle_delivers_bare_1d
+                {
                     if let Some(c) = &ctx {
-                        if self.resolve_action_now(0x1D) == crate::keymap::KeyAction::NotationRotate {
+                        if self.resolve_action_now(0x1D) == crate::keymap::KeyAction::NotationRotate
+                        {
                             return self.dispatch_notation_rotate(c, 0x1D);
                         }
                     }
@@ -1250,13 +2385,31 @@ impl TextService_Impl {
     /// 「モード切替は暗黙確定」挙動 — UU-3）。開いた composition がモード境界をまたぐと、
     /// direct 側では will_handle が showing しか見ないため Enter/Esc/BS が素通しになり
     /// preedit を閉じる手段がなくなる。実体は `settle_active_input`。
-    pub(crate) fn settle_before_mode_toggle(&self, ctx: Option<&ITfContext>) {
-        self.settle_active_input(ctx, "mode_toggle");
+    /// 巡5 GLM I-2: 戻り値は settle の成否 — 呼び出し側は false ならトグルを中止すること
+    /// （拒否時 composition が残ったまま direct へ落ちると上記の「閉じる手段がない」状態を
+    /// 自ら作ることになる）。
+    pub(crate) fn settle_before_mode_toggle(&self, ctx: Option<&ITfContext>) -> bool {
+        // A menu command must not bypass an accepted commit or its pending input.
+        // Existing failures are resolved by Enter/Esc before another mode change.
+        if self.conversion_queue_has_work() || self.pending_commit.borrow().is_some() {
+            return false;
+        }
+        if self.local_converting() {
+            let Some(ctx) = ctx else { return false; };
+            self.queue_local_clause_commit(ctx, true);
+            return !self.conversion_queue_has_work()
+                && self.pending_commit.borrow().is_none()
+                && !self.composition_end_pending.get()
+                && !self.state.borrow().composing
+                && !self.local_converting();
+        }
+        self.settle_active_input(ctx, "mode_toggle")
     }
 
     /// モード切替の共有ディスパッチ。OnKeyDown の `KeyAction::ModeToggle`（bare 無変換 0x1D の
     /// OnKeyDown 救済）と OnPreservedKey の `ToggleMode` 枝の両方が呼ぶ。順序厳守:
     /// (a) 進行中の再変換を畳む → (b) settle → (c) toggle → (d) ephemeral 解除。
+    /// (a)/(b) が拒否されたらトグル中止で抜ける（文書が未復元/未確定のまま境界をまたがせない）。
     /// `ctx=None`（preserved key で ctx が取れない）でも再変換ラッチだけは必ず落とす。
     pub(crate) fn dispatch_mode_toggle(&self, ctx: Option<&ITfContext>) {
         // SP5: 進行中の再変換があればモード切替の前に畳む。reconverting ラッチと開いた
@@ -1264,7 +2417,17 @@ impl TextService_Impl {
         // （Esc が誤って RestoreText に流れる／composition の取り違え）。
         if self.reconverting.get() {
             match ctx {
-                Some(ctx) => self.cancel_reconvert(ctx),
+                // cancel_reconvert=false は RestoreText が走っていない＝文書未復元で、ラッチも
+                // composition も畳まれていない。best-effort で先へ進むと未復元の再変換
+                // composition を settle が確定してしまい、reconverting ラッチを跨いだモード切替
+                // になる（SP5 の取り違えの再発）。settle 拒否（下）と同じ規律で中止し、
+                // キーは TRUE で食いた呼び出し元の再押下に任せる。
+                Some(ctx) => {
+                    if !self.cancel_reconvert(ctx) {
+                        tip_log("ev=mode_toggle skip=reconvert_cancel_rejected");
+                        return;
+                    }
+                }
                 None => {
                     self.reconverting.set(false);
                     self.reconvert_original.borrow_mut().clear();
@@ -1273,12 +2436,20 @@ impl TextService_Impl {
             }
         }
         // UU-3: 進行中の合成/候補もモード切替の前に確定して畳む（再変換の畳み込みと対）。
-        self.settle_before_mode_toggle(ctx);
-        self.toggle_conversion_mode(ctx);
-        // ephemeral かな: ユーザが明示的にモードトグルした＝永続かなへの昇格。compartment は
-        // toggle が native にする（exit は呼ばない — direct への引き戻しはトグルと衝突する）。
-        // flag だけ落として、以降の commit_and_reset 等が direct へ戻さないようにする。
-        self.ephemeral_kana.set(false);
+        // 巡5 GLM I-2: settle 拒否（文書に composition が残る）ならトグルしない — direct へ
+        // 落ちると preedit を閉じる手段が消える。キーは TRUE で食いて再試行に任せる。
+        if !self.settle_before_mode_toggle(ctx) {
+            tip_log("ev=mode_toggle skip=settle_rejected");
+            return;
+        }
+        let toggled = self.toggle_conversion_mode(ctx);
+        // ephemeral かな: ユーザが明示的にモードトグルした＝永続かなへの昇格。
+        // toggle 自身が NATIVE を反転せず通常かなへ昇格する（exit は呼ばない）。
+        // 成功時だけ flag を落として、以降の commit_and_reset 等が direct へ戻さないようにする。
+        // SetValue 失敗時は復帰要求を維持し、別の exit 経路で再試行する。
+        if toggled {
+            self.ephemeral_kana.set(false);
+        }
     }
 
     /// 開いている入力（候補表示 or composition）を確定して畳む共通処理。モード切替(UU-3)と
@@ -1289,38 +2460,100 @@ impl TextService_Impl {
     /// - composition のみ: ライブ変換結果（無ければ読み）を全確定（Enter の候補非表示枝と同一）。
     /// - idle（合成も候補表示も無い）: no-op。
     /// - ctx が無い: 確定先の文書が無いので放棄リセットで一括に畳む（取り残し防止）。
-    pub(crate) fn settle_active_input(&self, ctx: Option<&ITfContext>, source: &str) {
-        if !self.state.borrow().composing && !self.showing.get() {
+    ///   I-2(トグル中止)の例外 — この枝は常に true を返し、文書の composition を残した
+    ///   まま後続へ進め得る(回収はホスト側の composition 終了に任せる)。
+    ///   巡4 T3(d): 戻り値は確定の成否（idle/放棄は true=後続を進めてよい）。呼び出し側は
+    ///   false なら後続処理（Shift 直打ち等）を止めること — composition が文書に残るため。
+    pub(crate) fn settle_active_input(&self, ctx: Option<&ITfContext>, source: &str) -> bool {
+        if self.local_converting() { return ctx.is_some_and(|ctx| self.commit_local_clauses(ctx)); }
+        let composing = self.state.borrow().composing;
+        let showing = self.showing.get();
+        let end_pending = self.composition_end_pending.get();
+        if !input_needs_settle(composing, showing, end_pending) {
             // C-1: idle でも settle が呼ばれた以上、直前確定への武装は残さない
             // （「Space→無変換トグル」直後の direct モード誤発火を塞ぐ）。
             self.disarm_undo();
-            return;
+            return true;
+        }
+        // settle 内部では candidate/clause/live と同じ確定プリミティブを再利用するが、
+        // ユーザーの Enter/候補決定ではない。全 return/panic で復元する RAII flag で予測起動を抑止する。
+        let _prediction_guard = ScopedCellFlag::set(&self.prediction_commit_suppressed);
+
+        // SetText 成功後の EndComposition だけが保留された状態は、InputState 上は idle でも
+        // 文書には composition が残る。mode toggle / Shift 直打ちより先に、保存済み owner
+        // context 上で本文へ触れない close-only を完了させる。ctx=None の preserved-key
+        // 経路でも owner context があれば回収できる。拒否時は境界を越えず再押下に任せる。
+        if end_pending {
+            let retry_ctx = self
+                .composition_end_context
+                .borrow()
+                .clone()
+                .or_else(|| ctx.cloned());
+            let Some(retry_ctx) = retry_ctx else {
+                self.abandon_pending_composition_end("settle_context_missing");
+                tip_log(&format!(
+                    "ev=settle source={source} quarantine=pending_context_missing"
+                ));
+                self.disarm_undo();
+                return true;
+            };
+            if !self.finish_pending_composition(&retry_ctx) {
+                self.disarm_undo();
+                return false;
+            }
+            // A pending-only state has now become genuinely idle.  Do not run a second
+            // CommitText session with empty logical input.
+            if !composing && !showing {
+                // commit_and_reset は pending 中の ephemeral exit を延期する。close が本当に
+                // 完了したこの安全点で direct 復帰を再開する。
+                self.exit_ephemeral_to_direct(Some(&retry_ctx));
+                self.disarm_undo();
+                return !input_needs_settle(
+                    self.state.borrow().composing,
+                    self.showing.get(),
+                    self.composition_end_pending.get(),
+                );
+            }
         }
         let Some(ctx) = ctx else {
             self.reset_abandoned_composition();
             self.disarm_undo();
-            return;
+            return true;
         };
         tip_log(&format!("ev=settle source={source}"));
+        // 巡4 T3(d) + 巡5 GLM I-1 + 巡10(round10): 戻り値は「settle 後に合成/候補が
+        // 残っていないか」の最終状態判定 — clause/cand/部分確定の全枝で do_commit 拒否なら
+        // composing が文書に残るため false になり、呼び出し側の後続処理を止める。個別枝の
+        // 戻り値伝播よりも「最終状態で判定」の方が抜けを作らない。試みの有無(attempted)の
+        // ゲートは「確定を一度も試みていないのに composing/showing が残る」不変条件破れを
+        // 成功扱いにする抜けだったので撤去(idle は上方で早期 return 済み)。
         // 文節ナビゲーション中の settle は全文節の確定（VK_RETURN の文節枝と同じ理由 —
         // cand_state の index は選択文節の候補添字で、Commit{index} へは流せない）。
         if self.showing.get() && self.clause_nav.borrow().is_some() {
             self.commit_clauses(ctx);
             self.disarm_undo();
-            return;
+            return !input_needs_settle(
+                self.state.borrow().composing,
+                self.showing.get(),
+                self.composition_end_pending.get(),
+            );
         }
         // 候補表示中: 選択中の候補を確定（VK_RETURN の候補枝と同じ読み元・同じ経路）。
         let cand_pick = if self.showing.get() {
-            let st = self.cand_state.borrow();
-            st.resolve_commit(st.selected())
+            self.module_candidate_commit(None)
         } else {
             None
         };
-        if let Some((index, text)) = cand_pick {
-            self.commit_candidate(ctx, index, &text);
+        if let Some((request, index, text)) = cand_pick {
+            self.commit_candidate(ctx, request, index, &text);
         }
         // 候補確定が部分確定だった場合・候補非表示の場合とも、composition が残っていれば
         // VK_RETURN の候補非表示枝と同一の「ライブ変換結果（無ければ読み）」で全確定する。
+        // 巡10(round10): 候補 FullReset 拒否(drop_engine 済み)でここに来た場合、
+        // engine_live_convert は None なので plan_live_enter は live_text(最後のライブ変換
+        // 結果。ライブ OFF 時は読み)→空なら読み、の順で素材を拾う — 選択中の候補ではなく
+        // 表示済み文字列が確定され得るが、preedit を閉じる手段を失う(確定を試みない)
+        // よりは良い(稀経路: 同一コンテキストで1発目拒否・2発目成功)。
         if self.state.borrow().composing {
             // ライブ変換 OFF / 表記固定中は engine のライブ変換を参照しない
             // （Enter の VK_RETURN 枝と同じ規律）— 表示中の live_text をそのまま確定して畳む。
@@ -1335,18 +2568,26 @@ impl TextService_Impl {
             let live_text = self.live_text.borrow().clone();
             let last_reading = self.last_reading.borrow().clone();
             // Why not(Enter と同じく EngineCommit を engine_commit(0) へ通す): settle は
-            // モードトグル/カーソル移動に付随する暗黙確定で、呼び出し元は結果に関わらず先へ進む。
-            // 2 度目のエンジン往復は失敗経路を増やすだけなので、素材の優先順位だけを Enter と
-            // 共有し（`plan_live_enter`）確定は常に直確定にする。
+            // モードトグル/カーソル移動に付随する暗黙確定。2 度目のエンジン往復は失敗経路を
+            // 増やすだけなので、素材の優先順位だけを Enter と共有し（`plan_live_enter`）
+            // 確定は常に直確定にする。成否は戻り値で呼び出し側が判定する（巡5 GLM I-1）。
             let text = match plan_live_enter(live, &live_text, &last_reading) {
                 LiveEnterPlan::EngineCommit { text } | LiveEnterPlan::DirectCommit { text } => text,
             };
-            self.commit_and_reset(ctx, &text, source, None);
+            let _ = self.commit_and_reset(ctx, &text, source, None);
         }
         // C-1: settle は候補確定（source="candidate" 経由で commit_candidate→commit_and_reset が
         // armed を立てうる）を含め、armed を残さない。settle_active_input を通った確定は
         // 「Space→無変換トグル」等の設計ロック対象外イベントの一部なので、末尾で必ず解除する。
         self.disarm_undo();
+        // SetText は成功して logical state が idle でも、EndComposition の close-only が
+        // 新たに pending になった場合は settle 未完了。fresh な三状態で判定し、mode toggle
+        // や Shift 直打ちを物理 composition の終了前に進めない。
+        !input_needs_settle(
+            self.state.borrow().composing,
+            self.showing.get(),
+            self.composition_end_pending.get(),
+        )
     }
 
     /// 変換（henkan）本体。Space と native モードの VK_CONVERT(再変換キー) で共有する。
@@ -1362,27 +2603,37 @@ impl TextService_Impl {
         let composing = self.state.borrow().composing;
         if composing {
             self.disarm_debounce();
-            match self.engine_convert() {
-                Some(cands) if !cands.is_empty() => {
-                    // 確定文字列の唯一の真実源は cand_state（show() が set する）。別途持たない。
-                    self.showing.set(true);
-                    // 候補窓を開いた時点で preedit を選択候補へ揃える（show_reconvert_candidates と
-                    // 同じ形）。候補確定は幅を変えない契約なので、ここは widen を通さない生の候補。
-                    // これが無いと、数字を全角表示した preedit のまま半角候補を確定して
-                    // 「見えている幅と確定の幅が違う」が候補経路で再発する。
-                    self.run_preedit(ctx, &cands[0]);
-                    let anchor = self.caret_point(ctx);
-                    // Task 7: 表示ごとに settings/ダークモードを再評価した Theme を渡す。
-                    let theme = self.appearance.borrow_mut().current_theme();
-                    self.candidate_ui.borrow_mut().show(&cands, 0, anchor, theme);
-                    self.reading_monitor.borrow_mut().hide();
-                    let list = cands.join("|");
-                    tip_log(&format!("ev=candidates_shown n={} sel=0 list={}", cands.len(), list));
-                }
-                // エンジン失敗/空: preedit はそのまま（ハングさせない）。
-                _ => {}
-            }
+            self.begin_explicit_snapshot_wait();
         }
+    }
+
+    pub(crate) fn show_explicit_candidates(
+        &self,
+        ctx: &ITfContext,
+        candidates: &[String],
+        selected: usize,
+    ) {
+        if candidates.is_empty() {
+            return;
+        }
+        let selected = selected.min(candidates.len() - 1);
+        self.hide_explicit_snapshot_status();
+        self.explicit_snapshot_pending.set(false);
+        self.explicit_snapshot_candidates_active.set(true);
+        self.showing.set(true);
+        self.state.borrow_mut().invalidate_live_display();
+        self.run_preedit(ctx, &candidates[selected]);
+        let anchor = self.caret_point(ctx);
+        let theme = self.appearance.borrow_mut().current_theme();
+        self.candidate_ui
+            .borrow_mut()
+            .show(candidates, selected, anchor, theme);
+        self.reading_monitor.borrow_mut().hide();
+        tip_log(&candidates_event(
+            self.prediction_enabled.get(),
+            "candidates_shown",
+            candidates,
+        ));
     }
 
     /// 修正変換（Tab）本体。読みのタイポ修復候補を要求し候補窓に出す。showing 中なら次の候補へ
@@ -1398,13 +2649,19 @@ impl TextService_Impl {
             match self.engine_typo_convert() {
                 Some(cands) if !cands.is_empty() => {
                     self.showing.set(true);
-                    self.run_preedit(ctx, &cands[0]); // trigger_convert と同じ理由（幅の一致）
+                    let first = self.replace_module_candidates(&cands, 0);
+                    self.run_preedit(ctx, &first); // trigger_convert と同じ理由（幅の一致）
                     let anchor = self.caret_point(ctx);
                     let theme = self.appearance.borrow_mut().current_theme();
-                    self.candidate_ui.borrow_mut().show(&cands, 0, anchor, theme);
+                    self.candidate_ui
+                        .borrow_mut()
+                        .show(&cands, 0, anchor, theme);
                     self.reading_monitor.borrow_mut().hide();
-                    let list = cands.join("|");
-                    tip_log(&format!("ev=typo_candidates_shown n={} sel=0 list={}", cands.len(), list));
+                    tip_log(&candidates_event(
+                        self.prediction_enabled.get(),
+                        "typo_candidates_shown",
+                        &cands,
+                    ));
                 }
                 // エンジン失敗/空: preedit はそのまま（ハングさせない）。
                 _ => {}
@@ -1420,13 +2677,46 @@ impl TextService_Impl {
     /// （InsertTextAtSelection＋末尾 SetSelection）で 1 発挿入し、連続 Shift 打鍵の順序も
     /// キャレット末尾追従で保たれる。
     pub(crate) fn commit_char_direct(&self, ctx: &ITfContext, ch: char) -> Result<BOOL> {
-        if self.state.borrow().composing || self.showing.get() {
-            self.settle_active_input(Some(ctx), "shift_latin");
+        if self.local_converting() && !self.replaying_conversion_queue.get() {
+            self.queue_commit_before_text(ctx, ch, ModuleTextStyle::Direct, true);
+            return Ok(TRUE);
+        }
+        if input_needs_settle(
+            self.state.borrow().composing,
+            self.showing.get(),
+            self.composition_end_pending.get(),
+        ) {
+            // 巡4 T3(d) + 巡10(round10): settle の確定が拒否されたら直打ちを挿入しない —
+            // composition が文書に残っているので、このまま CommitText を流すと合成中文字列を
+            // 1 文字で置換して消す。キーは TRUE で食いて再押下の再試行に任せる(モードトグルと同じ)。
+            // Why not(FALSE でホストの自前挿入に救済): TestKeyDown は A–Z を常に TRUE と
+            // 宣言するため FALSE 返しは Test/実の eaten 食い違いとなり、Test を信じた
+            // ホストで打鍵が失われる(item19 の教訓)。自前挿入が動いても composition
+            // 残存への挿入は preedit を破壊し得る。
+            if !self.settle_active_input(Some(ctx), "shift_latin") {
+                tip_log("ev=shift_latin skip=settle_rejected");
+                return Ok(TRUE);
+            }
         }
         let text = ch.to_string();
         let fields = commit_fields(None, 0, "", &text, self.is_direct_mode());
-        tip_log(&format!("ev=commit text={text} source=shift_latin {fields}"));
-        self.do_commit(ctx, &text);
+        tip_log(&commit_event(
+            self.prediction_enabled.get(),
+            &text,
+            "shift_latin",
+            None,
+            &fields,
+        ));
+        // 巡3 P3: 挿入拒否は文字が挿入されないだけ（状態を畳むものが無い）— FALSE で返して
+        // ホストの自前挿入に救わせる（旧実装は Ok(TRUE) で打鍵が握りつぶされていた）。
+        // 巡11(round11): settle 拒否枝だけ TRUE で食べるのは composition 残存の差 — この枝は
+        // settle 成功後(=composition 無し)なので FALSE による自前挿入の救済が安全に働く。
+        // Test を信じて FALSE を無視するホストでは打鍵が失われ得る(item19)が、P3 の実測
+        // (TRUE での握りつぶし)とトレードオフの設計判断としてここは FALSE を維持する。
+        if !self.do_commit(ctx, &text) {
+            tip_log("ev=commit_rejected source=shift_latin");
+            return Ok(FALSE);
+        }
         Ok(TRUE)
     }
 
@@ -1455,7 +2745,7 @@ impl TextService_Impl {
             Some(ch) => {
                 let folded = zenkaku_symbol(ch, punct, symbol, chars).unwrap_or(ch);
                 // 呼び出し側が英語モードを先に分岐させるので、ここは常にかな読みへの畳み込み。
-                self.input_char(ctx, folded, InsertStyle::Kana)
+                self.input_char_with_original(ctx, folded, InsertStyle::Kana, (folded != ch).then_some(ch))
             }
             // L-3: 印字不能キー（デッドキー/合字）は食って無視（stray char 漏れ防止）。
             None => Ok(TRUE),
@@ -1464,80 +2754,123 @@ impl TextService_Impl {
 
     /// 1文字 `ch` を入力としてエンジンへ送り、読みを即 preedit 表示してデバウンス変換を仕込む。
     /// A–Z でも記号/数字でも共通。候補窓が出ていれば閉じてライブ入力へ戻す。
-    pub(crate) fn input_char(&self, ctx: &ITfContext, ch: char, style: InsertStyle) -> Result<BOOL> {
+    fn queue_commit_before_text(&self, ctx: &ITfContext, ch: char, style: ModuleTextStyle, direct_commit: bool) {
+        if !self.bind_conversion_queue_context(ctx) { return; }
+        let admitted = self.conversion_queue.borrow_mut().push_commit_then_insert(ch.to_string(), style, direct_commit);
+        if admitted == crate::conversion_queue::QueueAdmission::Accepted {
+            if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+            self.drain_conversion_actions(ctx);
+        } else {
+            self.show_conversion_queue_notice(ctx, "入力を受け付けられません。Enterで再試行、Escで取消");
+        }
+    }
+
+    pub(crate) fn input_char(
+        &self,
+        ctx: &ITfContext,
+        ch: char,
+        style: InsertStyle,
+    ) -> Result<BOOL> {
+        self.input_char_with_original(ctx, ch, style, None)
+    }
+
+    fn replay_reading_navigation(&self, ctx: &ITfContext, key: ModuleKeyEvent) {
+        if self.local_converting() {
+            let direction = match key { ModuleKeyEvent::MoveReading(direction) => direction,
+                ModuleKeyEvent::ReadingHome => i32::MIN, ModuleKeyEvent::ReadingEnd => i32::MAX, _ => return };
+            if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.move_clause(direction); }
+            self.render_local_edit(ctx);
+        } else { let _ = self.edit_reading(ctx, key); }
+    }
+
+    fn input_char_with_original(&self, ctx: &ITfContext, ch: char, style: InsertStyle, original: Option<char>) -> Result<BOOL> {
+        if self.mixed_editing() {
+            return self.edit_mixed_reading(ctx, ModuleKeyEvent::Text { ch,
+                style: if style == InsertStyle::Direct { ModuleTextStyle::Direct } else { ModuleTextStyle::Kana },
+                replay: ModuleReplayMode::Full }, original);
+        }
+        if self.local_converting() && !self.replaying_conversion_queue.get() {
+            let style = match style { InsertStyle::Direct => ModuleTextStyle::Direct, InsertStyle::Kana => ModuleTextStyle::Kana };
+            if !self.bind_conversion_queue_context(ctx) { return Ok(TRUE); }
+            let admitted = self.conversion_queue.borrow_mut().push_commit_then_mapped_insert(ch.to_string(), original.map(|ch| ch.to_string()), style, false);
+            if admitted == crate::conversion_queue::QueueAdmission::Accepted {
+                if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+                self.drain_conversion_actions(ctx);
+            } else { self.show_conversion_queue_notice(ctx, "入力を受け付けられません。Enterで再試行、Escで取消"); }
+            return Ok(TRUE);
+        }
+        if self.local_converting() && !self.commit_local_clauses(ctx) { return Ok(FALSE); }
         if self.showing.get() {
             self.candidate_ui.borrow_mut().hide();
             self.showing.set(false);
             self.clear_clause_nav();
         }
-        // 喪失判定は ensure_engine より**前**に行う: drop_engine 後の再接続は
-        // ensure_engine 内の start_and_store が StartSession まで済ませて engine_session を
-        // 非0にするため、ensure_session は「新規作成」を検知できず false を返す
-        // （この経路が fac6315 の盲点 — item24 ヘッドレス再現で崩壊が残ることを実測済み）。
-        // 「session==0 かつ raw 非空」は commit/cancel/放棄/Deactivate 後にはあり得ない
-        // 組合せ（それらは必ず raw を clear する — needs_session_reseed の doc 参照）ので、
-        // 合成途中のエンジン喪失と同値。
-        let lost_mid_composition =
-            needs_session_reseed(self.engine_session.get(), &self.state.borrow().raw);
-        self.ensure_engine();
-        let session_created = self.ensure_session();
-        match style {
-            InsertStyle::Direct => self.state.borrow_mut().on_char_latin(ch),
-            InsertStyle::Kana => self.state.borrow_mut().on_char(ch),
+        if !self.state.borrow().composing {
+            self.background_input.begin_composition();
+        }
+        let background_reseed = self.background_input.needs_reseed();
+        let module_output =
+            self.state
+                .borrow_mut()
+                .handle(ModuleEvent::Key(ModuleKeyEvent::Text {
+                    ch,
+                    style: match style {
+                        InsertStyle::Direct => ModuleTextStyle::Direct,
+                        InsertStyle::Kana => ModuleTextStyle::Kana,
+                    },
+                    replay: if background_reseed {
+                        ModuleReplayMode::Full
+                    } else {
+                        ModuleReplayMode::Delta
+                    },
+                }));
+        let displayed = match module_output.immediate.as_ref() {
+            Some(ModuleOperation::SetPreedit { text }) => text.clone(),
+            other => unreachable!("text input must produce local preedit, got {other:?}"),
+        };
+        if let Some(original) = original { self.state.borrow_mut().preserve_last_literal_original(original); }
+        let (request, segments, background_reseed) = match module_output.background {
+            Some(ModuleIntent::Insert { request, segments }) => (request, segments, background_reseed),
+            Some(ModuleIntent::Reseed { request, segments }) => (request, segments, true),
+            _ => unreachable!("composing text input must produce one insert intent"),
         };
         *self.current_context.borrow_mut() = Some(ctx.clone());
-        // セッションを今作った（＝engine 側の読みが空）なら raw 全体を送り直す。
-        // composition 継続中の drop_engine（ライブ変換タイムアウト等）からの復帰打鍵で、
-        // 新セッションに新規1文字だけを入れると preedit が積み上げた読みごと 1 文字に
-        // 置き換わる（22 文字打鍵→23 文字目で全部消えるデータロス）。raw は打鍵の全履歴
-        // （部分確定後は残り読みのかな）を保持しているので、replay で読みが完全復元される。
-        // 新規 composition では raw == ch 1 文字なので従来とワイヤ等価。
-        // リプレイは raw をかな部/英語部で style 分割して順送する（split_replay）。複数区間の
-        // 途中失敗は最終 Insert の結果だけを見る — 部分成功を巻き戻す経路は無く、None 劣化
-        // （raw 表示）は単発失敗時と同じ挙動に収束するため。
-        let segments: Vec<(String, InsertStyle)> = if session_created || lost_mid_composition {
-            let st = self.state.borrow();
-            if lost_mid_composition {
-                // 実機受入で「復旧が発火した」ことを確認するための診断（NOSPACEKEY_LOG ゲート内）。
-                // len はリプレイ payload の長さ＝喪失していた raw + 今回の打鍵1文字（M-3）。
-                tip_log(&format!("ev=session_reseed len={}", st.raw.chars().count()));
-            }
-            crate::input_state::split_replay(&st.raw, st.latin_from)
-        } else {
-            vec![(ch.to_string(), style)]
-        };
-        let mut inserted = None;
-        for (seg, seg_style) in &segments {
-            inserted = self.engine_insert(seg, *seg_style);
+        // 表示は anchor 継ぎ足し文字列、last_reading は正規読み。SetPreedit text が
+        // 読みと一致しなくなったため、ここで分離する。
+        *self.last_reading.borrow_mut() = self.state.borrow().canonical_reading().to_owned();
+        *self.live_text.borrow_mut() = displayed.clone();
+        let local_applied = self.apply_preedit_with_target(ctx, &self.widen_display_text(&displayed), None).fully_applied();
+        if !local_applied {
+            // ghost cleanup の一過性競合などで表示だけ拒否されても、打鍵は logical/raw と
+            // local composer に保存済み。cleanup 後に同じ読みを再描画して入力を失わない。
+            self.partial_preedit_redraw_pending.set(true);
+            self.partial_preedit_redraw_retries.set(0);
+            self.arm_partial_preedit_redraw_retry();
         }
-        let reading = match inserted {
-            Some(r) => {
-                self.state.borrow_mut().mark_good(&r);
-                *self.last_reading.borrow_mut() = r.clone();
-                r
-            }
-            None => {
-                let degraded = self.state.borrow_mut().degraded_reading();
-                *self.last_reading.borrow_mut() = degraded.clone();
-                degraded
-            }
+        if background_reseed {
+            self.background_input.try_reseed(request, segments)
+        } else {
+            self.background_input.try_insert(request, segments)
         };
-        *self.live_text.borrow_mut() = reading.clone();
-        // 表示だけ全角化する。live_text/last_reading/raw は半角 canonical のまま置く —
-        // これらは劣化フォールバックや確定取消のリプレイでエンジンへ戻る素材だから。
-        self.run_preedit(ctx, &self.widen_display_text(&reading));
         self.arm_debounce();
         Ok(TRUE)
     }
 
     /// 品質ループ③: 直前確定バッファ（誤変換ワンキー記録の対象）を保存する。commit サイトが
     /// **状態クリア前に** ev=commit と同じ採取材料で呼ぶ。かな変換系の確定
-    /// （commit_and_reset / apply_commit_plan / apply_live_auto_commit）のみが対象で、
+    /// （commit_and_reset / apply_commit_plan）のみが対象で、
     /// shift_latin の直接確定は**意図的に対象外**（読みが無く「誤変換」の概念が成立しない）。
     /// idle 記号は 2026-08-03 の仕様変更（直接確定→合成開始）で通常の commit 経路に乗り、
     /// 対象**内**になった — 「。」だけの確定も undo/feedback の対象になるのは、記号 composition
     /// を通常の合成と区別しない一様性の帰結（旧・対象外の理由づけは直接確定経路ごと消滅）。
-    fn remember_last_commit(&self, reading: &str, text: &str, source: &str, sel: Option<usize>, cand_n: usize) {
+    fn remember_last_commit(
+        &self,
+        reading: &str,
+        text: &str,
+        source: &str,
+        sel: Option<usize>,
+        cand_n: usize,
+    ) {
         // F-5 改定（確定取消）: opt-in（settings.feedback.enabled）に加えて、この確定が undo
         // 武装対象（arms_undo(source)）なら保存する。常時保存にはしない — mode_toggle/navigate/
         // prefix 系確定は既定ユーザで従来どおり保持ゼロ（I-2）。非武装化した時点で feedback も
@@ -1577,7 +2910,11 @@ impl TextService_Impl {
             (st.latin_mode(), st.notation_fixed)
         };
         if should_widen_digits(
-            self.number_full_width.get(), self.is_direct_mode(), latin, notation_fixed, source,
+            self.number_full_width.get(),
+            self.is_direct_mode(),
+            latin,
+            notation_fixed,
+            source,
         ) {
             to_zenkaku_digits(text)
         } else {
@@ -1587,7 +2924,31 @@ impl TextService_Impl {
 
     /// `text` を確定し、composition/候補/状態/タイマを片付ける（Enter・数字選択 共通）。
     /// `sel` は候補確定時の実確定 index（品質ループ②/③ — ライブ/settle 確定は None）。
-    pub(crate) fn commit_and_reset(&self, ctx: &ITfContext, text: &str, source: &str, sel: Option<usize>) {
+    /// 巡4 T3: 戻り値は確定の成否。false では文書未挿入のまま composition が残るため、
+    /// 呼び出し側は後続処理（settle 後の直打ち・訂正通知）を止めること。
+    pub(crate) fn commit_and_reset(
+        &self,
+        ctx: &ITfContext,
+        text: &str,
+        source: &str,
+        sel: Option<usize>,
+    ) -> bool {
+        self.commit_and_reset_core(ctx, text, source, sel, true, true)
+    }
+
+    fn commit_local_and_reset(&self, ctx: &ITfContext, text: &str, source: &str) -> bool {
+        self.commit_and_reset_core(ctx, text, source, None, false, false)
+    }
+
+    fn commit_and_reset_core(
+        &self,
+        ctx: &ITfContext,
+        text: &str,
+        source: &str,
+        sel: Option<usize>,
+        reset_module_state: bool,
+        end_engine_session: bool,
+    ) -> bool {
         self.disarm_debounce();
         // ④: 既定確定（候補選択でない）はかなモード全角設定に従い数字を全角化する。
         // 以降のログ/remember/do_commit はすべて widened を使う（shadowing）。
@@ -1595,27 +2956,87 @@ impl TextService_Impl {
         let text = widened.as_str();
         // 品質ループ②: 構造化フィールドはクリア**前**に採取する（reading/候補数はこの後の
         // reset/hide で消える）。cand_n は候補確定時のみ意味を持つ（ライブ確定は 0）。
-        let cand_n = if sel.is_some() { self.cand_state.borrow().count() } else { 0 };
+        let cand_n = if sel.is_some() {
+            self.cand_state.borrow().count()
+        } else {
+            0
+        };
         let reading = self.last_reading.borrow().clone();
-        let fields = commit_fields(sel, cand_n, &reading, text, self.is_direct_mode());
-        tip_log(&format!("ev=commit text={text} source={source} {fields}"));
+        let correction_reading = if self.reconverting.get() && source == "candidate" {
+            let reading = self.reconvert_reading.borrow().clone();
+            sel.filter(|index| crate::text_service::should_record_correction(*index, &reading))
+                .map(|_| reading)
+        } else { None };
+        let direct = self.is_direct_mode();
+        let ephemeral = self.ephemeral_kana.get();
+        let fields = commit_fields(sel, cand_n, &reading, text, direct);
+        tip_log(&commit_event(
+            self.prediction_enabled.get(),
+            text,
+            source,
+            None,
+            &fields,
+        ));
+        // 巡3 P3 + 巡4 T3: CommitText セッションが拒否された（TF_E_LOCKED 等）ら状態を畳まない —
+        // 文書へは何も書かれていないのに composition/候補/セッションを破棄すると確定文字が
+        // 消失する。remember_last_commit / undo 武装も do_commit の**後**に実行する
+        // （先行更新だと文書に存在しない「幽霊確定」が Ctrl+変換の記録に混入する）。
+        if !self.do_commit(ctx, text) {
+            tip_log("ev=commit_rejected source=do_commit");
+            return false;
+        }
+        // do_commit acknowledges the actual body write, including a later
+        // caret/close failure. Send before cleanup drops the reconversion pipe.
+        if let Some(reading) = correction_reading {
+            self.engine_record_correction(&reading, text);
+        }
+        // Phase 1 はユーザーが明示した全確定だけを起点にする。settle / 部分確定は除外。
+        let prediction_source = prediction_commit_source(
+            source,
+            self.prediction_commit_suppressed.get(),
+            direct,
+            ephemeral,
+        );
+        if let Some(prediction_source) = prediction_source {
+            self.on_explicit_prediction_commit(prediction_source, text);
+        }
         // 品質ループ③: 誤変換ワンキー記録用の直前確定バッファ（同じ採取材料を流用）。
-        self.remember_last_commit(&reading, text, source, sel, cand_n);
+        // 巡12(round12): 空 text（空 BS cancel 拒否巻き戻し中の Enter=cancel 代わり）は
+        // 確定書類を残さない — remember_last_commit の空レコード(feedback への混入)と
+        // arms_undo による空確定武装(直後の Ctrl+Backspace が text_mismatch disarm まで
+        // 食われる)を防ぐ。cancel 成功経路も書類を残さず対称。
+        let keep_records = commit_keeps_records(text);
+        if keep_records {
+            self.remember_last_commit(&reading, text, source, sel, cand_n);
+        }
         // 確定取消: 全消費して composition を畳む確定（candidate/live）だけ武装する。
-        // apply_commit_plan の PartialReseed / apply_live_auto_commit の部分確定枝は
+        // apply_commit_plan の PartialReseed 枝は
         // commit_and_reset を経由しない（=ここを通らないので自然に武装しない）。
-        if arms_undo(source) {
+        if keep_records && arms_undo(source) {
             self.undo_armed.set(true);
         }
-        self.do_commit(ctx, text);
-        self.engine_end_session();
-        self.state.borrow_mut().reset();
+        match commit_session_cleanup_plan(end_engine_session) {
+            CommitSessionCleanup::EndMainAndCloseBackground => {
+                self.engine_end_session();
+                self.background_input.request_close();
+            }
+            CommitSessionCleanup::DropMainOnly => self.drop_engine(),
+        }
+        if reset_module_state {
+            self.state.borrow_mut().reset();
+        }
         self.reconverting.set(false);
         self.live_text.borrow_mut().clear();
+        // pending EndComposition の所有 context は専用 slot が保持する。通常の current_context は
+        // 確定済み状態へ持ち越さず、次の入力文書と混同しない。
         *self.current_context.borrow_mut() = None;
         self.candidate_ui.borrow_mut().hide();
         self.reading_monitor.borrow_mut().hide();
         self.showing.set(false);
+        self.explicit_snapshot_candidates_active.set(false);
+        self.explicit_snapshot_candidate_remaining
+            .borrow_mut()
+            .clear();
         self.clear_clause_nav();
         // U9: 合成終了 — 次 composition の再捕捉まで前文書の左文脈を残さない（stale 残留防止）。
         *self.left_context.borrow_mut() = None;
@@ -1623,32 +3044,90 @@ impl TextService_Impl {
         // engine_end_session へはフックしない — timeout→drop_engine の劣化経路は合成継続中で、
         // そこで消すと表示が不連続になる）。
         self.monitor_committed_reading.borrow_mut().clear();
-        // ephemeral かな: composition を畳んで確定＝direct へ復帰する（非 ephemeral 時は no-op）。
-        // PartialReseed/live_auto の部分確定枝はここを通らない＝composition 継続で ephemeral 維持。
-        self.exit_ephemeral_to_direct(Some(ctx));
+        // ephemeral かな: composition を物理的にも畳めたときだけ direct へ復帰する。
+        // SetText 済みでも EndComposition が pending なら marker/mode を維持し、キー入口の
+        // close-only 障壁または OnCompositionTerminated が回収してから復帰する。
+        // PartialReseed の部分確定枝はここを通らない＝composition 継続で ephemeral 維持。
+        if self.composition_end_pending.get() {
+            tip_log("ev=ephemeral_exit deferred=pending_end");
+        } else {
+            self.exit_ephemeral_to_direct(Some(ctx));
+        }
+        true
     }
 
     /// 候補(index)を確定する。`resolved_text` は cand_state で解決済みの確定文字列（index と一致）。
     /// 前方一致候補ならエンジンが残り読みを返すので **部分確定**し、残り読みで composition を継続して
     /// エンジンセッションを保持する（前方一致候補のデータロス対策）。全消費・エンジン失敗・再変換中は
     /// 従来どおりの **全確定**（`commit_and_reset`）でバイト等価。
-    pub(crate) fn commit_candidate(&self, ctx: &ITfContext, index: usize, resolved_text: &str) {
+    pub(crate) fn commit_candidate(
+        &self,
+        ctx: &ITfContext,
+        request: ModuleRequestId,
+        index: usize,
+        resolved_text: &str,
+    ) {
         self.disarm_debounce();
         // 再変換中の確定は対象外（g1 リプレイ由来の別セッション）。従来確定へフォールバック。
         if self.reconverting.get() {
-            let reading = self.reconvert_reading.borrow().clone();
             self.commit_and_reset(ctx, resolved_text, "candidate", Some(index));
-            // 訂正通知は確定完了後(ユーザ可視の確定を待たせない)。確定契約(Commit IPC 迂回・
-            // 直接挿入)は不変で、これは記録専用の別 op。resolved_text を widen 前の値で
-            // 記録できるのは should_widen_digits が source=="candidate" を除外している前提
-            // (除外を外すなら widen 後の文字列を送ること — 確定本文と記録表層の一致が契約)。
-            if crate::text_service::should_record_correction(index, &reading) {
-                self.engine_record_correction(&reading, resolved_text);
-            }
             return;
         }
-        let plan = plan_commit(self.engine_commit(index), resolved_text);
-        self.apply_commit_plan(ctx, plan, "candidate", "candidate_prefix", Some(index));
+        let snapshot_candidate = self.explicit_snapshot_candidates_active.replace(false);
+        let snapshot_remaining = snapshot_candidate
+            .then(|| {
+                self.explicit_snapshot_candidate_remaining
+                    .borrow()
+                    .get(index)
+                    .cloned()
+            })
+            .flatten();
+        self.explicit_snapshot_candidate_remaining
+            .borrow_mut()
+            .clear();
+        if snapshot_candidate {
+            self.drop_engine();
+        }
+        let outcome = resolve_candidate_commit(
+            snapshot_candidate,
+            resolved_text,
+            snapshot_remaining.as_deref(),
+            || self.engine_commit(index),
+        );
+        let output =
+            self.state
+                .borrow_mut()
+                .handle(ModuleEvent::Engine(ModuleEngineResult::Commit {
+                    request,
+                    candidate: Some(index),
+                    resolved_text: resolved_text.to_string(),
+                    outcome,
+                }));
+        let Some(operation @ ModuleOperation::Commit { .. }) = output.immediate else {
+            tip_log("ev=partial_reseed_rejected source=candidate");
+            self.drop_engine();
+            return;
+        };
+        let plan = match &operation {
+            ModuleOperation::Commit {
+                text,
+                remaining: Some(remaining),
+                ..
+            } if !remaining.is_empty() => CommitPlan::PartialReseed {
+                prefix: text.clone(),
+                remaining: remaining.clone(),
+            },
+            ModuleOperation::Commit { text, .. } => CommitPlan::FullReset { text: text.clone() },
+            _ => unreachable!(),
+        };
+        self.apply_commit_plan(
+            ctx,
+            plan,
+            operation,
+            "candidate",
+            "candidate_prefix",
+            Some(index),
+        );
     }
 
     /// 文節ナビゲーション中の確定（Enter / settle / ホスト Finalize）。エンジンの CommitClauses が
@@ -1676,34 +3155,77 @@ impl TextService_Impl {
             tip_log("ev=clause_commit skip=empty");
             return;
         }
-        tip_log(&format!("ev=clause_commit text={text}"));
-        self.commit_and_reset(ctx, &text, source, None);
+        tip_log(&clause_commit_event(self.prediction_enabled.get(), &text));
+        // 巡4 T3(a): clauses はエンジンの学習往復(CommitClauses)が済んだ後 — 挿入拒否時に
+        // エンジン側だけ文脈が進んだまま残すと次入力とズレるので、接続を作り直して
+        // 次の変換でcanonical全量をreanchorして自己修復させる。
+        if !self.commit_and_reset(ctx, &text, source, None) {
+            self.drop_engine();
+        }
     }
 
     /// plan_commit の結果を composition へ適用する（候補確定とライブ確定で共有 — Spec2）。
     /// `full_source`/`prefix_source` は ev=commit の source ラベル
     /// （"candidate"/"candidate_prefix" と "live"/"live_prefix"）。
     /// `sel` は候補確定時の実確定 index（品質ループ② — ライブ確定は None）。
-    fn apply_commit_plan(&self, ctx: &ITfContext, plan: CommitPlan, full_source: &str, prefix_source: &str, sel: Option<usize>) {
+    fn apply_commit_plan(
+        &self,
+        ctx: &ITfContext,
+        plan: CommitPlan,
+        operation: ModuleOperation,
+        full_source: &str,
+        prefix_source: &str,
+        sel: Option<usize>,
+    ) {
         match plan {
             CommitPlan::PartialReseed { prefix, remaining } => {
                 // ④: 部分確定の prefix も既定確定なら数字を全角化（candidate_prefix は不変）。
                 let prefix = self.widen_commit_text(&prefix, prefix_source);
                 // 品質ループ②: クリア前に採取（last_reading はこの後 remaining へ上書きされる）。
-                let cand_n = if sel.is_some() { self.cand_state.borrow().count() } else { 0 };
+                let cand_n = if sel.is_some() {
+                    self.cand_state.borrow().count()
+                } else {
+                    0
+                };
                 let reading = self.last_reading.borrow().clone();
                 let fields = commit_fields(sel, cand_n, &reading, &prefix, self.is_direct_mode());
-                tip_log(&format!(
-                    "ev=commit text={prefix} source={prefix_source} remaining={remaining} {fields}"
+                tip_log(&commit_event(
+                    self.prediction_enabled.get(),
+                    &prefix,
+                    prefix_source,
+                    Some(&remaining),
+                    &fields,
                 ));
-                // 品質ループ③: 部分確定も直前確定として記録対象（reading は消費前の全読み）。
-                self.remember_last_commit(&reading, &prefix, prefix_source, sel, cand_n);
                 // do_commit の合成終了が（ホスト依存で）OnCompositionTerminated を誘発しても
                 // エンジンセッションを畳まないようガードする。残り読みのセッションは保持する。
                 self.partial_committing.set(true);
-                self.do_commit(ctx, &prefix); // 現 composition を終了し prefix を確定
+                // 巡3 P3: prefix 挿入が拒否されたら reseed しない — 文書へ書かれていない
+                // prefix を確定済み扱いで残り読みへ進むと文字が消失する。composition は
+                // CommitText 未実行で生きており、ユーザの再選択に任せる。
+                let applied = apply_and_complete_module_operation(
+                    &operation,
+                    || self.do_commit(ctx, &prefix),
+                    |operation, applied| self.state.borrow_mut().complete(operation, applied),
+                );
+                if !applied {
+                    self.partial_committing.set(false);
+                    tip_log("ev=commit_rejected source=partial");
+                    // 巡4 T3(a): エンジン側は既に prefix を消費済み — このまま既存セッションを
+                    // 使い続けると次入力が読み欠落する。drop_engine し、次の変換とbackground
+                    // intentをcanonical全量replayで自己修復させる。
+                    self.drop_engine();
+                    return;
+                }
+                reseed_background(
+                    || self.background_input.request_close(),
+                    || self.state.borrow_mut().background_reseed(),
+                    |request, segments| self.background_input.try_reseed(request, segments),
+                );
+                // 巡5 GLM I-4: remember_last_commit は挿入成功後に — 拒否時 return の後ろへ
+                // 移動（文書に存在しない prefix の学習記録混入を防ぐ。commit_and_reset と対称）。
+                // 品質ループ③: 部分確定も直前確定として記録対象（reading は消費前の全読み）。
+                self.remember_last_commit(&reading, &prefix, prefix_source, sel, cand_n);
                 // エンジンセッションは保持（engine_end_session を呼ばない）。残り読みで継続する。
-                self.state.borrow_mut().reseed_after_partial_commit(&remaining);
                 self.reconverting.set(false);
                 *self.last_reading.borrow_mut() = remaining.clone();
                 self.monitor_committed_reading.borrow_mut().clear();
@@ -1713,82 +3235,209 @@ impl TextService_Impl {
                 self.candidate_ui.borrow_mut().hide();
                 self.showing.set(false);
                 self.clear_clause_nav();
-                // 残り読みで新しい composition を張る（表示だけ全角化 — remaining 自体は半角のまま
-                // reseed_after_partial_commit / last_reading / live_text へ渡してある）。
-                self.run_preedit(ctx, &self.widen_display_text(&remaining));
+                // 残り読みで新しい composition を張る。旧 composition の close がまだ pending
+                // なら、終了 callback / 次打鍵 / debounce のいずれかの安全点まで再描画を保持する。
+                self.partial_preedit_redraw_pending.set(true);
+                self.partial_preedit_redraw_retries.set(0);
+                let redrawn = self.redraw_partial_preedit_if_needed(ctx);
                 self.partial_committing.set(false); // 張り替え完了。以降の app 都合終了は通常処理。
-                self.arm_debounce(); // 残り読みのライブ変換を再開
+                if redrawn {
+                    self.arm_debounce(); // 残り読みのライブ変換を再開
+                } else {
+                    self.arm_partial_preedit_redraw_retry();
+                }
             }
             CommitPlan::FullReset { text } => {
                 // 全消費 or エンジン失敗: 従来どおり全確定（engine_end_session も呼ばれる）。
-                self.commit_and_reset(ctx, &text, full_source, sel);
+                // 巡4 T3(a): 挿入拒否時はエンジン側の読み消費済みの可能性（候補経由）—
+                // drop_engine し、次の変換でcanonical全量をreanchorして自己修復させる。
+                let applied = apply_and_complete_module_operation(
+                    &operation,
+                    || self.commit_and_reset_core(ctx, &text, full_source, sel, false, true),
+                    |operation, applied| self.state.borrow_mut().complete(operation, applied),
+                );
+                if !applied {
+                    self.drop_engine();
+                }
             }
         }
     }
 
-    /// ライブ変換の自動確定（iOS nospacekey の先頭文節自動確定の再現）を composition へ適用する。
-    /// エンジンは LiveConvert{auto_commit:true} の応答時点で既に先頭文節分の読みを消費済み
-    /// （ComposingText.prefixComplete 実行済み）なので、ここでは engine_commit を呼ばず、
-    /// TIP 側の確定挿入と残り読みへの reseed だけを行う（apply_commit_plan::PartialReseed と
-    /// 同じ規律。違いはエンジン側の状態遷移が済んでいることだけ）。
-    /// `prefix` = 確定する先頭文節、`text` = 残り読みのライブ変換結果、`reading` = 残り読み。
-    /// reading が空（全消費 — 稀だが iOS でも起きる正当ケース）なら全確定と同じ片付けに落とす。
-    pub(crate) fn apply_live_auto_commit(&self, ctx: &ITfContext, prefix: &str, text: &str, reading: &str) {
-        if reading.is_empty() {
-            // 全消費: エンジン側の読みは空。従来の全確定と同じ片付け（セッションも畳む）。
-            self.commit_and_reset(ctx, prefix, "live_auto", None);
+    pub(crate) fn apply_auto_commit_proposal(
+        &self,
+        ctx: &ITfContext,
+        operation: ModuleOperation,
+        remainder_display: &str,
+    ) {
+        let ModuleOperation::Commit {
+            text,
+            remaining: Some(remaining),
+            ..
+        } = &operation
+        else {
             return;
-        }
-        // ④: 部分自動確定の prefix も既定確定なので数字を全角化（source="live_auto"）。
-        let prefix = self.widen_commit_text(prefix, "live_auto");
-        let prefix = prefix.as_str();
-        // 品質ループ②: 自動確定は候補選択でない（sel=-1 cand_n=0）。rlen はこの時点の
-        // last_reading（=消費前の全読み。この後 remaining へ上書きされる）。
-        let full_reading = self.last_reading.borrow().clone();
-        let fields = commit_fields(None, 0, &full_reading, prefix, self.is_direct_mode());
-        tip_log(&format!("ev=commit text={prefix} source=live_auto remaining={reading} {fields}"));
-        // 品質ループ③: ライブ自動確定も直前確定として記録対象。
-        self.remember_last_commit(&full_reading, prefix, "live_auto", None, 0);
-        // do_commit の合成終了が（ホスト依存で）OnCompositionTerminated を誘発しても
-        // エンジンセッションを畳まないようガードする（apply_commit_plan と同じ）。
-        self.partial_committing.set(true);
-        self.do_commit(ctx, prefix); // 現 composition を終了し prefix を確定
-        // エンジンセッションは保持（読みは消費済みで残り読みと同期している）。
-        self.state.borrow_mut().reseed_after_partial_commit(reading);
-        self.reconverting.set(false); // 部分確定で composition を張り替えた（apply_commit_plan と同じ）
-        // 読みキャッシュ: 追記は last_reading を remaining へ縮める行と run_preedit（表示更新）
-        // より前が契約 — 後に置くと自動確定フレームだけ表示が consumed ぶん縮んで戻る
-        // 「跳ね」になる（spec 順序契約）。サフィックス不成立は追記スキップ（欠落は Enter まで
-        // 恒久だが壊れない）。skip ログは発生観測用（通常入力で出ないことが受入条件）。
-        if self.reading_monitor_accumulate.get() {
-            match crate::reading_monitor::consumed_reading(&full_reading, reading) {
-                Some(consumed) => crate::reading_monitor::append_committed(
-                    &mut self.monitor_committed_reading.borrow_mut(),
-                    consumed,
-                    crate::reading_monitor::display_bound(self.reading_monitor_max_chars.get()),
-                ),
-                None => tip_log("ev=reading_monitor accumulate=skip"),
+        };
+        let plan = if remaining.is_empty() {
+            CommitPlan::FullReset { text: text.clone() }
+        } else {
+            CommitPlan::PartialReseed {
+                prefix: text.clone(),
+                remaining: remaining.clone(),
             }
+        };
+        self.apply_commit_plan(ctx, plan, operation, "live", "live_prefix", None);
+        let receipt = self.state.borrow_mut().take_auto_commit_receipt();
+        let Some(receipt) = receipt else {
+            return;
+        };
+        if !self.background_input.try_auto_commit_receipt(receipt) {
+            tip_log("ev=auto_commit_receipt queued=false");
         }
-        *self.last_reading.borrow_mut() = reading.to_string();
-        let display = if text.is_empty() { reading } else { text };
-        // 直前の reseed_after_partial_commit が残り読みで記録済みだが、表示は
-        // ライブ変換結果でありうる — より良い表示素材で上書きする。
-        self.state.borrow_mut().mark_good(display);
-        *self.live_text.borrow_mut() = display.to_string();
-        // 残りの読み/ライブ結果で新しい composition を張る。mark_good/live_text へ入れた display は
-        // 半角のまま — ここを全角にすると degraded_reading 経由で読みが汚染される。
-        self.run_preedit(ctx, &self.widen_display_text(display));
-        self.partial_committing.set(false); // 張り替え完了。以降の app 都合終了は通常処理。
+        *self.live_text.borrow_mut() = remainder_display.to_owned();
+        self.run_preedit(ctx, &self.widen_display_text(remainder_display));
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_digit_after_commit_is_input_even_when_old_window_was_open() {
+        assert!(!super::queued_digit_selects_candidate(true, true));
+        assert!(super::queued_digit_selects_candidate(false, true));
+    }
+
+    #[test]
+    fn queued_symbols_keep_the_normal_reading_mapping() {
+        use settings::symbol::SymbolCharSet;
+        assert_eq!(super::queued_reading_char('.', true, true, false, SymbolCharSet::ALL), '。');
+        assert_eq!(super::queued_reading_char('-', false, false, false, SymbolCharSet::ALL), 'ー');
+        assert_eq!(super::queued_reading_char('.', false, true, false, SymbolCharSet::ALL), '.');
+        assert_eq!(super::queued_nonalpha('.', true, true, true, false, SymbolCharSet::ALL), ('.', super::ModuleTextStyle::Direct));
+        assert_eq!(super::queued_nonalpha('.', false, true, true, false, SymbolCharSet::ALL), ('。', super::ModuleTextStyle::Kana));
+    }
+
+    #[test]
+    fn rejected_replayed_character_stops_before_later_accepted_text() {
+        let mut attempted = Vec::new();
+        assert_eq!(super::apply_accepted_text("ABC", |ch| { attempted.push(ch); ch != 'B' }), 1);
+        assert_eq!(attempted, vec!['A', 'B']);
+        assert_eq!(super::apply_accepted_text("B", |_| false), 0);
+    }
     use super::{
-        ephemeral_idle_abort, is_cmd_modifier, will_handle, will_handle_awaiting, will_handle_gated,
+        apply_and_complete_module_operation, backspace_route,
+        cancel_explicit_wait_for_actual_keydown, commit_keeps_records, commit_session_cleanup_plan,
+        ephemeral_idle_abort, is_cmd_modifier, newer_preserved_action_supersedes_deferred,
+        prediction_commit_source, prediction_key_action, reseed_background,
+        resolve_candidate_commit, should_defer_preserved_until_prediction_cleanup,
+        should_invalidate_hidden_prediction, will_handle, will_handle_awaiting, will_handle_gated,
+        CommitSessionCleanup, ModuleCommitOutcome, ModuleInputSegment, ModuleIntent,
+        ModuleOperation, ModuleRequestId, ModuleTextStyle, PredictionKeyAction, PreservedAction,
+        ScopedCellFlag,
     };
     use crate::keymap::{resolve_action, ActionInput, KeyAction, Keymap};
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    #[test]
+    fn keydown_only_space_clears_the_old_wait_then_dispatches_one_new_wait() {
+        let pending = Cell::new(true);
+        let visible = Cell::new(true);
+        let deadline = Cell::new(Some(Instant::now()));
+        let dispatches = Cell::new(0);
+
+        cancel_explicit_wait_for_actual_keydown(0x20, || {
+            pending.set(false);
+            visible.set(false);
+            deadline.set(None);
+        });
+        assert!(!pending.get());
+        assert!(!visible.get());
+        assert_eq!(deadline.get(), None);
+
+        dispatches.set(dispatches.get() + 1);
+        pending.set(true);
+        deadline.set(Some(Instant::now()));
+        assert_eq!(dispatches.get(), 1, "the key still reaches Space dispatch");
+        assert!(pending.get(), "Space owns exactly one fresh wait");
+    }
+
+    /// P1(clause-nav): ←→は explicit snapshot 待ちをキャンセルしない。Space 変換の応答
+    /// 待ちに←→が来ると composing-only の settle（全文確定）へ劣化するため、待ちの
+    /// キャンセル対象から外す（ poll は継続し dispatch 側で食い切る）。
+    #[test]
+    fn arrow_keys_keep_the_explicit_snapshot_wait_alive() {
+        for vk in [0x25, 0x27] {
+            let cancelled = Cell::new(false);
+            cancel_explicit_wait_for_actual_keydown(vk, || cancelled.set(true));
+            assert!(!cancelled.get(), "vk={vk:#04x} must not cancel the explicit wait");
+        }
+        // exempt は←→だけ: 他の打鍵（'A'）は従来どおり古い待ちをキャンセルする。
+        let cancelled = Cell::new(false);
+        cancel_explicit_wait_for_actual_keydown(0x41, || cancelled.set(true));
+        assert!(cancelled.get(), "'A' must still cancel the explicit wait");
+    }
+
+    #[test]
+    fn full_commit_closes_main_and_private_sessions_but_local_enter_defers_private_commit() {
+        assert_eq!(
+            commit_session_cleanup_plan(true),
+            CommitSessionCleanup::EndMainAndCloseBackground
+        );
+        assert_eq!(
+            commit_session_cleanup_plan(false),
+            CommitSessionCleanup::DropMainOnly
+        );
+    }
+
+    #[test]
+    fn snapshot_candidate_commit_uses_the_displayed_text_without_engine_io() {
+        let called = std::cell::Cell::new(false);
+        let outcome = resolve_candidate_commit(true, "日本", Some("ご"), || {
+            called.set(true);
+            Some(("wrong".into(), String::new()))
+        });
+        assert_eq!(
+            outcome,
+            ModuleCommitOutcome::Applied {
+                text: "日本".into(),
+                remaining: "ご".into()
+            }
+        );
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn background_reseed_closes_then_snapshots_and_submits_styled_remaining() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let accepted = reseed_background(
+            || events.borrow_mut().push("close"),
+            || {
+                events.borrow_mut().push("snapshot");
+                ModuleIntent::Insert {
+                    request: ModuleRequestId(9),
+                    segments: vec![
+                        ModuleInputSegment {
+                            text: "かな".to_string(),
+                            style: ModuleTextStyle::Kana,
+                        },
+                        ModuleInputSegment {
+                            text: "A".to_string(),
+                            style: ModuleTextStyle::Direct,
+                        },
+                    ],
+                }
+            },
+            |request, segments| {
+                events.borrow_mut().push("submit");
+                assert_eq!(request, ModuleRequestId(9));
+                assert_eq!(segments[0].style, ModuleTextStyle::Kana);
+                assert_eq!(segments[1].style, ModuleTextStyle::Direct);
+                true
+            },
+        );
+        assert!(accepted);
+        assert_eq!(*events.borrow(), vec!["close", "snapshot", "submit"]);
+    }
 
     // 既存テストは全て native(ひらがな)モード＝第5引数 direct=false。
     // will_handle_gated/awaiting の action 引数は KeyAction を直接渡す（Convert/Typo/Llm/Undo/
@@ -1796,11 +3445,46 @@ mod tests {
 
     /// テスト用: 既定 keymap でこの (vk, 文脈) の KeyAction を解決する（実処理と同じ source）。
     fn act(vk: u32, composing: bool, showing: bool, direct: bool) -> KeyAction {
-        resolve_action(&Keymap::default(), &ActionInput {
-            vk, ctrl: false, shift: false, alt: false,
-            composing, showing, direct,
-            undo_armed: false, ephemeral_enabled: true, typo_enabled: true, llm_enabled: true,
-        })
+        resolve_action(
+            &Keymap::default(),
+            &ActionInput {
+                vk,
+                ctrl: false,
+                shift: false,
+                alt: false,
+                composing,
+                showing,
+                direct,
+                undo_armed: false,
+                ephemeral_enabled: true,
+                typo_enabled: true,
+                llm_enabled: true,
+            },
+        )
+    }
+
+    #[test]
+    fn synchronous_apply_result_is_forwarded_to_module_completion_once() {
+        let apply_calls = std::cell::Cell::new(0);
+        let completion_calls = std::cell::Cell::new(0);
+        let operation = ModuleOperation::Cancel;
+
+        let applied = apply_and_complete_module_operation(
+            &operation,
+            || {
+                apply_calls.set(apply_calls.get() + 1);
+                false
+            },
+            |forwarded, result| {
+                completion_calls.set(completion_calls.get() + 1);
+                assert_eq!(forwarded, &operation);
+                assert!(!result);
+            },
+        );
+
+        assert!(!applied);
+        assert_eq!(apply_calls.get(), 1);
+        assert_eq!(completion_calls.get(), 1);
     }
 
     #[test]
@@ -1826,22 +3510,57 @@ mod tests {
     fn space_is_no_longer_a_fixed_key_and_is_eaten_via_convert() {
         // Space は will_handle の固定キーから外れ、Convert アクション(henkan)でのみ食う（keymap 化）。
         // 「composing||showing×Convert 束縛一致」の判定は resolve_action へ移った（keymap.rs でテスト）。
-        assert!(!will_handle(0x20, true, false, false, false));  // will_handle 単独ではもう食わない
+        assert!(!will_handle(0x20, true, false, false, false)); // will_handle 単独ではもう食わない
         assert!(!will_handle(0x20, false, true, false, false));
         // native の Space は composing/showing で Convert へ解決し、gated が食う。idle は素通し。
         assert_eq!(act(0x20, true, false, false), KeyAction::Convert);
         assert_eq!(act(0x20, false, true, false), KeyAction::Convert);
         assert_eq!(act(0x20, false, false, false), KeyAction::None);
-        assert!(will_handle_gated(0x20, true, false, false, false, false, false, KeyAction::Convert));
-        assert!(will_handle_gated(0x20, false, true, false, false, false, false, KeyAction::Convert));
-        assert!(!will_handle_gated(0x20, false, false, false, false, false, false, KeyAction::None));
+        assert!(will_handle_gated(
+            0x20,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::Convert
+        ));
+        assert!(will_handle_gated(
+            0x20,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::Convert
+        ));
+        assert!(!will_handle_gated(
+            0x20,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
     }
 
     #[test]
     fn enter_digits_esc_backspace_only_when_active() {
         for vk in [0x0D, 0x1B, 0x08, 0x31, 0x39] {
-            assert!(!will_handle(vk, false, false, false, false), "vk {:#x} should pass when idle", vk);
-            assert!(will_handle(vk, true, false, false, false), "vk {:#x} should be handled when composing", vk);
+            assert!(
+                !will_handle(vk, false, false, false, false),
+                "vk {:#x} should pass when idle",
+                vk
+            );
+            assert!(
+                will_handle(vk, true, false, false, false),
+                "vk {:#x} should be handled when composing",
+                vk
+            );
         }
     }
 
@@ -1850,9 +3569,18 @@ mod tests {
         // ↑(0x26)/↓(0x28) は候補表示中だけ食う。idle / composition のみ では素通し
         // （アプリのキャレット移動を邪魔しない）。
         for vk in [0x26u32, 0x28] {
-            assert!(!will_handle(vk, false, false, false, false), "vk {vk:#x} idle should pass");
-            assert!(!will_handle(vk, true, false, false, false), "vk {vk:#x} composing-no-candidates should pass");
-            assert!(will_handle(vk, false, true, false, false), "vk {vk:#x} showing should be handled");
+            assert!(
+                !will_handle(vk, false, false, false, false),
+                "vk {vk:#x} idle should pass"
+            );
+            assert!(
+                !will_handle(vk, true, false, false, false),
+                "vk {vk:#x} composing-no-candidates should pass"
+            );
+            assert!(
+                will_handle(vk, false, true, false, false),
+                "vk {vk:#x} showing should be handled"
+            );
         }
     }
 
@@ -1860,11 +3588,29 @@ mod tests {
     fn tab_is_no_longer_a_fixed_key_and_is_eaten_via_hot() {
         // Tab は固定キーの真実(will_handle)から外れ、typo/llm hot でのみ食う（keymap 化）。
         // 「flag×composing×チョード一致」の判定は resolve_action へ移った（keymap.rs でテスト）。
-        assert!(!will_handle(0x09, true, false, false, false));  // will_handle 単独ではもう食わない
+        assert!(!will_handle(0x09, true, false, false, false)); // will_handle 単独ではもう食わない
         assert!(!will_handle(0x09, false, false, false, false));
         // typo action が立てば composition 中は食う。無ければ composing でも素通し。
-        assert!(will_handle_gated(0x09, true, false, false, false, false, false, KeyAction::Typo));
-        assert!(!will_handle_gated(0x09, true, false, false, false, false, false, KeyAction::None));
+        assert!(will_handle_gated(
+            0x09,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::Typo
+        ));
+        assert!(!will_handle_gated(
+            0x09,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
     }
 
     // ---- Tab 二毛作の feature flag/文脈ゲートは resolve_action が織り込む（keymap.rs でテスト）。
@@ -1872,24 +3618,96 @@ mod tests {
     #[test]
     fn tab_typo_and_llm_actions_are_eaten_by_gated() {
         // Typo（無 Shift Tab の修正変換）→ 食う。
-        assert!(will_handle_gated(0x09, true, false, false, false, false, false, KeyAction::Typo));
+        assert!(will_handle_gated(
+            0x09,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::Typo
+        ));
         // Llm（Shift+Tab の外部LLM変換）→ 食う。
-        assert!(will_handle_gated(0x09, true, false, false, false, true, false, KeyAction::Llm));
+        assert!(will_handle_gated(
+            0x09,
+            true,
+            false,
+            false,
+            false,
+            true,
+            false,
+            KeyAction::Llm
+        ));
         // action が無ければ idle でも composing でも direct でも素通し。
-        assert!(!will_handle_gated(0x09, false, false, false, false, false, false, KeyAction::None));
-        assert!(!will_handle_gated(0x09, true, false, false, true, false, false, KeyAction::None));
+        assert!(!will_handle_gated(
+            0x09,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
+        assert!(!will_handle_gated(
+            0x09,
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::None
+        ));
     }
 
     #[test]
     fn actionless_keys_fall_back_to_will_handle_fixed_keys() {
         // action=None なら gated は will_handle の固定キー真実そのまま（'A' は常に食う）。
-        assert!(will_handle_gated(0x41, false, false, false, false, false, false, KeyAction::None));
+        assert!(will_handle_gated(
+            0x41,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
         // Space は will_handle 固定キーから外れたので action=None では composing でも食わない
         //（henkan は Convert アクション carve-out 経由 — space テストが担保）。
-        assert!(!will_handle_gated(0x20, true, false, false, false, false, false, KeyAction::None));
-        assert!(!will_handle_gated(0x20, false, false, false, false, false, false, KeyAction::None));
+        assert!(!will_handle_gated(
+            0x20,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
+        assert!(!will_handle_gated(
+            0x20,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
         // Convert アクションが立てば composing で食う。
-        assert!(will_handle_gated(0x20, true, false, false, false, false, false, KeyAction::Convert));
+        assert!(will_handle_gated(
+            0x20,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::Convert
+        ));
     }
 
     // ---- Minor 2: Shift+数字の Test/実一致 ----
@@ -1897,14 +3715,59 @@ mod tests {
     fn shift_digit_matches_real_handler_condition() {
         // 候補表示のみ(showing && !composing)で Shift+数字は「食わない」＝記号として本文へ
         // （実処理 OnKeyDown の VK_1..=VK_9 アームが `!shift_down()` を要求するのに一致）。
-        assert!(!will_handle_gated(0x31, false, true, false, false, /*shift=*/true, false, KeyAction::None)); // Shift+'1', showing only
-        // Shift 無しなら従来どおり食う（候補選択）。
-        assert!(will_handle_gated(0x31, false, true, false, false, false, false, KeyAction::None));
+        assert!(!will_handle_gated(
+            0x31,
+            false,
+            true,
+            false,
+            false,
+            /*shift=*/ true,
+            false,
+            KeyAction::None
+        )); // Shift+'1', showing only
+            // Shift 無しなら従来どおり食う（候補選択）。
+        assert!(will_handle_gated(
+            0x31,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
         // composition 中は Shift 有無に依らず食う（記号としてエンジンへ）。
-        assert!(will_handle_gated(0x31, true, true, false, false, true, false, KeyAction::None));
-        assert!(will_handle_gated(0x31, true, false, false, false, true, false, KeyAction::None));
+        assert!(will_handle_gated(
+            0x31,
+            true,
+            true,
+            false,
+            false,
+            true,
+            false,
+            KeyAction::None
+        ));
+        assert!(will_handle_gated(
+            0x31,
+            true,
+            false,
+            false,
+            false,
+            true,
+            false,
+            KeyAction::None
+        ));
         // 数字以外は shift に左右されない（'A' は常に食う）。
-        assert!(will_handle_gated(0x41, false, false, false, false, true, false, KeyAction::None));
+        assert!(will_handle_gated(
+            0x41,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            KeyAction::None
+        ));
     }
 
     // ---- ②: かなモード idle の無修飾数字は composition を開始する ----
@@ -1912,20 +3775,60 @@ mod tests {
     fn native_idle_unshifted_digit_is_eaten_to_start_composition() {
         // gated(vk, composing=false, showing=false, cmd=false, direct=false, shift=false, action=None)
         for vk in [0x30u32, 0x31, 0x39, 0x60, 0x69] {
-            assert!(will_handle_gated(vk, false, false, false, false, false, false, KeyAction::None),
-                "vk {vk:#x} native idle unshifted -> eaten");
+            assert!(
+                will_handle_gated(
+                    vk,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    KeyAction::None
+                ),
+                "vk {vk:#x} native idle unshifted -> eaten"
+            );
         }
         // direct モードでは従来どおり素通し。
         for vk in [0x31u32, 0x39] {
-            assert!(!will_handle_gated(vk, false, false, false, true, false, false, KeyAction::None),
-                "vk {vk:#x} direct idle -> pass through");
+            assert!(
+                !will_handle_gated(vk, false, false, false, true, false, false, KeyAction::None),
+                "vk {vk:#x} direct idle -> pass through"
+            );
         }
         // Shift+数字 idle は記号入力なので食わない（従来どおり）。
-        assert!(!will_handle_gated(0x31, false, false, false, false, /*shift=*/true, false, KeyAction::None));
+        assert!(!will_handle_gated(
+            0x31,
+            false,
+            false,
+            false,
+            false,
+            /*shift=*/ true,
+            false,
+            KeyAction::None
+        ));
         // Ctrl+数字（cmd 修飾）はアプリのアクセラレータ＝食わない。
-        assert!(!will_handle_gated(0x31, false, false, true, false, false, false, KeyAction::None));
+        assert!(!will_handle_gated(
+            0x31,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
         // テンキー演算子（0x6D='-'）は数字でないので idle では食わない（従来どおり）。
-        assert!(!will_handle_gated(0x6D, false, false, false, false, false, false, KeyAction::None));
+        assert!(!will_handle_gated(
+            0x6D,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
     }
 
     // ---- Bug 3: awaiting_llm の Test/実一致（Bug A の鏡像）----
@@ -1935,14 +3838,56 @@ mod tests {
         // 待機中は cmd 修飾以外の全キーを食う（実処理が待機中に return Ok(TRUE) するのと一致）。
         // will_handle 単独では食わないキー（F1=0x70, ←=0x25）でも待機中は食う。
         for vk in [0x70u32, 0x25, 0x1B /*Esc*/, 0x41 /*A*/] {
-            assert!(will_handle_awaiting(vk, false, false, false, false, false, /*awaiting=*/true, false, KeyAction::None),
-                "vk {vk:#x} must be eaten while awaiting llm");
+            assert!(
+                will_handle_awaiting(
+                    vk,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    /*awaiting=*/ true,
+                    false,
+                    KeyAction::None
+                ),
+                "vk {vk:#x} must be eaten while awaiting llm"
+            );
         }
         // cmd 修飾は待機中でも最優先でパススルー（実処理が awaiting より先に cmd を弾くのと一致）。
-        assert!(!will_handle_awaiting(0x41, false, false, true, false, false, true, false, KeyAction::None));
+        assert!(!will_handle_awaiting(
+            0x41,
+            false,
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+            KeyAction::None
+        ));
         // 非待機なら通常の gate に一致する（F1 は食わない、'A' は食う）。
-        assert!(!will_handle_awaiting(0x70, false, false, false, false, false, false, false, KeyAction::None));
-        assert!(will_handle_awaiting(0x41, false, false, false, false, false, false, false, KeyAction::None));
+        assert!(!will_handle_awaiting(
+            0x70,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
+        assert!(will_handle_awaiting(
+            0x41,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
     }
 
     // ---- Bug 4: 数字キーのページオフセット選択 ----
@@ -1952,17 +3897,17 @@ mod tests {
         // 1ページに収まる（9件以下）: digit==絶対 index。
         assert_eq!(page_candidate_index(0, 3, 0), Some(0)); // '1' → 0
         assert_eq!(page_candidate_index(0, 3, 2), Some(2)); // '3' → 2
-        // 可視行数を超える数字は no-op。
-        assert_eq!(page_candidate_index(0, 3, 3), None);    // '4' with 3 cands → None
-        assert_eq!(page_candidate_index(1, 3, 8), None);    // '9' → None（誤選択しない）
-        // 2ページ目（selected=9, 総 20 件）: ページ先頭 9 が加算される。
-        assert_eq!(page_candidate_index(9, 20, 0), Some(9));  // '1' → 9（表示上の "10"）
+                                                            // 可視行数を超える数字は no-op。
+        assert_eq!(page_candidate_index(0, 3, 3), None); // '4' with 3 cands → None
+        assert_eq!(page_candidate_index(1, 3, 8), None); // '9' → None（誤選択しない）
+                                                         // 2ページ目（selected=9, 総 20 件）: ページ先頭 9 が加算される。
+        assert_eq!(page_candidate_index(9, 20, 0), Some(9)); // '1' → 9（表示上の "10"）
         assert_eq!(page_candidate_index(9, 20, 8), Some(17)); // '9' → 17
-        // 末尾の半端ページ（selected=18, 総 20 件, ページ [18,20)）: 2 行しか無い。
+                                                              // 末尾の半端ページ（selected=18, 総 20 件, ページ [18,20)）: 2 行しか無い。
         assert_eq!(page_candidate_index(18, 20, 0), Some(18)); // '1' → 18
         assert_eq!(page_candidate_index(18, 20, 1), Some(19)); // '2' → 19
-        assert_eq!(page_candidate_index(18, 20, 2), None);     // '3' → None（ページ外）
-        // 空候補は常に None。
+        assert_eq!(page_candidate_index(18, 20, 2), None); // '3' → None（ページ外）
+                                                           // 空候補は常に None。
         assert_eq!(page_candidate_index(0, 0, 0), None);
     }
 
@@ -1986,15 +3931,37 @@ mod tests {
         assert_eq!(f, "sel=0 cand_n=3 rlen=4 tlen=3 mode=direct");
     }
 
+    #[test]
+    fn prediction_enabled_commit_events_never_contain_body_text() {
+        use super::{candidates_event, clause_commit_event, commit_event};
+        let sentinel = "秘密の予測文脈";
+        let remaining = "残りの秘密";
+        let event = commit_event(
+            true,
+            sentinel,
+            "candidate",
+            Some(remaining),
+            "sel=0 cand_n=1 rlen=8 tlen=8 mode=native",
+        );
+        assert!(!event.contains(sentinel));
+        assert!(!event.contains(remaining));
+        assert!(event.contains("len=7"));
+        assert!(event.contains("remaining_len=5"));
+        assert!(!clause_commit_event(true, sentinel).contains(sentinel));
+        assert!(!candidates_event(true, "candidates_shown", &[sentinel.into()]).contains(sentinel));
+        assert!(commit_event(false, sentinel, "candidate", None, "fields").contains(sentinel));
+        assert!(candidates_event(false, "candidates_shown", &[sentinel.into()]).contains(sentinel));
+    }
+
     // ---- 打鍵作法 Task2: composing 中の ←→ は食って確定畳み（意図的な仕様変更）----
     // 旧仕様「←→は常にパススルー」の assert は本テストへ反転統合した（キャレット逃げ防止。
     // UU-6 Home/End と同じ settle_active_input 経路）。
     #[test]
     fn arrows_mid_composition_are_eaten_to_settle() {
         // composing 中の ←→ は食って確定して畳む（UU-6 Home/End と同じ作法）。
-        assert!(will_handle(0x25, true, false, false, false));  // ← composing
-        assert!(will_handle(0x27, true, false, false, false));  // → composing
-        // 候補表示中も食う（Home/End と同じく settle が候補確定まで面倒を見る）。
+        assert!(will_handle(0x25, true, false, false, false)); // ← composing
+        assert!(will_handle(0x27, true, false, false, false)); // → composing
+                                                               // 候補表示中も食う（Home/End と同じく settle が候補確定まで面倒を見る）。
         assert!(will_handle(0x25, false, true, false, false));
         assert!(will_handle(0x27, false, true, false, false));
         // idle は従来どおり素通し（アプリのキャレット移動を壊さない）。
@@ -2014,9 +3981,18 @@ mod tests {
         // composition 中/候補表示中だけ食う（settle で確定して畳む）。idle は素通し
         // （本文のキャレット移動/前方削除をアプリに任せる＝旧挙動不変）。
         for vk in [0x24u32, 0x23, 0x21, 0x22, 0x2E] {
-            assert!(!will_handle(vk, false, false, false, false), "vk {vk:#x} idle native should pass");
-            assert!(will_handle(vk, true, false, false, false), "vk {vk:#x} composing native should be eaten");
-            assert!(will_handle(vk, false, true, false, false), "vk {vk:#x} showing native should be eaten");
+            assert!(
+                !will_handle(vk, false, false, false, false),
+                "vk {vk:#x} idle native should pass"
+            );
+            assert!(
+                will_handle(vk, true, false, false, false),
+                "vk {vk:#x} composing native should be eaten"
+            );
+            assert!(
+                will_handle(vk, false, true, false, false),
+                "vk {vk:#x} showing native should be eaten"
+            );
         }
     }
 
@@ -2024,8 +4000,14 @@ mod tests {
     fn navigation_keys_direct_mode_only_when_showing() {
         // direct(半角英数): 候補表示中(reconvert)だけ食う。非表示なら本文操作なので素通し。
         for vk in [0x24u32, 0x23, 0x21, 0x22, 0x2E] {
-            assert!(will_handle(vk, false, true, false, true), "vk {vk:#x} direct showing should be eaten");
-            assert!(!will_handle(vk, false, false, false, true), "vk {vk:#x} direct not-showing should pass");
+            assert!(
+                will_handle(vk, false, true, false, true),
+                "vk {vk:#x} direct showing should be eaten"
+            );
+            assert!(
+                !will_handle(vk, false, false, false, true),
+                "vk {vk:#x} direct not-showing should pass"
+            );
         }
     }
 
@@ -2034,7 +4016,10 @@ mod tests {
         // Ctrl+Home / Ctrl+End 等（ドキュメント先頭/末尾ジャンプのアクセラレータ）は
         // composition 中でも食わずアプリへ通す（cmd 修飾は最優先パススルー）。
         for vk in [0x24u32, 0x23, 0x2E] {
-            assert!(!will_handle(vk, true, true, true, false), "vk {vk:#x} with cmd modifier must pass through");
+            assert!(
+                !will_handle(vk, true, true, true, false),
+                "vk {vk:#x} with cmd modifier must pass through"
+            );
         }
     }
 
@@ -2042,10 +4027,23 @@ mod tests {
     fn navigation_keys_test_matches_real_via_gated() {
         // OnTestKeyDown が使う gated 述語でも合成中は食う（Test/実の eaten 判定を一致）。
         for vk in [0x24u32, 0x23, 0x21, 0x22, 0x2E] {
-            assert!(will_handle_gated(vk, true, false, false, false, false, false, KeyAction::None),
-                "vk {vk:#x} composing must be eaten by gated predicate");
-            assert!(!will_handle_gated(vk, false, false, false, false, false, false, KeyAction::None),
-                "vk {vk:#x} idle must pass through gated predicate");
+            assert!(
+                will_handle_gated(vk, true, false, false, false, false, false, KeyAction::None),
+                "vk {vk:#x} composing must be eaten by gated predicate"
+            );
+            assert!(
+                !will_handle_gated(
+                    vk,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    KeyAction::None
+                ),
+                "vk {vk:#x} idle must pass through gated predicate"
+            );
         }
     }
 
@@ -2054,8 +4052,14 @@ mod tests {
         // 0(0x30) とテンキーは composition 中だけ食う（エンジンへ送る）。idle では素通し
         // （単独の数字・テンキー記号は通常入力。打鍵作法 Task3 でも対象外 — テンキー混同防止）。
         for vk in [0x30u32, 0x60, 0x6E /*Numpad .*/] {
-            assert!(will_handle(vk, true, false, false, false), "vk {vk:#x} composing -> handled (text)");
-            assert!(!will_handle(vk, false, false, false, false), "vk {vk:#x} idle -> pass through");
+            assert!(
+                will_handle(vk, true, false, false, false),
+                "vk {vk:#x} composing -> handled (text)"
+            );
+            assert!(
+                !will_handle(vk, false, false, false, false),
+                "vk {vk:#x} idle -> pass through"
+            );
         }
     }
 
@@ -2067,24 +4071,58 @@ mod tests {
         use super::{resolve_az_char, AzRoute};
         // shift_latin=commit(compose=false): Shift+C は一時直接入力（大文字をそのまま直接確定へ）。
         // idle でも composition 中でも同じ（呼び出し側 commit_char_direct が先に settle して畳む）。
-        assert_eq!(resolve_az_char(0x43, true, Some('C'), false, false), AzRoute::DirectCommit('C'));
+        assert_eq!(
+            resolve_az_char(0x43, true, Some('C'), false, false),
+            AzRoute::DirectCommit('C')
+        );
         // ToUnicode が取れないホストでも shift なら大文字へフォールバック。
-        assert_eq!(resolve_az_char(0x43, true, None, false, false), AzRoute::DirectCommit('C'));
-        assert_eq!(resolve_az_char(0x41, true, Some('A'), false, false), AzRoute::DirectCommit('A'));
+        assert_eq!(
+            resolve_az_char(0x43, true, None, false, false),
+            AzRoute::DirectCommit('C')
+        );
+        assert_eq!(
+            resolve_az_char(0x41, true, Some('A'), false, false),
+            AzRoute::DirectCommit('A')
+        );
         // CapsLock 併用で shift+英字が小文字を返すレイアウトはその文字を尊重（key_char が真実）。
-        assert_eq!(resolve_az_char(0x41, true, Some('a'), false, false), AzRoute::DirectCommit('a'));
+        assert_eq!(
+            resolve_az_char(0x41, true, Some('a'), false, false),
+            AzRoute::DirectCommit('a')
+        );
+    }
+
+    #[test]
+    fn pending_physical_composition_is_not_logical_idle_for_settle() {
+        use super::input_needs_settle;
+
+        assert!(!input_needs_settle(false, false, false));
+        assert!(input_needs_settle(true, false, false));
+        assert!(input_needs_settle(false, true, false));
+        assert!(input_needs_settle(false, false, true));
     }
 
     #[test]
     fn resolve_az_keeps_kana_route_unchanged() {
         use super::{resolve_az_char, AzRoute};
         // 無修飾はかな経路（小文字へ正規化）— 従来挙動。設定・英語モードに依らない。
-        assert_eq!(resolve_az_char(0x41, false, Some('a'), false, false), AzRoute::Kana('a'));
-        assert_eq!(resolve_az_char(0x41, false, None, false, false), AzRoute::Kana('a'));
+        assert_eq!(
+            resolve_az_char(0x41, false, Some('a'), false, false),
+            AzRoute::Kana('a')
+        );
+        assert_eq!(
+            resolve_az_char(0x41, false, None, false, false),
+            AzRoute::Kana('a')
+        );
         // AltGr 等の非英字レイアウト文字は従来どおり尊重（かな経路のまま）。
-        assert_eq!(resolve_az_char(0x41, false, Some('á'), false, false), AzRoute::Kana('á'));
+        assert_eq!(
+            resolve_az_char(0x41, false, Some('á'), false, false),
+            AzRoute::Kana('á')
+        );
         // CapsLock（shift 無しで大文字が来る）は従来どおり小文字正規化のかな経路。
-        assert_eq!(resolve_az_char(0x43, false, Some('C'), false, false), AzRoute::Kana('c'));
+        assert_eq!(
+            resolve_az_char(0x43, false, Some('C'), false, false),
+            AzRoute::Kana('c')
+        );
     }
 
     // ---- Shift英語モード(shift_latin=compose): A–Z 経路決定 ----
@@ -2093,26 +4131,44 @@ mod tests {
     fn resolve_az_compose_shift_enters_latin() {
         use super::{resolve_az_char, AzRoute};
         // compose 設定では Shift+英字は直接確定でなく英語未確定モードへ（MS-IME 系）。
-        assert_eq!(resolve_az_char(0x41, true, Some('A'), true, false), AzRoute::Latin('A'));
+        assert_eq!(
+            resolve_az_char(0x41, true, Some('A'), true, false),
+            AzRoute::Latin('A')
+        );
         // ToUnicode が取れなくても shift なら大文字へフォールバック。
-        assert_eq!(resolve_az_char(0x41, true, None, true, false), AzRoute::Latin('A'));
+        assert_eq!(
+            resolve_az_char(0x41, true, None, true, false),
+            AzRoute::Latin('A')
+        );
     }
 
     #[test]
     fn resolve_az_compose_latin_mode_continues_unshifted_as_lowercase() {
         use super::{resolve_az_char, AzRoute};
         // 英語モード中は無修飾でも英語継続（Shift なし=小文字 — 依頼仕様の核）。
-        assert_eq!(resolve_az_char(0x41, false, Some('a'), true, true), AzRoute::Latin('a'));
-        assert_eq!(resolve_az_char(0x42, false, None, true, true), AzRoute::Latin('b'));
+        assert_eq!(
+            resolve_az_char(0x41, false, Some('a'), true, true),
+            AzRoute::Latin('a')
+        );
+        assert_eq!(
+            resolve_az_char(0x42, false, None, true, true),
+            AzRoute::Latin('b')
+        );
         // モード中の Shift は大文字。
-        assert_eq!(resolve_az_char(0x41, true, Some('A'), true, true), AzRoute::Latin('A'));
+        assert_eq!(
+            resolve_az_char(0x41, true, Some('A'), true, true),
+            AzRoute::Latin('A')
+        );
     }
 
     #[test]
     fn resolve_az_compose_without_shift_or_mode_stays_kana() {
         use super::{resolve_az_char, AzRoute};
         // compose 設定でも Shift 無し・非英語モードなら従来のかな経路。
-        assert_eq!(resolve_az_char(0x41, false, Some('a'), true, false), AzRoute::Kana('a'));
+        assert_eq!(
+            resolve_az_char(0x41, false, Some('a'), true, false),
+            AzRoute::Kana('a')
+        );
     }
 
     // ---- 打鍵作法 Task4: F6-F10 の表記変換は notation hot で食う（keymap 化）----
@@ -2122,11 +4178,32 @@ mod tests {
         // F6-F10 は will_handle の固定キーから外れ、Notation アクションでのみ食う。composing×非 direct×
         // チョード一致の判定は resolve_action が持つ（keymap.rs でテスト）。
         for vk in 0x75u32..=0x79 {
-            assert!(!will_handle(vk, true, false, false, false), "vk {vk:#x} will_handle 単独ではもう食わない");
+            assert!(
+                !will_handle(vk, true, false, false, false),
+                "vk {vk:#x} will_handle 単独ではもう食わない"
+            );
         }
         // Notation アクションが立てば gated は食う。無ければ composing でも素通し。
-        assert!(will_handle_gated(0x76, true, false, false, false, false, false, KeyAction::Notation(Notation::Katakana)));
-        assert!(!will_handle_gated(0x76, true, false, false, false, false, false, KeyAction::None));
+        assert!(will_handle_gated(
+            0x76,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::Notation(Notation::Katakana)
+        ));
+        assert!(!will_handle_gated(
+            0x76,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
     }
 
     // ---- OEM 記号は idle でも食う（2026-08-03: 全角化して合成開始。旧 Task3 は直接確定）----
@@ -2137,10 +4214,16 @@ mod tests {
         // OEM 記号 VK は idle でも食う（全角化して composition を開始するため）。native のみ。
         assert!(will_handle(0xBE, false, false, false, false)); // VK_OEM_PERIOD idle
         assert!(will_handle(0xBC, false, false, false, false)); // VK_OEM_COMMA idle
-        // composition 中も従来どおり食う（エンジンへ送る経路は OnKeyDown 側で分岐）。
+                                                                // composition 中も従来どおり食う（エンジンへ送る経路は OnKeyDown 側で分岐）。
         for vk in [0xBAu32, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xDB, 0xDE] {
-            assert!(will_handle(vk, true, false, false, false), "vk {vk:#x} composing -> handled");
-            assert!(will_handle(vk, false, false, false, false), "vk {vk:#x} idle -> handled (合成開始)");
+            assert!(
+                will_handle(vk, true, false, false, false),
+                "vk {vk:#x} composing -> handled"
+            );
+            assert!(
+                will_handle(vk, false, false, false, false),
+                "vk {vk:#x} idle -> handled (合成開始)"
+            );
         }
         // Ctrl/Alt 併用はアプリのアクセラレータとして常に素通し。
         assert!(!will_handle(0xBE, false, false, true, false));
@@ -2153,7 +4236,15 @@ mod tests {
     fn cmd_modifier_always_passes_through() {
         // Ctrl/Alt 併用キー（Ctrl+C/V/X/A/Z/S 等）は composition / 候補表示中でも食わない。
         // これが今回のバグ（Ctrl+C 等が IME に食われアプリへ届かない）の回帰テスト。
-        for vk in [0x43u32 /*C*/, 0x56 /*V*/, 0x58 /*X*/, 0x41 /*A*/, 0x5A /*Z*/, 0x53 /*S*/, 0x59 /*Y*/] {
+        for vk in [
+            0x43u32, /*C*/
+            0x56,    /*V*/
+            0x58,    /*X*/
+            0x41,    /*A*/
+            0x5A,    /*Z*/
+            0x53,    /*S*/
+            0x59,    /*Y*/
+        ] {
             assert!(
                 !will_handle(vk, true, true, true, false),
                 "vk {vk:#x} with cmd modifier must pass through to the app"
@@ -2169,27 +4260,102 @@ mod tests {
     fn direct_mode_passes_text_keys_but_eats_candidates_when_showing() {
         // direct(半角英数): A–Z/数字/記号は食わない（本文へ流す）。
         assert!(!will_handle(0x41, false, false, false, true)); // 'A' direct → pass
-        assert!(!will_handle(0x30, true, false, false, true));  // '0' direct → pass
-        // direct: 候補表示中(showing)は候補キー(Enter/Esc/↑↓/数字)を食う。
-        assert!(will_handle(0x0D, false, true, false, true));   // Enter, showing
-        assert!(will_handle(0x1B, false, true, false, true));   // Esc, showing
-        assert!(will_handle(0x28, false, true, false, true));   // ↓, showing
-        assert!(will_handle(0x31, false, true, false, true));   // '1', showing
-        // Space は will_handle 固定キーから外れ、direct+showing は Convert アクションで候補送り。
+        assert!(!will_handle(0x30, true, false, false, true)); // '0' direct → pass
+                                                               // direct: 候補表示中(showing)は候補キー(Enter/Esc/↑↓/数字)を食う。
+        assert!(will_handle(0x0D, false, true, false, true)); // Enter, showing
+        assert!(will_handle(0x1B, false, true, false, true)); // Esc, showing
+        assert!(will_handle(0x28, false, true, false, true)); // ↓, showing
+        assert!(will_handle(0x31, false, true, false, true)); // '1', showing
+                                                              // Space は will_handle 固定キーから外れ、direct+showing は Convert アクションで候補送り。
         assert_eq!(act(0x20, false, true, true), KeyAction::Convert);
-        assert!(will_handle_gated(0x20, false, true, false, true, false, false, KeyAction::Convert));
+        assert!(will_handle_gated(
+            0x20,
+            false,
+            true,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::Convert
+        ));
         // direct: 非表示なら候補キーも食わない（全部本文へ）。Space は Convert も立たず素通し。
         assert!(!will_handle(0x20, false, false, false, true)); // Space, not showing → pass (will_handle)
         assert_eq!(act(0x20, false, false, true), KeyAction::None);
     }
 
     #[test]
+    fn backspace_reconvert_candidate_is_eaten_in_native_and_direct() {
+        use super::{BackspaceRoute, VK_BACK};
+
+        // 再変換/確定取消の共有尾部は composing=false でも候補を表示するため、
+        // OnTestKeyDown の native/direct 判定はいずれも TRUE でなければならない。
+        assert!(will_handle(VK_BACK, false, true, false, false));
+        assert!(will_handle(VK_BACK, false, true, false, true));
+        assert_eq!(
+            backspace_route(false, true, true),
+            BackspaceRoute::CancelReconvert
+        );
+    }
+
+    #[test]
+    fn backspace_reconvert_and_commit_undo_share_cancel_route() {
+        use super::{BackspaceRoute, VK_BACK};
+
+        // start_reconvert と start_commit_undo は同じ show_reconvert_candidates 尾部を使う。
+        for source in ["reconvert", "commit_undo"] {
+            for direct in [false, true] {
+                assert!(
+                    will_handle_awaiting(
+                        VK_BACK,
+                        false,
+                        true,
+                        false,
+                        direct,
+                        false,
+                        false,
+                        false,
+                        KeyAction::None,
+                    ),
+                    "{source} direct={direct} OnTestKeyDown must eat Backspace",
+                );
+                assert_eq!(
+                    backspace_route(false, true, true),
+                    BackspaceRoute::CancelReconvert,
+                    "{source} direct={direct} OnKeyDown must cancel through RestoreText",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backspace_route_keeps_composing_behavior_and_hides_only_stale_candidates() {
+        use super::BackspaceRoute;
+
+        assert_eq!(backspace_route(true, false, false), BackspaceRoute::Compose);
+        assert_eq!(backspace_route(true, true, true), BackspaceRoute::Compose);
+        assert_eq!(
+            backspace_route(false, true, false),
+            BackspaceRoute::HideStaleCandidates
+        );
+        assert_eq!(backspace_route(false, false, true), BackspaceRoute::Pass);
+    }
+
+    #[test]
     fn native_mode_unchanged() {
         // native(ひらがな)は従来どおり（第5引数 false）。
         assert!(will_handle(0x41, false, false, false, false)); // 'A' native → 食う
-        // Space は will_handle 固定キーから外れ、Convert アクション経由で食う（下記 space テスト）。
-        // native composing の Space が食われることは gated+Convert で担保する。
-        assert!(will_handle_gated(0x20, true, false, false, false, false, false, KeyAction::Convert));
+                                                                // Space は will_handle 固定キーから外れ、Convert アクション経由で食う（下記 space テスト）。
+                                                                // native composing の Space が食われることは gated+Convert で担保する。
+        assert!(will_handle_gated(
+            0x20,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::Convert
+        ));
         assert!(!will_handle(0x09, false, false, false, false)); // Tab idle → pass
     }
 
@@ -2200,14 +4366,50 @@ mod tests {
         //（reconvert_fallback 特例は撤去。ephemeral フォールバック無し）。
         assert!(!will_handle(0x1C, false, false, false, true)); // will_handle 単独ではもう食わない
         assert_eq!(act(0x1C, false, false, true), KeyAction::Reconvert); // direct idle → 再変換
-        assert_eq!(act(0x1C, true, false, true), KeyAction::Convert);    // direct composing → 候補送り(henkan)
-        assert_eq!(act(0x1C, false, true, true), KeyAction::Convert);    // direct showing → 候補送り
-        // gate ではその action が立てば食う。
-        assert!(will_handle_gated(0x1C, false, false, false, true, false, false, KeyAction::Reconvert));
-        assert!(will_handle_gated(0x1C, true, false, false, true, false, false, KeyAction::Convert));
-        assert!(will_handle_gated(0x1C, false, true, false, true, false, false, KeyAction::Convert));
+        assert_eq!(act(0x1C, true, false, true), KeyAction::Convert); // direct composing → 候補送り(henkan)
+        assert_eq!(act(0x1C, false, true, true), KeyAction::Convert); // direct showing → 候補送り
+                                                                      // gate ではその action が立てば食う。
+        assert!(will_handle_gated(
+            0x1C,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::Reconvert
+        ));
+        assert!(will_handle_gated(
+            0x1C,
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::Convert
+        ));
+        assert!(will_handle_gated(
+            0x1C,
+            false,
+            true,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::Convert
+        ));
         // action が無ければ（リバインド/無効化済み）direct の 変換キーは素通し。
-        assert!(!will_handle_gated(0x1C, false, false, false, true, false, false, KeyAction::None));
+        assert!(!will_handle_gated(
+            0x1C,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::None
+        ));
     }
 
     #[test]
@@ -2215,11 +4417,29 @@ mod tests {
         // native(ひらがな): 変換キー(0x1C) は Space と同じ henkan。will_handle 固定キーから外れ、
         // Convert アクションで composing/showing だけ食う。idle は素通し。
         assert!(!will_handle(0x1C, false, false, false, false)); // will_handle 単独ではもう食わない
-        assert_eq!(act(0x1C, false, false, false), KeyAction::None);    // native idle → 素通し
-        assert_eq!(act(0x1C, true, false, false), KeyAction::Convert);  // composing → Convert
-        assert_eq!(act(0x1C, false, true, false), KeyAction::Convert);  // showing → Convert
-        assert!(will_handle_gated(0x1C, true, false, false, false, false, false, KeyAction::Convert));
-        assert!(will_handle_gated(0x1C, false, true, false, false, false, false, KeyAction::Convert));
+        assert_eq!(act(0x1C, false, false, false), KeyAction::None); // native idle → 素通し
+        assert_eq!(act(0x1C, true, false, false), KeyAction::Convert); // composing → Convert
+        assert_eq!(act(0x1C, false, true, false), KeyAction::Convert); // showing → Convert
+        assert!(will_handle_gated(
+            0x1C,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::Convert
+        ));
+        assert!(will_handle_gated(
+            0x1C,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::Convert
+        ));
     }
 
     #[test]
@@ -2242,8 +4462,38 @@ mod tests {
         assert!(is_oem_symbol_vk(0xBF)); // メイン行 '/'（OEM_2）
         assert!(!is_oem_symbol_vk(0x6D)); // テンキー '-'（VK_SUBTRACT）→ to_kana_reading_char 枝でー
         assert!(!is_oem_symbol_vk(0x6E)); // テンキー '.'（VK_DECIMAL）→ literal のまま
-        // いずれも is_text_vk=true（composition 枝に入る前提）。
+                                          // いずれも is_text_vk=true（composition 枝に入る前提）。
         assert!(is_text_vk(0xBD) && is_text_vk(0x6D) && is_text_vk(0x6E));
+    }
+
+    #[test]
+    fn oem_102_is_text_and_symbol_without_changing_direct_or_ephemeral_modes() {
+        use super::{
+            ephemeral_idle_abort, is_oem_symbol_vk, is_symbol_keystroke, is_text_vk, VK_OEM_102,
+        };
+
+        assert!(is_text_vk(VK_OEM_102));
+        assert!(is_oem_symbol_vk(VK_OEM_102));
+        assert!(is_symbol_keystroke(VK_OEM_102, false, false));
+
+        // native は idle で合成開始し、composition 中も食い続ける。
+        assert!(will_handle(VK_OEM_102, false, false, false, false));
+        assert!(will_handle(VK_OEM_102, true, false, false, false));
+        // direct/Cmd 修飾では本文・アプリへ渡す。
+        assert!(!will_handle(VK_OEM_102, false, false, false, true));
+        assert!(!will_handle(VK_OEM_102, true, false, false, true));
+        assert!(!will_handle(VK_OEM_102, false, false, true, false));
+        // native ephemeral 中も、このキーでは direct へ脱出しない。
+        assert!(!ephemeral_idle_abort(
+            VK_OEM_102,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::None,
+        ));
     }
 
     #[test]
@@ -2251,60 +4501,103 @@ mod tests {
         use super::{is_main_row_digit_vk, is_symbol_keystroke};
         // Shift+テンキーは記号を生まない(NumLock 系の別 VK になる)ので、記号打鍵述語は
         // メイン行(0x30-0x39)限定。この境界が崩れるとテンキー入力が記号化されて壊れる。
-        assert!(is_main_row_digit_vk(0x30) && is_main_row_digit_vk(0x31) && is_main_row_digit_vk(0x39));
-        assert!(!is_main_row_digit_vk(0x60) && !is_main_row_digit_vk(0x69) && !is_main_row_digit_vk(0x6D));
+        assert!(
+            is_main_row_digit_vk(0x30) && is_main_row_digit_vk(0x31) && is_main_row_digit_vk(0x39)
+        );
+        assert!(
+            !is_main_row_digit_vk(0x60)
+                && !is_main_row_digit_vk(0x69)
+                && !is_main_row_digit_vk(0x6D)
+        );
         // OEM 記号キーはトグル/Shift 非依存(従来契約=常に記号打鍵。表外も食い切って ASCII 確定)。
         assert!(is_symbol_keystroke(0xBF, false, false)); // '/'
-        assert!(is_symbol_keystroke(0xC0, true, false));  // Shift+` = '~'
-        // 数字行は「Shift かつ 記号 overlay ON」のときだけ記号打鍵。OFF を含めないのは
-        // 既定 OFF で現行経路と完全同一(新規に食う打鍵ゼロ)を保証するため。
-        assert!(is_symbol_keystroke(0x31, true, true));   // Shift+1 = '!' (ON)
+        assert!(is_symbol_keystroke(0xC0, true, false)); // Shift+` = '~'
+                                                         // 数字行は「Shift かつ 記号 overlay ON」のときだけ記号打鍵。OFF を含めないのは
+                                                         // 既定 OFF で現行経路と完全同一(新規に食う打鍵ゼロ)を保証するため。
+        assert!(is_symbol_keystroke(0x31, true, true)); // Shift+1 = '!' (ON)
         assert!(!is_symbol_keystroke(0x31, true, false)); // OFF なら記号扱いしない
         assert!(!is_symbol_keystroke(0x31, false, true)); // 無 Shift は数字
-        assert!(!is_symbol_keystroke(0x62, true, true));  // テンキー2は対象外
+        assert!(!is_symbol_keystroke(0x62, true, true)); // テンキー2は対象外
     }
 
     #[test]
     fn gated_eats_shifted_digit_row_only_when_symbol_overlay() {
         // (vk, composing, showing, cmd, direct, shift, symbol_overlay, action) — action は記号 overlay に無関係。
         let none = KeyAction::None;
-        assert!(will_handle_gated(0x31, false, false, false, false, true, true, none),
-            "ON: idle の Shift+1 を食って！で合成を開始する");
-        assert!(will_handle_gated(0x30, false, false, false, false, true, true, none),
-            "ON: Shift+0=) も対象(0x30 を含む)");
-        assert!(!will_handle_gated(0x31, false, false, false, false, true, false, none),
-            "OFF: 現行と完全同一(食わない)");
-        assert!(!will_handle_gated(0x31, false, false, false, true, true, true, none),
-            "direct は対象外");
-        assert!(!will_handle_gated(0x31, false, false, true, false, true, true, none),
-            "cmd 修飾は対象外");
+        assert!(
+            will_handle_gated(0x31, false, false, false, false, true, true, none),
+            "ON: idle の Shift+1 を食って！で合成を開始する"
+        );
+        assert!(
+            will_handle_gated(0x30, false, false, false, false, true, true, none),
+            "ON: Shift+0=) も対象(0x30 を含む)"
+        );
+        assert!(
+            !will_handle_gated(0x31, false, false, false, false, true, false, none),
+            "OFF: 現行と完全同一(食わない)"
+        );
+        assert!(
+            !will_handle_gated(0x31, false, false, false, true, true, true, none),
+            "direct は対象外"
+        );
+        assert!(
+            !will_handle_gated(0x31, false, false, true, false, true, true, none),
+            "cmd 修飾は対象外"
+        );
         assert!(will_handle_gated(0x31, false, true, false, false, true, true, none),
             "ON: showing 中も記号として食う(Shift+数字の候補選択取消より前=OEM 記号の showing 中挙動と同型)");
-        assert!(!will_handle_gated(0x31, false, true, false, false, true, false, none),
-            "OFF: showing 中 Shift+数字は従来どおり素通し");
-        assert!(!will_handle_gated(0x62, false, false, false, false, true, true, none),
-            "テンキーは対象外");
+        assert!(
+            !will_handle_gated(0x31, false, true, false, false, true, false, none),
+            "OFF: showing 中 Shift+数字は従来どおり素通し"
+        );
+        assert!(
+            !will_handle_gated(0x62, false, false, false, false, true, true, none),
+            "テンキーは対象外"
+        );
     }
 
     #[test]
     fn classify_preserved_key_routes_jis_and_us_keys() {
+        use super::{classify_preserved_key, PreservedAction};
         use crate::globals::{
             GUID_DISPLAY_ATTRIBUTE, GUID_PRESERVEDKEY_FEEDBACK, GUID_PRESERVEDKEY_FEEDBACK_US,
             GUID_PRESERVEDKEY_MODE_TOGGLE, GUID_PRESERVEDKEY_MODE_TOGGLE_US,
             GUID_PRESERVEDKEY_RECONVERT, GUID_PRESERVEDKEY_RECONVERT_US,
         };
-        use super::{classify_preserved_key, PreservedAction};
-        assert_eq!(classify_preserved_key(&GUID_PRESERVEDKEY_MODE_TOGGLE), PreservedAction::ToggleMode);
-        assert_eq!(classify_preserved_key(&GUID_PRESERVEDKEY_MODE_TOGGLE_US), PreservedAction::ToggleMode);
-        assert_eq!(classify_preserved_key(&crate::globals::GUID_PRESERVEDKEY_MODE_TOGGLE_HZ),
-                   PreservedAction::ToggleMode);
-        assert_eq!(classify_preserved_key(&GUID_PRESERVEDKEY_RECONVERT), PreservedAction::Reconvert);
-        assert_eq!(classify_preserved_key(&GUID_PRESERVEDKEY_RECONVERT_US), PreservedAction::Reconvert);
+        assert_eq!(
+            classify_preserved_key(&GUID_PRESERVEDKEY_MODE_TOGGLE),
+            PreservedAction::ToggleMode
+        );
+        assert_eq!(
+            classify_preserved_key(&GUID_PRESERVEDKEY_MODE_TOGGLE_US),
+            PreservedAction::ToggleMode
+        );
+        assert_eq!(
+            classify_preserved_key(&crate::globals::GUID_PRESERVEDKEY_MODE_TOGGLE_HZ),
+            PreservedAction::ToggleMode
+        );
+        assert_eq!(
+            classify_preserved_key(&GUID_PRESERVEDKEY_RECONVERT),
+            PreservedAction::Reconvert
+        );
+        assert_eq!(
+            classify_preserved_key(&GUID_PRESERVEDKEY_RECONVERT_US),
+            PreservedAction::Reconvert
+        );
         // 品質ループ③: 誤変換フィードバック記録（Ctrl+変換 / Ctrl+/）の両 GUID。
-        assert_eq!(classify_preserved_key(&GUID_PRESERVEDKEY_FEEDBACK), PreservedAction::Feedback);
-        assert_eq!(classify_preserved_key(&GUID_PRESERVEDKEY_FEEDBACK_US), PreservedAction::Feedback);
+        assert_eq!(
+            classify_preserved_key(&GUID_PRESERVEDKEY_FEEDBACK),
+            PreservedAction::Feedback
+        );
+        assert_eq!(
+            classify_preserved_key(&GUID_PRESERVEDKEY_FEEDBACK_US),
+            PreservedAction::Feedback
+        );
         // 未知の GUID（表示属性 GUID を流用）は None。
-        assert_eq!(classify_preserved_key(&GUID_DISPLAY_ATTRIBUTE), PreservedAction::None);
+        assert_eq!(
+            classify_preserved_key(&GUID_DISPLAY_ATTRIBUTE),
+            PreservedAction::None
+        );
     }
 
     // ---- M-3: 確定文字列の唯一の真実源は cand_state ----
@@ -2350,14 +4643,17 @@ mod tests {
         let items: Vec<String> = (0..20).map(|i| format!("c{i}")).collect();
         st.set(items, 0);
         st.set_selection(9); // 2ページ目へ
-        assert_eq!(digit_commit_text(&st, 0x31).as_deref(), Some("c9"));  // '1' → 先頭 c9
+        assert_eq!(digit_commit_text(&st, 0x31).as_deref(), Some("c9")); // '1' → 先頭 c9
         assert_eq!(digit_commit_text(&st, 0x39).as_deref(), Some("c17")); // '9' → c17
     }
 
     #[test]
     fn empty_cand_state_commits_nothing() {
         let st = CandidateState::new();
-        assert_eq!(st.string_at(st.selected()).or_else(|| st.string_at(0)), None);
+        assert_eq!(
+            st.string_at(st.selected()).or_else(|| st.string_at(0)),
+            None
+        );
         assert_eq!(digit_commit_text(&st, 0x31), None);
     }
 
@@ -2365,19 +4661,27 @@ mod tests {
     use super::{arms_undo, is_pure_modifier_vk};
 
     #[test]
+    fn empty_commit_keeps_no_records() {
+        // 巡13(round13): 空 text の確定(巻き戻し中間状態の Enter=cancel 代わり)は
+        // remember_last_commit/undo 武装の対象外。非空は従来どおり書類を残す。
+        assert!(!commit_keeps_records(""));
+        assert!(commit_keeps_records("あ"));
+    }
+    #[test]
     fn undo_arms_only_on_full_commit_sources() {
         assert!(arms_undo("candidate"));
         assert!(arms_undo("live"));
         assert!(!arms_undo("candidate_prefix")); // 部分確定（composition 継続）
         assert!(!arms_undo("live_prefix"));
-        assert!(!arms_undo("live_auto"));
-        assert!(!arms_undo("mode_toggle"));      // settle 系は対象外（設計ロック）
+        assert!(!arms_undo("mode_toggle")); // settle 系は対象外（設計ロック）
         assert!(!arms_undo("navigate"));
     }
 
     #[test]
     fn pure_modifier_keys_do_not_disarm() {
-        for vk in [0x10u32, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C] {
+        for vk in [
+            0x10u32, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C,
+        ] {
             assert!(is_pure_modifier_vk(vk)); // Ctrl 押下自体で非武装化しない（Ctrl→BS の順押しを守る）
         }
         assert!(!is_pure_modifier_vk(0x08)); // Backspace
@@ -2388,17 +4692,64 @@ mod tests {
     #[test]
     fn ctrl_backspace_is_eaten_only_when_undo_armed() {
         // CommitUndo（armed Ctrl+BS）は cmd_modifier=true として届くが carve-out で食う。
-        assert!(will_handle_gated(0x08, false, false, true, false, false, false, KeyAction::CommitUndo));   // armed: 食う
-        assert!(!will_handle_gated(0x08, false, false, true, false, false, false, KeyAction::None)); // 非武装: アプリの単語削除へ素通し
-        assert!(!will_handle_gated(0x41, false, false, true, false, false, false, KeyAction::None)); // Ctrl+A は従来どおり素通し
+        assert!(will_handle_gated(
+            0x08,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            KeyAction::CommitUndo
+        )); // armed: 食う
+        assert!(!will_handle_gated(
+            0x08,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            KeyAction::None
+        )); // 非武装: アプリの単語削除へ素通し
+        assert!(!will_handle_gated(
+            0x41,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            KeyAction::None
+        )); // Ctrl+A は従来どおり素通し
     }
 
     #[test]
     fn undo_action_survives_awaiting_entrypoint() {
         // I-1: OnTestKeyDown は will_handle_awaiting 経由。CommitUndo の carve-out が冒頭の
         // cmd_modifier 早期 return より前にないと armed Ctrl+BS が殺される。
-        assert!(will_handle_awaiting(0x08, false, false, true, false, false, /*awaiting=*/false, false, KeyAction::CommitUndo)); // armed Ctrl+BS × awaiting=false → true
-        assert!(!will_handle_awaiting(0x08, false, false, true, false, false, false, false, KeyAction::None)); // 非武装は従来どおり素通し
+        assert!(will_handle_awaiting(
+            0x08,
+            false,
+            false,
+            true,
+            false,
+            false,
+            /*awaiting=*/ false,
+            false,
+            KeyAction::CommitUndo
+        )); // armed Ctrl+BS × awaiting=false → true
+        assert!(!will_handle_awaiting(
+            0x08,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        )); // 非武装は従来どおり素通し
     }
 
     // ---- ephemeral かなモード: idle-abort（トリガ発火は keymap.rs の resolve_action テストが後継）----
@@ -2407,24 +4758,114 @@ mod tests {
         // abort は「かな(native)が食わない」＝ !will_handle_gated(direct=false) と同義。
         // 素通しキー（矢印・nav idle）は abort=true（direct へ戻して素通し）。
         // 引数: (vk, cmd, shift, symbol_overlay, ephemeral, composing, showing, action)
-        assert!(ephemeral_idle_abort(0x26, false, false, false, true, false, false, act(0x26, false, false, false)));  // ↑ → 素通し
-        assert!(ephemeral_idle_abort(0x0D, false, false, false, true, false, false, act(0x0D, false, false, false)));  // Enter idle → 素通し
-        assert!(ephemeral_idle_abort(0x1B, false, false, false, true, false, false, act(0x1B, false, false, false)));  // Esc idle → 素通し
-        // 回帰ガード: romaji A–Z はかな(native)モードが食う（will_handle 真）ので abort=false。
-        // F8 直後の1文字目で ephemeral を誤って抜けないこと。
-        assert!(!ephemeral_idle_abort(0x41, false, false, false, true, false, false, act(0x41, false, false, false))); // 'A' → 合成継続
-        // アクションを持つキーは abort 対象外（CommitUndo/Ephemeral dispatch を殺さない）。
-        // Ctrl+BS(armed) は will_handle の Ctrl ゲートで素通し扱いだが action==CommitUndo で守られる。
-        assert!(!ephemeral_idle_abort(0x08, /*cmd=*/true, false, false, true, false, false, KeyAction::CommitUndo));
-        assert!(!ephemeral_idle_abort(0x77, false, false, false, true, false, false, KeyAction::Ephemeral));
+        assert!(ephemeral_idle_abort(
+            0x26,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            act(0x26, false, false, false)
+        )); // ↑ → 素通し
+        assert!(ephemeral_idle_abort(
+            0x0D,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            act(0x0D, false, false, false)
+        )); // Enter idle → 素通し
+        assert!(ephemeral_idle_abort(
+            0x1B,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            act(0x1B, false, false, false)
+        )); // Esc idle → 素通し
+            // 回帰ガード: romaji A–Z はかな(native)モードが食う（will_handle 真）ので abort=false。
+            // F8 直後の1文字目で ephemeral を誤って抜けないこと。
+        assert!(!ephemeral_idle_abort(
+            0x41,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            act(0x41, false, false, false)
+        )); // 'A' → 合成継続
+            // アクションを持つキーは abort 対象外（CommitUndo/Ephemeral dispatch を殺さない）。
+            // Ctrl+BS(armed) は will_handle の Ctrl ゲートで素通し扱いだが action==CommitUndo で守られる。
+        assert!(!ephemeral_idle_abort(
+            0x08,
+            /*cmd=*/ true,
+            false,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::CommitUndo
+        ));
+        assert!(!ephemeral_idle_abort(
+            0x77,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::Ephemeral
+        ));
         // 非武装 Ctrl+BS（action==None）は will_handle が食う（BS composing/showing のみだが idle は
         // 素通し）— idle なので abort=true（アプリの単語削除へ素通し）。
-        assert!(ephemeral_idle_abort(0x08, false, false, false, true, false, false, KeyAction::None));
+        assert!(ephemeral_idle_abort(
+            0x08,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::None
+        ));
         // ephemeral でなければ常に false。
-        assert!(!ephemeral_idle_abort(0x26, false, false, false, false, false, false, KeyAction::None));
+        assert!(!ephemeral_idle_abort(
+            0x26,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
         // composition 中/候補中は abort しない（畳む経路が別にある）。
-        assert!(!ephemeral_idle_abort(0x26, false, false, false, true, true, false, KeyAction::None));
-        assert!(!ephemeral_idle_abort(0x26, false, false, false, true, false, true, KeyAction::None));
+        assert!(!ephemeral_idle_abort(
+            0x26,
+            false,
+            false,
+            false,
+            true,
+            true,
+            false,
+            KeyAction::None
+        ));
+        assert!(!ephemeral_idle_abort(
+            0x26,
+            false,
+            false,
+            false,
+            true,
+            false,
+            true,
+            KeyAction::None
+        ));
     }
 
     #[test]
@@ -2432,34 +4873,102 @@ mod tests {
         // かなモードは idle の無修飾数字を食って composition を開始する(will_handle_gated ②)。
         // よって ephemeral 直後の1打鍵目が数字でも ephemeral を抜けてはならない。
         for vk in [0x30u32, 0x31, 0x39, 0x60, 0x69] {
-            assert!(!ephemeral_idle_abort(vk, false, false, false, true, false, false, act(vk, false, false, false)),
-                "vk {vk:#x}: かなが食う数字キーで ephemeral を抜けてはならない");
+            assert!(
+                !ephemeral_idle_abort(
+                    vk,
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    act(vk, false, false, false)
+                ),
+                "vk {vk:#x}: かなが食う数字キーで ephemeral を抜けてはならない"
+            );
         }
         // 記号トグル ON の Shift+数字行も「かなが食う」側（全角記号で合成を開始する）。
         // 既定キーマップで数字は未束縛なので action は None（act ヘルパは shift を取らないため直接渡す）。
-        assert!(!ephemeral_idle_abort(0x31, false, true, true, true, false, false, KeyAction::None));
+        assert!(!ephemeral_idle_abort(
+            0x31,
+            false,
+            true,
+            true,
+            true,
+            false,
+            false,
+            KeyAction::None
+        ));
         // トグル OFF の Shift+数字はかなが食わない＝素通しなので従来どおり abort する。
-        assert!(ephemeral_idle_abort(0x31, false, true, false, true, false, false, KeyAction::None));
+        assert!(ephemeral_idle_abort(
+            0x31,
+            false,
+            true,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::None
+        ));
     }
 
     #[test]
     fn ephemeral_action_is_eaten_at_both_entrypoints() {
         // will_handle_gated / will_handle_awaiting の先頭 carve-out（action != None）。
         // direct+idle で F8 は will_handle 上は false（素通し）だが Ephemeral アクションなら食う。
-        assert!(will_handle_gated(0x77, false, false, false, true, false, false, KeyAction::Ephemeral));
-        assert!(!will_handle_gated(0x77, false, false, false, true, false, false, KeyAction::None));
+        assert!(will_handle_gated(
+            0x77,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::Ephemeral
+        ));
+        assert!(!will_handle_gated(
+            0x77,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            KeyAction::None
+        ));
         // Ctrl 併用チョードでも殺されない（cmd_modifier=true でも action != None 優先）。
-        assert!(will_handle_awaiting(0x4A, false, false, true, false, false, false, false, KeyAction::Ephemeral));
-        assert!(!will_handle_awaiting(0x4A, false, false, true, false, false, false, false, KeyAction::None));
+        assert!(will_handle_awaiting(
+            0x4A,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::Ephemeral
+        ));
+        assert!(!will_handle_awaiting(
+            0x4A,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::None
+        ));
     }
 
     /// 既定 keymap のとき、リファクタ後の最終述語(will_handle_awaiting)が旧実装と
     /// 全キー×全文脈で一致する。残る方向差分は「修飾併用の厳格化」— チョードは修飾
     /// 完全一致だが、旧実装は shift と AltGr(Ctrl+Alt 同時=cmd_modifier では落ちない)を
     /// 見ていなかった。その場合は必ず 旧=食う/新=食わない の方向に限る。
-    /// 本設計は逆向きの新規 eaten を2つ意図的に導入する(spec §8 差分 f/g): 無変換(0x1D) の
-    /// ModeToggle 全文脈救済、Space の direct+composing henkan(モード非依存 Convert)。これらは
-    /// legacy baseline 側を新側へ合わせて更新することで方向不変条件を保つ(下記アーム内コメント)。
+    /// 本設計は逆向きの新規 eaten を意図的に導入する(spec §8 差分 f/g): 無変換(0x1D) の
+    /// ModeToggle 全文脈救済、Space の direct+composing henkan(モード非依存 Convert)、および
+    /// 再変換候補表示中の direct Backspace(本文復元取消)。これらは legacy baseline 側を新側へ
+    /// 合わせて更新することで方向不変条件を保つ(下記アーム内コメント)。
     /// さらに半角/全角(0x19/0xF3/0xF4→正準 0xF3)の全文脈 eaten を導入する(2026-07-23 spec §8-1)。
     /// new 側は入口と同じく normalize_vk を通し、legacy 基準側は 3 VK とも eaten に更新した。
     #[test]
@@ -2469,9 +4978,18 @@ mod tests {
         // ベースラインはマージ後のマスタ側最終述語(d9e8a32): 旧 will_handle は
         // Tab(0x09)/F6-F10(0x75..=0x79)/direct VK_CONVERT(0x1C) を食い、旧 gated は
         // 記号設定(symbol_overlay)の Shift+数字行 overlay を持っていた。
-        // これに本設計の意図的差分 f/g(無変換 0x1D 救済・direct+composing Space)を足して更新する。
-        fn legacy_will_handle(vk: u32, composing: bool, showing: bool, cmd_modifier: bool, direct: bool) -> bool {
-            if cmd_modifier { return false; }
+        // これに本設計の意図的差分 f/g(無変換 0x1D 救済・direct+composing Space)と、
+        // 再変換候補中の direct Backspace を足して更新する。
+        fn legacy_will_handle(
+            vk: u32,
+            composing: bool,
+            showing: bool,
+            cmd_modifier: bool,
+            direct: bool,
+        ) -> bool {
+            if cmd_modifier {
+                return false;
+            }
             if direct {
                 return match vk {
                     0x1C => true, // VK_CONVERT: direct 再変換(Reconvert)/composing・showing は Convert
@@ -2484,6 +5002,8 @@ mod tests {
                     // 意図的な新規 eaten（モード非依存 Convert）: direct+composing の Space も henkan
                     // ゲート下に入る（旧 direct は Space を showing のみ食っていた）。0x20 を切り出す。
                     0x20 => composing || showing,
+                    // 意図的な新規 eaten（再変換取消）: 候補表示中の Backspace は RestoreText へ送る。
+                    0x08 => showing,
                     0x0D | 0x1B | 0x26 | 0x28 => showing,
                     0x24 | 0x23 | 0x21 | 0x22 | 0x2E => showing,
                     0x31..=0x39 => showing,
@@ -2510,57 +5030,135 @@ mod tests {
         }
         #[allow(clippy::too_many_arguments)]
         fn legacy_awaiting(
-            vk: u32, composing: bool, showing: bool, cmd_modifier: bool, direct: bool,
-            llm_enabled: bool, typo_enabled: bool, shift: bool, awaiting: bool,
-            undo_hot: bool, ephemeral_hot: bool, symbol_overlay: bool,
+            vk: u32,
+            composing: bool,
+            showing: bool,
+            cmd_modifier: bool,
+            direct: bool,
+            llm_enabled: bool,
+            typo_enabled: bool,
+            shift: bool,
+            awaiting: bool,
+            undo_hot: bool,
+            ephemeral_hot: bool,
+            symbol_overlay: bool,
         ) -> bool {
-            if ephemeral_hot { return true; }
-            if undo_hot { return true; }
-            if cmd_modifier { return false; }
-            if awaiting { return true; }
+            if ephemeral_hot {
+                return true;
+            }
+            if undo_hot {
+                return true;
+            }
+            if cmd_modifier {
+                return false;
+            }
+            if awaiting {
+                return true;
+            }
             // 旧 will_handle_gated (master d9e8a32)
-            if vk == 0x09 && !(if shift { llm_enabled } else { typo_enabled }) { return false; }
+            if vk == 0x09 && !(if shift { llm_enabled } else { typo_enabled }) {
+                return false;
+            }
             // 記号 overlay: Shift+数字行を食う(showing veto より前)。
-            if !direct && !cmd_modifier && symbol_overlay && shift && is_main_row_digit_vk(vk) { return true; }
-            if (0x31..=0x39).contains(&vk) && shift && showing && !composing { return false; }
-            if !direct && !cmd_modifier && !shift && is_digit_vk(vk) { return true; }
+            if !direct && !cmd_modifier && symbol_overlay && shift && is_main_row_digit_vk(vk) {
+                return true;
+            }
+            if (0x31..=0x39).contains(&vk) && shift && showing && !composing {
+                return false;
+            }
+            if !direct && !cmd_modifier && !shift && is_digit_vk(vk) {
+                return true;
+            }
             legacy_will_handle(vk, composing, showing, cmd_modifier, direct)
         }
 
         let km = crate::keymap::Keymap::default();
         let bools = [false, true];
         for vk in 0u32..=0xFF {
-            for composing in bools { for showing in bools { for direct in bools {
-            for ctrl in bools { for shift in bools { for alt in bools {
-            for armed in bools { for awaiting in bools {
-            for typo_en in bools { for llm_en in bools { for symbol in bools {
-            for eph_en in bools {
-                let cmd = ctrl != alt;
-                // new 側は実入口(on_test/on_key_down)と同じく normalize_vk を通す。legacy 側は
-                // 生 vk のまま — だから legacy arm に 0x19/0xF3/0xF4 の 3 VK を明記してある。
-                let nvk = crate::keymap::normalize_vk(vk);
-                let action = crate::keymap::resolve_action(&km, &crate::keymap::ActionInput {
-                    vk: nvk, ctrl, shift, alt, composing, showing, direct,
-                    undo_armed: armed, ephemeral_enabled: eph_en,
-                    typo_enabled: typo_en, llm_enabled: llm_en,
-                });
-                let new = will_handle_awaiting(nvk, composing, showing, cmd, direct, shift, awaiting, symbol, action);
-                let legacy_undo = armed && vk == 0x08 && ctrl && !alt;
-                let legacy_eph = eph_en && direct && !composing && !showing && vk == 0x77 && !cmd;
-                let old = legacy_awaiting(vk, composing, showing, cmd, direct,
-                    llm_en, typo_en, shift, awaiting, legacy_undo, legacy_eph, symbol);
-                if new != old {
-                    // 厳格化された修飾 = shift、または AltGr(ctrl&&alt は cmd_modifier を
-                    // 抜けるが既定チョードは無修飾なので新実装は食わない)。
-                    assert!(
+            for composing in bools {
+                for showing in bools {
+                    for direct in bools {
+                        for ctrl in bools {
+                            for shift in bools {
+                                for alt in bools {
+                                    for armed in bools {
+                                        for awaiting in bools {
+                                            for typo_en in bools {
+                                                for llm_en in bools {
+                                                    for symbol in bools {
+                                                        for eph_en in bools {
+                                                            let cmd = ctrl != alt;
+                                                            // new 側は実入口(on_test/on_key_down)と同じく normalize_vk を通す。legacy 側は
+                                                            // 生 vk のまま — だから legacy arm に 0x19/0xF3/0xF4 の 3 VK を明記してある。
+                                                            let nvk =
+                                                                crate::keymap::normalize_vk(vk);
+                                                            let action =
+                                                                crate::keymap::resolve_action(
+                                                                    &km,
+                                                                    &crate::keymap::ActionInput {
+                                                                        vk: nvk,
+                                                                        ctrl,
+                                                                        shift,
+                                                                        alt,
+                                                                        composing,
+                                                                        showing,
+                                                                        direct,
+                                                                        undo_armed: armed,
+                                                                        ephemeral_enabled: eph_en,
+                                                                        typo_enabled: typo_en,
+                                                                        llm_enabled: llm_en,
+                                                                    },
+                                                                );
+                                                            let new = will_handle_awaiting(
+                                                                nvk, composing, showing, cmd,
+                                                                direct, shift, awaiting, symbol,
+                                                                action,
+                                                            );
+                                                            let legacy_undo =
+                                                                armed && vk == 0x08 && ctrl && !alt;
+                                                            let legacy_eph = eph_en
+                                                                && direct
+                                                                && !composing
+                                                                && !showing
+                                                                && vk == 0x77
+                                                                && !cmd;
+                                                            let old = legacy_awaiting(
+                                                                vk,
+                                                                composing,
+                                                                showing,
+                                                                cmd,
+                                                                direct,
+                                                                llm_en,
+                                                                typo_en,
+                                                                shift,
+                                                                awaiting,
+                                                                legacy_undo,
+                                                                legacy_eph,
+                                                                symbol,
+                                                            );
+                                                            if new != old {
+                                                                // 厳格化された修飾 = shift、または AltGr(ctrl&&alt は cmd_modifier を
+                                                                // 抜けるが既定チョードは無修飾なので新実装は食わない)。
+                                                                assert!(
                         old && !new && (shift || (ctrl && alt)),
                         "許容外の差分: vk={vk:#04x} composing={composing} showing={showing} \
                          direct={direct} ctrl={ctrl} shift={shift} alt={alt} armed={armed} \
                          awaiting={awaiting} typo={typo_en} llm={llm_en} symbol={symbol} \
                          eph_en={eph_en} old={old} new={new}"
                     );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-            }}}}}}}}}}}}
+            }
         }
     }
 
@@ -2571,5 +5169,123 @@ mod tests {
         assert!(!shift_latin_is_compose("commit"));
         // 未知値は既定(compose)へ劣化 — 手編集 JSON で黙って旧挙動(直接確定)に化けない。
         assert!(shift_latin_is_compose("unknown"));
+    }
+
+    #[test]
+    fn visible_prediction_claims_only_accept_and_dismiss_keys() {
+        assert_eq!(
+            prediction_key_action(0x27, true, false, false, false),
+            PredictionKeyAction::Accept
+        );
+        assert_eq!(
+            prediction_key_action(0x23, true, false, false, false),
+            PredictionKeyAction::Accept
+        );
+        assert_eq!(
+            prediction_key_action(0x1B, true, false, false, false),
+            PredictionKeyAction::Dismiss
+        );
+        assert_eq!(
+            prediction_key_action(0x41, true, false, false, false),
+            PredictionKeyAction::InvalidateAndContinue
+        );
+        assert_eq!(
+            prediction_key_action(0x10, true, false, true, false),
+            PredictionKeyAction::None
+        );
+        assert_eq!(
+            prediction_key_action(0x27, true, false, true, false),
+            PredictionKeyAction::InvalidateAndContinue
+        );
+        assert_eq!(
+            prediction_key_action(0x23, true, true, false, false),
+            PredictionKeyAction::InvalidateAndContinue
+        );
+        assert_eq!(
+            prediction_key_action(0x27, true, true, false, true),
+            PredictionKeyAction::InvalidateAndContinue
+        );
+        assert_eq!(
+            prediction_key_action(0x27, false, false, false, false),
+            PredictionKeyAction::None
+        );
+    }
+
+    #[test]
+    fn prediction_commit_requires_native_non_suppressed_context() {
+        assert_eq!(
+            prediction_commit_source("candidate", false, false, false),
+            Some(crate::prediction_state::CommitSource::Candidate)
+        );
+        assert_eq!(
+            prediction_commit_source("candidate", true, false, false),
+            None
+        );
+        assert_eq!(prediction_commit_source("clause", true, false, false), None);
+        assert_eq!(prediction_commit_source("live", true, false, false), None);
+        assert_eq!(
+            prediction_commit_source("candidate", false, true, false),
+            None
+        );
+        assert_eq!(prediction_commit_source("clause", false, true, false), None);
+        assert_eq!(prediction_commit_source("live", false, true, false), None);
+        assert_eq!(
+            prediction_commit_source("candidate", false, false, true),
+            None
+        );
+        assert_eq!(prediction_commit_source("clause", false, false, true), None);
+        assert_eq!(prediction_commit_source("live", false, false, true), None);
+
+        let flag = std::cell::Cell::new(false);
+        {
+            let _guard = ScopedCellFlag::set(&flag);
+            assert!(flag.get());
+        }
+        assert!(!flag.get());
+    }
+
+    #[test]
+    fn mode_toggle_is_immediate_but_context_actions_wait_for_cleanup() {
+        assert!(!should_defer_preserved_until_prediction_cleanup(
+            PreservedAction::ToggleMode,
+            true,
+        ));
+        assert!(should_defer_preserved_until_prediction_cleanup(
+            PreservedAction::Reconvert,
+            true,
+        ));
+        assert!(should_defer_preserved_until_prediction_cleanup(
+            PreservedAction::Feedback,
+            true,
+        ));
+        assert!(!should_defer_preserved_until_prediction_cleanup(
+            PreservedAction::Reconvert,
+            false,
+        ));
+    }
+
+    #[test]
+    fn a_new_preserved_action_supersedes_a_deferred_context_action() {
+        assert!(newer_preserved_action_supersedes_deferred(
+            PreservedAction::ToggleMode
+        ));
+        assert!(newer_preserved_action_supersedes_deferred(
+            PreservedAction::Reconvert
+        ));
+        assert!(newer_preserved_action_supersedes_deferred(
+            PreservedAction::Feedback
+        ));
+        assert!(!newer_preserved_action_supersedes_deferred(
+            PreservedAction::None
+        ));
+    }
+
+    #[test]
+    fn hidden_pending_prediction_is_invalidated_by_non_modifier_input() {
+        assert!(should_invalidate_hidden_prediction(0x41, false, true));
+        assert!(should_invalidate_hidden_prediction(0x27, false, true));
+        assert!(!should_invalidate_hidden_prediction(0x10, false, true));
+        assert!(!should_invalidate_hidden_prediction(0x41, true, true));
+        assert!(!should_invalidate_hidden_prediction(0x41, false, false));
     }
 }

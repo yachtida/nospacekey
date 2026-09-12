@@ -15,13 +15,99 @@ func encodeResponse(_ response: Response) -> Data {
 /// リクエスト1件（connId, フレーム body）を処理して応答フレーム body を返すハンドラを構築する。
 /// runEngineHost から分離した唯一の理由はテスト可能化（パイプ無しで request/response を検証する）。
 /// serviceLock で ConversionService への全アクセスを直列化する規律は従来どおり。
-func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Sendable (Int, Data) -> (reply: Data, exitAfterReply: Bool) {
+func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
+                       predictionService: PredictionService = PredictionService()) -> @Sendable (Int, Data) -> (reply: Data, exitAfterReply: Bool) {
     return { connId, body in
+        let req: Request
+        do {
+            req = try Framing.decode(Request.self, from: body)
+        } catch {
+            return (encodeResponse(.error("\(error)")), false)
+        }
+
+        // Runtime status reads a short sanitized snapshot instead of waiting for converterLock.
+        // The snapshot excludes model/input data and is updated independently of converterLock.
+        if case .queryZenzaiStatus = req {
+            let status = service.zenzaiRuntimeSnapshot
+            return (encodeResponse(.zenzaiStatus(
+                state: status.state.rawValue,
+                backend: status.backend,
+                device: status.device,
+                reason: status.reason,
+                liveLatency: status.liveLatency,
+                convertLatency: status.convertLatency)), false)
+        }
+
+        // Explicit retry is accepted immediately; native probe/warm-up runs after the
+        // response so a UI deadline never becomes a native model-load deadline.
+        if case .retryZenzai = req {
+            let retryService = service
+            Thread.detachNewThread {
+                retryService.retryZenzai()
+            }
+            return (encodeResponse(.ok), false)
+        }
+
+        // Link supervision must distinguish a dead host from a busy converter. Ping is process
+        // liveness only, so it must not queue behind serviceLock or a long GPU conversion.
+        if case .ping = req {
+            return (encodeResponse(.pong), false)
+        }
+
+        if case .pollSnapshotEnhancement(let composition, let revision,
+                                         let configurationGeneration, let connectionGeneration,
+                                         let baseline, let conversionRevision, let requestID) = req {
+            let key = ConversionService.SnapshotEnhancementKey(
+                composition: composition, revision: revision,
+                configurationGeneration: configurationGeneration,
+                connectionGeneration: connectionGeneration, conversionRevision: conversionRevision, requestID: requestID)
+            let responseKey = SnapshotResponseKey(composition: composition, revision: revision,
+                configuration_generation: configurationGeneration, connection_generation: connectionGeneration,
+                baseline: baseline, conversion_revision: conversionRevision, request_id: requestID)
+            let response: Response = switch service.pollSnapshotEnhancement(
+                key: key, baseline: baseline)
+            {
+            case .pending: .snapshotEnhancementPending(responseKey)
+            case .unavailable: .snapshotEnhancementUnavailable(responseKey)
+            case .ready(let text, let candidates, let candidateRemaining, let clauseData):
+                .snapshotEnhancement(
+                    composition: composition, revision: revision,
+                    configurationGeneration: configurationGeneration,
+                    connectionGeneration: connectionGeneration, baseline: baseline,
+                    text: text, candidates: candidates, candidateRemaining: candidateRemaining, clauseData: clauseData)
+            }
+            return (encodeResponse(response), false)
+        }
+
+        // 予測はモデル待ちの間も通常変換の serviceLock を保持しない。所有権だけ短く確認する。
+        if case .predict(let session, let seq, let tokenIDs) = req {
+            serviceLock.lock()
+            let owns = service.connectionOwns(session: Int(session), connection: connId)
+            serviceLock.unlock()
+            guard owns else { return (encodeResponse(.error("no session")), false) }
+            guard (2...480).contains(tokenIDs.count), tokenIDs.first == 1,
+                  tokenIDs.allSatisfy({ $0 < 99_584 }) else {
+                return (encodeResponse(.predictionUnavailable(seq: seq, state: "invalid_prompt")), false)
+            }
+            return (encodeResponse(predictionService.predict(seq: seq, tokenIDs: tokenIDs)), false)
+        }
+
+        // Clear may wait for already accepted persistence, so it cannot hold the global request
+        // lock. Admission is single-flight to keep the fixed pipe worker pool available.
+        if case .clearLearning = req {
+            let response: Response = switch service.clearLearningForIPC() {
+            case .cleared: .ok
+            case .failed: .error("learning files still locked; retry after engine restart")
+            case .inProgress: .error("learning clear already in progress; retry")
+            }
+            return (encodeResponse(response), false)
+        }
+
+        // All operations below can change the visible conversion context.
+        predictionService.cancel()
         serviceLock.lock(); defer { serviceLock.unlock() }
         let response: Response
         var exitAfterReply = false
-        do {
-            let req = try Framing.decode(Request.self, from: body)
             // セッション所有権（UU-2）: session を伴う op は、その session を作成した接続からのみ
             // 受け付ける。session id は全接続共有の単調増加値なので、照合しないと別クライアントが
             // 他人のセッションを破棄・汚染できる。非所有（および未知 id）は既存の "no session" へ
@@ -32,9 +118,26 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
             // insert/backspace/convert/liveConvert は未知セッションのとき nil を返す（空の正当な
             // 結果と区別する）。nil は一律 .error("no session") にして TIP 側で degrade させる。
             switch req {
-            case .ping: response = .pong
+            case .queryZenzaiStatus, .retryZenzai:
+                // Routed before serviceLock is acquired above. This arm is unreachable but
+                // keeps the exhaustive dispatch table explicit when protocol cases change.
+                response = .error("runtime status routing error")
+            case .predict:
+                // 上のロック外レーンで必ず処理済み。網羅性のためだけの防御分岐。
+                response = .error("prediction routing error")
+            case .ping: response = .error("ping routing error")
             // 接続id を渡してセッションの所有者を記録する（切断時に cleanupConnection で掃除するため）。
-            case .startSession: response = .session(Int64(service.startSession(connection: connId)), proto: ProtocolVersion.current)
+            case .startSession:
+                response = .session(
+                    Int64(service.startSession(connection: connId)),
+                    proto: ProtocolVersion.current,
+                    boot: BuildInfo.version, engineEpoch: service.engineEpoch, learningGeneration: service.currentLearningGeneration)
+            case .clauseCandidates(let request):
+                response = .clauseCandidatesResult(service.clauseCandidates(request))
+            case .convertClauses(let request):
+                response = .convertClausesResult(service.convertClauses(request))
+            case .commitReceipt(let receipt):
+                response = .commitReceiptAck(service.commitReceipt(receipt))
             case .insert(let s, let t, let style):
                 response = service.insert(session: Int(s), text: t, style: style).map(Response.reading) ?? .error("no session")
             case .backspace(let s):
@@ -58,24 +161,88 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                 } else {
                     response = .error("no session")
                 }
+            case .liveSnapshot(let composition, let revision, let configurationGeneration,
+                               let connectionGeneration, let segments, let explicit, let context, let conversionRevision, let requestID):
+                let key = ConversionService.SnapshotEnhancementKey(
+                    composition: composition, revision: revision,
+                    configurationGeneration: configurationGeneration,
+                    connectionGeneration: connectionGeneration, conversionRevision: conversionRevision, requestID: requestID)
+                let result = service.snapshot(
+                    segments, explicit: explicit, leftContext: context, enhancementKey: key,
+                    snapshotConnection: connId)
+                response = .snapshotResult(
+                    composition: composition, revision: revision,
+                    configurationGeneration: configurationGeneration,
+                    connectionGeneration: connectionGeneration,
+                    text: result.text, candidates: result.candidates,
+                    candidateRemaining: result.candidateRemaining, baseline: result.baseline,
+                    autoCommit: result.autoCommit.map {
+                        AutoCommitProposal(
+                            proposal: $0.proposal, text: $0.text,
+                            consumedReading: $0.consumedReading, remaining: $0.remaining)
+                    }, clauseData: result.clauseData)
+            case .autoCommitReceipt(let composition, let revision,
+                                    let configurationGeneration, let connectionGeneration,
+                                    let proposal):
+                let key = ConversionService.SnapshotEnhancementKey(
+                    composition: composition, revision: revision,
+                    configurationGeneration: configurationGeneration,
+                    connectionGeneration: connectionGeneration)
+                response = service.applySnapshotAutoCommitReceipt(
+                    connection: connId, key: key, proposal: proposal)
+                    ? .ok : .error("stale auto commit receipt")
+            case .pollSnapshotEnhancement(let composition, let revision,
+                                          let configurationGeneration, let connectionGeneration,
+                                          let baseline, _, _):
+                _ = (composition, revision, configurationGeneration, connectionGeneration, baseline)
+                response = .error("snapshot enhancement routing error")
             case .llmConvert(let s, let seq, let ctx):
                 switch service.llmConvert(session: Int(s), leftContext: ctx) {
                 case .success(let text): response = .llmResult(seq: seq, text: text)
                 case .failure(let e): response = .error(e.message)
                 }
             case .reloadConfig(let p):
+                if let enabled = p.inline_prediction_enabled {
+                    var predictionEnvironment = ProcessInfo.processInfo.environment
+                    predictionEnvironment["NOSPACEKEY_INLINE_PREDICTION"] = enabled ? "1" : "0"
+                    predictionService.reload(config: .resolve(environment: predictionEnvironment))
+                }
                 // UU-5: TIP が push した最新設定を、LLMConfig.resolve / ZenzaiConfig.resolve が読む
                 // env キーの「上書き集合」へ写す（reload が実プロセス env に重ねる — #2）。
-                // LLM 無効時は TIP が空フィールドで送るのでキーが載らず disabled になる（H-1 整合）。
                 var overrides: [String: String] = [:]
                 overrides["NOSPACEKEY_ZENZAI"] = p.zenzai_enabled ? "on" : "off"
-                if !p.zenzai_weight.isEmpty { overrides["NOSPACEKEY_ZENZAI_WEIGHT"] = p.zenzai_weight }
+                // 常時 put（空値も）: spawn 時に env へ積んだ旧 weight が reload の重ね書きで
+                // 残り続け、UI(weight_path 空 → per-user 表示)とエンジン(旧明示パス)が分岐する
+                // のを防ぐ（敵対レビュー巡1 G1-A）。ZenzaiConfig.resolve は空文字を候補から除外。
+                // 設計トレードオフ（巡2 D6）: この常時 put は「reload は UI 設定を正とする」の
+                // 明示的選択で、spawn 時の D6 env override（親 env 優先）と非対称。診断 env
+                // NOSPACEKEY_ZENZAI_WEIGHT を恒常運用するケースでは reload が設定値で上書きする。
+                // inference_limit と対称の push 抑止（Option 化）はプロトコル変更を要するため
+                // 見送り、本コメントで意図を明示する。
+                overrides["NOSPACEKEY_ZENZAI_WEIGHT"] = p.zenzai_weight
                 if p.llm_enabled {
-                    if !p.llm_api_key.isEmpty { overrides["NOSPACEKEY_LLM_API_KEY"] = p.llm_api_key }
-                    if !p.llm_endpoint.isEmpty { overrides["NOSPACEKEY_LLM_ENDPOINT"] = p.llm_endpoint }
-                    if !p.llm_model.isEmpty { overrides["NOSPACEKEY_LLM_MODEL"] = p.llm_model }
-                    if !p.llm_prompt.isEmpty { overrides["NOSPACEKEY_LLM_PROMPT"] = p.llm_prompt }
+                    // 巡3 Z2: MODEL/PROMPT も空値を含め常時 put する — 「空なら put しない」は
+                    // spawn 時に env へ積んだ旧値の残存（stale env）を許し、UI で model/prompt を
+                    // 空に戻した適用や無効化→再有効化で旧値が復活する。LLMConfig.resolve は空文字
+                    // を既定値へ畳むため常時 put は安全（ZENZAI_WEIGHT の常時 put と対称）。
+                    overrides["NOSPACEKEY_LLM_API_KEY"] = p.llm_api_key
+                    overrides["NOSPACEKEY_LLM_ENDPOINT"] = p.llm_endpoint
+                    overrides["NOSPACEKEY_LLM_MODEL"] = p.llm_model
+                    overrides["NOSPACEKEY_LLM_PROMPT"] = p.llm_prompt
                     overrides["NOSPACEKEY_LLM_TIMEOUT_MS"] = String(p.llm_timeout_ms)
+                } else {
+                    // 巡2 D4 + 巡3 Z2 + 巡4 J4: 無効化時は認証/接続系の LLM キー
+                    // （API_KEY/ENDPOINT/MODEL/PROMPT）へ空値を put する — spawn 時に
+                    // resolve_env_map が env へ積んだ旧キー群の残存で「UI は無効・エンジンは
+                    // 平文キー保持」に解離するのを防ぐ（G1-A と同型の stale env 掃討。
+                    // 無効化の達成は API_KEY/ENDPOINT の空（enabled=false）で、MODEL/PROMPT
+                    // の空は既定値へ畳まれる — いずれも stale 値の残存は掃討される）。
+                    // NOSPACEKEY_LLM_TIMEOUT_MS は enabled 判定に無関係な性能値で、無効中は
+                    // 参照されず再有効化時に必ず現行値を put するため掃討対象外。
+                    overrides["NOSPACEKEY_LLM_API_KEY"] = ""
+                    overrides["NOSPACEKEY_LLM_ENDPOINT"] = ""
+                    overrides["NOSPACEKEY_LLM_MODEL"] = ""
+                    overrides["NOSPACEKEY_LLM_PROMPT"] = ""
                 }
                 if let le = p.learning_enabled {
                     overrides["NOSPACEKEY_LEARNING"] = le ? "1" : "0"
@@ -86,15 +253,15 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                 if let il = p.zenzai_inference_limit {
                     overrides["NOSPACEKEY_ZENZAI_INFERENCE_LIMIT"] = String(il)
                 }
-                service.reload(overrides: overrides)
-                response = .ok
-            case .clearLearning:
-                // Spec2: 学習メモリは全クライアント共有の単一資源（所有の概念がない）。
-                // serviceLock 下で直列化されるので変換と競合しない。消し切れなかった場合は
-                // Error（Ok なのに学習が復活する事故を防ぐ — I-4。設定アプリが UI 表示する）。
-                response = service.clearLearning()
+                // 巡2 D5: busy（warm-up/変換中）でスキップされた場合も .ok を返さない —
+                // TIP 側が「反映成功」と誤認する詐称をやめる。Error 応答でも接続は維持され、
+                // TIP は "reload busy" 接頭辞を見て同一接続で上限付き（1s×5）の遅延再送をする
+                // （text_service.rs schedule_reload_retry。再送後も busy なら次回接続で反映）。
+                response = service.reload(overrides: overrides)
                     ? .ok
-                    : .error("learning files still locked; retry after engine restart")
+                    : .error("reload busy (warm-up or conversion in progress); TIP will retry on this connection")
+            case .clearLearning:
+                response = .error("learning clear routing error")
             case .recordCorrection(let reading, let surface):
                 service.recordCorrection(reading: reading, surface: surface)
                 response = .ok
@@ -133,20 +300,139 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                 // ここで exit しないのは、応答を書き終える前にプロセスを殺すと TIP が broken pipe に
                 // 落ちる（degrade 経路）ため。実際の exit(0) は writeAll 成功後に exitHook が
                 // serviceLock を取り直して（進行中の別接続要求を drain して）から行う。
+                predictionService.shutdown()
                 service.prepareForShutdown()
                 exitAfterReply = true
                 response = .ok
             }
-        } catch {
-            response = .error("\(error)")
-        }
         return (encodeResponse(response), exitAfterReply)
     }
+}
+
+/// Config の ClearLearning と、別 logon session の Engine 起動を直列化する短期 gate。
+/// CreateMutex(initialOwner=true) は既存 object を開いた場合 ownership を与えないため、
+/// ERROR_ALREADY_EXISTS を直後に採取してから bounded wait する。
+private final class LearningLifecycleGate {
+    private var handle: HANDLE?
+    private var owned = false
+
+    init?(name: String, timeoutMs: DWORD = 4_000) {
+        let (created, lastError) = name.withCString(encodedAs: UTF16.self) { p -> (HANDLE?, DWORD) in
+            let h = CreateMutexW(nil, true, p)
+            return (h, GetLastError())
+        }
+        guard let created else { return nil }
+        handle = created
+        if lastError == DWORD(ERROR_ALREADY_EXISTS) {
+            let wait = WaitForSingleObject(created, timeoutMs)
+            // WinSDK の Swift module は WAIT_ABANDONED(_0) macro を公開しない。
+            // WinBase.h の固定値 0x80 を明示し、取得済み ownership として扱う。
+            owned = wait == WAIT_OBJECT_0 || wait == DWORD(0x0000_0080)
+        } else {
+            owned = true
+        }
+        if !owned {
+            CloseHandle(created)
+            handle = nil
+            return nil
+        }
+    }
+
+    func release() {
+        guard let handle else { return }
+        if owned { ReleaseMutex(handle) }
+        CloseHandle(handle)
+        self.handle = nil
+        owned = false
+    }
+
+    deinit { release() }
+}
+
+private func sessionID(fromStablePipeName pipeName: String) -> UInt32? {
+    guard let marker = pipeName.range(of: ".s", options: .backwards),
+          marker.upperBound < pipeName.endIndex else { return nil }
+    return UInt32(pipeName[marker.upperBound...])
+}
+
+/// 安定 pipe 名 `\\.\pipe\nospacekey-engine.v{proto}.b{build}.s{session}`（crates/ipc の
+/// pipe_name_for_session が生成）から `{build}` 部分を抽出する。末尾 `.s{数字}` の直前の
+/// `.b` を後ろから探す — build には `.` を含められないが `+meta` は許す。形式に従わない
+/// pipe 名（テスト用の任意名）は nil を返し、呼び出し側は版検証を skip する。
+func pipeNameEmbeddedBuild(_ pipeName: String) -> String? {
+    guard let sessionMarker = pipeName.range(of: ".s", options: .backwards),
+          sessionMarker.upperBound < pipeName.endIndex,
+          pipeName[sessionMarker.upperBound...].allSatisfy(\.isNumber) else { return nil }
+    let beforeSession = pipeName[..<sessionMarker.lowerBound]
+    guard let buildMarker = beforeSession.range(of: ".b", options: .backwards),
+          buildMarker.upperBound < beforeSession.endIndex else { return nil }
+    return String(beforeSession[buildMarker.upperBound...])
+}
+
+/// Handle の存在自体が「この user-scope/session の Engine が RAM 学習を保持し得る」証拠。
+/// Config は lifecycle gate を保持して全 session の同名 object を probe する。process crash 時は
+/// kernel が handle を閉じるので stale marker の生存判定は不要。
+private func createLearningPresence(name: String) -> HANDLE? {
+    let (created, lastError) = name.withCString(encodedAs: UTF16.self) { p -> (HANDLE?, DWORD) in
+        let h = CreateMutexW(nil, false, p)
+        return (h, GetLastError())
+    }
+    guard let created else { return nil }
+    if lastError == DWORD(ERROR_ALREADY_EXISTS) {
+        CloseHandle(created)
+        return nil
+    }
+    return created
 }
 
 /// ConversionService を名前付きパイプに配線して常駐する。main.swift から呼ぶ唯一の公開関数。
 /// oneShot=true なら1接続を捌いて切断したら終了する（TIP のプロセス毎一意エンジン向け）。
 public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, oneShot: Bool = false) {
+    // 版混在事故（2026-09-06）: 旧版 TIP が DLL 隣の新版 exe を旧版 pipe 名で起動でき、
+    // そのプロセスが（learning presence の名前はバイナリ実体の版で決まるため）新版の
+    // presence を占有し、新版 TIP の正当な起動まで弾いていた。pipe 名埋め込み版と自版が
+    // 不一致なら presence 等の起動ガードを取得する前に終了する — 誤った組み合わせを
+    // 拒否し、少なくとも新版側を巻き込まない。形式外の pipe 名（テスト用）は検証しない。
+    if let embedded = pipeNameEmbeddedBuild(pipeName), embedded != BuildInfo.version {
+        engineLog("ev=engine_start_blocked reason=pipe_name_build_mismatch pipe=\(pipeName) self=\(BuildInfo.version)\n")
+        return
+    }
+    guard let versionLease = createVersionLifetimeLease() else {
+        engineLog("ev=engine_start_blocked reason=version_lifetime_unavailable\n")
+        return
+    }
+    defer {
+        CloseHandle(versionLease.tree)
+        CloseHandle(versionLease.named)
+    }
+    let environment = ProcessInfo.processInfo.environment
+    let learningScope = LearningSettings.coordinationScope(environment: environment)
+    var lifecycleGate: LearningLifecycleGate?
+    var learningPresence: HANDLE?
+    if let learningScope {
+        guard let sessionID = sessionID(fromStablePipeName: pipeName),
+              let gate = LearningLifecycleGate(
+                name: LearningSettings.lifecycleMutexName(scope: learningScope)) else {
+            // presence を公開できない Engine を動かすと別 session の Clear が安全を判定できない。
+            engineLog("ev=engine_start_blocked reason=learning_coordination_unavailable\n")
+            return
+        }
+        lifecycleGate = gate
+
+        let presenceName = LearningSettings.presenceMutexName(
+            scope: learningScope, build: BuildInfo.version, sessionID: sessionID)
+        guard let presence = createLearningPresence(name: presenceName) else {
+            engineLog("ev=engine_start_blocked reason=learning_presence_unavailable\n")
+            return
+        }
+        learningPresence = presence
+    }
+    // NamedPipeServer.run の全寿命で presence handle を保持する。通常の persist host は exit(0)
+    // まで戻らないが、one-shot/初期化失敗で戻る場合も確実に閉じる。
+    defer {
+        if let learningPresence { CloseHandle(learningPresence) }
+    }
+
     // cold start ② I-1: 同一 pipe 名の engine を 1 プロセスに限る named mutex シングルトンガード。
     // TIP 側の prespawn（Activate）と初回打鍵の ensure_engine が「spawn 済みだが listening 前」の
     // 透き間で二重 spawn しうる（SpawnGuard は CreateProcess 直後に解放されるため）。persist engine は
@@ -175,8 +461,12 @@ public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, one
 
     // cold start ①: 起動区間の分解計測。engineLog は NOSPACEKEY_LOG ゲート済み（計測の既定 OFF）。
     let t0 = Date()
-    let service = ConversionService()               // 辞書ロード含む(init が eager)
+    let service = ConversionService(productionMain: true) // main owns classic; worker is isolated
     engineLog("ev=coldstart stage=service_init ms=\(Int(Date().timeIntervalSince(t0) * 1000))\n")
+    // service init が共有学習ファイルを読み得る区間まで Clear と直列化する。presence は gate を
+    // 放す前に公開済みなので、以後 Config はこの Engine を必ず検出して fail-closed にできる。
+    lifecycleGate?.release()
+    lifecycleGate = nil
     // cold start ③: warm-up（背景スレッドのダミー変換による llama モデル先読み）は listening を塞がない。
     // Zenzai ゲート（zenzaiReady）は warmUp 完了後に開き、ロード中（正確には warmUp が converterLock を
     // 取る前）に届いた変換要求はゲート閉により古典（辞書）変換で即応する。ロック保持中に届いた要求は
@@ -186,7 +476,9 @@ public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, one
     service.startWarmUp()
 
     let serviceLock = NSLock()
-    let handle = makeEngineHandler(service: service, serviceLock: serviceLock)
+    let predictionService = PredictionService.configured(environment: environment)
+    let handle = makeEngineHandler(service: service, serviceLock: serviceLock,
+                                   predictionService: predictionService)
 
     // NOTE: `handle` 内で参照される `service` は @Sendable クロージャ内でキャプチャされる。
     // ConversionService はスレッドセーフではないが、serviceLock で排他制御されているため安全。
@@ -229,4 +521,61 @@ public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, one
     }
     NamedPipeServer(pipeName: pipeName).run(handler: handle, onDisconnect: onDisconnect, oneShot: oneShot,
                                             exitHook: exitHook, onListening: onListening)
+}
+
+private struct VersionLifetimeLease {
+    let named: HANDLE
+    let tree: HANDLE
+}
+
+public func runVersionLifetimeFixture(readyPath: String, continuePath: String) -> Int32 {
+    guard let lease = createVersionLifetimeLease() else { return 2 }
+    defer {
+        CloseHandle(lease.tree)
+        CloseHandle(lease.named)
+    }
+    do {
+        try "pid=\(GetCurrentProcessId()) path=\(CommandLine.arguments[0])".write(
+            toFile: readyPath, atomically: true, encoding: .utf8)
+    } catch { return 2 }
+    let deadline = Date().addingTimeInterval(60)
+    while !FileManager.default.fileExists(atPath: continuePath) && Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.02)
+    }
+    return FileManager.default.fileExists(atPath: continuePath) ? 0 : 2
+}
+
+private func createVersionLifetimeLease() -> VersionLifetimeLease? {
+    var sessionID: DWORD = 0
+    guard ProcessIdToSessionId(GetCurrentProcessId(), &sessionID) else { return nil }
+    let leaseName = "Global\\nospacekey-version-lease-" + BuildInfo.version + "-s" + String(sessionID)
+    guard let named = leaseName.withCString(encodedAs: UTF16.self, {
+        CreateMutexW(nil, false, $0)
+    }) else { return nil }
+    var modulePath = [WCHAR](repeating: 0, count: 1024)
+    let length = modulePath.withUnsafeMutableBufferPointer {
+        GetModuleFileNameW(nil, $0.baseAddress, DWORD($0.count))
+    }
+    guard length > 0, length < modulePath.count else {
+        CloseHandle(named)
+        return nil
+    }
+    let executable = String(decoding: modulePath.prefix(Int(length)), as: UTF16.self)
+    let sentinel = ((executable as NSString).deletingLastPathComponent as NSString)
+        .appendingPathComponent(".nospacekey-lifetime")
+    let tree = sentinel.withCString(encodedAs: UTF16.self) {
+        CreateFileW($0, DWORD(GENERIC_READ), DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE), nil,
+                    DWORD(OPEN_EXISTING), DWORD(FILE_ATTRIBUTE_NORMAL), nil)
+    }
+    guard let tree, tree != INVALID_HANDLE_VALUE else {
+        CloseHandle(named)
+        return nil
+    }
+    var overlapped = OVERLAPPED()
+    guard LockFileEx(tree, DWORD(LOCKFILE_FAIL_IMMEDIATELY), 0, 1, 0, &overlapped) else {
+        CloseHandle(tree)
+        CloseHandle(named)
+        return nil
+    }
+    return VersionLifetimeLease(named: named, tree: tree)
 }

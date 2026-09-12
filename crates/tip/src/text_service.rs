@@ -8,29 +8,34 @@
 //! 単一スレッドアパートメント（STA）前提のため、内部状態は `Rc`/`Cell`/`RefCell` で持つ
 //! （Send/Sync は不要）。COM 境界を越えて panic させないこと（IPC/COM 失敗は no-op に潰す）。
 
+use crate::apply_state::{ApplyOutcome, ApplyReport};
+use crate::preedit_apply::PreeditApply;
+use crate::preedit_session::StartOrUpdatePreedit;
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use windows::core::{implement, Interface, IUnknown, IUnknownImpl, Ref, Result, HSTRING};
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::core::{implement, IUnknown, IUnknownImpl, Interface, Ref, Result, GUID, HSTRING};
+use windows::Win32::Foundation::{E_FAIL, HWND, RECT};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Variant::{VARIANT, VT_I4};
 use windows::Win32::UI::TextServices::{
-    ITfCategoryMgr, ITfCompartment, ITfCompartmentMgr, ITfComposition, ITfCompositionSink,
-    ITfCompositionSink_Impl, ITfContext, ITfDisplayAttributeProvider, ITfDocumentMgr, ITfEditSession,
-    ITfFnConfigure, ITfFnConfigure_Impl, ITfFunction_Impl, ITfKeyEventSink, ITfKeystrokeMgr,
-    ITfLangBarItemButton, ITfLangBarItemMgr, ITfLangBarItemSink,
-    ITfSource, ITfThreadFocusSink, ITfThreadFocusSink_Impl, ITfThreadMgr, ITfThreadMgrEx,
-    ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl,
-    ITfTextInputProcessor_Impl,
-    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfUIElementMgr, CLSID_TF_CategoryMgr,
-    GUID_COMPARTMENT_EMPTYCONTEXT, GUID_COMPARTMENT_KEYBOARD_DISABLED,
-    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READ,
-    TF_ES_READWRITE, TF_ES_SYNC, TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_TEXT, TF_PRESERVEDKEY,
-    TF_TMF_IMMERSIVEMODE,
+    CLSID_TF_CategoryMgr, ITfCategoryMgr, ITfCompartment, ITfCompartmentMgr, ITfComposition,
+    ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextView,
+    ITfDisplayAttributeProvider, ITfDocumentMgr, ITfEditRecord, ITfEditSession, ITfFnConfigure,
+    ITfFnConfigure_Impl, ITfFunction_Impl, ITfKeyEventSink, ITfKeystrokeMgr, ITfLangBarItemButton,
+    ITfMouseSink, ITfMouseTracker,
+    ITfLangBarItemMgr, ITfLangBarItemSink, ITfSource, ITfTextEditSink, ITfTextEditSink_Impl,
+    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl,
+    ITfTextLayoutSink, ITfTextLayoutSink_Impl, ITfThreadFocusSink, ITfThreadFocusSink_Impl,
+    ITfThreadMgr, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, ITfThreadMgrEx,
+    ITfUIElementMgr, TfLayoutCode, GUID_COMPARTMENT_EMPTYCONTEXT,
+    GUID_COMPARTMENT_KEYBOARD_DISABLED, GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
+    TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
+    TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_TEXT, TF_PRESERVEDKEY, TF_TMF_IMMERSIVEMODE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
@@ -39,16 +44,30 @@ use crate::candidate_state::CandidateState;
 use crate::candidate_uielement::BehaviorAction;
 use crate::candidate_window::CandidateUI;
 use crate::edit_session::{
-    CancelComposition, CommitText, CommitUndoStart, QueryCaretRect, QueryInputScopes,
-    QueryMonitorAnchorRect, ReconvertCapture, ReconvertStart, RestoreText, StartOrUpdatePreedit,
+    classify_composition_end_error, CancelComposition, CommitText, CommitUndoStart,
+    CompositionEndStatus, EndCompositionOnly, FinishPredictionGhost, QueryCaretRect,
+    QueryInputScopes, QueryMonitorAnchorRect, ReconvertCapture, ReconvertStart, RestoreText,
+    StartPredictionGhost,
 };
-use crate::globals::{ComObjectGuard, GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_TARGET};
-use crate::input_state::InputState;
-use crate::input_state::InsertStyle;
+use crate::globals::{
+    ComObjectGuard, GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_PREDICTION,
+    GUID_DISPLAY_ATTRIBUTE_TARGET, GUID_DISPLAY_ATTRIBUTE_CONVERTED,
+};
+use crate::input_module::{
+    apply_presenter_candidate_selection, resolve_absolute_flat_candidate,
+    resolve_current_flat_candidate, CandidateEvent as ModuleCandidateEvent,
+    CandidateReplacement as ModuleCandidateReplacement, ImmediateOperation as ModuleOperation,
+    InputEvent as ModuleEvent, InputModule, KeyEvent as ModuleKeyEvent,
+    LifecycleEvent as ModuleLifecycleEvent, RequestId as ModuleRequestId,
+};
 use crate::input_state::is_fresh_live;
 use crate::input_state::preedit_after_candidates_closed;
+use crate::input_state::InsertStyle;
 use crate::input_state::ReconvertKind;
 use crate::llm_worker::{spawn_llm_worker, LlmOutcome, LlmSlot};
+use crate::prediction_worker::{
+    spawn_ipc_prediction_worker, warm_prediction_artifacts, IpcPredictionResult, PredictionSlot,
+};
 
 use ipc::client::EngineClient;
 use ipc::protocol::{Request, Response, PROTO_VERSION};
@@ -61,10 +80,240 @@ static NEXT_PIPE_SEQ: AtomicU32 = AtomicU32::new(0);
 /// デバウンス間隔（ms）。打鍵が落ち着いてから変換するまでの待ち。
 const DEBOUNCE_MS: u32 = 30;
 
+/// 部分確定後の preedit 張り直しが edit-session 拒否された場合の再試行上限。
+/// タイマは単発なので、永続拒否で 30ms ループを作らない範囲だけ再武装する。
+const PARTIAL_REDRAW_RETRY_MAX: u8 = 5;
+
+/// SetText 後の close-only 呼出し総数の上限（初回 EndComposition を含む）。
+/// TF_E_LOCKED/TF_E_SYNCHRONOUS が恒常的な context であっても、打鍵を無期限に
+/// 全消費する barrier へ退化させない。
+const COMPOSITION_END_RETRY_MAX: u8 = 3;
+
+#[derive(Default)]
+pub(crate) struct ShadowMismatchAggregate {
+    count: u32,
+    first_local_utf16: u32,
+    first_azookey_utf16: u32,
+    last_local_utf16: u32,
+    last_azookey_utf16: u32,
+}
+
+impl ShadowMismatchAggregate {
+    fn record(&mut self, local: &str, azookey: &str) -> bool {
+        if local == azookey {
+            return false;
+        }
+        let local_utf16 = u32::try_from(local.encode_utf16().count()).unwrap_or(u32::MAX);
+        let azookey_utf16 = u32::try_from(azookey.encode_utf16().count()).unwrap_or(u32::MAX);
+        if self.count == 0 {
+            self.first_local_utf16 = local_utf16;
+            self.first_azookey_utf16 = azookey_utf16;
+        }
+        self.count = self.count.saturating_add(1);
+        self.last_local_utf16 = local_utf16;
+        self.last_azookey_utf16 = azookey_utf16;
+        true
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        self.count != 0
+    }
+
+    fn flush_with(&mut self, write: impl FnOnce(&str)) {
+        if self.count == 0 {
+            return;
+        }
+        let event = format!(
+            "ev=local_kana_mismatch count={} first_local_utf16={} first_azookey_utf16={} last_local_utf16={} last_azookey_utf16={}",
+            self.count,
+            self.first_local_utf16,
+            self.first_azookey_utf16,
+            self.last_local_utf16,
+            self.last_azookey_utf16,
+        );
+        *self = Self::default();
+        write(&event);
+    }
+}
+
+pub(crate) fn observe_shadow_compare(
+    aggregate: &RefCell<ShadowMismatchAggregate>,
+    local: &str,
+    azookey: &str,
+) -> bool {
+    aggregate.borrow_mut().record(local, azookey);
+    deferred_work_pending(false, aggregate.borrow().has_pending())
+}
+
+fn deferred_work_pending(behavior_pending: bool, shadow_pending: bool) -> bool {
+    behavior_pending || shadow_pending
+}
+
+fn should_rearm_deferred_work(
+    in_operation: bool,
+    behavior_pending: bool,
+    shadow_pending: bool,
+) -> bool {
+    !in_operation && deferred_work_pending(behavior_pending, shadow_pending)
+}
+
+pub(crate) fn arm_deferred_work_timer(
+    timer: &Cell<usize>,
+    arm: bool,
+    set_timer: impl FnOnce() -> usize,
+) -> bool {
+    if !arm || timer.get() != 0 {
+        return false;
+    }
+    let id = set_timer();
+    if id == 0 {
+        return false;
+    }
+    timer.set(id);
+    true
+}
+
+/// 次の部分 preedit 再描画試行番号。None は上限到達（純関数＝単体テスト用）。
+fn next_partial_redraw_retry(current: u8) -> Option<u8> {
+    let next = current.saturating_add(1);
+    (next <= PARTIAL_REDRAW_RETRY_MAX).then_some(next)
+}
+
+fn prepare_debounce_redraw(redraw_pending: bool, redraw: impl FnOnce() -> bool) -> bool {
+    !redraw_pending || redraw()
+}
+
+/// 初回 EndComposition 失敗を 1 と数え、総呼出し上限まで追加 retry を許可する。
+fn next_composition_end_retry(current: u8) -> Option<u8> {
+    let next = current.saturating_add(1);
+    // `current` は既に実行済みの EndComposition 呼出し数。初回込み最大3回
+    // なので count=2 の失敗後には追加呼出しを作らない。
+    (next < COMPOSITION_END_RETRY_MAX).then_some(next)
+}
+
+/// TestKeyDown→KeyDown の物理イベント照合に使う軽量署名。
+///
+/// COM オブジェクトを強参照で保持すると context の lifecycle と相互参照しやすいため、
+/// context は IUnknown identity の raw address だけを持つ。署名には正規化前の VK と
+/// 正規化後の VK、lParam、修飾キーも含め、同じ VK の別イベントを予約として replay しない。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PendingEndKeySignature {
+    pub(crate) context_identity: usize,
+    pub(crate) raw_vk: u32,
+    pub(crate) normalized_vk: u32,
+    pub(crate) lparam: isize,
+    pub(crate) modifiers: u8,
+}
+
+impl PendingEndKeySignature {
+    pub(crate) fn from_context(
+        context: &ITfContext,
+        raw_vk: u32,
+        normalized_vk: u32,
+        lparam: isize,
+        modifiers: u8,
+    ) -> Option<Self> {
+        let identity = context.cast::<IUnknown>().ok()?.as_raw() as usize;
+        Some(Self {
+            context_identity: identity,
+            raw_vk,
+            normalized_vk,
+            lparam,
+            modifiers,
+        })
+    }
+
+    #[cfg(test)]
+    fn synthetic(
+        context_identity: usize,
+        raw_vk: u32,
+        normalized_vk: u32,
+        lparam: isize,
+        modifiers: u8,
+    ) -> Self {
+        Self {
+            context_identity,
+            raw_vk,
+            normalized_vk,
+            lparam,
+            modifiers,
+        }
+    }
+}
+
+/// OnTestKeyDown が TRUE を返した pending-end のキーを、一つだけ次の OnKeyDown
+/// と対応付ける状態。正規の TSF 契約は Test→Key の直列 pair であり、複数 outstanding は
+/// キュー化しない。lifecycle 境界で無効化されるため、将来の同じ VK を誤って食わない。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PendingEndKeyReservation {
+    reservation: Option<PendingEndKeyReservationEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingEndKeyReservationEntry {
+    signature: PendingEndKeySignature,
+    generation: u64,
+}
+
+impl PendingEndKeyReservation {
+    fn reserve(&mut self, signature: PendingEndKeySignature, generation: u64) -> bool {
+        if self.reservation.is_some() {
+            return false;
+        }
+        self.reservation = Some(PendingEndKeyReservationEntry {
+            signature,
+            generation,
+        });
+        true
+    }
+
+    fn is_stale(&self, generation: u64) -> bool {
+        self.reservation
+            .is_some_and(|entry| entry.generation != generation)
+    }
+
+    fn is_occupied(&self) -> bool {
+        self.reservation.is_some()
+    }
+
+    /// Test→Key pairの take は必ず slot を消費する。不一致や stale でも捨てることで、
+    /// 後続の同じ VK/password/direct 入力を旧予約が食うことを防ぐ。
+    fn take_if_matches(&mut self, signature: PendingEndKeySignature, generation: u64) -> bool {
+        let Some(entry) = self.reservation.take() else {
+            return false;
+        };
+        entry.generation == generation && entry.signature == signature
+    }
+
+    fn invalidate(&mut self) {
+        self.reservation = None;
+    }
+
+    #[cfg(test)]
+    fn signature(&self) -> Option<PendingEndKeySignature> {
+        self.reservation.map(|entry| entry.signature)
+    }
+
+    #[cfg(test)]
+    fn generation(&self) -> Option<u64> {
+        self.reservation.map(|entry| entry.generation)
+    }
+}
+
+/// OnTestKeyDown/OnKeyDown の予約判定。実際の reservation storage は
+/// `PendingEndKeyReservation` にあり、両 COM 入口と lifecycle 境界が同じ production
+/// methods を利用する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingEndTestDecision {
+    Reserve,
+    Busy,
+    Normal,
+}
+
 /// IPC 要求の op 別締め切り。超過すると request_within が TimedOut を返し、既存の劣化枝に合流する。
-const IPC_TIMEOUT_FAST: Duration = Duration::from_millis(250);    // Insert/Backspace/Commit/Start/EndSession
+const IPC_TIMEOUT_FAST: Duration = Duration::from_millis(250); // Insert/Backspace/Commit/Start/EndSession
 const IPC_TIMEOUT_CONVERT: Duration = Duration::from_millis(1200); // Convert/Reconvert（Zenzai 推論に余裕）
-const IPC_TIMEOUT_LIVE: Duration = Duration::from_millis(400);     // LiveConvert（debounce 済・遅ければ捨てる）
+const IPC_TIMEOUT_LIVE: Duration = Duration::from_millis(400); // LiveConvert（debounce 済・遅ければ捨てる）
 
 /// A' INV5: pending（未読応答を owe）になってからこの時間を超えても drain できなければ
 /// engine 真死とみなし drop_engine する（永久劣化の暴走ガード）。
@@ -99,7 +348,11 @@ fn should_log_slow(elapsed: Duration, tier: Duration) -> bool {
 /// スリープ復帰世代の刈り取り判定（純関数＝単体テスト用）。
 /// 戻り値: None=世代変化なし / Some(true)=復帰かつ idle → drop する / Some(false)=復帰だが busy → 温存。
 fn resume_poll_action(gen: u32, last: u32, busy: bool) -> Option<bool> {
-    if gen == last { None } else { Some(!busy) }
+    if gen == last {
+        None
+    } else {
+        Some(!busy)
+    }
 }
 
 /// cold start ②: Activate 時プリスポーンの判定（純関数＝単体テスト用）。
@@ -122,7 +375,10 @@ fn timed_request(
     let elapsed = start.elapsed();
     let ms = elapsed.as_millis();
     if should_log_slow(elapsed, tier) {
-        tip_log(&format!("ev=ipc_slow op={op} ms={ms} tier={}", tier.as_millis()));
+        tip_log(&format!(
+            "ev=ipc_slow op={op} ms={ms} tier={}",
+            tier.as_millis()
+        ));
     }
     if matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::TimedOut) {
         tip_log(&format!("ev=ipc_timeout op={op} ms={ms}"));
@@ -143,7 +399,10 @@ fn timed_request_keep(
     let elapsed = start.elapsed();
     let ms = elapsed.as_millis();
     if should_log_slow(elapsed, tier) {
-        tip_log(&format!("ev=ipc_slow op={op} ms={ms} tier={}", tier.as_millis()));
+        tip_log(&format!(
+            "ev=ipc_slow op={op} ms={ms} tier={}",
+            tier.as_millis()
+        ));
     }
     if matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::TimedOut) {
         tip_log(&format!("ev=ipc_timeout op={op} ms={ms}"));
@@ -159,18 +418,47 @@ fn timed_request_keep(
 /// 「1つ前の応答」を読む恒常 1-off desync になる。
 fn plan_start_session(result: std::io::Result<Response>) -> Option<i64> {
     match result {
-        Ok(Response::Session { session, proto: _ }) => Some(session),
+        Ok(Response::Session { session, .. }) => Some(session),
         _ => None,
     }
 }
 
-/// EndSession 応答を ack として受理してよいか決める純関数。false＝接続破棄（drop_engine）。
-/// Why not(`Ok(_)` を一律受理する — 従来形): protocol.rs は request-id 相関を持たず、正しさは
-/// 要求/応答の交互性だけに依存する。想定外の型を ack として飲むと交互性が崩れていても検出できない。
-/// 他の op（`plan_start_session` / `engine_backspace` / `engine_convert`）は全て「期待した型以外は
-/// 破棄」で揃っており、EndSession だけ緩いのが規律の穴だった。
-fn end_session_ack_accepted(result: &std::io::Result<Response>) -> bool {
-    matches!(result, Ok(Response::Ok))
+/// IPC failure diagnostics must describe only the response shape / I/O class. `Response` carries
+/// readings, candidates, committed text and predictions, so formatting it with `Debug` would put
+/// user input back into the log even when the caller's normal event is redacted.
+fn response_kind(response: &Response) -> &'static str {
+    match response {
+        Response::Pong => "pong",
+        Response::Session { .. } => "session",
+        Response::Reading { .. } => "reading",
+        Response::Candidates { .. } => "candidates",
+        Response::Committed { .. } => "committed",
+        Response::Ok => "ok",
+        Response::Error { .. } => "error",
+        Response::LiveResult { .. } => "live_result",
+        Response::SnapshotResult { .. } => "snapshot_result",
+        Response::SnapshotEnhancement { .. } => "snapshot_enhancement",
+        Response::SnapshotEnhancementPending { .. } => "snapshot_enhancement_pending",
+        Response::SnapshotEnhancementUnavailable { .. } => "snapshot_enhancement_unavailable",
+        Response::ClauseCandidatesResult { .. } => "clause_candidates_result",
+        Response::ConvertClausesResult { .. } => "convert_clauses_result",
+        Response::CommitReceiptAck { .. } => "commit_receipt_ack",
+        Response::LlmResult { .. } => "llm_result",
+        Response::Prediction { .. } => "prediction",
+        Response::PredictionUnavailable { .. } => "prediction_unavailable",
+        Response::ClauseView { .. } => "clause_view",
+        Response::ZenzaiStatus { .. } => "zenzai_status",
+    }
+}
+
+fn engine_failure_event(op: &str, result: &std::io::Result<Response>) -> String {
+    match result {
+        Ok(response) => format!(
+            "ev=engine_failure op={op} response={}",
+            response_kind(response)
+        ),
+        Err(error) => format!("ev=engine_failure op={op} io={:?}", error.kind()),
+    }
 }
 
 /// version handshake の判定（純関数）。StartSession 応答の proto（互換世代）から、この接続を
@@ -179,22 +467,16 @@ fn end_session_ack_accepted(result: &std::io::Result<Response>) -> bool {
 enum HandshakeAction {
     /// proto 一致。従来どおりセッションを採用する。
     Accept,
-    /// proto 不一致かつ未試行。graceful に旧エンジンを止めて新エンジンへ世代交代する。
-    ShutdownRespawn,
-    /// proto 不一致だが一度試行済み。接続を維持し現行 op 範囲で動作継続する（無限 shutdown ループ防止）。
-    DegradeKeep,
+    /// wire または boot identity 不一致。接続を保持せず fail-closed にする。
+    Reject,
 }
 
-/// proto=None は handshake 以前の旧エンジン。Some(PROTO_VERSION) 以外は全て不一致として扱う。
-fn decide_handshake(proto: Option<u32>, already_attempted: bool) -> HandshakeAction {
-    if proto == Some(PROTO_VERSION) {
+/// 欠落フィールドは handshake 以前の旧エンジン。両identityの完全一致だけを採用する。
+fn decide_handshake(proto: Option<u32>, boot: Option<&str>) -> HandshakeAction {
+    if proto == Some(PROTO_VERSION) && boot == Some(env!("CARGO_PKG_VERSION")) {
         HandshakeAction::Accept
-    } else if already_attempted {
-        // インストーラの停止失敗等で exe が古いままでも、接続を保って旧プロトコル範囲で動かし続ける。
-        // proto=None の旧エンジンは現行 op 全対応なので実害はない（Shutdown だけ未対応＝回収は installer）。
-        HandshakeAction::DegradeKeep
     } else {
-        HandshakeAction::ShutdownRespawn
+        HandshakeAction::Reject
     }
 }
 
@@ -202,7 +484,7 @@ fn decide_handshake(proto: Option<u32>, already_attempted: bool) -> HandshakeAct
 /// `api_key_plain` は DPAPI 復号済みの平文鍵（無ければ None）。
 /// LLM 無効時は LLM 系フィールドを空で送る（エンジンは非空チェックで disabled に落ちる＝H-1 と整合。
 /// resolve_env_map が enabled のときだけ LLM env を注入するのと同じ意味論）。zenzai_weight は
-/// 空なら送り、エンジン側が既定パス（exe 隣）を解決する。
+/// 空でもそのまま送り、エンジン側が per-user → exe 隣の順で解決する（3段表）。
 ///
 /// セキュリティ注記（fable レビュー #3・許容済トレードオフ）: 平文 API キーが常駐エンジンへの
 /// 名前付きパイプを流れる。パイプ DACL は AppContainer/LPAC SID にも接続を許すため、同一ユーザの
@@ -237,6 +519,7 @@ fn build_reload_config(
         llm_timeout_ms: s.llm.timeout_ms,
         zenzai_enabled: s.zenzai.enabled,
         zenzai_weight: s.zenzai.weight_path.clone(),
+        inline_prediction_enabled: s.inline_prediction.enabled,
         learning_enabled: s.learning.enabled,
         typo_learn_enabled: s.typo_correct.learn,
         // D6: 診断 env が既に居るときは None（push 抑止＝spawn/reload とも env が勝つ。
@@ -249,20 +532,189 @@ fn build_reload_config(
     }
 }
 
-/// キャレット矩形を `GetTextExt` で取得できないときの既定アンカー（スクリーン座標）。
-/// 候補窓・モード HUD ともこの座標へフォールバックする（旧 MVP の固定値と同一）。
-pub(crate) const DEFAULT_CARET_POS: crate::candidate_window::CaretAnchor =
-    crate::candidate_window::CaretAnchor { x: 200, y: 200, caret_top: None };
-
 thread_local! {
     /// デバウンスタイマ proc から現在の TextService を引くための生ポインタ（STA 単一スレッド）。
     static DEBOUNCE_TS: std::cell::Cell<*const TextService_Impl> =
         const { std::cell::Cell::new(std::ptr::null()) };
 }
 
+#[derive(Default)]
+struct TimerOwnerRegistry<T> {
+    owners: HashMap<usize, T>,
+}
+
+impl<T: Copy> TimerOwnerRegistry<T> {
+    fn insert(&mut self, id: usize, owner: T) {
+        self.owners.insert(id, owner);
+    }
+
+    fn remove(&mut self, id: usize) -> Option<T> {
+        self.owners.remove(&id)
+    }
+
+    fn get(&self, id: usize) -> Option<T> {
+        self.owners.get(&id).copied()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotStatusAction {
+    Configured {
+        schedule_conversion: bool,
+    },
+    Invalidated,
+    VersionMismatch {
+        actual: Option<u32>,
+        actual_boot: Option<String>,
+    },
+}
+
+fn snapshot_status_action(
+    status: crate::background_input::SnapshotStatus,
+    current_configuration: u64,
+    current_connection: u64,
+    composing: bool,
+) -> Option<SnapshotStatusAction> {
+    use crate::background_input::SnapshotStatus;
+
+    match status {
+        SnapshotStatus::Configured {
+            configuration_generation,
+            connection_epoch,
+            ..
+        } if configuration_generation == current_configuration
+            && connection_epoch == current_connection =>
+        {
+            Some(SnapshotStatusAction::Configured {
+                schedule_conversion: composing,
+            })
+        }
+        SnapshotStatus::Invalidated {
+            configuration_generation,
+            connection_epoch,
+        } if configuration_generation == current_configuration
+            && connection_epoch == current_connection =>
+        {
+            Some(SnapshotStatusAction::Invalidated)
+        }
+        SnapshotStatus::VersionMismatch {
+            configuration_generation,
+            connection_epoch,
+            actual,
+            actual_boot,
+        } if configuration_generation == current_configuration
+            && connection_epoch == current_connection =>
+        {
+            Some(SnapshotStatusAction::VersionMismatch {
+                actual,
+                actual_boot,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn snapshot_result_is_current(
+    identity: crate::input_module::SnapshotIdentity,
+    acknowledged_configuration: u64,
+    acknowledged_connection: u64,
+    current_connection: u64,
+) -> bool {
+    identity.configuration_generation == acknowledged_configuration
+        && identity.connection_generation == acknowledged_connection
+        && identity.connection_generation == current_connection
+}
+
+fn snapshot_configuration_is_acknowledged(
+    configuration: u64,
+    acknowledged_configuration: u64,
+    connection: u64,
+    acknowledged_connection: u64,
+) -> bool {
+    configuration == acknowledged_configuration
+        && connection == acknowledged_connection
+        && configuration != 0
+        && connection != 0
+}
+
+fn current_snapshot_configuration_is_represented(
+    current_configuration: u64,
+    desired_configuration: u64,
+) -> bool {
+    current_configuration != 0 && current_configuration == desired_configuration
+}
+
+thread_local! {
+    static LIVE_RESULT_OWNERS: RefCell<TimerOwnerRegistry<*const TextService_Impl>> =
+        RefCell::new(TimerOwnerRegistry::default());
+}
+const LIVE_RESULT_POLL_MS: u32 = 15;
+const SNAPSHOT_RECONNECT_POLL_MS: u32 = 250;
+const LIVE_RESULT_TIMEOUT: Duration = Duration::from_millis(2_000);
+const EXPLICIT_STATUS_DELAY: Duration = Duration::from_millis(500);
+const EXPLICIT_RECONNECTING_TEXT: &str = "変換エンジンに再接続中…";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotUiWaitState {
+    configuration_pending: bool,
+    live_result_deadline: Option<Instant>,
+    explicit_pending: bool,
+    explicit_status_deadline: Option<Instant>,
+    explicit_status_visible: bool,
+    version_mismatch: bool,
+}
+
+fn snapshot_ui_version_mismatch(mut state: SnapshotUiWaitState) -> SnapshotUiWaitState {
+    state.configuration_pending = false;
+    state.live_result_deadline = None;
+    state.explicit_pending = false;
+    state.explicit_status_deadline = None;
+    state.explicit_status_visible = false;
+    state.version_mismatch = true;
+    state
+}
+
+fn snapshot_ui_begin_configuration_change(mut state: SnapshotUiWaitState) -> SnapshotUiWaitState {
+    state.configuration_pending = false;
+    state.live_result_deadline = None;
+    state.version_mismatch = false;
+    state
+}
+
+fn should_show_explicit_status(
+    pending: bool,
+    visible: bool,
+    deadline: Option<Instant>,
+    now: Instant,
+    version_mismatch: bool,
+) -> bool {
+    !version_mismatch && pending && !visible && deadline.is_some_and(|deadline| now >= deadline)
+}
+
+fn snapshot_poll_interval(
+    has_live_result_deadline: bool,
+    configuration_pending: bool,
+    monitor_configured_link: bool,
+) -> Option<u32> {
+    if has_live_result_deadline {
+        Some(LIVE_RESULT_POLL_MS)
+    } else if configuration_pending || monitor_configured_link {
+        Some(SNAPSHOT_RECONNECT_POLL_MS)
+    } else {
+        None
+    }
+}
+
 thread_local! {
     /// LLM ポーリングタイマ proc から TextService を引くための生ポインタ（STA 単一スレッド）。
     static LLM_TS: std::cell::Cell<*const TextService_Impl> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+thread_local! {
+    /// UIバグ4: RefreshAnchorOnLayout（非同期 edit session）の DoEditSession から
+    /// TextService を引くための生ポインタ（STA 単一スレッド）。Activate で set、Drop で null。
+    static LAYOUT_TS: std::cell::Cell<*const TextService_Impl> =
         const { std::cell::Cell::new(std::ptr::null()) };
 }
 /// LLM 結果ポーリング間隔（ms）。数秒の処理に対し十分細かい。
@@ -290,6 +742,54 @@ thread_local! {
         const { std::cell::Cell::new(std::ptr::null()) };
 }
 
+thread_local! {
+    /// 巡3 Z4: ReloadConfig busy 再送タイマ proc から TextService を引くための生ポインタ
+    /// （STA 単一スレッド。llm_poll と同じ規律 — Drop で null 化）。
+    static RELOAD_RETRY_TS: std::cell::Cell<*const TextService_Impl> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+thread_local! {
+    /// 予測 composition 終了の bounded retry 用。Activate–Deactivate 間の STA だけで有効。
+    static PREDICTION_RETRY_TS: std::cell::Cell<*const TextService_Impl> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+thread_local! {
+    /// 予測 debounce／結果ポーリング用。Activate–Deactivate 間の STA だけで有効。
+    static PREDICTION_POLL_TS: std::cell::Cell<*const TextService_Impl> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+const PREDICTION_RETRY_MS: u32 = 50;
+const PREDICTION_RETRY_MAX: u8 = 8;
+const PREDICTION_DEBOUNCE_MS: u32 = 300;
+
+fn consume_expected_prediction_commit_end_edit(
+    deadline: &Cell<Option<Instant>>,
+    selection_changed: bool,
+    now: Instant,
+) -> bool {
+    deadline
+        .replace(None)
+        .is_some_and(|deadline| !selection_changed && now <= deadline)
+}
+const PREDICTION_POLL_MS: u32 = 15;
+const PREDICTION_TIMEOUT: Duration = Duration::from_millis(400);
+
+fn prediction_slot_available(physical_composition: bool, finish_pending: bool) -> bool {
+    !physical_composition && !finish_pending
+}
+
+fn prediction_mode_allows_display(direct: bool, ephemeral: bool) -> bool {
+    !direct && !ephemeral
+}
+
+pub(crate) struct DeferredPredictionPreservedKey {
+    pub(crate) context: Option<ITfContext>,
+    pub(crate) guid: GUID,
+}
+
 #[implement(
     ITfTextInputProcessorEx,
     ITfKeyEventSink,
@@ -297,11 +797,21 @@ thread_local! {
     ITfCompositionSink,
     ITfThreadMgrEventSink,
     ITfThreadFocusSink,
-    ITfFnConfigure
+    ITfFnConfigure,
+    ITfTextLayoutSink,
+    ITfTextEditSink,
+    ITfMouseSink
 )]
 pub struct TextService {
     pub(crate) tid: Cell<u32>,
     pub(crate) thread_mgr: RefCell<Option<ITfThreadMgr>>,
+    /// Deactivate 実行中（本体内の COM コールアウトを含む全区間）を示すフラグ。RAII ガード
+    /// （DeactivatingGuard）が Deactivate 入口で true にし、return・panic unwind を含む全出口で
+    /// false に戻す。この間の同期再入 Activate（RemoveItem 等のコールアウト中にホストが呼び
+    /// うる）は即 Err で拒否する — 受け入れると外側 Deactivate の後続清算が新しい世代の登録
+    /// （key sink/PreservedKey/langbar）を道連れに消す「活性化済みなのに登録が無い幽霊状態」を
+    /// 作る（Medium fix）。ネスト Deactivate もこのフラグで弾き二重清算を防ぐ。
+    pub(crate) deactivating: Cell<bool>,
     /// ITfThreadMgrEventSink を AdviseSink した cookie（0=未登録）。Deactivate で UnadviseSink する。
     /// スレッド内 doc フォーカス変化（別ウィンドウ切替）を OnSetFocus で捕捉し、ホストが
     /// OnCompositionTerminated を呼ばずに合成を確定/破棄しても、エンジンセッションの読み残留を防ぐ。
@@ -310,13 +820,111 @@ pub struct TextService {
     /// クロスプロセス（別アプリへ前面が移る）でのフォーカス喪失は ITfThreadMgrEventSink::OnSetFocus
     /// では届かないため、前面（スレッド）喪失を OnKillThreadFocus で捕捉して同じ放棄リセットを焚く。
     pub(crate) thread_focus_cookie: Cell<u32>,
+    /// UIバグ4: フォーカス context へ AdviseSink した `ITfTextLayoutSink` の cookie（0=未登録）。
+    /// スクロール/リフローで OnLayoutChange が届き、表示中の候補窓・読みモニタを追従させる。
+    /// advise 先 context を併せて保持し、フォーカス移動（OnSetFocus/OnPush/OnPopContext）で
+    /// 対称的に unadvise→advise し直す。Deactivate で掃討する。
+    pub(crate) layout_sink_cookie: Cell<u32>,
+    /// フォーカス context の選択・本文変更を監視し、ゴーストを stale 化する edit sink。
+    pub(crate) text_edit_sink_cookie: Cell<u32>,
+    pub(crate) layout_sink_ctx: RefCell<Option<ITfContext>>,
+    /// OnLayoutChange 連発（スクロール中）を 1 本の非同期再照会セッションにまとめるフラグ。
+    /// RefreshAnchorOnLayout::DoEditSession → layout_refresh_apply で解除する。
+    pub(crate) layout_refresh_pending: Cell<bool>,
+    /// レイアウト再照会セッションの世代（巡2 E1/E3/E4）。RefreshAnchorOnLayout は
+    /// TF_ES_ASYNC で旧 context を保持したまま遅延実行されるため、投入後に Activate/
+    /// Deactivate/context 貼替が起きたセッションの結果は現在の表示を汚してはならない。
+    /// セッション投入時にこの世代を埋め込み、layout_refresh_apply 側で一致したときだけ
+    /// 座標を適用する（不一致は pending 解除のみで座標破棄）。
+    pub(crate) layout_sink_gen: Cell<u64>,
+    /// 巡3 Z4: ReloadConfig busy 再送の試行回数とタイマID（上限付き bounded retry）。
+    pub(crate) reload_retry_count: Cell<u32>,
+    pub(crate) reload_retry_timer: Cell<usize>,
+    /// 巡4 T1: 遅延 flush タイマの ID（0=未武装）。多重武装の防止と proc 側の照合に使う。
+    pub(crate) behavior_flush_timer: Cell<usize>,
+    /// 自分を包む `TextService_Impl` への自己ポインタ（Activate で設定）。Drop は outer 型
+    /// （&mut TextService）から Impl へ橋渡しできないため、TLS の所有権比較（巡2 E2）は
+    /// このフィールド経由で行う。STA 専用なので !Send で問題ない。
+    pub(crate) impl_ptr: Cell<*const TextService_Impl>,
     pub(crate) client: RefCell<Option<EngineClient>>,
+    /// UI スレッドが現在所有する client の世代。None は接続無しか LLM worker 所有中。
+    pub(crate) client_generation: Cell<Option<u64>>,
+    /// 新しい pipe 接続ごとに進める単調世代。古い LLM lease と新接続を区別する。
+    pub(crate) next_client_generation: Cell<u64>,
     pub(crate) engine_session: Cell<i64>,
-    /// engine_end_session を呼んだとき client が LLM ワーカへ move 済みで EndSession を送れなかった
-    /// セッション id を保留する。client 復帰時(on_llm_outcome)に送って engine 側の取り残しを防ぐ。
-    pub(crate) pending_end_session: Cell<i64>,
-    pub(crate) state: RefCell<InputState>,
+    pub(crate) state: RefCell<InputModule>,
+    /// 通常打鍵のIPCだけを所有するbounded worker。STA側の変換sessionとは共有しない。
+    pub(crate) background_input: crate::background_input::BackgroundInputWorker,
+    pub(crate) configuration_generation: Cell<u64>,
+    pub(crate) acknowledged_configuration_generation: Cell<u64>,
+    pub(crate) acknowledged_snapshot_connection_generation: Cell<u64>,
+    pub(crate) snapshot_configuration_pending: Cell<bool>,
+    pub(crate) snapshot_version_mismatch: Cell<bool>,
+    pub(crate) live_result_timer: Cell<usize>,
+    pub(crate) snapshot_poll_interval_ms: Cell<u32>,
+    pub(crate) live_result_deadline: Cell<Option<Instant>>,
+    pub(crate) explicit_snapshot_pending: Cell<bool>,
+    pub(crate) explicit_status_deadline: Cell<Option<Instant>>,
+    pub(crate) explicit_status_visible: Cell<bool>,
+    pub(crate) explicit_snapshot_candidates_active: Cell<bool>,
+    pub(crate) explicit_snapshot_candidate_remaining: RefCell<Vec<String>>,
+    /// A reset clears the next composition's input, not diagnostics already scheduled for flush.
+    shadow_mismatches: RefCell<ShadowMismatchAggregate>,
     pub(crate) composition: Rc<RefCell<Option<ITfComposition>>>,
+    /// 通常 preedit と直交するインライン予測専用 composition。
+    pub(crate) prediction_composition: Rc<RefCell<Option<ITfComposition>>>,
+    pub(crate) prediction_context: Rc<RefCell<Option<ITfContext>>>,
+    pub(crate) prediction_editing: Rc<Cell<bool>>,
+    pub(crate) prediction_state: RefCell<crate::prediction_state::PredictionState>,
+    pub(crate) prediction_enabled: Cell<bool>,
+    pub(crate) prediction_commit_suppressed: Cell<bool>,
+    /// The host may deliver the `OnEndEdit` for an explicit IME commit after the
+    /// commit callback returns (VS Code does this). Consume that one expected edit
+    /// instead of treating the text we just committed as a later external edit.
+    pub(crate) prediction_commit_edit_deadline: Cell<Option<Instant>>,
+    pub(crate) prediction_poll_timer: Cell<usize>,
+    pub(crate) prediction_slot: RefCell<Option<Arc<PredictionSlot>>>,
+    pub(crate) prediction_failed_context: Rc<RefCell<Option<ITfContext>>>,
+    /// Some(accept) は終了 edit session の実行待ち／再試行待ち。
+    pub(crate) prediction_finish_pending: Rc<Cell<Option<bool>>>,
+    prediction_preserve_selection: Cell<bool>,
+    pub(crate) prediction_retry_timer: Cell<usize>,
+    pub(crate) prediction_retry_count: Cell<u8>,
+    pub(crate) prediction_deferred_preserved: RefCell<VecDeque<DeferredPredictionPreservedKey>>,
+    pub(crate) prediction_anchor_gen: Cell<u64>,
+    /// CommitText の SetText 成功後に EndComposition だけが失敗した状態。true の間も
+    /// composition handle を保持し、本文へ再度触れない close-only edit session で再試行する。
+    pub(crate) composition_end_pending: Rc<Cell<bool>>,
+    /// pending composition を所有する context。通常の current_context と分離し、focus 移動や
+    /// 次打鍵で current が変わっても元 context の edit session で close-only を実行する。
+    /// ただし terminal/focus/context 境界では bounded liveness のため即座に捨てる。
+    pub(crate) composition_end_context: Rc<RefCell<Option<ITfContext>>>,
+    /// close-only の最新試行状態。`Retryable` だけを bounded retry へ進める。
+    pub(crate) composition_end_status: Rc<Cell<CompositionEndStatus>>,
+    /// close-only の試行回数（初回 EndComposition 失敗を 1 とする）。
+    pub(crate) composition_end_retry_count: Rc<Cell<u8>>,
+    /// composition lifecycle の世代。focus/pop で pending を捨てた後に届く古い
+    /// callback は identity とこの世代境界で無害化する。
+    pub(crate) composition_generation: Cell<u64>,
+    pub(crate) preedit_apply: Rc<PreeditApply>,
+    pub(crate) pending_end_generation: Cell<u64>,
+    /// Test→Key pair だけの世代。composition_generation とは独立で、pending close の
+    /// 成功/callback/quarantine では進めず pair を維持し、focus/context/activation 境界
+    /// では進めて reservation を無効化する。
+    pub(crate) key_pair_generation: Cell<u64>,
+    /// `StartComposition` 成功を edit session から同期再入入口へ伝える one-shot signal。
+    /// StartComposition 後の COM callout 中に OnTest/OnKey が再入しても、caller が戻る前に
+    /// stale な Test→Key pair を無効化できる。STA 契約上、別の StartComposition はこの
+    /// signal を caller が consume する前に nested にはならないため、bool で十分とする。
+    pub(crate) composition_started_signal: Rc<Cell<bool>>,
+    /// OnTestKeyDown が pending close の回収用として TRUE を返した物理イベントの one-shot
+    /// reservation。composition/context の lifecycle と分離して保持する。
+    pub(crate) pending_end_test_reservation: RefCell<PendingEndKeyReservation>,
+    /// 部分確定の SetText 後、旧 composition の EndComposition だけが保留されて残り読みを
+    /// まだ新しい preedit として張れていない状態。close 完了後の STA 安全点で一度だけ再描画する。
+    pub(crate) partial_preedit_redraw_pending: Cell<bool>,
+    /// 上記再描画の単発タイマ再試行回数。永続 edit-session 拒否時の無限ループを防ぐ。
+    pub(crate) partial_preedit_redraw_retries: Cell<u8>,
     /// U9: composition 開始時に捕捉した左文脈（サニタイズ済・最大40字）。
     /// StartOrUpdatePreedit / ReconvertStart が**成否によらず必ず上書き**し、変換系
     /// リクエスト（Convert/LiveConvert/LlmConvert/Reconvert）へ載せる。合成終了経路
@@ -326,13 +934,36 @@ pub struct TextService {
     pub(crate) da_atom: Cell<u32>,
     /// 文節ナビゲーションの選択文節（太下線）用の表示属性 atom（0=未登録）。
     pub(crate) da_target_atom: Cell<u32>,
+    pub(crate) da_converted_atom: Cell<u32>,
+    pub(crate) display_end_context: RefCell<Option<ITfContext>>,
+    /// インライン予測ゴースト属性 atom（0=未登録）。
+    pub(crate) da_prediction_atom: Cell<u32>,
     pub(crate) showing: Cell<bool>,
+    pub(crate) local_clauses: RefCell<Option<crate::clause_conversion::ClauseConversion>>,
+    pub(crate) local_clause_redraw_pending: Cell<bool>,
+    pub(crate) local_clause_redraw_deadline: Cell<Option<Instant>>,
+    pub(crate) conversion_queue: RefCell<crate::conversion_queue::ConversionQueue>,
+    pub(crate) conversion_queue_context: RefCell<Option<ITfContext>>,
+    pub(crate) replaying_conversion_queue: Cell<bool>,
+    pub(crate) pending_commit: RefCell<Option<Rc<crate::pending_commit::PendingCommit>>>,
+    pub(crate) composition_end_caret:
+        Rc<RefCell<Option<windows::Win32::UI::TextServices::ITfRange>>>,
+    pub(crate) composition_end_epoch: Rc<Cell<u64>>,
+    pub(crate) composition_end_report: RefCell<Option<Rc<crate::apply_state::ApplyState>>>,
+    #[cfg(feature = "tsf-test-hooks")]
+    pub(crate) commit_fail_attributes: Rc<Cell<bool>>,
+    pub(crate) clause_worker: crate::clause_worker::ClauseWorker,
+    pub(crate) receipt_outbox: RefCell<Option<crate::receipt_outbox::ReceiptOutbox>>,
     /// 文節ナビゲーション（変換中の←/→）のビュー。Some=文節モード中（不変条件:
     /// Some ⇒ showing。候補窓を閉じる/確定する全経路が clear_clause_nav で None に落とす）。
     /// segments の連結が preedit 全体、selected が太下線を引く文節。候補列そのものは
     /// 従来どおり cand_state が唯一の真実源（文節モード中は「選択文節の候補」が入る）。
     pub(crate) clause_nav: RefCell<Option<ClauseNav>>,
     pub(crate) candidate_ui: RefCell<CandidatePresenter>,
+    /// 直近に GetTextExt で取れた有効キャレットアンカー。照会失敗（レイアウト未確定等）
+    /// のフォールバック先として使い、失敗のたび無害位置へ跳ねるちらつきを防ぐ
+    /// （UIバグ5）。フォーカス切替でクリア — 別 context の座標は無意味なため。
+    pub(crate) last_valid_anchor: RefCell<Option<crate::candidate_window::CaretAnchor>>,
     /// SP6a: presenter / UIElement と共有する候補状態（GetCount/GetString 等の読み元）。
     /// TextService も co-owner として保持し、drain_behavior の Finalize で
     /// 選択中候補（Behavior::SetSelection が更新する唯一の真実源）を読む。
@@ -349,10 +980,8 @@ pub struct TextService {
     /// 起こさず保留→安全点で flush させる門（純粋ロジック＝単体テスト可能）。
     pub(crate) reentrancy: ReentrancyGate,
     pub(crate) last_reading: RefCell<String>,
-    /// 読みキャッシュ: 自動確定(live_auto)で消費された読みの累積。accumulate ON のとき
-    /// モニタは「これ + last_reading」を表示する。リセットは composition 完全終了の全経路
-    /// + PartialReseed(U9 左文脈クリアと同じ規律)。候補窓の開閉では消さない —
-    /// Space→候補→Esc で合成へ戻ったとき累積表示を復元するため。
+    /// 読みモニタの確定済みprefix枠。非同期変換結果を本文へ反映しない現行段階では空のまま保持し、
+    /// composition終了境界でクリアする。
     pub(crate) monitor_committed_reading: RefCell<String>,
     /// 現在のライブ変換結果（preedit に出している漢字かな交じり文）。Enter で確定する文字列。
     pub(crate) live_text: RefCell<String>,
@@ -360,6 +989,7 @@ pub struct TextService {
     pub(crate) debounce_timer: Cell<usize>,
     /// 遅延 convert 時に edit session を張るための直近 ITfContext。
     pub(crate) current_context: RefCell<Option<ITfContext>>,
+    pub(crate) clause_mouse: RefCell<Option<(ITfMouseTracker, u32, ITfComposition, Rc<Cell<bool>>)>>,
     /// このインスタンス専用エンジンのパイプ名（初回に生成して固定）。
     pub(crate) pipe_name: RefCell<String>,
     /// この活性化中にエンジン起動を既に試みたか（連打での多重起動を防ぐ）。
@@ -369,9 +999,6 @@ pub struct TextService {
     /// DPAPI 復号＋失敗 CreateProcess を払い続けないための最小ガード。ensure_engine の
     /// spawn 経路（spawn_attempted＋バックオフ）には影響しない。
     pub(crate) prespawn_failed: Cell<bool>,
-    /// version handshake: proto 不一致で一度 graceful 世代交代（Shutdown→respawn）を試したか。
-    /// 試行済みで再び不一致なら DegradeKeep に落として無限 shutdown ループを防ぐ。Accept でリセット。
-    pub(crate) handshake_shutdown_attempted: Cell<bool>,
     /// A7: engine 再接続フルコースの失敗間隔を制御し、キースレッドが死んだ／半死の engine を
     /// 連打で叩き続けないためのバックオフゲート。クールダウン中は一発プローブのみ許し、
     /// session 確立失敗（半死）検出後はプローブも満了まで停止する（ensure_engine が消費）。
@@ -415,7 +1042,14 @@ pub struct TextService {
     /// SP7: default_direct を「このインスタンスで1度だけ」適用したか。
     /// 真にしたら Deactivate でもリセットしない＝IME 切替往復後の再 Activate で
     /// ユーザの手動トグル（無変換）を巻き戻さない（spec §3.3「以後の手動トグルを尊重」）。
+    /// 適用に失敗した Activate では false のまま＝次回 Activate で再試行する
+    /// （「1度だけ」は apply_default_direct が成功した時点で確定する）。
     pub(crate) default_direct_applied: Cell<bool>,
+    /// TIP が conversion-mode の真実を所有しているか。default_direct 適用・トグル・
+    /// ephemeral のあと true。true のとき `is_direct_mode` は compartment ではなく
+    /// `langbar_is_direct` を読む（Activate 後のホスト上書きで表示A・入力あ にしない）。
+    /// Deactivate ではリセットしない（`default_direct_applied` と同じワンショット契約）。
+    pub(crate) direct_mode_owned: Cell<bool>,
     /// SP5/US: 言語バーの あ/A モードインジケータと共有する「現在モード」フラグ（true=半角英数=A）。
     /// toggle_conversion_mode / apply_default_direct が更新し、ModeLangBarItem の GetText が読む。
     pub(crate) langbar_is_direct: Rc<Cell<bool>>,
@@ -465,8 +1099,8 @@ pub struct TextService {
     /// None=owe 無し。Some(t)=t 時点で pending 化。INV5: pending 化から `PENDING_MAX` を超えても
     /// drain できなければ engine 真死とみなし drop_engine する（永久劣化の暴走ガード）。
     pub(crate) pending_since: Cell<Option<std::time::Instant>>,
-    /// 品質ループ③: 直前確定 1 件のバッファ。commit_and_reset / apply_commit_plan /
-    /// apply_live_auto_commit が**クリア前に**保存し、Ctrl+変換（OnPreservedKey Feedback）が
+    /// 品質ループ③: 直前確定 1 件のバッファ。commit_and_reset / apply_commit_plan が
+    /// **クリア前に**保存し、Ctrl+変換（OnPreservedKey Feedback）が
     /// 消費して feedback.jsonl へ書く。shift_latin の直接確定（読み無し）は対象外。
     /// F-5 改定（確定取消）: 保存条件は `feedback_enabled || arms_undo(source)` へ拡大済み
     /// （常時保存ではない — remember_last_commit 参照）。
@@ -523,6 +1157,35 @@ pub struct TextService {
 }
 
 impl TextService {
+    /// AdviseSink 済みの `ITfTextLayoutSink` を解除する。outer 型（TextService）側のメソッド
+    /// にしているのは、Drop からも呼ぶため（巡2 F5 — Deactivate を経ない解放での cookie
+    /// 残り防止）。Impl 側からは Deref でここへ届く。
+    pub(crate) fn unadvise_layout_sink(&self) {
+        let layout_cookie = self.layout_sink_cookie.get();
+        let edit_cookie = self.text_edit_sink_cookie.get();
+        if layout_cookie == 0 && edit_cookie == 0 {
+            return;
+        }
+        // 巡4 T6: if let scrutinee の一時 Ref はブロック末尾まで延命されるため先に束縛 —
+        // UnadviseSink コールアウト中に再入した borrow_mut()（context 貼替え等）との衝突を防ぐ。
+        let ctx = self.layout_sink_ctx.borrow().clone();
+        if let Some(ctx) = ctx {
+            if let Ok(source) = ctx.cast::<ITfSource>() {
+                unsafe {
+                    if layout_cookie != 0 {
+                        let _ = source.UnadviseSink(layout_cookie);
+                    }
+                    if edit_cookie != 0 {
+                        let _ = source.UnadviseSink(edit_cookie);
+                    }
+                }
+            }
+        }
+        self.layout_sink_cookie.set(0);
+        self.text_edit_sink_cookie.set(0);
+        *self.layout_sink_ctx.borrow_mut() = None;
+    }
+
     pub fn new() -> Self {
         // DLL の生存参照は `_guard`（ComObjectGuard）が生成で +1 / Drop で -1 する。
         // DllCanUnloadNow はこのカウントが 0 のときだけ S_OK を返す。これを怠ると活性中の
@@ -546,18 +1209,95 @@ impl TextService {
         Self {
             tid: Cell::new(0),
             thread_mgr: RefCell::new(None),
+            deactivating: Cell::new(false),
             thread_mgr_event_cookie: Cell::new(0),
             thread_focus_cookie: Cell::new(0),
+            layout_sink_cookie: Cell::new(0),
+            text_edit_sink_cookie: Cell::new(0),
+            layout_sink_ctx: RefCell::new(None),
+            layout_refresh_pending: Cell::new(false),
+            layout_sink_gen: Cell::new(0),
+            reload_retry_count: Cell::new(0),
+            reload_retry_timer: Cell::new(0),
+            behavior_flush_timer: Cell::new(0),
+            impl_ptr: Cell::new(std::ptr::null()),
             client: RefCell::new(None),
+            client_generation: Cell::new(None),
+            next_client_generation: Cell::new(0),
             engine_session: Cell::new(0),
-            pending_end_session: Cell::new(0),
-            state: RefCell::new(InputState::default()),
+            state: RefCell::new(InputModule::default()),
+            background_input: crate::background_input::BackgroundInputWorker::start(
+                crate::engine_link::stable_pipe_name(),
+                64,
+            ),
+            configuration_generation: Cell::new(1),
+            acknowledged_configuration_generation: Cell::new(0),
+            acknowledged_snapshot_connection_generation: Cell::new(0),
+            snapshot_configuration_pending: Cell::new(false),
+            snapshot_version_mismatch: Cell::new(false),
+            live_result_timer: Cell::new(0),
+            snapshot_poll_interval_ms: Cell::new(0),
+            live_result_deadline: Cell::new(None),
+            explicit_snapshot_pending: Cell::new(false),
+            explicit_status_deadline: Cell::new(None),
+            explicit_status_visible: Cell::new(false),
+            explicit_snapshot_candidates_active: Cell::new(false),
+            explicit_snapshot_candidate_remaining: RefCell::new(Vec::new()),
+            shadow_mismatches: RefCell::new(ShadowMismatchAggregate::default()),
             composition: Rc::new(RefCell::new(None)),
+            prediction_composition: Rc::new(RefCell::new(None)),
+            prediction_context: Rc::new(RefCell::new(None)),
+            prediction_editing: Rc::new(Cell::new(false)),
+            prediction_state: RefCell::new(crate::prediction_state::PredictionState::default()),
+            prediction_enabled: Cell::new(false),
+            prediction_commit_suppressed: Cell::new(false),
+            prediction_commit_edit_deadline: Cell::new(None),
+            prediction_poll_timer: Cell::new(0),
+            prediction_slot: RefCell::new(None),
+            prediction_failed_context: Rc::new(RefCell::new(None)),
+            prediction_finish_pending: Rc::new(Cell::new(None)),
+            prediction_preserve_selection: Cell::new(false),
+            prediction_retry_timer: Cell::new(0),
+            prediction_retry_count: Cell::new(0),
+            prediction_deferred_preserved: RefCell::new(VecDeque::new()),
+            prediction_anchor_gen: Cell::new(0),
+            composition_end_pending: Rc::new(Cell::new(false)),
+            composition_end_context: Rc::new(RefCell::new(None)),
+            composition_end_status: Rc::new(Cell::new(CompositionEndStatus::Idle)),
+            composition_end_retry_count: Rc::new(Cell::new(0)),
+            composition_generation: Cell::new(0),
+            preedit_apply: Rc::new(PreeditApply::default()),
+            pending_end_generation: Cell::new(0),
+            key_pair_generation: Cell::new(0),
+            composition_started_signal: Rc::new(Cell::new(false)),
+            pending_end_test_reservation: RefCell::new(PendingEndKeyReservation::default()),
+            partial_preedit_redraw_pending: Cell::new(false),
+            partial_preedit_redraw_retries: Cell::new(0),
             left_context: Rc::new(RefCell::new(None)),
             da_atom: Cell::new(0),
             da_target_atom: Cell::new(0),
+            da_converted_atom: Cell::new(0),
+            display_end_context: RefCell::new(None),
+            da_prediction_atom: Cell::new(0),
             showing: Cell::new(false),
+            local_clauses: RefCell::new(None),
+            local_clause_redraw_pending: Cell::new(false),
+            local_clause_redraw_deadline: Cell::new(None),
+            conversion_queue: RefCell::new(crate::conversion_queue::ConversionQueue::default()),
+            conversion_queue_context: RefCell::new(None),
+            replaying_conversion_queue: Cell::new(false),
+            pending_commit: RefCell::new(None),
+            composition_end_caret: Rc::new(RefCell::new(None)),
+            composition_end_epoch: Rc::new(Cell::new(0)),
+            composition_end_report: RefCell::new(None),
+            #[cfg(feature = "tsf-test-hooks")]
+            commit_fail_attributes: Rc::new(Cell::new(false)),
+            clause_worker: crate::clause_worker::ClauseWorker::start(
+                crate::engine_link::stable_pipe_name(),
+            ),
+            receipt_outbox: RefCell::new(None),
             clause_nav: RefCell::new(None),
+            last_valid_anchor: RefCell::new(None),
             candidate_ui,
             cand_state,
             behavior_outbox,
@@ -568,10 +1308,10 @@ impl TextService {
             live_text: RefCell::new(String::new()),
             debounce_timer: Cell::new(0),
             current_context: RefCell::new(None),
+            clause_mouse: RefCell::new(None),
             pipe_name: RefCell::new(String::new()),
             spawn_attempted: Cell::new(false),
             prespawn_failed: Cell::new(false),
-            handshake_shutdown_attempted: Cell::new(false),
             reconnect_backoff: RefCell::new(crate::engine_link::ReconnectBackoff::new()),
             engine_child: RefCell::new(None),
             llm_poll_timer: Cell::new(0),
@@ -586,13 +1326,16 @@ impl TextService {
             llm_enabled: Cell::new(false),
             typo_enabled: Cell::new(false),
             default_direct_applied: Cell::new(false),
+            direct_mode_owned: Cell::new(false),
             langbar_is_direct: Rc::new(Cell::new(false)),
             langbar_ephemeral: Rc::new(Cell::new(false)),
             langbar_sink: Rc::new(RefCell::new(None)),
             langbar_item: RefCell::new(None),
             langbar_on_toggle: Rc::new(RefCell::new(None)),
             mode_hud: std::cell::RefCell::new(crate::mode_hud::ModeHud::empty()),
-            reading_monitor: std::cell::RefCell::new(crate::reading_monitor::ReadingMonitor::empty()),
+            reading_monitor: std::cell::RefCell::new(
+                crate::reading_monitor::ReadingMonitor::empty(),
+            ),
             appearance: RefCell::new(crate::theme::AppearanceSource::new()),
             last_mode_toggle: Cell::new(None),
             password_ctx: Cell::new(false),
@@ -623,6 +1366,36 @@ impl TextService {
 
 impl ITfTextInputProcessor_Impl for TextService_Impl {
     fn Activate(&self, ptim: Ref<'_, ITfThreadMgr>, tid: u32) -> Result<()> {
+        // Medium fix: Deactivate 実行中の同期再入 Activate を最初に弾く。このチェックは
+        // tid/thread_mgr のセットを含む「一切の状態変更・登録」より前になければならない —
+        // RemoveItem 等の清算コールアウト中に Activate が混入すると、作られた新しい登録世代を
+        // 外側 Deactivate の後続清算が道連れに消す。ホストは Deactivate 完了後に改めて
+        // Activate すればよい（フラグは Deactivate の全出口で RAII 的に外れる）。
+        if self.deactivating.get() {
+            tip_log("ev=activate_rejected reason=deactivating");
+            return Err(E_FAIL.into());
+        }
+        // A rejected terminal edit must be resolved before a new activation
+        // can reuse its composition slot. No subscriptions exist during retry.
+        if self.thread_mgr.borrow().is_none()
+            && (self.composition.borrow().is_some() || self.prediction_ghost_visible())
+        {
+            let composition = self.composition.borrow().clone();
+            *self.current_context.borrow_mut() =
+                composition.as_ref().and_then(|composition| unsafe {
+                    composition
+                        .GetRange()
+                        .and_then(|range| range.GetContext())
+                        .ok()
+                });
+            self.tid.set(tid);
+            let _guard = DeactivatingGuard::new(&self.deactivating);
+            self.deactivate_inner()?;
+        }
+        self.consume_started_composition();
+        // Activation is a new key lifecycle.  A reservation from a previous activation must
+        // never be replayed into the new context, even if the host reuses the same VK.
+        self.invalidate_pending_end_test_reservation();
         // 1) tid とスレッドマネージャを保持する。
         let tm: ITfThreadMgr = ptim.ok()?.clone();
         self.tid.set(tid);
@@ -636,7 +1409,8 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             if let Ok(flags) = unsafe { ex.GetActiveFlags() } {
                 tip_log(&format!(
                     "ev=activate_flags raw=0x{:08X} immersive={}",
-                    flags, flags & TF_TMF_IMMERSIVEMODE != 0
+                    flags,
+                    flags & TF_TMF_IMMERSIVEMODE != 0
                 ));
             }
         }
@@ -661,7 +1435,8 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         if self.thread_mgr_event_cookie.get() == 0 {
             if let Ok(source) = tm.cast::<ITfSource>() {
                 let tmes: ITfThreadMgrEventSink = self.to_interface();
-                if let Ok(cookie) = unsafe { source.AdviseSink(&ITfThreadMgrEventSink::IID, &tmes) } {
+                if let Ok(cookie) = unsafe { source.AdviseSink(&ITfThreadMgrEventSink::IID, &tmes) }
+                {
                     self.thread_mgr_event_cookie.set(cookie);
                 }
                 // クロスプロセス（別アプリへ前面が移る）でのフォーカス喪失は、スレッド内 doc フォーカス
@@ -683,25 +1458,47 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             ));
         }
 
+        // 巡1レビュー 8c2354e指摘1+2: LAYOUT_TS は debounce のライフサイクルと独立に Activate で
+        // 設定する（ライブ変換 OFF でも変換で候補窓は出る=追従が必要）。sink も Activate 時点で
+        // 現在フォーカス中の document へ初期適用する（OnSetFocus はフォーカス「変化」にのみ発火し、
+        // Activate 時点で既にフォーカス済みの document では再配送されない）。
+        // 巡2 E3: 世代も進める — 前ライフサイクルで投入済みの非同期セッションが再 Activate 後に
+        // 発火しても、旧世代の座標が現在の self へ適用されないようにする。
+        LAYOUT_TS.with(|p| p.set(self as *const TextService_Impl));
+        PREDICTION_RETRY_TS.with(|p| p.set(self as *const TextService_Impl));
+        PREDICTION_POLL_TS.with(|p| p.set(self as *const TextService_Impl));
+        self.impl_ptr.set(self as *const TextService_Impl);
+        self.bump_layout_sink_gen();
+        self.refresh_layout_sink_target();
+
         // SP6b/SP7: 設定を活性化時に1度だけ読む（engine 流の「起動時に1回」=D7）。
         // F-1: feedback の PreserveKey 登録可否（opt-in）を決めるため、登録より**前**に読む。
         // UU-7: load_reporting で読み取り要因を診断ログに残す。AppContainer/LPAC ホスト（検索窓）
         // から settings.json が権限で読めないと Loaded ではなく PermissionDenied になり、
         // 「検索窓でだけ設定が既定に戻る」症状を実機ログで切り分けられる（従来は握り潰しで不可視）。
         let (s, load_outcome) = settings::load_reporting();
+        self.begin_configuration_change();
         tip_log(&format!("ev=settings_load outcome={load_outcome:?}"));
         // 品質ループ③: 誤変換ワンキー記録の opt-in（既定 false）。Activate で1度読む（D7）。
         // Deactivate の Unpreserve と remember_last_commit（F-5）のゲートにも使う。
         self.feedback_enabled.set(s.feedback.enabled);
+        self.prediction_enabled.set(s.inline_prediction.enabled);
+        if s.inline_prediction.enabled && warm_prediction_artifacts().is_err() {
+            tip_log("ev=prediction_unavailable state=warm_worker_spawn_failed");
+        }
         self.number_full_width.set(s.number.full_width);
         self.punctuation_full_width.set(s.punctuation.full_width);
         self.symbol_overlay.set(s.symbol.symbol_overlay());
         self.symbol_chars.set(s.symbol.effective_chars());
         self.reading_monitor_enabled.set(s.reading_monitor.enabled);
-        self.reading_monitor_accumulate.set(s.reading_monitor.accumulate);
-        self.reading_monitor_max_chars.set(s.reading_monitor.effective_max_chars());
-        self.shift_latin_compose.set(
-            crate::key_event_sink::shift_latin_is_compose(&s.shift_latin.mode));
+        self.reading_monitor_accumulate
+            .set(s.reading_monitor.accumulate);
+        self.reading_monitor_max_chars
+            .set(s.reading_monitor.effective_max_chars());
+        self.shift_latin_compose
+            .set(crate::key_event_sink::shift_latin_is_compose(
+                &s.shift_latin.mode,
+            ));
         self.ephemeral_enabled.set(s.ephemeral.enabled);
         self.keymap.set(crate::keymap::Keymap::from_settings(&s));
 
@@ -712,13 +1509,19 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         {
             let regs = crate::keymap::build_preserved_regs(&self.keymap.get(), s.feedback.enabled);
             for r in &regs {
-                let pk = TF_PRESERVEDKEY { uVKey: r.vk, uModifiers: r.modifiers };
+                let pk = TF_PRESERVEDKEY {
+                    uVKey: r.vk,
+                    uModifiers: r.modifiers,
+                };
                 let d: Vec<u16> = r.desc.encode_utf16().collect();
                 let res = unsafe { ksm.PreserveKey(tid, &r.guid, &pk, &d) };
                 let hr = res.as_ref().err().map(|e| e.code().0 as u32).unwrap_or(0);
                 tip_log(&format!(
                     "ev=preservekey desc={:?} vk={:#04x} mods={:#x} ok={} hr={hr:#010x}",
-                    r.desc, r.vk, r.modifiers, res.is_ok()
+                    r.desc,
+                    r.vk,
+                    r.modifiers,
+                    res.is_ok()
                 ));
             }
             *self.preserved_regs.borrow_mut() = regs;
@@ -726,14 +1529,22 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
 
         // 2) 表示属性 GUID を登録して atom を保持する（失敗しても致命的ではない）。
         unsafe {
-            if let Ok(cat) =
-                CoCreateInstance::<_, ITfCategoryMgr>(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)
-            {
+            if let Ok(cat) = CoCreateInstance::<_, ITfCategoryMgr>(
+                &CLSID_TF_CategoryMgr,
+                None,
+                CLSCTX_INPROC_SERVER,
+            ) {
                 if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE) {
                     self.da_atom.set(atom);
                 }
                 if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_TARGET) {
                     self.da_target_atom.set(atom);
+                }
+                if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_CONVERTED) {
+                    self.da_converted_atom.set(atom);
+                }
+                if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_PREDICTION) {
+                    self.da_prediction_atom.set(atom);
                 }
             }
         }
@@ -746,7 +1557,19 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // 無変換/Alt+; で conversion-mode が切り替わってもユーザが現在モードを視認できるように。
         // 二重 Activate ガード: 既に item があれば再追加しない（item と Rc 共有状態を取りこぼさない）。
         if self.langbar_item.borrow().is_none() {
-            self.langbar_is_direct.set(self.is_direct_mode());
+            // default_direct 適用予定かつ compartment が取れるときだけ AddItem 前に A を出す。
+            // 取れなければ live 読みのまま（失敗時に表示A・入力あ を残さない）。
+            let will_be_direct = crate::conversion_mode::should_apply_default_direct(
+                s.default_direct,
+                self.default_direct_applied.get(),
+            );
+            let compartment_available = self.conversion_compartment().is_some();
+            self.langbar_is_direct
+                .set(crate::conversion_mode::langbar_direct_for_additem(
+                    will_be_direct,
+                    compartment_available,
+                    self.is_direct_mode(),
+                ));
             let item: ITfLangBarItemButton = crate::langbar::ModeLangBarItem::new(
                 self.langbar_is_direct.clone(),
                 self.langbar_ephemeral.clone(),
@@ -762,18 +1585,19 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             if added {
                 *self.langbar_item.borrow_mut() = Some(item);
                 // 右クリックメニュー「切替」用のトグル closure を格納する。自身の COM 参照を owned で
-                // 捕まえ、呼ばれるたびに cast_object_ref で &TextService_Impl を復元して正規トグル経路
-                // toggle_conversion_mode(None) を叩く（is_direct の直接反転は禁止＝実 compartment 追従）。
-                // ctx=None なので HUD は既定座標に出る（メニュー操作時は実キャレット位置が取れない）。
+                // 捕まえ、呼ばれるたびに cast_object_ref で &TextService_Impl を復元して、打鍵と同じ
+                // dispatch_mode_toggle を通す。active/pending composition の settle を迂回して compartment
+                // だけ切り替えてはいけない。通常 composition は current_context、pending-only は
+                // dispatch 内で専用 owner context を使う。
                 // 参照循環（closure→COM 参照→TextService→この Rc→closure）は Deactivate で None にして断つ。
                 // to_interface は #[implement] に列挙した interface のみ可（ComObjectInterface 境界）。
                 // このオブジェクトは ITfTextInputProcessorEx を実装しているのでそれを owned で握る。
                 let self_com: ITfTextInputProcessorEx = self.to_interface();
                 *self.langbar_on_toggle.borrow_mut() = Some(Box::new(move || {
                     // cast_object_ref は QI 相当で &TextService_Impl を返す（0.62 の supported API）。
-                    // toggle_conversion_mode は TextService_Impl のメソッドなのでこの参照から呼べる。
                     if let Ok(ts) = self_com.cast_object_ref::<crate::text_service::TextService>() {
-                        ts.toggle_conversion_mode(None);
+                        let ctx = ts.current_context.borrow().clone();
+                        ts.dispatch_mode_toggle(ctx.as_ref());
                     }
                 }));
             }
@@ -804,8 +1628,12 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // SP7: default_direct なら起動時の conversion-mode を半角英数(直接入力)へ初期化。
         // このインスタンスで1度だけ適用する（default_direct_applied ガード）。Deactivate でも
         // リセットしないので、IME 切替で再 Activate されてもユーザの手動トグルを巻き戻さない。
-        if crate::conversion_mode::should_apply_default_direct(s.default_direct, self.default_direct_applied.get()) {
-            self.apply_default_direct();
+        // 適用に失敗した間は applied を立てない＝次回 Activate で再試行する（成功が1度だけ）。
+        if crate::conversion_mode::should_apply_default_direct(
+            s.default_direct,
+            self.default_direct_applied.get(),
+        ) && self.apply_default_direct()
+        {
             self.default_direct_applied.set(true);
         }
 
@@ -833,20 +1661,278 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // cold start ②: IME 切替（Activate）の時点でエンジンを先行起動しておく。
         // 接続はしない（初回打鍵の ensure_engine の 200ms 接続が即成功する状態を作るだけ）。
         self.prespawn_engine();
+        self.queue_snapshot_configuration(&s);
 
         Ok(())
     }
 
     fn Deactivate(&self) -> Result<()> {
+        self.preedit_apply.invalidate();
+        // Medium fix: ネスト Deactivate（清算の COM コールアウト中にホストが同期再入する）は
+        // 二重清算をしない — 外側の Deactivate が継続中なので即座に戻る（冪等）。
+        if self.deactivating.get() {
+            tip_log("ev=deactivate_skipped reason=nested");
+            return Ok(());
+        }
+        // Medium fix: 実行中フラグは RAII で立てる — return・panic unwind を含む全出口で
+        // 外れる。外れ残ると以後の Activate が永久に拒否される。
+        let _deactivating = DeactivatingGuard::new(&self.deactivating);
+        // 巡4 T6: Deactivate は多数の COM コールアウト（UnadviseKeyEventSink/RemoveItem/
+        // UnadviseSink/SetValue/hide/destroy）を含む入口で、relayout の show() 中の同期再入で
+        // 保持中 RefCell の再借用 panic が起きうる — thunk に保護が無く abort になるため、
+        // 他入口と同じ規律で包む。
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.deactivate_inner()));
+        match r {
+            Ok(result) => result,
+            Err(_) => {
+                // High fix: panic を握り潰して Ok を返すのは嘘になる — ホストは Deactivate
+                // 成功と信じたまま再 Activate せず、清算途中の状態が固定化される。失敗を
+                // 素直に伝える（フラグは RAII で既に復帰済み＝再 Activate 可能）。
+                tip_log("ev=panic site=Deactivate");
+                Err(E_FAIL.into())
+            }
+        }
+    }
+}
+
+/// High fix: Deactivate preflight の取消方式（純粋ロジック＝単体テスト可能）。
+#[derive(Debug, PartialEq, Eq)]
+enum DeactivateCancelPlan {
+    /// composition 無し — 取消不要、そのまま清算へ。
+    Nothing,
+    /// composition ありだが所有 context 無し — 文書取消は失敗、サービス資源は清算する。
+    AbortNoContext,
+    /// 再変換中 — RestoreText で元ラテンを書き戻す cancel_reconvert（do_cancel は原文を消す）。
+    CancelReconvert,
+    /// 通常合成は CancelComposition、pending-end は close-only で閉じる do_cancel。
+    DoCancel,
+}
+
+/// composition の有無・取消 context・再変換ラッチ・本文確定済み pending-end から
+/// Deactivate preflight の取消方式を決める。pending-end は reconverting より優先し、
+/// RestoreText/空文字化をせず close-only の DoCancel へ送る。
+fn deactivate_cancel_plan(
+    has_composition: bool,
+    has_ctx: bool,
+    reconverting: bool,
+    end_pending: bool,
+) -> DeactivateCancelPlan {
+    if !has_composition {
+        DeactivateCancelPlan::Nothing
+    } else if !has_ctx {
+        DeactivateCancelPlan::AbortNoContext
+    } else if end_pending {
+        DeactivateCancelPlan::DoCancel
+    } else if reconverting {
+        DeactivateCancelPlan::CancelReconvert
+    } else {
+        DeactivateCancelPlan::DoCancel
+    }
+}
+
+/// Medium fix: Deactivate 実行中フラグの RAII ガード。new で true を立て、Drop（return・
+/// panic unwind を含む全出口）で false に戻す。STA 専用（&Cell のみ保持）で Send 不要。
+struct DeactivatingGuard<'a> {
+    flag: &'a Cell<bool>,
+}
+
+impl<'a> DeactivatingGuard<'a> {
+    fn new(flag: &'a Cell<bool>) -> Self {
+        flag.set(true);
+        Self { flag }
+    }
+}
+
+impl Drop for DeactivatingGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.set(false);
+    }
+}
+
+impl TextService_Impl {
+    fn snapshot_ui_wait_state(&self) -> SnapshotUiWaitState {
+        SnapshotUiWaitState {
+            configuration_pending: self.snapshot_configuration_pending.get(),
+            live_result_deadline: self.live_result_deadline.get(),
+            explicit_pending: self.explicit_snapshot_pending.get(),
+            explicit_status_deadline: self.explicit_status_deadline.get(),
+            explicit_status_visible: self.explicit_status_visible.get(),
+            version_mismatch: self.snapshot_version_mismatch.get(),
+        }
+    }
+
+    fn apply_snapshot_ui_wait_state(&self, state: SnapshotUiWaitState) {
+        if !state.explicit_status_visible {
+            self.hide_explicit_snapshot_status();
+        }
+        self.snapshot_configuration_pending
+            .set(state.configuration_pending);
+        self.live_result_deadline.set(state.live_result_deadline);
+        self.explicit_snapshot_pending.set(state.explicit_pending);
+        self.explicit_status_deadline
+            .set(state.explicit_status_deadline);
+        self.explicit_status_visible
+            .set(state.explicit_status_visible);
+        self.snapshot_version_mismatch.set(state.version_mismatch);
+    }
+
+    fn deactivate_inner(&self) -> Result<()> {
+        self.deactivate_with_document_cancel(|| self.cancel_deactivating_document())
+    }
+
+    fn apply_live_preedit(&self, text: &str, apply: impl FnOnce() -> bool) {
+        let applied = apply();
+        if applied {
+            *self.live_text.borrow_mut() = text.to_owned();
+            tip_log("ev=live_snapshot_applied");
+        }
+        self.state.borrow_mut().complete(
+            &crate::input_module::ImmediateOperation::SetPreedit {
+                text: text.to_owned(),
+            },
+            applied,
+        );
+    }
+
+    fn deactivate_with_document_cancel(&self, cancel: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.retire_conversion_owner();
+        let cancellation = cancel();
+        self.release_deactivated_resources(cancellation.is_ok());
+        cancellation
+    }
+
+    fn cancel_deactivating_document(&self) -> Result<()> {
+        // 通常 preedit と別 slot の予測ゴーストも、登録解除より前に本文を消して閉じる。
+        if !self
+            .abandon_prediction_for_context_change(crate::prediction_state::Invalidation::Disabled)
+        {
+            tip_log("ev=deactivate_document_cancel_failed reason=prediction_cancel_rejected");
+            return Err(E_FAIL.into());
+        }
+        // Document cancellation precedes resource teardown, but failure only
+        // preserves the composition/restoration material. It never skips teardown.
+        // A committed pending-end composition uses its dedicated owner context.
+        let lifecycle_cancel = self
+            .state
+            .borrow_mut()
+            .handle(ModuleEvent::Lifecycle(ModuleLifecycleEvent::Deactivated))
+            .immediate;
+        let has_composition = self.composition.borrow().is_some();
+        let ctx: Option<ITfContext> = if has_composition {
+            if self.composition_end_pending.get() {
+                self.composition_end_context.borrow().clone()
+            } else {
+                self.current_context.borrow().clone()
+            }
+        } else {
+            None
+        };
+        let plan = deactivate_cancel_plan(
+            has_composition,
+            ctx.is_some(),
+            self.reconverting.get(),
+            self.composition_end_pending.get(),
+        );
+        let cancel_ok = match (&plan, ctx.as_ref()) {
+            (DeactivateCancelPlan::Nothing, _) => true,
+            (DeactivateCancelPlan::AbortNoContext, _) if self.composition_end_pending.get() => {
+                // The text is already committed.  No owner context is terminal for this
+                // close-only marker, so release it and let Deactivate finish.
+                self.abandon_pending_composition_end("deactivate_no_context");
+                true
+            }
+            (DeactivateCancelPlan::AbortNoContext, _) => {
+                if let Some(operation) = lifecycle_cancel.as_ref() {
+                    self.state.borrow_mut().complete(operation, false);
+                }
+                tip_log("ev=deactivate_document_cancel_failed reason=no_context");
+                return Err(E_FAIL.into());
+            }
+            (DeactivateCancelPlan::CancelReconvert, Some(ctx)) => {
+                // 再変換中はユーザの**既存テキスト**の上に composition が張られている。
+                // do_cancel(CancelComposition) は range を空文字で潰す＝元テキストを消すため、
+                // RestoreText で元ラテンを書き戻す cancel_reconvert を使う（Esc / Behavior::Abort
+                // と同じ取消経路）。これを怠ると再変換中の IME 切替でユーザの原文が消失する。
+                self.cancel_reconvert(ctx)
+            }
+            (DeactivateCancelPlan::DoCancel, Some(ctx)) => self.do_cancel(ctx),
+            // plan が Cancel* を返すとき ctx は必ず Some（None は AbortNoContext が拾う）。
+            _ => unreachable!("cancel plan and context presence must agree"),
+        };
+        if !cancel_ok {
+            if self.composition_end_pending.get() {
+                // Deactivate is a terminal lifecycle boundary.  A locked owner context must
+                // not survive into an unknown future activation; SetText already committed,
+                // so dropping the stale handle is safer than retaining an input barrier.
+                self.abandon_pending_composition_end("deactivate");
+            } else {
+                if let Some(operation) = lifecycle_cancel.as_ref() {
+                    self.state.borrow_mut().complete(operation, false);
+                }
+                tip_log("ev=deactivate_document_cancel_failed reason=cancel_rejected");
+                return Err(E_FAIL.into());
+            }
+        }
+        if let Some(operation) = lifecycle_cancel.as_ref() {
+            self.state.borrow_mut().complete(operation, true);
+        }
+        Ok(())
+    }
+
+    // Resource teardown is unconditional. Failed document edits retain only
+    // their composition and restoration material until the host terminates it
+    // or activation retries it; subscriptions, workers and timers never survive.
+    fn release_deactivated_resources(&self, document_cancelled: bool) {
+        self.background_input.request_close();
+        // A failed document edit must retain the handle needed to restore its
+        // text. Successful cancellation can release the remaining sink reference.
+        if document_cancelled {
+            *self.composition.borrow_mut() = None;
+        }
+        self.composition_end_pending.set(false);
+        *self.composition_end_context.borrow_mut() = None;
+        self.composition_end_status
+            .set(CompositionEndStatus::Closed);
+        self.composition_end_retry_count.set(0);
+        self.composition_generation
+            .set(self.composition_generation.get().wrapping_add(1));
+        // 事後検証(2026-08-20): レイアウト sink の解除は（preflight の次＝不可逆清算の）
+        // **最初**に行う — ここより後の
+        // COM コールアウト（UnadviseKeyEventSink/RemoveItem/hide/destroy 等）で再入 panic が
+        // 起きると Deactivate 全体が catch_unwind で握り潰されてここまで到達せず、
+        // context→sink→context の循環参照が残る。Drop の保険 unadvise も循環参照が
+        // 残る以上は到達しない（巡3 G5 の不変条件）ので、この前方移動が唯一の保険。
+        // UIバグ4: レイアウト sink を外す（context の寿命はホスト管理で、Deactivate 後の
+        // OnLayoutChange で self を触らせない。次 Activate で再 advise される）。
+        self.unadvise_layout_sink();
+        // 巡1レビュー 8c2354e指摘4: 非同期セッションの保留も此处で掃討 — Deactivate 後に
+        // 遅延実行された旧 context のセッションが layout_refresh_apply で self を触らない
+        // ように LAYOUT_TS を null 化し、pending フラグも戻す（次 Activate で再設定）。
+        // 巡2 E2: null 化は TLS が自分を指しているときだけ（旧インスタンスの Deactivate が
+        // 同一 STA に載る新インスタンスの TLS をワイプしない防御）。
+        self.layout_refresh_pending.set(false);
+        self.bump_layout_sink_gen();
+        LAYOUT_TS.with(|p| {
+            if std::ptr::eq(p.get(), self) {
+                p.set(std::ptr::null());
+            }
+        });
         // advise を解除し、保持状態を破棄する。
-        if let Some(tm) = self.thread_mgr.borrow().as_ref() {
+        // 巡4 T6: if let の一時 Ref はブロック末尾まで延命される（edition 2021）のため先に束縛 —
+        // UnadviseKeyEventSink/RemoveItem/UnadviseSink のコールアウト中に再入した
+        // borrow_mut()（Activate 等）との衝突を防ぐ。
+        let thread_mgr = self.thread_mgr.borrow().clone();
+        if let Some(tm) = thread_mgr.as_ref() {
             if let Ok(ksm) = tm.cast::<ITfKeystrokeMgr>() {
                 unsafe {
                     let _ = ksm.UnadviseKeyEventSink(self.tid.get());
                 }
                 // SP5/keymap: Activate で登録した実物(preserved_regs)を対称に解除する。
                 for r in self.preserved_regs.borrow().iter() {
-                    let pk = TF_PRESERVEDKEY { uVKey: r.vk, uModifiers: r.modifiers };
+                    let pk = TF_PRESERVEDKEY {
+                        uVKey: r.vk,
+                        uModifiers: r.modifiers,
+                    };
                     let _ = unsafe { ksm.UnpreserveKey(&r.guid, &pk) };
                 }
                 self.preserved_regs.borrow_mut().clear();
@@ -856,7 +1942,12 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             // COM 参照を owned で保持しており、TextService がこの Rc を保持するため相互参照（循環）
             // になっている。ここで None にして循環を断ち、Activate/Deactivate 往復でのリークを防ぐ。
             *self.langbar_on_toggle.borrow_mut() = None;
-            if let Some(item) = self.langbar_item.borrow_mut().take() {
+            // 巡4 T6 と同型: `if let` のスクラッチ式に置いた一時 RefMut はブロック末尾まで
+            // 延命される（edition 2021）ため、take() を独立 let 文へ切り出して RefMut を
+            // RemoveItem の COM コールアウト前に落とす。コールアウト中の再入（GetText 等
+            // 経由で langbar_item を borrow する Activate 等）との borrow-panic を防ぐ。
+            let item = self.langbar_item.borrow_mut().take();
+            if let Some(item) = item {
                 if let Ok(lbim) = tm.cast::<ITfLangBarItemMgr>() {
                     unsafe {
                         let _ = lbim.RemoveItem(&item);
@@ -872,35 +1963,25 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             if tmes_cookie != 0 || tfs_cookie != 0 {
                 if let Ok(source) = tm.cast::<ITfSource>() {
                     unsafe {
-                        if tmes_cookie != 0 { let _ = source.UnadviseSink(tmes_cookie); }
-                        if tfs_cookie != 0 { let _ = source.UnadviseSink(tfs_cookie); }
+                        if tmes_cookie != 0 {
+                            let _ = source.UnadviseSink(tmes_cookie);
+                        }
+                        if tfs_cookie != 0 {
+                            let _ = source.UnadviseSink(tfs_cookie);
+                        }
                     }
                 }
             }
         }
-        // C-2: コンポジション進行中に IME 切替（Deactivate）されると、生きている ITfComposition が
-        // 孤児化する。ITfComposition は作成時に sink(=TextService への ITfCompositionSink 強参照)を
-        // 保持するため、これを片付けないと TextService と DLL_REF がリークし、文書側にも宙ぶらりんの
-        // preedit が残る（OnCompositionTerminated は composition を片付けるのに Deactivate は未対応だった）。
-        // current_context が生きていれば CancelComposition を同期実行して文書から打ちかけを除去し、
-        // いずれにせよ composition の Rc を必ず None に戻して sink 参照（強参照）を解放する。
-        // ここは tid / current_context がまだ有効なうちに行う（後段でいずれもクリアされる）。
-        if self.composition.borrow().is_some() {
-            let ctx = self.current_context.borrow().clone();
-            if let Some(ctx) = ctx {
-                if self.reconverting.get() {
-                    // 再変換中はユーザの**既存テキスト**の上に composition が張られている。
-                    // do_cancel(CancelComposition) は range を空文字で潰す＝元テキストを消すため、
-                    // RestoreText で元ラテンを書き戻す cancel_reconvert を使う（Esc / Behavior::Abort
-                    // と同じ取消経路）。これを怠ると再変換中の IME 切替でユーザの原文が消失する。
-                    self.cancel_reconvert(&ctx);
-                } else {
-                    self.do_cancel(&ctx);
-                }
-            }
-            // context 無し等で edit session が走らなかった場合の保険。sink 参照を必ず断つ。
-            *self.composition.borrow_mut() = None;
-        }
+        // 巡15(round2): 冒頭の unadvise_layout_sink のあと〜この行までの間に、TMES/TFS 経由の
+        // 再入（OnSetFocus/OnPushContext/OnPopContext → refresh_layout_sink_target → AdviseSink）
+        // が layout sink を張り直すことがある（thread_mgr はまだ Some・key/langbar sink も
+        // コールアウト中に生きていた）。ここ以降は再入源（key/langbar/TMES/TFS の各 sink）が
+        // 全て外れているので再 advise は起きない — cookie==0 なら no-op の冪等呼び出しで
+        // 張り直された分を最終確認する（巡1と同型の循環参照残存を Deactivate 成功経路でも
+        // 残さない。旧配置の「末尾 unadvise が回収する」性質の復元）。
+        self.unadvise_layout_sink();
+        // The failed composition, if any, remains isolated from the next activation.
 
         // エンジン接続を破棄する。EndSession の同期往復は送らない — Deactivate は IME 切替時に
         // 切替先プロセスの UI スレッドで走るため、エンジンが多忙（serviceLock 直列化）だと
@@ -911,12 +1992,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // ⚠この契約は --persist モード限定（oneShot は NamedPipeServer が onDisconnect を呼ばず
         // 学習 flush も走らない）。本 TIP の spawn は常に --persist（spawn_engine_hidden）なので
         // 現行経路では成立するが、oneShot を再有効化する改修はここを再考すること（レビュー I-1）。
-        *self.client.borrow_mut() = None;
-        self.engine_session.set(0);
-        // 保留中の EndSession も破棄する。残すと再活性化で別 oneShot エンジン（id は 1 から振り直し）を
-        // 起動した後、古いワーカ由来の LLM 結果が flush され、別エンジンの無関係なセッションを
-        // 巻き添えに終了させうる。エンジンが変わる以上、古い保留 id は無効。
-        self.pending_end_session.set(0);
+        self.drop_engine();
         // 次の活性化で（エンジンが死んでいれば）起動し直せるようにする。
         self.spawn_attempted.set(false);
         // A7: 電源復帰通知の購読を解除する（Drop が PowerUnregisterSuspendResumeNotification を呼ぶ）。
@@ -927,13 +2003,17 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
 
         // 保留中のデバウンスタイマを解除し、保持 context を捨てる。
         self.disarm_debounce();
+        self.disarm_live_result_poll();
         self.disarm_llm_poll();
+        // 巡1検証G2: 非活性化で旧 context のアンカー保持も破棄 — 再 Activate 後の初回照会失敗で
+        // 前ライフサイクルの座標を使わない（password_ctx_key と同じ ABA 対策）。
+        *self.last_valid_anchor.borrow_mut() = None;
         // 入力状態を全て畳む（raw/composing/phase）。従来は set_awaiting_llm(false) だけで
-        // raw/composing を残していたが、それだと再活性化後の初打鍵で needs_session_reseed が
-        // 「session==0 かつ raw 非空＝合成途中の喪失」と誤認し、上の do_cancel で取消済みの
-        // テキストが新セッションへリプレイされて復活する（2026-07-07 レビュー I-1 の偽陽性
-        // リプレイ）。reset() は phase=Composing も含む＝AwaitingLlm 居残り防止も従来どおり。
+        // raw/composing を残すと、再活性化後の初打鍵が取消済みテキストをcanonical全量replayで
+        // 復活させる。reset() は phase=Composing も含む＝AwaitingLlm 居残り防止も従来どおり。
         self.state.borrow_mut().reset();
+        self.partial_preedit_redraw_pending.set(false);
+        self.partial_preedit_redraw_retries.set(0);
         self.live_text.borrow_mut().clear();
         *self.llm_slot.borrow_mut() = None;
         self.llm_started.set(None);
@@ -944,9 +2024,11 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         self.monitor_committed_reading.borrow_mut().clear();
         // SP5: 再変換ラッチも残さない（残ると再活性化後に start_reconvert の
         // 再入ガードに居残り、以降の再変換が不能になる＝awaiting_llm と同じ理由）。
-        self.reconverting.set(false);
-        self.reconvert_original.borrow_mut().clear();
-        self.reconvert_reading.borrow_mut().clear();
+        if document_cancelled {
+            self.reconverting.set(false);
+            self.reconvert_original.borrow_mut().clear();
+            self.reconvert_reading.borrow_mut().clear();
+        }
         // 品質ループ③: 直前確定バッファも持ち越さない（再活性化後の Ctrl+変換が
         // 非活性前の古い確定を記録しないように）。
         *self.last_commit.borrow_mut() = None;
@@ -956,18 +2038,67 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // ephemeral かな: 非活性化（IME 切替/シャットダウン）でも direct へ復帰する。thread_mgr が
         // まだ有効な（下で None にする前の）この時点で呼ぶ必要がある。
         self.exit_ephemeral_to_direct(None);
-        // SP7: default_direct_applied は **意図的にリセットしない**。リセットすると
-        // IME 切替の往復（Deactivate→Activate）のたびに半角英数へ再初期化してしまい、
-        // ユーザが無変換でひらがなへ戻した選択を巻き戻す。1度だけ適用を貫く。
+        if self.ephemeral_kana.replace(false) {
+            // Deactivate は再試行先を失う終端。compartment 取得/書込み失敗で保留が残った場合は
+            // 次 Activate へ ephemeral marker を持ち越さず、live 値追従へ戻す。
+            self.direct_mode_owned.set(false);
+            self.langbar_ephemeral.set(false);
+            tip_log("ev=ephemeral_exit abandoned=deactivate");
+        }
+        // SP7: 上の「ephemeral 復帰失敗」以外では default_direct_applied / direct_mode_owned を
+        // **意図的にリセットしない**。毎回リセットすると IME 切替の往復
+        // （Deactivate→Activate）でユーザが無変換により選んだモードを巻き戻すため。
 
         // 候補ウィンドウを隠す（presenter なら UIElement も EndUIElement で畳む）。
         self.candidate_ui.borrow_mut().hide();
         self.showing.set(false);
+        self.explicit_snapshot_candidates_active.set(false);
+        self.explicit_snapshot_candidate_remaining
+            .borrow_mut()
+            .clear();
         self.clear_clause_nav();
+        self.flush_shadow_mismatches();
         // SP6a: 非活性化後に Behavior が来ても dangling self を触らせない（UAF 防止）。
         // ui_mgr も手放して保持していた COM 参照を解放する。
-        BEHAVIOR_TS.with(|c| c.set(std::ptr::null()));
+        // 巡3 G2: null 化は TLS が自分を指しているときだけ（LAYOUT_TS/Drop と同じ E2 規律 —
+        // 旧インスタンスの Deactivate が同一 STA に載る新インスタンスの Behavior 経路を
+        // ワイプしない）。
+        BEHAVIOR_TS.with(|c| {
+            if std::ptr::eq(c.get(), self) {
+                c.set(std::ptr::null());
+            }
+        });
+        // 巡4 T1/T5: 遅延 flush タイマと busy 再送タイマも掃討 — 非活性化後の発火で self を
+        // 触らせない（キュー済み発火は proc 側の ID 照合/TLS null で無害化される）。
+        let bf = self.behavior_flush_timer.replace(0);
+        if bf != 0 {
+            unsafe {
+                let _ = KillTimer(None, bf);
+            }
+        }
+        let rt = self.reload_retry_timer.replace(0);
+        if rt != 0 {
+            unsafe {
+                let _ = KillTimer(None, rt);
+            }
+        }
+        self.reload_retry_count.set(0);
+        self.disarm_prediction_finish_retry();
+        self.disarm_prediction_poll();
+        self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
+        PREDICTION_RETRY_TS.with(|p| {
+            if p.get() == self as *const TextService_Impl {
+                p.set(std::ptr::null());
+            }
+        });
+        PREDICTION_POLL_TS.with(|p| {
+            if p.get() == self as *const TextService_Impl {
+                p.set(std::ptr::null());
+            }
+        });
         self.candidate_ui.borrow_mut().set_ui_mgr(None);
+        // レイアウト sink の掃討（unadvise/pending/世代/LAYOUT_TS）は deactivate_inner の
+        // 冒頭へ移動済み（panic で握り潰された場合の循環参照残存防止 — 事後検証指摘）。
 
         // 候補窓・モード HUD の DirectComposition/D3D リソースをここで畳む。畳まずに
         // 放置すると、プロセス終了時の msctf 後始末（LdrShutdownProcess 中の
@@ -981,8 +2112,11 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
 
         *self.thread_mgr.borrow_mut() = None;
         self.tid.set(0);
-        Ok(())
     }
+}
+
+impl TextService_Impl {
+    // 巡4 T6: Deactivate の本体（inherent 側へ置く — trait impl 内の非 trait メソッドは E0407）。
 }
 
 impl ITfTextInputProcessorEx_Impl for TextService_Impl {
@@ -992,12 +2126,119 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
     }
 }
 
+impl ITfTextEditSink_Impl for TextService_Impl {
+    fn OnEndEdit(
+        &self,
+        pic: Ref<'_, ITfContext>,
+        _ecreadonly: u32,
+        peditrecord: Ref<'_, ITfEditRecord>,
+    ) -> Result<()> {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let in_our_write_session = pic
+                .ok()
+                .ok()
+                .and_then(|ctx| unsafe { ctx.InWriteSession(self.tid.get()).ok() })
+                .is_some_and(|inside| inside.as_bool());
+            if self.prediction_editing.get() || in_our_write_session {
+                return Ok(());
+            }
+            let has_prediction_activity = self.prediction_state.borrow().has_private_state()
+                || self.prediction_ghost_visible();
+            if !has_prediction_activity {
+                return Ok(());
+            }
+            let selection_changed = peditrecord
+                .ok()
+                .ok()
+                .and_then(|record| unsafe { record.GetSelectionStatus().ok() })
+                .is_some_and(|changed| changed.as_bool());
+            if self.consume_expected_prediction_commit_end_edit(selection_changed) {
+                tip_log("ev=prediction_commit_edit state=settled");
+                return Ok(());
+            }
+            tip_log(&format!("ev=prediction_invalidate source=external_edit selection_changed={selection_changed}"));
+            // OnEndEdit 内から同期 edit session は要求できないため、range除去だけ非同期に積む。
+            self.invalidate_prediction_after_external_edit();
+            Ok(())
+        }));
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                tip_log("ev=panic site=OnEndEdit");
+                Ok(())
+            }
+        }
+    }
+}
+
 impl ITfCompositionSink_Impl for TextService_Impl {
     fn OnCompositionTerminated(
         &self,
         _ecwrite: u32,
         pcomposition: Ref<'_, ITfComposition>,
     ) -> Result<()> {
+        // 巡2 F2: この COM 入口は windows-implement の生成 thunk に panic 保護が無く、
+        // 非 unwind ABI（extern "system"）出口からの unwind は abort になる。このメソッドは
+        // relayout（candidate_ui の RefMut 保持中の Begin/UpdateUIElement コールアウト）や
+        // drain_behavior の最中にホストから同期再入され、reset_abandoned_composition が
+        // 保持中 RefCell を再借用して panic しうる唯一の入口 — OnKeyDown と同じくここで
+        // 受け止めないとホストプロセスごと落ちる。
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.on_composition_terminated_inner(_ecwrite, &pcomposition)
+        }));
+        match r {
+            Ok(result) => result,
+            Err(_) => {
+                tip_log("ev=panic site=OnCompositionTerminated");
+                Ok(())
+            }
+        }
+    }
+}
+
+impl TextService_Impl {
+    fn consume_expected_prediction_commit_end_edit(&self, selection_changed: bool) -> bool {
+        consume_expected_prediction_commit_end_edit(
+            &self.prediction_commit_edit_deadline,
+            selection_changed,
+            Instant::now(),
+        )
+    }
+
+    fn on_composition_terminated_inner(
+        &self,
+        _ecwrite: u32,
+        pcomposition: &Ref<'_, ITfComposition>,
+    ) -> Result<()> {
+        let is_prediction = match (
+            pcomposition.ok().ok(),
+            self.prediction_composition.borrow().as_ref(),
+        ) {
+            (Some(p), Some(cur)) => com_identity_eq(p, cur),
+            _ => false,
+        };
+        if is_prediction {
+            let internal = self.prediction_editing.get();
+            *self.prediction_composition.borrow_mut() = None;
+            *self.prediction_context.borrow_mut() = None;
+            self.prediction_finish_pending.set(None);
+            if self.prediction_deferred_preserved.borrow().is_empty() {
+                self.disarm_prediction_finish_retry();
+            } else {
+                // internal callback でも、timer 作成失敗後に別経路の async finish が成功した
+                // 場合がある。キューが残る限り必ず replay の安全点を予約する。
+                self.arm_prediction_finish_retry(false);
+            }
+            if !internal {
+                self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
+            }
+            tip_log(if internal {
+                "ev=prediction_comp_terminated source=internal"
+            } else {
+                "ev=prediction_comp_terminated source=host"
+            });
+            return Ok(());
+        }
         // 終了通知が現在追跡中の composition のものか確認する。フォーカス喪失 sink
         // （OnSetFocus/OnKillThreadFocus）は composition を End せずに手放す（ホストが既に確定/破棄
         // するため）。その後ユーザが戻って新しい composition を張った後で、ホストが古い（放棄した）
@@ -1010,6 +2251,43 @@ impl ITfCompositionSink_Impl for TextService_Impl {
         };
         if !is_current {
             tip_log("ev=comp_terminated skipped=stale");
+            return Ok(());
+        }
+        if self.composition_end_pending.get() && !self.pending_end_generation_is_current() {
+            // A lifecycle boundary advanced the generation while a host callback was in
+            // flight.  Do not let that callback clear a newer pending state.
+            tip_log("ev=comp_terminated skipped=stale_generation");
+            return Ok(());
+        }
+        self.preedit_apply.invalidate();
+        // SetText 済みで close-only 再試行待ちだった composition の終了通知。本文確定後の
+        // InputState は呼出し側が既に次状態へ進めているため、通常の放棄 reset を掛けず handle と
+        // marker だけを清算する（部分確定の残り読みも巻き添えにしない）。
+        if self.composition_end_pending.get() {
+            let owner_ctx = self.composition_end_context.borrow().clone();
+            let retired_caret = self.composition_end_caret.borrow_mut().take();
+            *self.composition.borrow_mut() = None;
+            self.composition_end_pending.set(false);
+            *self.composition_end_context.borrow_mut() = None;
+            self.composition_end_status
+                .set(CompositionEndStatus::Closed);
+            self.composition_end_retry_count.set(0);
+            drop(retired_caret);
+            // TestKeyDown と KeyDown の間に pending callback が入っても、ここでは key-pair
+            // slot/generation に触れない。次の matching KeyDown が一度だけ消費する。
+            // commit_and_reset 済みの idle ephemeral だけをここで direct へ戻す。部分確定中は
+            // logical composition が継続するため marker/mode を維持する。
+            if !self.state.borrow().composing && !self.showing.get() {
+                self.partial_preedit_redraw_pending.set(false);
+                self.partial_preedit_redraw_retries.set(0);
+                self.exit_ephemeral_to_direct(owner_ctx.as_ref());
+            } else if self.partial_preedit_redraw_pending.get() {
+                // composition sink callback 内から同期 edit session を張らず、STA timer へ逃がす。
+                // close 完了という新しい進捗があったので、過去の拒否回数は持ち越さない。
+                self.partial_preedit_redraw_retries.set(0);
+                self.arm_debounce();
+            }
+            tip_log("ev=comp_terminated closed=pending_end");
             return Ok(());
         }
         // 部分確定中(commit_candidate)の自己誘発終了なら何もしない。do_commit が（ホスト依存で）
@@ -1028,16 +2306,48 @@ impl ITfCompositionSink_Impl for TextService_Impl {
 }
 
 impl TextService_Impl {
+    pub(crate) fn compare_local_kana(&self, azookey_reading: &str) {
+        let state = self.state.borrow();
+        if observe_shadow_compare(
+            &self.shadow_mismatches,
+            state.canonical_reading(),
+            azookey_reading,
+        ) {
+            self.schedule_behavior_flush();
+        }
+    }
+
+    fn flush_shadow_mismatches(&self) {
+        self.shadow_mismatches.borrow_mut().flush_with(tip_log);
+    }
+
     /// 合成がアプリ側都合で終わった/放棄されたときの内部状態リセット
     /// （`OnCompositionTerminated` と、別ウィンドウへのフォーカス喪失 `OnSetFocus` で共有）。
     /// 文書側はホストが既に確定/破棄済みなので、ここでは cancel/commit はせず**自分の状態だけ**畳む。
     pub(crate) fn reset_abandoned_composition(&self) {
+        self.retire_conversion_owner();
+        self.preedit_apply.invalidate();
+        self.background_input.request_close();
         // 放棄時点で LLM(Tab変換)が in-flight だったか（client がワーカへ move 済みか）を、
         // state.reset() が phase を畳む前に捕まえる。awaiting_llm ⟺ client はワーカ側。
         let was_awaiting_llm = self.state.borrow().awaiting_llm();
 
-        *self.composition.borrow_mut() = None;
+        let keep_pending_end = self.composition_end_pending.get();
+        if keep_pending_end {
+            // Focus/context abandonment is an explicit liveness boundary.  Do not retain the
+            // old owner context waiting for a callback that may never arrive; any late callback
+            // is stale after the slot/generation is advanced.
+            self.abandon_pending_composition_end("focus_abandon");
+        } else {
+            *self.composition.borrow_mut() = None;
+            *self.composition_end_context.borrow_mut() = None;
+        }
         self.state.borrow_mut().reset();
+        self.partial_preedit_redraw_pending.set(false);
+        self.partial_preedit_redraw_retries.set(0);
+        // Abandon/reset is a lifecycle boundary.  The old Test→Key pair belongs to the discarded
+        // context/composition and must not be replayed into the next input.
+        self.invalidate_pending_end_test_reservation();
         // U9: 合成放棄 — 次 composition の再捕捉まで前文書の左文脈を残さない。
         *self.left_context.borrow_mut() = None;
         self.monitor_committed_reading.borrow_mut().clear();
@@ -1068,12 +2378,16 @@ impl TextService_Impl {
         }
 
         self.showing.set(false);
+        self.explicit_snapshot_candidates_active.set(false);
+        self.explicit_snapshot_candidate_remaining
+            .borrow_mut()
+            .clear();
         self.clear_clause_nav();
-        self.candidate_ui.borrow_mut().hide();
-        self.reading_monitor.borrow_mut().hide();
-        // composition が消えた以上、保持していた context/読みも捨てる。残すと遅延変換が死んだ
-        // composition の context へ preedit を張り直そうとする（無駄な StartComposition を誘発する）。
+        // 巡3 P4: 再入 panic しうる借用点は UI hide（candidate_ui/reading_monitor の RefMut）—
+        // 状態・フラグの清算を先に確実に済ませ、hide を最後に置く。途中で panic が起きても
+        // 残るのは表示だけ（次の hide 経路で回収）で、reconverting 残留（回収不能）を避ける。
         self.disarm_debounce();
+        self.disarm_live_result_poll();
         *self.current_context.borrow_mut() = None;
         self.live_text.borrow_mut().clear();
         // SP5: 再変換候補の表示中に放棄された場合（フォーカス喪失等）も reconverting を必ず落とす。
@@ -1085,19 +2399,68 @@ impl TextService_Impl {
         // ephemeral かな: 合成が畳まれた以上 direct へ復帰する（OnCompositionTerminated など
         // フォーカス変化を伴わない放棄経路でも残留させない。非 ephemeral 時は no-op）。
         self.exit_ephemeral_to_direct(None);
+        // 通常の current_context/読みは捨てる。pending-end は focus/context 境界で既に
+        // quarantine 済みなので、旧 owner context をここへ持ち越さない。
+        self.candidate_ui.borrow_mut().hide();
+        self.reading_monitor.borrow_mut().hide();
     }
 }
 
 impl ITfThreadMgrEventSink_Impl for TextService_Impl {
-    fn OnInitDocumentMgr(&self, _pdim: Ref<'_, ITfDocumentMgr>) -> Result<()> { Ok(()) }
-    fn OnUninitDocumentMgr(&self, _pdim: Ref<'_, ITfDocumentMgr>) -> Result<()> { Ok(()) }
-    fn OnPushContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
-        self.password_ctx_key.set(0); // Spec2: context 切替で password キャッシュ無効化（ABA 対策・I-3）
+    fn OnInitDocumentMgr(&self, _pdim: Ref<'_, ITfDocumentMgr>) -> Result<()> {
         Ok(())
     }
-    fn OnPopContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
-        self.password_ctx_key.set(0); // Spec2: context 切替で password キャッシュ無効化（ABA 対策・I-3）
+    fn OnUninitDocumentMgr(&self, _pdim: Ref<'_, ITfDocumentMgr>) -> Result<()> {
         Ok(())
+    }
+    fn OnPushContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
+        self.preedit_apply.invalidate();
+        self.consume_started_composition();
+        // 巡4 T6: refresh_layout_sink_target の Advise/UnadviseSink コールアウト中に同期再入しうる
+        // 入口 — 保護なし入口の panic は shim 越えで abort するため、他入口と同じ規律で包む。
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.password_ctx_key.set(0); // Spec2: context 切替で password キャッシュ無効化（ABA 対策・I-3）
+            let _ = self.abandon_prediction_for_context_change(
+                crate::prediction_state::Invalidation::FocusChanged,
+            );
+            *self.prediction_failed_context.borrow_mut() = None;
+            // UIバグ5: context スタックが変われば旧 context の座標は無意味 — アンカー保持も破棄。
+            *self.last_valid_anchor.borrow_mut() = None;
+            // UIバグ4: context スタックが変われば focus の top context も変わる — sink を貼り替える。
+            self.refresh_layout_sink_target();
+            Ok(())
+        }));
+        match r {
+            Ok(result) => result,
+            Err(_) => {
+                tip_log("ev=panic site=OnPushContext");
+                Ok(())
+            }
+        }
+    }
+    fn OnPopContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
+        self.preedit_apply.invalidate();
+        self.consume_started_composition();
+        // 巡4 T6: OnPushContext と同じ規律。
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.password_ctx_key.set(0); // Spec2: context 切替で password キャッシュ無効化（ABA 対策・I-3）
+            let _ = self.abandon_prediction_for_context_change(
+                crate::prediction_state::Invalidation::FocusChanged,
+            );
+            *self.prediction_failed_context.borrow_mut() = None;
+            // UIバグ5: 同上（pop 後の context でも旧座標は無意味）。
+            *self.last_valid_anchor.borrow_mut() = None;
+            // UIバグ4: 同上（pop 後の top context へ追従）。
+            self.refresh_layout_sink_target();
+            Ok(())
+        }));
+        match r {
+            Ok(result) => result,
+            Err(_) => {
+                tip_log("ev=panic site=OnPopContext");
+                Ok(())
+            }
+        }
     }
 
     /// フォーカスが別ドキュメント（別ウィンドウ/アプリ）へ移ったとき、進行中の合成＋エンジン
@@ -1105,17 +2468,74 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
     /// `OnCompositionTerminated` を呼ばないことがあり、その場合エンジンの読みが居残って次入力へ
     /// 連結される（フォーカス喪失データ残留。例: にほんご→別窓→aiueo で 日本語日本語あいうえお）。
     /// 自ドキュメントへ戻る/留まる・進行中状態が無い・部分確定中は何もしない。
+    /// 巡3 P2: relayout の show() COM コールアウト中に同期再入しうる入口の一つ —
+    /// reset_abandoned_composition が保持中 RefCell を再借用して panic すると shim 越えで
+    /// abort するため、OnCompositionTerminated と同じ入口保護を通す。
     fn OnSetFocus(
         &self,
         pdimfocus: Ref<'_, ITfDocumentMgr>,
         _pdimprevfocus: Ref<'_, ITfDocumentMgr>,
     ) -> Result<()> {
+        self.consume_started_composition();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.on_set_focus_inner(&pdimfocus)
+        }));
+        match r {
+            Ok(result) => result,
+            Err(_) => {
+                tip_log("ev=panic site=OnSetFocus");
+                Ok(())
+            }
+        }
+    }
+
+    // 巡3 P2: inherent 側へ置く（trait impl 内の非 trait メソッドは E0407）。
+}
+
+impl TextService_Impl {
+    fn on_set_focus_inner(&self, pdimfocus: &Ref<'_, ITfDocumentMgr>) -> Result<()> {
         self.password_ctx_key.set(0); // Spec2: フォーカス切替で password キャッシュ無効化（ABA 対策・I-3）
+        let new_focus: Option<ITfDocumentMgr> = pdimfocus.ok().ok().cloned();
+        let new_focus_ctx = new_focus
+            .as_ref()
+            .and_then(|doc| unsafe { doc.GetTop() }.ok());
+        self.preedit_apply.retain_context(new_focus_ctx.as_ref());
+        // A host can end an already-written composition before this focus
+        // callback. Accepted suffix input still belongs to the original field.
+        if self.conversion_queue_context_changed(new_focus_ctx.as_ref()) {
+            self.retire_conversion_owner();
+        }
+        // DocumentMgr ではなく top context で比較する。同じ document manager が
+        // 複数の編集欄を再利用するホストでも、欄Aの文脈／failure を欄Bへ持ち越さない。
+        let prediction_field = self
+            .prediction_context
+            .borrow()
+            .clone()
+            .or_else(|| self.layout_sink_ctx.borrow().clone());
+        let prediction_focus_is_same = match (&new_focus_ctx, &prediction_field) {
+            (Some(f), Some(o)) => com_identity_eq(f, o),
+            _ => false,
+        };
+        if !prediction_focus_is_same
+            && (self.prediction_state.borrow().has_private_state()
+                || self.prediction_ghost_visible()
+                || self.prediction_failed_context.borrow().is_some())
+        {
+            let _ = self.abandon_prediction_for_context_change(
+                crate::prediction_state::Invalidation::FocusChanged,
+            );
+            // cleanup failure は旧欄にだけ属する。新欄の予測を巻き添えで停止しない。
+            *self.prediction_failed_context.borrow_mut() = None;
+        }
+        // UIバグ5: キャレットアンカーの保持もフォーカス切替で破棄 — 別ドキュメントの座標は無意味。
+        *self.last_valid_anchor.borrow_mut() = None;
+        // UIバグ4: フォーカス context が変わったら ITfTextLayoutSink を貼り替える
+        // （同一 context なら内部で no-op。スクロール追従は表示中のみ意味を持つ）。
+        self.refresh_layout_sink_target();
         let has_active_input =
             self.engine_session.get() != 0 || self.composition.borrow().is_some();
         // 新フォーカス先（NULL=アプリがバックグラウンドへ）と、自分の合成があるドキュメントを
         // COM 同一性で比較する。current_context は borrow を即解放してから GetDocumentMgr を呼ぶ。
-        let new_focus: Option<ITfDocumentMgr> = pdimfocus.ok().ok().cloned();
         let our_ctx: Option<ITfContext> = self.current_context.borrow().clone();
         let our_doc: Option<ITfDocumentMgr> =
             our_ctx.and_then(|ctx| unsafe { ctx.GetDocumentMgr() }.ok());
@@ -1135,6 +2555,9 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         // （armed 残留による別文書での誤発火＝スチール解消。自 doc へ留まる場合も含め、
         // フォーカスが動いた以上は直前確定への Ctrl+Backspace を許さない）。
         if !focus_is_our_doc {
+            // NULL/別 document focus is a key lifecycle boundary even when no composition is
+            // active.  Clear a pending Test→Key pair before any later document can reuse its VK.
+            self.invalidate_pending_end_test_reservation();
             self.disarm_undo();
             // ephemeral かな: 別窓へフォーカスが動いた＝押し忘れの言語モードを持ち越さない
             // （thread compartment を direct へ。ctx 無しでも冪等に呼べる）。
@@ -1145,7 +2568,9 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
 }
 
 impl ITfThreadFocusSink_Impl for TextService_Impl {
-    fn OnSetThreadFocus(&self) -> Result<()> { Ok(()) }
+    fn OnSetThreadFocus(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// 前面（スレッド）フォーカスを失った＝別アプリ/プロセスへ切替わった。クロスプロセスの
     /// フォーカス喪失はこの通知が主経路（`ITfThreadMgrEventSink::OnSetFocus` はスレッド内 doc
@@ -1153,7 +2578,39 @@ impl ITfThreadFocusSink_Impl for TextService_Impl {
     /// 放棄リセットを焚き、ホストが `OnCompositionTerminated` を呼ばずに preedit を確定/破棄しても
     /// エンジンの読みが居残らないようにする。スレッドが前面を失った時点で自ドキュメントは
     /// 非フォーカスなので、should_abandon の focus_is_our_doc=false 相当で判定する。
+    /// 巡3 P2: 同期再入しうる入口 — OnSetFocus と同じ入口保護を通す（shim 越え abort 防止）。
     fn OnKillThreadFocus(&self) -> Result<()> {
+        self.preedit_apply.invalidate();
+        self.consume_started_composition();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.on_kill_thread_focus_inner()
+        }));
+        match r {
+            Ok(result) => result,
+            Err(_) => {
+                tip_log("ev=panic site=OnKillThreadFocus");
+                Ok(())
+            }
+        }
+    }
+
+    // 巡3 P2: inherent 側へ置く（trait impl 内の非 trait メソッドは E0407）。
+}
+
+impl TextService_Impl {
+    fn on_kill_thread_focus_inner(&self) -> Result<()> {
+        if self.conversion_queue_context_changed(None) {
+            self.retire_conversion_owner();
+        }
+        // 巡1検証G2: 前面（スレッド）フォーカス喪失でも旧 context のアンカー保持を破棄 —
+        // クロスプロセス前面化では OnSetFocus が届かないことがあるため（password と同じ理屈）。
+        // Cross-process focus loss invalidates the pair even when there is no active composition.
+        self.invalidate_pending_end_test_reservation();
+        *self.last_valid_anchor.borrow_mut() = None;
+        let _ = self.abandon_prediction_for_context_change(
+            crate::prediction_state::Invalidation::FocusChanged,
+        );
+        *self.prediction_failed_context.borrow_mut() = None;
         let has_active_input =
             self.engine_session.get() != 0 || self.composition.borrow().is_some();
         if crate::focus::should_abandon_on_focus_change(
@@ -1169,6 +2626,60 @@ impl ITfThreadFocusSink_Impl for TextService_Impl {
         self.disarm_undo();
         // ephemeral かな: 前面フォーカスが別プロセスへ移った＝別窓へモードを漏らさない。
         self.exit_ephemeral_to_direct(None);
+        Ok(())
+    }
+}
+
+impl ITfTextLayoutSink_Impl for TextService_Impl {
+    /// UIバグ4: ホストのスクロール・リフローで表示中の候補窓・読みモニタをキャレットへ
+    /// 追従させる。TSF の再入規律上ここから同期 edit session を要求できないため
+    /// （Mozc も非同期化）、非同期 READ セッション（RefreshAnchorOnLayout）で
+    /// GetTextExt をやり直し、その中で再配置まで済ませる。
+    fn OnLayoutChange(
+        &self,
+        _pic: Ref<'_, ITfContext>,
+        _lcode: TfLayoutCode,
+        _pview: Ref<'_, ITfContextView>,
+    ) -> Result<()> {
+        self.consume_started_composition();
+        // 追従を要るのは表示中だけ — 非表示のたびにセッションを張らない。
+        if !self.popups_visible() {
+            return Ok(());
+        }
+        // スクロール中は OnLayoutChange が連発する。保留中フラグで 1 本にまとめる
+        // （フラグは RefreshAnchorOnLayout::DoEditSession → layout_refresh_apply で解除）。
+        if self.layout_refresh_pending.get() {
+            return Ok(());
+        }
+        let Some(ctx) = self.layout_sink_ctx.borrow().clone() else {
+            return Ok(());
+        };
+        let sess: ITfEditSession = crate::edit_session::RefreshAnchorOnLayout {
+            context: ctx.clone(),
+            composition: Rc::clone(&self.composition),
+            // 巡2 E1/E3: 投入時点の世代を埋め込む — 遅延発火までに Activate/Deactivate/
+            // context 貼替が起きていたら、layout_refresh_apply が旧座標の適用を断つ。
+            gen: self.layout_sink_gen.get(),
+            _guard: ComObjectGuard::new(),
+        }
+        .into();
+        self.layout_refresh_pending.set(true);
+        let ok = match unsafe {
+            ctx.RequestEditSession(
+                self.tid.get(),
+                &sess,
+                TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_ASYNC.0 | TF_ES_READ.0),
+            )
+        } {
+            // 外側 HRESULT とは別に [out] phrSession がセッション確立結果を運ぶ（windows-rs は
+            // それを Ok(hr) で返す）。phrSession 失敗（TF_E_LOCKED 等）では DoEditSession が
+            // 実行されず pending を下ろす経路が消えるため、内側 HRESULT も判定する（巡2 F3）。
+            Ok(hr) => hr.is_ok(),
+            Err(_) => false,
+        };
+        if !ok {
+            self.layout_refresh_pending.set(false);
+        }
         Ok(())
     }
 }
@@ -1200,7 +2711,7 @@ impl ITfFnConfigure_Impl for TextService_Impl {
     ) -> Result<()> {
         // GUI を in-proc DLL に持ち込まない: 別 exe を起動して閉じるまで待つ（D3 隔離, engine と同じ思想）。
         // 失敗は no-op 劣化（host を巻き込まない）。
-        match config_exe_path() {
+        match crate::config_launch::active_config_exe_path() {
             Some(exe) => {
                 let mut cmd = std::process::Command::new(exe);
                 cmd.arg(format!("{}", hwndparent.0 as isize)); // 親HWND（config 側で owner 化に使える）
@@ -1243,9 +2754,10 @@ impl TextService_Impl {
             None => return,
         };
         let busy = {
-            let st = self.state.borrow();   // 1回の borrow で composing/awaiting_llm を読む
+            let st = self.state.borrow(); // 1回の borrow で composing/awaiting_llm を読む
             st.composing || st.awaiting_llm()
-        } || self.showing.get() || self.llm_slot.borrow().is_some();
+        } || self.showing.get()
+            || self.llm_slot.borrow().is_some();
         match resume_poll_action(gen, self.last_resume_gen.get(), busy) {
             None => (),
             Some(do_drop) => {
@@ -1256,56 +2768,66 @@ impl TextService_Impl {
                     self.drop_engine();
                     tip_log(&format!("ev=resume_reconnect mode=idle_drop gen={gen}"));
                 } else {
-                    tip_log(&format!("ev=resume_reconnect mode=composing_keep gen={gen}"));
+                    tip_log(&format!(
+                        "ev=resume_reconnect mode=composing_keep gen={gen}"
+                    ));
                 }
             }
         }
     }
 
+    fn store_fresh_client(&self, client: EngineClient) {
+        let generation = self.next_client_generation.get().wrapping_add(1);
+        self.next_client_generation.set(generation);
+        self.client_generation.set(Some(generation));
+        *self.client.borrow_mut() = Some(client);
+    }
+
     /// StartSession して client/session を確定保持する。失敗時は client を None のまま。
     fn start_and_store(&self, mut c: EngineClient) {
-        match timed_request(&mut c, &Request::StartSession, IPC_TIMEOUT_FAST, "start_session") {
-            Ok(Response::Session { session, proto }) => {
+        match timed_request(
+            &mut c,
+            &Request::StartSession,
+            IPC_TIMEOUT_FAST,
+            "start_session",
+        ) {
+            Ok(Response::Session {
+                session,
+                proto,
+                boot,
+                ..
+            }) => {
                 // version handshake は接続確立時（fresh StartSession）にだけ効かせる。proto はエンジン
                 // プロセスの属性で、一度確立した接続の途中では変わらないため、既存接続に StartSession を
                 // 貼り直す ensure_session 側では判定しない（この start_and_store が全 fresh 接続経路の合流点）。
-                match decide_handshake(proto, self.handshake_shutdown_attempted.get()) {
+                match decide_handshake(proto, boot.as_deref()) {
                     HandshakeAction::Accept => {
-                        self.handshake_shutdown_attempted.set(false);
                         self.engine_session.set(session);
-                        *self.client.borrow_mut() = Some(c);
-                        tip_log(&format!("ev=engine_proto ok=true proto={PROTO_VERSION} (session={session})"));
+                        self.store_fresh_client(c);
+                        // 巡4 T5: busy 再送の予算は接続単位 — 新しい接続で数え直す
+                        // （Drop でしか戻さないと過去の busy で予算を使い切り、以後の接続で
+                        // 即 giveup して設定反映が永久に再送されなくなる）。
+                        self.reload_retry_count.set(0);
+                        tip_log(&format!(
+                            "ev=engine_proto ok=true proto={PROTO_VERSION} (session={session})"
+                        ));
                         // UU-5: この接続で常駐エンジンへ現在の設定を push する。常駐エンジンは起動時
                         // env で LLM/Zenzai 設定を固定するため、接続確立ごとに settings.json の現在値を
                         // 送って「次回接続（≒次回 Activate）」に反映タイミングを統一する。
                         self.engine_reload_config();
                     }
-                    HandshakeAction::ShutdownRespawn => {
-                        // proto 不一致（更新後に旧エンジンが居座る等）。graceful に止めて世代交代する。
-                        // Shutdown 応答（Ok/Error/タイムアウト）は問わず先へ進む: 旧エンジンは Shutdown を
-                        // 知らず Error を返し自発終了しないが、その最終回収はインストーラの taskkill が担う。
-                        // ここは接続を捨てて respawn を撒くだけ。旧エンジン残存時は spawn_engine_only 冒頭の
-                        // connect(50ms) が成功して Some(0) を返し spawn 自体は起きない（二重化しない）。
-                        // この打鍵は degrade、次打鍵の ensure_engine が新エンジンへ接続して自己修復する。
-                        tip_log(&format!("ev=engine_proto ok=false got={proto:?} want={PROTO_VERSION} -> shutdown"));
-                        let _ = timed_request(&mut c, &Request::Shutdown, IPC_TIMEOUT_FAST, "shutdown");
+                    HandshakeAction::Reject => {
+                        tip_log(&format!(
+                            "ev=engine_identity ok=false wire_got={proto:?} wire_want={PROTO_VERSION} boot_got={boot:?} boot_want={} action=fail_closed",
+                            env!("CARGO_PKG_VERSION")
+                        ));
                         drop(c);
                         self.drop_engine();
-                        let pipe = self.engine_pipe_name();
-                        let _ = spawn_engine_only(&pipe);
-                        self.handshake_shutdown_attempted.set(true);
-                    }
-                    HandshakeAction::DegradeKeep => {
-                        // 一度世代交代を試した後も不一致（旧 exe 残存）。接続は維持し現行 op 範囲で継続する。
-                        tip_log(&format!("ev=engine_proto ok=false got={proto:?} action=keep (session={session})"));
-                        self.engine_session.set(session);
-                        *self.client.borrow_mut() = Some(c);
-                        self.engine_reload_config();
                     }
                 }
             }
             other => {
-                tip_log(&format!("StartSession unexpected: {other:?}"));
+                tip_log(&engine_failure_event("start_session", &other));
                 *self.client.borrow_mut() = None;
             }
         }
@@ -1315,12 +2837,45 @@ impl TextService_Impl {
     /// StartSession の直後に呼ばれる。プロトコルに request-id 相関が無いため要求→応答の交互性が
     /// 命で、応答を消費できたかどうかで分岐する（UU-1 と同型）:
     /// - `Ok(Ok)`: 正常反映。
-    /// - `Ok(Error)`: ReloadConfig 未対応の旧エンジン等。応答は消費済み＝交互性は保たれるので
+    /// - `Ok(Error)`: Engineが設定反映を拒否。応答は消費済み＝交互性は保たれるので
     ///   接続は維持する（設定反映の失敗で IME を止めない＝best-effort の本体）。
     /// - `Ok(その他)` / `Err(_)`: 予期しない応答型（desync 兆候）／タイムアウト・切断（応答未消費で
     ///   late frame が滞留し以降 1-off desync になる）。いずれも `drop_engine` で接続を破棄し、
     ///   次打鍵の ensure_engine で貼り直す（恒常 desync を防ぐ）。
+    fn begin_configuration_change(&self) {
+        self.configuration_generation
+            .set(self.configuration_generation.get().wrapping_add(1));
+        self.acknowledged_configuration_generation.set(0);
+        self.acknowledged_snapshot_connection_generation.set(0);
+        self.apply_snapshot_ui_wait_state(snapshot_ui_begin_configuration_change(
+            self.snapshot_ui_wait_state(),
+        ));
+        self.state.borrow_mut().invalidate_live_snapshot();
+        // 世代が変われば anchor の変換結果は旧設定の産物: 継ぎ足し表示に使わせない。
+        self.state.borrow_mut().invalidate_live_display();
+    }
+
+    fn queue_snapshot_configuration(&self, settings: &settings::Settings) {
+        let key_plain = if settings.llm.api_key_dpapi.is_empty() {
+            None
+        } else {
+            settings::dpapi::decrypt(&settings.llm.api_key_dpapi)
+        };
+        let request = build_reload_config(
+            settings,
+            key_plain.as_ref().map(|key| key.as_str()),
+            |key| std::env::var(key).ok(),
+        );
+        if self
+            .background_input
+            .try_configure_snapshot(self.configuration_generation.get(), request)
+        {
+            self.arm_snapshot_status_poll();
+        }
+    }
+
     pub(crate) fn engine_reload_config(&self) {
+        self.begin_configuration_change();
         let s = settings::load();
         let key_plain = if s.llm.api_key_dpapi.is_empty() {
             None
@@ -1330,28 +2885,93 @@ impl TextService_Impl {
         let req = build_reload_config(&s, key_plain.as_ref().map(|z| z.as_str()), |k| {
             std::env::var(k).ok()
         });
+        let snapshot_req = build_reload_config(&s, key_plain.as_ref().map(|z| z.as_str()), |k| {
+            std::env::var(k).ok()
+        });
+        if self
+            .background_input
+            .try_configure_snapshot(self.configuration_generation.get(), snapshot_req)
+        {
+            self.arm_snapshot_status_poll();
+        }
         let result = {
             let mut guard = self.client.borrow_mut();
-            let Some(client) = guard.as_mut() else { return; };
+            let Some(client) = guard.as_mut() else {
+                return;
+            };
             timed_request(client, &req, IPC_TIMEOUT_FAST, "reload_config")
         };
         match result {
-            Ok(Response::Ok) => tip_log("ev=reload_config ok=true"),
+            Ok(Response::Ok) => {
+                tip_log("ev=reload_config ok=true");
+                // 巡4 T5: 反映が成功したら予算を戻す（busy エピソード単位のカウントにする）。
+                self.reload_retry_count.set(0);
+            }
             Ok(Response::Error { message }) => {
-                // 応答は消費済み（交互性 OK）。旧エンジン等なので接続は維持する。
-                tip_log(&format!("ev=reload_config ok=false reason={message}"));
+                // 応答は消費済み（交互性 OK）。Engine側の明示拒否なので接続は維持する。
+                tip_log(if message.starts_with("reload busy") {
+                    "ev=reload_config ok=false reason=busy"
+                } else {
+                    "ev=reload_config ok=false reason=engine_error"
+                });
+                // 巡3 Z4: busy（warm-up/変換中でスキップ）は一過性 — engine_reload_config は
+                // 接続確立時にしか呼ばれず TIP は接続を維持するため、放置すると「次回接続」が
+                // 原理的に来ず設定が旧値のまま残る。上限付きの遅延再送で warm-up 明けに反映させる
+                // （恒常的なEngine error時の無限再送を防ぐため 2 回で打ち切る）。
+                if message.starts_with("reload busy") {
+                    self.schedule_reload_retry();
+                }
             }
             Ok(other) => {
                 // 予期しない応答型＝desync の兆候。安全側で接続を破棄する。
-                tip_log(&format!("ev=reload_config unexpected resp={other:?} -> drop"));
+                tip_log(&engine_failure_event("reload_config", &Ok(other)));
                 self.drop_engine();
             }
             Err(e) => {
                 // タイムアウト/切断: 応答未消費で late frame 滞留 → 恒常 1-off desync を防ぐため破棄。
-                tip_log(&format!("ev=reload_config err={e:?} -> drop"));
+                tip_log(&engine_failure_event("reload_config", &Err(e)));
                 self.drop_engine();
             }
         }
+    }
+
+    /// 巡3 Z4: busy 応答を受けた ReloadConfig の遅延再送（上限付き）。0ms スレッドタイマで
+    /// メッセージループの次周へ逃がし、タイマID 照合で disarm 済み/新しい再送との衝突を切る。
+    /// busy は warm-up の数秒窓で起こるため 1s 間隔・最大 2 回で実務的に十分。
+    fn schedule_reload_retry(&self) {
+        // 巡4 J5: warm-up は通常環境でも約2.1s・遅環境で 3〜5s+ — t+1s×2 では到達前に
+        // 予算切れする。5 回（t+1..t+5s）まで許す。予算は接続確立/成功時にリセットされる。
+        const RELOAD_RETRY_MAX: u32 = 5;
+        self.reload_retry_count
+            .set(self.reload_retry_count.get().saturating_add(1));
+        if self.reload_retry_count.get() > RELOAD_RETRY_MAX {
+            tip_log("ev=reload_config retry_giveup");
+            return;
+        }
+        let n = self.reload_retry_count.get();
+        tip_log(&format!("ev=reload_config retry={n}"));
+        // 既存の再送タイマがあれば差し替え（多重武装しない）。
+        let old = self.reload_retry_timer.replace(0);
+        if old != 0 {
+            unsafe {
+                let _ = KillTimer(None, old);
+            }
+        }
+        let ts = self as *const TextService_Impl;
+        let id = unsafe { SetTimer(None, 0, 1000, Some(reload_retry_timer_proc)) };
+        if id != 0 {
+            self.reload_retry_timer.set(id);
+            RELOAD_RETRY_TS.with(|p| p.set(ts));
+        }
+    }
+
+    /// 再送タイマの発火口（STA メッセージループ上）。タイマID 照合後に残り回数を消費して再送。
+    fn fire_reload_retry(&self, id: usize) {
+        if self.reload_retry_timer.get() != id {
+            return; // 旧タイマの発火（差し替え後の残り）— 掃除だけして無視。
+        }
+        self.reload_retry_timer.set(0);
+        self.engine_reload_config();
     }
 
     /// cold start ②: IME 切替（Activate）の時点でエンジンを先行起動しておく。
@@ -1380,7 +3000,9 @@ impl TextService_Impl {
         if should_prespawn(
             self.client.borrow().is_some(),
             self.spawn_attempted.get(),
-            self.reconnect_backoff.borrow().full_attempt_allowed(std::time::Instant::now()),
+            self.reconnect_backoff
+                .borrow()
+                .full_attempt_allowed(std::time::Instant::now()),
         ) {
             // pid=0 は「既に listening（spawn 不要）」、pid>0 は実 spawn（spawn_engine_only 参照）。
             match spawn_engine_only(&self.engine_pipe_name()) {
@@ -1398,7 +3020,9 @@ impl TextService_Impl {
     /// 起動はこの活性化につき最大1回（spawn_attempted）。全失敗は握り潰す（劣化動作）。
     /// キースレッドを長時間ブロックしない（200ms+50ms+400ms の短時間のみ）。
     pub(crate) fn ensure_engine(&self) {
-        if self.client.borrow().is_some() { return; }
+        if self.client.borrow().is_some() {
+            return;
+        }
         let pipe = self.engine_pipe_name(); // stable per-session name (Task 1)
         let now = std::time::Instant::now();
 
@@ -1406,7 +3030,9 @@ impl TextService_Impl {
         // 半死（session 確立失敗）検出後はプローブも満了まで停止する（probe_suppressed）。
         // borrow はブロックで閉じてから start_and_store/borrow を呼ぶ（二重借用 panic 回避）。
         if !self.reconnect_backoff.borrow().full_attempt_allowed(now) {
-            if !self.reconnect_backoff.borrow().probe_allowed() { return; }
+            if !self.reconnect_backoff.borrow().probe_allowed() {
+                return;
+            }
             if let Ok(c) = EngineClient::connect_to(&pipe, Duration::ZERO) {
                 self.start_and_store(c);
                 if self.client.borrow().is_some() {
@@ -1417,7 +3043,10 @@ impl TextService_Impl {
                     // 遅延の起算は「失敗を記録した今」— StartSession の 250ms を跨いだ後なので取り直す（I-1）。
                     let mut b = self.reconnect_backoff.borrow_mut();
                     b.on_session_failure(std::time::Instant::now());
-                    tip_log(&format!("ev=engine_backoff kind=session n={}", b.failures()));
+                    tip_log(&format!(
+                        "ev=engine_backoff kind=session n={}",
+                        b.failures()
+                    ));
                 }
             }
             return; // connect 失敗のプローブは無償（カウントしない）
@@ -1431,7 +3060,10 @@ impl TextService_Impl {
             tip_log(&format!("connected to {pipe}"));
             connected_once = true;
             self.start_and_store(c);
-            if self.client.borrow().is_some() { self.reconnect_backoff.borrow_mut().reset(); return; }
+            if self.client.borrow().is_some() {
+                self.reconnect_backoff.borrow_mut().reset();
+                return;
+            }
         }
 
         match crate::engine_link::decide(false, self.spawn_attempted.get()) {
@@ -1448,36 +3080,67 @@ impl TextService_Impl {
                 if let Ok(c) = EngineClient::connect_to(&pipe, Duration::from_millis(50)) {
                     connected_once = true;
                     self.start_and_store(c);
-                    if self.client.borrow().is_some() { self.reconnect_backoff.borrow_mut().reset(); return; }
+                    if self.client.borrow().is_some() {
+                        self.reconnect_backoff.borrow_mut().reset();
+                        return;
+                    }
                 }
                 match engine_exe_path() {
                     Some(exe) => {
-                        tip_log(&format!("ev=engine_exe path={} exists={}", exe.display(), exe.exists()));
+                        tip_log(&format!(
+                            "ev=engine_exe path={} exists={}",
+                            exe.display(),
+                            exe.exists()
+                        ));
                         let s = settings::load();
-                        let key_plain = if s.llm.api_key_dpapi.is_empty() { None }
-                            else { settings::dpapi::decrypt(&s.llm.api_key_dpapi) };
-                        let env_map = settings::resolve_env_map(&s, key_plain.as_ref().map(|z| z.as_str()), |k| std::env::var(k).ok());
+                        let key_plain = if s.llm.api_key_dpapi.is_empty() {
+                            None
+                        } else {
+                            settings::dpapi::decrypt(&s.llm.api_key_dpapi)
+                        };
+                        let env_map = settings::resolve_env_map(
+                            &s,
+                            key_plain.as_ref().map(|z| z.as_str()),
+                            |k| std::env::var(k).ok(),
+                        );
                         match spawn_engine_hidden(&exe, &pipe, &env_map) {
                             Some(child) => {
-                                tip_log(&format!("ev=engine_spawn pid={} ok=true env_keys={}", child.id(), env_map.len()));
+                                tip_log(&format!(
+                                    "ev=engine_spawn pid={} ok=true env_keys={}",
+                                    child.id(),
+                                    env_map.len()
+                                ));
                                 *self.engine_child.borrow_mut() = Some(child);
                                 // 起動直後は listening まで間があるので短く一度だけ。ダメでも degrade（次打鍵の 1) で拾う）。
                                 // 成功しても早期 return せず fall-through で末尾判定に達する（M-4）。
                                 // cold start ①: spawn→connect 成功までの所要（engine 側 stage=listening と突き合わせる）。
                                 let started = std::time::Instant::now();
-                                if let Ok(c) = EngineClient::connect_to(&pipe, Duration::from_millis(400)) {
-                                    tip_log(&format!("ev=coldstart stage=spawn_to_connect ms={}", started.elapsed().as_millis()));
+                                if let Ok(c) =
+                                    EngineClient::connect_to(&pipe, Duration::from_millis(400))
+                                {
+                                    tip_log(&format!(
+                                        "ev=coldstart stage=spawn_to_connect ms={}",
+                                        started.elapsed().as_millis()
+                                    ));
                                     tip_log("connected after spawn");
                                     connected_once = true;
                                     self.start_and_store(c);
                                 } else {
-                                    tip_log("spawn ok, not yet listening -> degrade this keystroke");
+                                    tip_log(
+                                        "spawn ok, not yet listening -> degrade this keystroke",
+                                    );
                                 }
                             }
-                            None => { tip_log("ev=engine_spawn pid=0 ok=false"); tip_log("ev=degraded reason=spawn_failed"); }
+                            None => {
+                                tip_log("ev=engine_spawn pid=0 ok=false");
+                                tip_log("ev=degraded reason=spawn_failed");
+                            }
                         }
                     }
-                    None => { tip_log("engine exe path not found"); tip_log("ev=degraded reason=spawn_failed"); }
+                    None => {
+                        tip_log("engine exe path not found");
+                        tip_log("ev=degraded reason=spawn_failed");
+                    }
                 }
             }
         }
@@ -1490,26 +3153,44 @@ impl TextService_Impl {
         } else {
             let end = std::time::Instant::now();
             let mut b = self.reconnect_backoff.borrow_mut();
-            if connected_once { b.on_session_failure(end); } else { b.on_connect_failure(end); }
-            tip_log(&format!("ev=engine_backoff kind={} n={}",
-                             if connected_once { "session" } else { "connect" }, b.failures()));
+            if connected_once {
+                b.on_session_failure(end);
+            } else {
+                b.on_connect_failure(end);
+            }
+            tip_log(&format!(
+                "ev=engine_backoff kind={} n={}",
+                if connected_once { "session" } else { "connect" },
+                b.failures()
+            ));
         }
     }
 
     /// エンジン接続が壊れたとみなして破棄する。client/session を捨て、起動フラグも戻すので、
     /// 次の打鍵の `ensure_engine` で再接続（必要なら再起動）して復帰できる。
     /// 注意: 呼び出し側は `self.client` の borrow を一切持っていないこと（二重借用 panic 防止）。
-    fn drop_engine(&self) {
-        *self.client.borrow_mut() = None;
+    /// 巡4 T3: key_event_sink からも呼ぶ（エンジン消費済み確定の挿入拒否時の自己修復）ため pub(crate)。
+    pub(crate) fn drop_engine(&self) {
+        // 接続世代が変わる = anchor の変換結果は旧接続の産物。preedit は書き換えないが、
+        // 次打鍵から継ぎ足しに使わせない（Enter で現在表示のまま確定できる）。
+        self.state.borrow_mut().invalidate_live_display();
+        self.client.borrow_mut().take();
+        self.client_generation.set(None);
         self.engine_session.set(0);
+        // 巡4 T5: busy 再送タイマも接続と運命を共にする — 旧接続向けの再送が残っていると
+        // 新接続確立後に重複 ReloadConfig を送る。予算は次の start_and_store で数え直す。
+        let rt = self.reload_retry_timer.replace(0);
+        if rt != 0 {
+            unsafe {
+                let _ = KillTimer(None, rt);
+            }
+        }
         // 接続を捨てる＝パイプの切断。契約: サーバは接続断を検知すると、その接続が所有する
         // セッションを掃除する（--persist 常駐サーバでは接続単位のセッション所有マッピングを持ち、
         // 切断時に endSession 相当＋必要なら stopComposition を実行する。Swift サーバ側で並行対応中）。
         //   注: 旧コメントの「接続を捨てる＝engine プロセスごと終了しセッションも消える」は
         //   --persist 常駐サーバの導入で false になった（プロセスは生き続ける）。掃除の責務は
         //   プロセス終了ではなくサーバの接続断ハンドラに移った。
-        // 保留 EndSession は無効化する（復帰時は新接続なので古い id を送ってはいけない）。
-        self.pending_end_session.set(0);
         // A': owe していた応答も接続ごと消える。新接続には持ち越さない。
         self.pending_since.set(None);
         self.spawn_attempted.set(false);
@@ -1525,9 +3206,7 @@ impl TextService_Impl {
     /// 破棄しないと遅延 Session フレームの滞留で恒常 1-off desync になる — UU-1）。
     ///
     /// 戻り値: **今この呼び出しでセッションを新規作成したか**。true のとき engine 側の
-    /// ComposingText は空なので、composition 継続中の呼び出し元（input_char）は打鍵1文字では
-    /// なく `state.raw` 全体を送り直すこと（ライブ変換タイムアウト等の drop_engine 後に
-    /// 積み上げた読みが消える 22→23 文字目データロスの再発防止）。
+    /// ComposingText は空なので、合成継続中の呼び出し元はcanonical journal全量を送り直す。
     pub(crate) fn ensure_session(&self) -> bool {
         if self.engine_session.get() != 0 {
             return false;
@@ -1537,7 +3216,12 @@ impl TextService_Impl {
         let result = {
             let mut guard = self.client.borrow_mut();
             guard.as_mut().map(|client| {
-                timed_request(client, &Request::StartSession, IPC_TIMEOUT_FAST, "start_session")
+                timed_request(
+                    client,
+                    &Request::StartSession,
+                    IPC_TIMEOUT_FAST,
+                    "start_session",
+                )
             })
         };
         match result.map(plan_start_session) {
@@ -1612,17 +3296,65 @@ impl TextService_Impl {
         }
     }
 
+    /// 通常の同期要求用の送信前ゲート。未読応答を期限内に回収できない接続をそのまま
+    /// 保持すると、要求を送れなかった打鍵だけ engine 側の composing から欠落する。
+    /// そこで user action を伴う同期 op は drain 不成立時に接続ごと捨て、次の変換要求が
+    /// canonical journal 全量から新セッションを張り直す。
+    ///
+    /// LiveConvert はタイマ起点で本文状態を進めないため、この helper を使わず従来どおり
+    /// pending を保持する。EndSession も composition 終端固有の扱いがあるため専用分岐を保つ。
+    fn prepare_send_or_drop(&self, op: &str, tier: Duration) -> bool {
+        match self.prepare_send(op, tier) {
+            DrainOutcome::Proceed => true,
+            DrainOutcome::StillPending => {
+                tip_log(&format!("ev=degraded reason=pending_before_{op}"));
+                self.drop_engine();
+                false
+            }
+            DrainOutcome::Dropped => false,
+        }
+    }
+
+    /// Explicit/live conversion keeps using the synchronous client until the snapshot protocol
+    /// lands. Rebuild that separate session from the authoritative styled journal; the input
+    /// worker's private session is never borrowed by the STA thread.
+    pub(crate) fn reanchor_engine_from_local(&self) -> bool {
+        let segments = self.state.borrow().canonical_segments();
+        if segments.is_empty() {
+            return false;
+        }
+        self.drop_engine();
+        self.ensure_engine();
+        if self.client.borrow().is_none() {
+            return false;
+        }
+        let mut engine_reading = None;
+        for segment in segments {
+            let style = match segment.style {
+                crate::input_module::TextStyle::Kana => InsertStyle::Kana,
+                crate::input_module::TextStyle::Direct => InsertStyle::Direct,
+            };
+            engine_reading = self.engine_insert(&segment.text, style);
+            if engine_reading.is_none() {
+                return false;
+            }
+        }
+        if let Some(reading) = engine_reading {
+            self.compare_local_kana(&reading);
+        }
+        true
+    }
+
     /// `text` を挿入して読みを得る。client/session が無い・失敗なら None（劣化）。
-    /// 通常の打鍵は 1 文字だが、drop_engine 後の再接続でセッションを張り直した直後は
-    /// `state.raw` 全体を 1 回で送り直す（ensure_session のドキュメント参照）。
+    /// 同期変換のreanchorではcanonical journalのstyle区間ごとに全量を送り直す。
     /// エンジン側 insert は文字列単位（roman2kana は逐次挿入とバッチ挿入で等価、かなは素通し）。
     /// 失敗時は接続を破棄して次打鍵で復帰できるようにする。
     /// borrow は `result` ブロック内で完結させ、drop 後に `drop_engine` を呼ぶ（二重借用 panic 防止）。
     pub(crate) fn engine_insert(&self, text: &str, style: InsertStyle) -> Option<String> {
-        // INV1: pending 中は送信前にドレイン。解消できなければ要求は送らず劣化継続。
-        match self.prepare_send("insert", IPC_TIMEOUT_FAST) {
-            DrainOutcome::Proceed => {}
-            DrainOutcome::StillPending | DrainOutcome::Dropped => return None,
+        // INV1: pending 中は送信前にドレイン。解消できなければ接続を捨て、今回 TIP 側へ
+        // 積んだ文字を次打鍵の raw 全量 reseed で必ず engine へ戻す。
+        if !self.prepare_send_or_drop("insert", IPC_TIMEOUT_FAST) {
+            return None;
         }
         let session = self.engine_session.get();
         let result = {
@@ -1633,7 +3365,7 @@ impl TextService_Impl {
                 &Request::Insert {
                     session,
                     text: text.to_string(),
-                    // ワイヤ既定(roman2kana)は None で省略 — 旧エンジンに繋いでも壊れない。
+                    // ワイヤ既定(roman2kana)は None で省略する。
                     style: match style {
                         InsertStyle::Direct => Some("direct".to_string()),
                         InsertStyle::Kana => None,
@@ -1654,7 +3386,7 @@ impl TextService_Impl {
                 None
             }
             other => {
-                tip_log(&format!("insert('{text}') failed: {other:?}"));
+                tip_log(&engine_failure_event("insert", &other));
                 tip_log("ev=degraded reason=insert_failed");
                 self.drop_engine();
                 None
@@ -1662,8 +3394,12 @@ impl TextService_Impl {
         }
     }
 
-    /// 変換候補を要求する。失敗なら None（劣化）し接続を破棄する。
-    pub(crate) fn engine_convert(&self) -> Option<Vec<String>> {
+    /// Reconvert/undo owns a captured reading, independent of the current input journal.
+    fn engine_convert_reading(&self, reading: &str) -> Option<(String, Vec<String>)> {
+        let kana = self.engine_insert(reading, InsertStyle::Kana)?;
+        if !self.prepare_send_or_drop("convert", IPC_TIMEOUT_CONVERT) {
+            return None;
+        }
         let session = self.engine_session.get();
         let left_context = self.left_context.borrow().clone();
         let result = {
@@ -1675,22 +3411,26 @@ impl TextService_Impl {
             let started = std::time::Instant::now();
             let r = timed_request(
                 client,
-                &Request::Convert { session, left_context },
+                &Request::Convert {
+                    session,
+                    left_context,
+                },
                 IPC_TIMEOUT_CONVERT,
                 "convert",
             );
             if resume_probe {
                 tip_log(&format!(
                     "ev=resume_first_convert op=convert ms={} ok={}",
-                    started.elapsed().as_millis(), r.is_ok()
+                    started.elapsed().as_millis(),
+                    r.is_ok()
                 ));
             }
             r
         };
         match result {
-            Ok(Response::Candidates { candidates }) => Some(candidates),
+            Ok(Response::Candidates { candidates }) => Some((kana, candidates)),
             other => {
-                tip_log(&format!("convert failed: {other:?}"));
+                tip_log(&engine_failure_event("convert", &other));
                 tip_log("ev=degraded reason=convert_failed");
                 self.drop_engine();
                 None
@@ -1701,6 +3441,12 @@ impl TextService_Impl {
     /// 修正変換候補を要求する（Tab）。失敗なら None（劣化）し接続を破棄する。手動キー起動なので
     /// A7 の resume_probe 計測（復帰後最初の変換系 op）は対象外（engine_convert と異なり計測しない）。
     pub(crate) fn engine_typo_convert(&self) -> Option<Vec<String>> {
+        if !self.reanchor_engine_from_local() {
+            return None;
+        }
+        if !self.prepare_send_or_drop("typo_convert", IPC_TIMEOUT_CONVERT) {
+            return None;
+        }
         let session = self.engine_session.get();
         let left_context = self.left_context.borrow().clone();
         let result = {
@@ -1708,7 +3454,10 @@ impl TextService_Impl {
             let client = guard.as_mut()?;
             timed_request(
                 client,
-                &Request::TypoConvert { session, left_context },
+                &Request::TypoConvert {
+                    session,
+                    left_context,
+                },
                 IPC_TIMEOUT_CONVERT,
                 "typo_convert",
             )
@@ -1716,7 +3465,7 @@ impl TextService_Impl {
         match result {
             Ok(Response::Candidates { candidates }) => Some(candidates),
             other => {
-                tip_log(&format!("typo_convert failed: {other:?}"));
+                tip_log(&engine_failure_event("typo_convert", &other));
                 tip_log("ev=degraded reason=typo_convert_failed");
                 self.drop_engine();
                 None
@@ -1726,6 +3475,9 @@ impl TextService_Impl {
 
     /// 選択かな表層を1往復で再変換し候補を得る（SP5 step-6）。失敗なら None（劣化）し接続を破棄する。
     pub(crate) fn engine_reconvert_surface(&self, surface: &str) -> Option<Vec<String>> {
+        if !self.prepare_send_or_drop("reconvert", IPC_TIMEOUT_CONVERT) {
+            return None;
+        }
         let session = self.engine_session.get();
         let left_context = self.left_context.borrow().clone();
         let result = {
@@ -1736,14 +3488,19 @@ impl TextService_Impl {
             let started = std::time::Instant::now();
             let r = timed_request(
                 client,
-                &Request::Reconvert { session, surface: surface.to_string(), left_context },
+                &Request::Reconvert {
+                    session,
+                    surface: surface.to_string(),
+                    left_context,
+                },
                 IPC_TIMEOUT_CONVERT,
                 "reconvert",
             );
             if resume_probe {
                 tip_log(&format!(
                     "ev=resume_first_convert op=reconvert ms={} ok={}",
-                    started.elapsed().as_millis(), r.is_ok()
+                    started.elapsed().as_millis(),
+                    r.is_ok()
                 ));
             }
             r
@@ -1751,7 +3508,7 @@ impl TextService_Impl {
         match result {
             Ok(Response::Candidates { candidates }) => Some(candidates),
             other => {
-                tip_log(&format!("reconvert_surface failed: {other:?}"));
+                tip_log(&engine_failure_event("reconvert", &other));
                 tip_log("ev=degraded reason=reconvert_surface_failed");
                 self.drop_engine();
                 None
@@ -1764,13 +3521,19 @@ impl TextService_Impl {
     /// 失敗（未知セッション/キャッシュ無し/index 範囲外/接続断）は None＝劣化し、呼び出し側で従来確定へ。
     /// borrow は `result` ブロック内で完結させ、drop 後に degrade する（二重借用 panic 防止）。
     pub(crate) fn engine_commit(&self, index: usize) -> Option<(String, String)> {
+        if !self.prepare_send_or_drop("commit", IPC_TIMEOUT_FAST) {
+            return None;
+        }
         let session = self.engine_session.get();
         let result = {
             let mut guard = self.client.borrow_mut();
             let client = guard.as_mut()?;
             timed_request(
                 client,
-                &Request::Commit { session, index: index as u32 },
+                &Request::Commit {
+                    session,
+                    index: index as u32,
+                },
                 IPC_TIMEOUT_FAST,
                 "commit",
             )
@@ -1780,12 +3543,12 @@ impl TextService_Impl {
             // エンジンが確定を拒否（未知セッション/キャッシュ無し/index 範囲外/stale）= 想定内の劣化。
             // convert/insert と違い commit の拒否は接続不良ではないので drop_engine しない
             // （部分確定で保持中の生きたセッションを巻き添えで壊さない）。None を返し全確定へフォールバック。
-            Ok(Response::Error { message }) => {
-                tip_log(&format!("commit declined: {message}"));
+            Ok(Response::Error { .. }) => {
+                tip_log("ev=engine_declined op=commit");
                 None
             }
             other => {
-                tip_log(&format!("commit failed: {other:?}"));
+                tip_log(&engine_failure_event("commit", &other));
                 tip_log("ev=degraded reason=commit_failed");
                 self.drop_engine();
                 None
@@ -1794,10 +3557,17 @@ impl TextService_Impl {
     }
 
     /// 文節ナビゲーション: 選択文節を `offset` だけ動かす（未開始ならエンジンが `base_index` を
-    /// 種に開始する）。Error 応答は decline（旧エンジンの unknown method / キャッシュ無し /
+    /// 種に開始する）。Error 応答は decline（キャッシュ無し /
     /// stale / 被覆候補無し）= 接続不良ではないので drop しない — 呼び出し側が従来の
     /// 「確定して畳む」へ劣化する（engine_commit の decline と同じ規律）。
-    pub(crate) fn engine_move_clause(&self, offset: i32, base_index: usize) -> Option<ClauseViewData> {
+    pub(crate) fn engine_move_clause(
+        &self,
+        offset: i32,
+        base_index: usize,
+    ) -> Option<ClauseViewData> {
+        if !self.prepare_send_or_drop("move_clause", IPC_TIMEOUT_CONVERT) {
+            return None;
+        }
         let session = self.engine_session.get();
         let left_context = self.left_context.borrow().clone();
         let result = {
@@ -1816,20 +3586,23 @@ impl TextService_Impl {
             )
         };
         match result {
-            Ok(Response::ClauseView { segments, selected, candidates, candidate_index }) => {
-                Some(ClauseViewData {
-                    segments,
-                    selected: selected as usize,
-                    candidates,
-                    candidate_index: candidate_index as usize,
-                })
-            }
-            Ok(Response::Error { message }) => {
-                tip_log(&format!("move_clause declined: {message}"));
+            Ok(Response::ClauseView {
+                segments,
+                selected,
+                candidates,
+                candidate_index,
+            }) => Some(ClauseViewData {
+                segments,
+                selected: selected as usize,
+                candidates,
+                candidate_index: candidate_index as usize,
+            }),
+            Ok(Response::Error { .. }) => {
+                tip_log("ev=engine_declined op=move_clause");
                 None
             }
             other => {
-                tip_log(&format!("move_clause failed: {other:?}"));
+                tip_log(&engine_failure_event("move_clause", &other));
                 tip_log("ev=degraded reason=move_clause_failed");
                 self.drop_engine();
                 None
@@ -1840,32 +3613,41 @@ impl TextService_Impl {
     /// 文節ナビゲーション: 選択文節の候補を `index` へ差し替える。decline 規約は
     /// engine_move_clause と同じ（Error は drop しない）。
     pub(crate) fn engine_select_clause_candidate(&self, index: usize) -> Option<ClauseViewData> {
+        if !self.prepare_send_or_drop("select_clause_candidate", IPC_TIMEOUT_FAST) {
+            return None;
+        }
         let session = self.engine_session.get();
         let result = {
             let mut guard = self.client.borrow_mut();
             let client = guard.as_mut()?;
             timed_request(
                 client,
-                &Request::SelectClauseCandidate { session, index: index as u32 },
+                &Request::SelectClauseCandidate {
+                    session,
+                    index: index as u32,
+                },
                 IPC_TIMEOUT_FAST, // 変換なし（状態差し替えのみ）
                 "select_clause_candidate",
             )
         };
         match result {
-            Ok(Response::ClauseView { segments, selected, candidates, candidate_index }) => {
-                Some(ClauseViewData {
-                    segments,
-                    selected: selected as usize,
-                    candidates,
-                    candidate_index: candidate_index as usize,
-                })
-            }
-            Ok(Response::Error { message }) => {
-                tip_log(&format!("select_clause_candidate declined: {message}"));
+            Ok(Response::ClauseView {
+                segments,
+                selected,
+                candidates,
+                candidate_index,
+            }) => Some(ClauseViewData {
+                segments,
+                selected: selected as usize,
+                candidates,
+                candidate_index: candidate_index as usize,
+            }),
+            Ok(Response::Error { .. }) => {
+                tip_log("ev=engine_declined op=select_clause_candidate");
                 None
             }
             other => {
-                tip_log(&format!("select_clause_candidate failed: {other:?}"));
+                tip_log(&engine_failure_event("select_clause_candidate", &other));
                 tip_log("ev=degraded reason=select_clause_failed");
                 self.drop_engine();
                 None
@@ -1877,6 +3659,9 @@ impl TextService_Impl {
     /// engine_commit と同じ — None なら呼び出し側が表示中ビューの連結を直確定する（学習に
     /// 乗らないだけで確定は必ず成功する）。
     pub(crate) fn engine_commit_clauses(&self) -> Option<(String, String)> {
+        if !self.prepare_send_or_drop("commit_clauses", IPC_TIMEOUT_CONVERT) {
+            return None;
+        }
         let session = self.engine_session.get();
         let result = {
             let mut guard = self.client.borrow_mut();
@@ -1895,12 +3680,12 @@ impl TextService_Impl {
         };
         match result {
             Ok(Response::Committed { text, reading }) => Some((text, reading)),
-            Ok(Response::Error { message }) => {
-                tip_log(&format!("commit_clauses declined: {message}"));
+            Ok(Response::Error { .. }) => {
+                tip_log("ev=engine_declined op=commit_clauses");
                 None
             }
             other => {
-                tip_log(&format!("commit_clauses failed: {other:?}"));
+                tip_log(&engine_failure_event("commit_clauses", &other));
                 tip_log("ev=degraded reason=commit_clauses_failed");
                 self.drop_engine();
                 None
@@ -1919,15 +3704,16 @@ impl TextService_Impl {
 
     /// ライブ変換を要求し (text, reading, committed) を得る。失敗なら None（劣化）し接続を破棄する。
     /// seq は要求に載せてエコーさせる（A1 では 1:1 のため鮮度判定は不要。A2 で is_fresh_live を使う）。
-    /// `auto_commit` はエンジン側の自動確定（iOS nospacekey の先頭文節自動確定）を許可するか。
-    /// true を送ってよいのは応答の `committed` を composition へ適用できる経路
-    /// （on_debounce_convert → apply_live_auto_commit）だけ。Enter 系の確定経路は false
-    /// （直後の Commit{0} が残り読みしか確定できなくなるため — protocol.rs 参照）。
+    /// `auto_commit` はエンジン側の先頭文節消費を許可するか。現在の呼び出し元は非同期結果を
+    /// compositionへ適用しないため、すべて false を渡す。
     pub(crate) fn engine_live_convert(
         &self,
         seq: u64,
         auto_commit: bool,
     ) -> Option<(String, String, Option<String>)> {
+        if !self.reanchor_engine_from_local() {
+            return None;
+        }
         // INV1: pending 中は送信前にドレイン。解消できなければ要求は送らず劣化継続。
         match self.prepare_send("live_convert", IPC_TIMEOUT_LIVE) {
             DrainOutcome::Proceed => {}
@@ -1944,24 +3730,37 @@ impl TextService_Impl {
             let started = std::time::Instant::now();
             let r = timed_request_keep(
                 client,
-                &Request::LiveConvert { session, seq, left_context, auto_commit },
+                &Request::LiveConvert {
+                    session,
+                    seq,
+                    left_context,
+                    auto_commit,
+                },
                 IPC_TIMEOUT_LIVE,
                 "live_convert",
             );
             if resume_probe {
                 tip_log(&format!(
                     "ev=resume_first_convert op=live_convert ms={} ok={}",
-                    started.elapsed().as_millis(), r.is_ok()
+                    started.elapsed().as_millis(),
+                    r.is_ok()
                 ));
             }
             r
         };
         match result {
-            Ok(Response::LiveResult { seq: _resp_seq, text, reading, committed }) => {
+            Ok(Response::LiveResult {
+                seq: _resp_seq,
+                text,
+                reading,
+                committed,
+            }) => {
+                // 候補が読みと同一でも、IPC が成功した事実を本文なしで診断できるようにする。
+                tip_log("ev=live_convert_ok");
                 Some((text, reading, committed))
             }
             // INV3: LiveConvert のタイムアウトは drop_engine しない。pending をマークし接続・
-            //       セッションを保つ（自動確定の安定履歴＝セッション単位を守る＝死のループを断つ）。
+            //       要求/応答の交互性を回復できるようセッションを保つ。
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 if self.pending_since.get().is_none() {
                     self.pending_since.set(Some(std::time::Instant::now()));
@@ -1970,7 +3769,7 @@ impl TextService_Impl {
                 None
             }
             other => {
-                tip_log(&format!("live_convert failed: {other:?}"));
+                tip_log(&engine_failure_event("live_convert", &other));
                 tip_log("ev=degraded reason=live_convert_failed");
                 self.drop_engine();
                 None
@@ -1983,12 +3782,36 @@ impl TextService_Impl {
     /// Space/Enter で SP1 候補フローに任せる（既存タイマがあれば畳むだけ）。
     pub(crate) fn arm_debounce(&self) {
         self.disarm_debounce();
-        if !self.live_enabled.get() {
+        if self.local_clauses.borrow().is_some() && !self.partial_preedit_redraw_pending.get() { return; }
+        if !self.live_enabled.get() && !self.partial_preedit_redraw_pending.get() {
             return;
         }
         DEBOUNCE_TS.with(|p| p.set(self as *const TextService_Impl));
         let id = unsafe { SetTimer(None, 0, DEBOUNCE_MS, Some(debounce_timer_proc)) };
+        // 巡3 P9: 失敗（タイマ資源枯渇。稀）を黙らない — debounce が発火せずライブ変換が
+        // 次打鍵まで止まる。フォールバック（即時変換）は preedit 確定前のタイミングで
+        // 副作用が大きいのでログで診断可能にする（arm_llm_poll と非対称なまま黙すより良い）。
+        if id == 0 {
+            tip_log("ev=debounce_arm_failed");
+        }
         self.debounce_timer.set(id);
+    }
+
+    /// 部分確定後の preedit 再描画だけを上限付きで再武装する。通常の live debounce と異なり、
+    /// edit-session が永続拒否されても無限タイマにならない。新しい打鍵/callback は回数を
+    /// リセットして別の回復機会を作る。
+    pub(crate) fn arm_partial_preedit_redraw_retry(&self) {
+        if !self.partial_preedit_redraw_pending.get() {
+            self.partial_preedit_redraw_retries.set(0);
+            return;
+        }
+        let Some(next) = next_partial_redraw_retry(self.partial_preedit_redraw_retries.get())
+        else {
+            tip_log("ev=partial_preedit_redraw retry=exhausted");
+            return;
+        };
+        self.partial_preedit_redraw_retries.set(next);
+        self.arm_debounce();
     }
 
     /// デバウンスタイマを解除する（非武装に戻す）。
@@ -2024,6 +3847,13 @@ impl TextService_Impl {
     /// text_mismatch・NoBuffer・TooLong → disarm／CompositionOpen → 維持（no-op）。
     /// ログは長さのみ（確定本文を出さない — I-3）。
     pub(crate) fn start_commit_undo(&self, ctx: &ITfContext) {
+        self.preedit_apply.invalidate();
+        // 前回確定の EndComposition だけが保留なら先に close-only で回収する。本文は既に
+        // SetText 済みなので、ここで新しい composition を重ねてはいけない。
+        if !self.finish_pending_composition(ctx) {
+            tip_log("ev=commit_undo skipped=pending_end");
+            return;
+        }
         // 1) 純関数で事前条件を判定する（COM を触る前）。tlen は UTF-16 単位で数える。
         let armed = self.undo_armed.get();
         let has_composition = self.composition.borrow().is_some();
@@ -2070,6 +3900,7 @@ impl TextService_Impl {
             context: ctx.clone(),
             sink,
             composition: Rc::clone(&self.composition),
+            started: Rc::clone(&self.composition_started_signal),
             expected: text.clone(),
             out: Rc::clone(&matched),
             left_context_out: Rc::clone(&self.left_context),
@@ -2083,6 +3914,7 @@ impl TextService_Impl {
                 TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
             );
         }
+        self.consume_started_composition();
         if !*matched.borrow() {
             // 照合失敗（文書を一切書いていない）。武装を残さず離脱する（I-6）。
             tip_log("ev=commit_undo_skip reason=text_mismatch");
@@ -2096,12 +3928,13 @@ impl TextService_Impl {
         *self.reconvert_reading.borrow_mut() = reading.clone();
         *self.last_commit.borrow_mut() = None;
 
-        // 4) 新セッションを張り直して読みをリプレイする（セッション不変条件 — start_reconvert 同型）。
-        self.ensure_engine();
+        // 4) 旧 pipe を閉じてから新接続・新セッションを張り、読みをリプレイする。
+        // engine_end_session は接続を drop する非同期 lifecycle signal なので、ensure_engine より
+        // 後に置くと今作った接続まで捨ててしまう。
         self.engine_end_session();
+        self.ensure_engine();
         self.ensure_session();
-        let _ = self.engine_insert(&reading, InsertStyle::Kana);
-        let cands = self.engine_convert().unwrap_or_default();
+        let cands = self.engine_convert_reading(&reading).map(|(_, candidates)| candidates).unwrap_or_default();
         if cands.is_empty() {
             // 空結果: cancel_reconvert が reconvert_original（=確定文字列）を書き戻して畳む無害離脱。
             self.cancel_reconvert(ctx);
@@ -2118,7 +3951,7 @@ impl TextService_Impl {
         ));
     }
 
-    /// Tab: 現在の読みを外部LLMへ。接続をワーカへ move し、preedit を「変換中…」にして
+    /// Tab: 現在の読みを外部LLMへ。専用ワーカに読みを渡し、preedit を「変換中…」にして
     /// 入力ロック（AwaitingLlm）。UI スレッドはポーリングタイマで結果を受け取る。
     pub(crate) fn start_llm_convert(&self, ctx: &ITfContext) {
         // 外部LLM変換が無効(フィーチャーフラグ off)なら何もしない（呼び元でも弾くが多重防御）。
@@ -2128,76 +3961,107 @@ impl TextService_Impl {
         if !self.state.borrow().composing || self.state.borrow().awaiting_llm() {
             return;
         }
-        // 接続を取り出して move（無ければ劣化＝何もしない）。
-        let client = match self.client.borrow_mut().take() {
-            Some(c) => c,
-            None => { tip_log("ev=llm_no_client"); return; }
-        };
-        let session = self.engine_session.get();
+        // 巡11(round11): 素材(表示中テキスト)が空なら開始しない — 空 Backspace の cancel
+        // 拒否巻き戻し(composing=true・素材空)で Tab が通ると、空セッションへ投げた上に
+        // preedit を「変換中…」で上書きし awaiting_llm 中の入力ロックで cancel 再試行を
+        // 死なせる。素材が無い変換に意味は無い。
+        if self.live_text.borrow().is_empty() {
+            tip_log("ev=llm_skip_empty_text");
+            return;
+        }
+        if self.explicit_snapshot_pending.get() {
+            if !self.conversion_queue.borrow_mut().supersede_calculation() {
+                self.show_conversion_queue_notice(ctx, "未処理入力があります。処理完了後に変換してください");
+                return;
+            }
+            self.cancel_explicit_snapshot_wait();
+            tip_log("ev=llm_supersede_pending");
+        }
+        let segments = self.state.borrow().canonical_segments();
+        if segments.is_empty() { return; }
+        let pipe = self.engine_pipe_name();
         *self.pre_llm_text.borrow_mut() = self.live_text.borrow().clone();
         *self.current_context.borrow_mut() = Some(ctx.clone());
-        // 修正候補窓が出ていれば閉じる（その上に「変換中…」を出さない）。input_char と同じ片付け。
-        if self.showing.get() {
-            self.candidate_ui.borrow_mut().hide();
-            self.showing.set(false);
-            self.clear_clause_nav();
-        }
+        // Local candidate windows deliberately do not use the legacy showing flag.
+        // Retire both kinds of UI before replacing the preedit with the LLM status.
+        self.showing.set(false);
+        self.clause_nav.borrow_mut().take();
+        self.state.borrow_mut().handle(ModuleEvent::Candidates(ModuleCandidateEvent::Closed));
+        if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.close_window(); }
+        self.candidate_ui.borrow_mut().hide();
         let seq = self.state.borrow_mut().bump_llm_seq();
         self.state.borrow_mut().set_awaiting_llm(true);
         self.llm_started.set(Some(std::time::Instant::now())); // タイムアウト計測の起点
         self.disarm_debounce(); // 進行中のライブ変換タイマは止める
+        self.state.borrow_mut().invalidate_live_display();
         self.run_preedit(ctx, "🌐変換中…");
         let slot: LlmSlot = Arc::new(Mutex::new(None));
         *self.llm_slot.borrow_mut() = Some(slot.clone());
         let left_context = self.left_context.borrow().clone();
         // ワーカ上限 30s: UI の LLM_TIMEOUT(8s) 打ち切り後もエンジン側タイムアウト応答
-        // （llm_timeout_ms 既定 15s の Error）は受け取って接続を正常返却できる長さ。
+        // （llm_timeout_ms 既定 15s の Error）を受け取れる長さ。
         // これを超える無応答は接続破棄（B10: 無期限ブロックでワーカ/エンジン接続スレッドを
         // 永久占有しない）。
-        spawn_llm_worker(client, session, seq, left_context, slot, Duration::from_secs(30));
-        self.arm_llm_poll();
-        tip_log(&format!("ev=llm_request seq={seq} session={session}"));
+        // 巡3 P6: スレッド生成失敗（OS 資源枯渇）は panic させない — awaiting_llm=true の
+        // まま poll 未武装で入力ロックが残る。arm_llm_poll 失敗と同じ abort_llm 劣化へ。
+        if spawn_llm_worker(
+            pipe,
+            segments,
+            seq,
+            left_context,
+            slot,
+            Duration::from_secs(30),
+        )
+        .is_err()
+        {
+            self.abort_llm("worker_spawn_failed");
+            return;
+        }
+        if !self.arm_llm_poll() {
+            // 巡2 B3: ポーリングを張れない以上、結果受け取りもタイムアウト判定も走らない。
+            // seq を bump 済みの abort_llm で入力ロックを解除し読み preedit へ復元する
+            // （in-flight のワーカ結果は seq 不一致で stale 扱いになる）。
+            self.abort_llm("poll_arm_failed");
+            return;
+        }
+        tip_log(&format!("ev=llm_request seq={seq}"));
     }
 
-    fn arm_llm_poll(&self) {
+    /// LLM ポーリングタイマを武装する。失敗（タイマ資源枯渇。稀）は false — 呼び出し側は
+    /// 即時 abort へ劣化する（巡2 B3）。awaiting_llm の解除経路は llm_poll_proc と Esc のみ
+    /// なので、失敗を無視すると自動タイムアウトが死に、Esc を知らないユーザーは入力
+    /// ロックから抜けられない（3窓の「SetTimer 失敗→即時劣化」と同じ規律）。
+    fn arm_llm_poll(&self) -> bool {
         self.disarm_llm_poll();
         LLM_TS.with(|p| p.set(self as *const TextService_Impl));
         let id = unsafe { SetTimer(None, 0, LLM_POLL_MS, Some(llm_poll_proc)) };
+        if id == 0 {
+            return false;
+        }
         self.llm_poll_timer.set(id);
+        true
     }
 
     fn disarm_llm_poll(&self) {
         let id = self.llm_poll_timer.replace(0);
-        if id != 0 { unsafe { let _ = KillTimer(None, id); } }
+        if id != 0 {
+            unsafe {
+                let _ = KillTimer(None, id);
+            }
+        }
     }
 
-    /// LLM 待機を中断する共通経路（Esc 手動取消・タイムアウト共用）。世代を進めて in-flight
-    /// 結果を確実に stale 化し、入力ロック（AwaitingLlm）を解除、ポーリング/スロット/起点時刻を
-    /// 片付け、接続を捨てて読み preedit へ復元する。これが無いと、応答が来ないエンジンでは
-    /// `awaiting_llm()` が永久に真のまま残り、IME 全体がフリーズする。
-    ///
-    /// 注意: 接続（EngineClient）はワーカスレッドへ move 済みで、エンジンが真に無応答の場合は
-    /// ワーカが read でブロックしたままになりうる（スレッド/ハンドルのリーク）。これを避けるため、
-    /// spawn したエンジンを Child ハンドル経由で kill して pipe を壊し、ブロック中のワーカ read を
-    /// 即座に失敗させてスレッド/ハンドルを回収する（L-5）。あわせて pipe_name を破棄し、次打鍵の
-    /// `ensure_engine` が stable_pipe_name で同名パイプに再接続できるようにする（engine は永続
-    /// singleton — pipe_name のキャッシュを空にするのは engine_pipe_name に再計算させるためで、
-    /// 名前自体は logon session 固定で変わらない）。
+    /// Retire the result slot and restore the pre-request surface. The worker owns its
+    /// bounded connection; cancelling it must not close a newer STA connection.
     pub(crate) fn abort_llm(&self, reason: &str) {
         {
             let mut st = self.state.borrow_mut();
-            st.bump_llm_seq();          // 後から届く結果を stale として確実に捨てる
+            st.bump_llm_seq(); // 後から届く結果を stale として確実に捨てる
             st.set_awaiting_llm(false); // 入力ロック解除（フリーズからの脱出）
         }
         self.disarm_llm_poll();
         *self.llm_slot.borrow_mut() = None;
         self.llm_started.set(None);
-        self.pipe_name.borrow_mut().clear(); // キャッシュを空にし、次回 engine_pipe_name に同名で再解決させる
-        // 共有 engine は殺さない（他ホストが接続中の永続 singleton。旧 oneShot 専用 engine 時代の kill を
-        // ここで行うと設定アプリ等を巻き込んで変換不可にする）。drop_engine が Child ハンドルを手放す
-        // （プロセス継続）。ブロック中の LLM worker は engine 応答で自然完了し、戻った接続は stale 化済みで
-        // drop される＝その1接続のみ閉じ engine は生存。真にハングした稀ケースは worker リークを許容する。
-        self.drop_engine();
         let ctx = self.current_context.borrow().clone();
         self.restore_pre_llm(ctx);
         tip_log(&format!("ev=llm_abort reason={reason}"));
@@ -2205,48 +4069,55 @@ impl TextService_Impl {
 
     /// LLM 待機が上限時間を超えたか（llm_poll_proc から呼ぶ）。
     fn llm_timed_out(&self) -> bool {
-        self.llm_started.get().map(|t| t.elapsed() >= LLM_TIMEOUT).unwrap_or(false)
+        self.llm_started
+            .get()
+            .map(|t| t.elapsed() >= LLM_TIMEOUT)
+            .unwrap_or(false)
     }
 
-    /// ワーカ結果を UI スレッドで反映する。seq 最新かつ成功なら適用、古い/空/失敗なら pre-LLM へ復元。
+    /// 最新の待機にだけ結果を反映する。空/失敗なら pre-LLM へ復元する。
     pub(crate) fn on_llm_outcome(&self, o: LlmOutcome) {
+        let current = self.state.borrow().llm_seq;
+        if !is_fresh_live(o.seq, current) || !self.state.borrow().awaiting_llm() {
+            return;
+        }
         self.state.borrow_mut().set_awaiting_llm(false);
         self.llm_started.set(None);
         let ctx = self.current_context.borrow().clone();
-        let current = self.state.borrow().llm_seq;
-        let fresh = is_fresh_live(o.seq, current);
         match o.result {
-            Ok(text) if fresh && !text.is_empty() => {
-                if let Some(c) = o.client { *self.client.borrow_mut() = Some(c); }
-                self.flush_pending_end_session(); // 合成が in-flight 中に終了していたら保留 EndSession を送る
-                self.state.borrow_mut().mark_good(&text);
+            Ok(text) if !text.is_empty() => {
+                let accepted = self.local_clauses.borrow_mut().as_mut()
+                    .map_or(true, |model| model.replace_whole_surface(text.clone()));
+                if !accepted {
+                    self.restore_pre_llm(ctx);
+                    return;
+                }
                 *self.live_text.borrow_mut() = text.clone();
-                if let Some(ctx) = ctx { self.run_preedit(&ctx, &text); }
+                self.state.borrow_mut().invalidate_live_display();
+                if let Some(ctx) = ctx {
+                    self.run_preedit(&ctx, &text);
+                }
                 tip_log(&format!("ev=llm_applied seq={}", o.seq));
             }
             Ok(_) => {
-                // 古い seq（Esc等）or 空 → 接続を戻し pre-LLM へ復元。
-                if let Some(c) = o.client { *self.client.borrow_mut() = Some(c); }
-                self.flush_pending_end_session(); // 合成が in-flight 中に終了していたら保留 EndSession を送る
+                // 空結果は pre-LLM へ復元。古い結果は上のガードで捨てる。
                 self.restore_pre_llm(ctx);
-                tip_log(&format!("ev=llm_stale_or_empty seq={} current={}", o.seq, current));
+                tip_log(&format!(
+                    "ev=llm_stale_or_empty seq={} current={}",
+                    o.seq, current
+                ));
             }
-            Err(msg) => {
-                // 失敗 → 接続は drop（戻さない）。次操作で再接続。pre-LLM へ復元。
-                self.drop_engine();
+            Err(_) => {
                 self.restore_pre_llm(ctx);
-                tip_log(&format!("ev=llm_failed msg={msg}"));
+                tip_log("ev=llm_failed");
             }
         }
     }
 
     fn restore_pre_llm(&self, ctx: Option<ITfContext>) {
         let pre = self.pre_llm_text.borrow().clone();
-        // last_good は live_text でなく「実際に画面へ出す文字列」で記録する — pre が
-        // 空のとき表示は last_reading であり、劣化フォールバックの素材はそちらが正しい。
-        let shown = if pre.is_empty() { self.last_reading.borrow().clone() } else { pre.clone() };
-        self.state.borrow_mut().mark_good(&shown);
         *self.live_text.borrow_mut() = pre.clone();
+        self.state.borrow_mut().invalidate_live_display();
         if let Some(ctx) = ctx {
             if pre.is_empty() {
                 // 退避が空なら読みのまま（last_reading）に。
@@ -2258,130 +4129,519 @@ impl TextService_Impl {
         }
     }
 
-    /// タイマ発火時（入力が一定時間落ち着いた）の遅延変換。
-    /// composing 中なら現在の読みを convert し preedit を漢字へ全置換する。失敗/空は据え置き。
-    /// auto_commit=true で要求するのはこの経路だけ: エンジンが自動確定（iOS nospacekey の
-    /// 先頭文節自動確定）を返したら apply_live_auto_commit で prefix を確定し残りを継続する。
+    /// タイマ発火時は immutable snapshot を専用 worker へ渡し、identity が現在値と一致する
+    /// 結果だけを STA 上で preedit へ適用する。
     pub(crate) fn on_debounce_convert(&self) {
         if !self.state.borrow().composing {
+            self.partial_preedit_redraw_pending.set(false);
+            self.partial_preedit_redraw_retries.set(0);
             return;
         }
         let ctx = match self.current_context.borrow().clone() {
-            Some(c) => c,
+            Some(ctx) => ctx,
             None => return,
         };
-        // INV6: pending（未読応答を owe）中は新規 LiveConvert を発行しない。engine_live_convert
-        //       内の prepare_send がドレインを試み、解消できなければ要求は送らず None を返す
-        //       （＝この経路はドレイン試行だけ行い、回収できたときのみ次の変換へ進む）。
-        let seq = self.state.borrow_mut().bump_live_seq();
-        if let Some((text, reading, committed)) = self.engine_live_convert(seq, true) {
-            if let Some(prefix) = committed.filter(|p| !p.is_empty()) {
-                self.apply_live_auto_commit(&ctx, &prefix, &text, &reading);
-            } else if !text.is_empty() {
-                self.state.borrow_mut().mark_good(&text);
-                *self.live_text.borrow_mut() = text.clone();
-                // 表示だけ全角化（mark_good/live_text は半角のまま — 劣化時の確定素材だから）。
-                self.run_preedit(&ctx, &self.widen_display_text(&text));
-            }
-        }
-    }
-
-    /// バックスペースを送って更新後の読みを得る。失敗なら None（劣化）し接続を破棄する。
-    pub(crate) fn engine_backspace(&self) -> Option<String> {
-        let session = self.engine_session.get();
-        let result = {
-            let mut guard = self.client.borrow_mut();
-            let client = guard.as_mut()?;
-            timed_request(client, &Request::Backspace { session }, IPC_TIMEOUT_FAST, "backspace")
-        };
-        match result {
-            Ok(Response::Reading { reading }) => Some(reading),
-            other => {
-                tip_log(&format!("backspace failed: {other:?}"));
-                tip_log("ev=degraded reason=backspace_failed");
-                self.drop_engine();
-                None
-            }
-        }
-    }
-
-    /// エンジンの現在セッションを終了する。
-    /// 終了後は `engine_session` を 0 に戻し、次の composition で張り直せるようにする。
-    /// Bug 1: EndSession がタイムアウト/broken pipe で失敗したら **接続を破棄する**
-    /// （convert/reconvert/commit/backspace/start_session と同じ形に揃える）。
-    /// さもないと遅延応答フレームがパイプに滞留し、以降そのパイプ上の全リクエストが
-    /// 「1つ前のリクエストの応答」を読む恒常 1-off desync になる（request-id 相関が無く
-    /// 正しさが厳密な要求/応答交互性のみに依存するため）。start_reconvert 等は直後に
-    /// ensure_session を呼ぶが、drop 後は client=None なので無害に degrade する。
-    ///
-    /// 唯一の例外（A' pending+drain）: LiveConvert/Insert のタイムアウトだけは drop_engine せず、
-    /// 未読応答を `pending_since` に owe して接続とセッションを保つ（自動確定の安定履歴＝セッション
-    /// 単位を守る）。交互性は「次の要求を送る前に prepare_send が drain_pending で滞留フレームを
-    /// 1 枚読み切る」ことで回復する（INV1）。ドレインで committed 付き LiveResult を回収したら
-    /// engine 側だけ確定適用済みの不整合なので安全側で drop（INV2）。他 op はこの例外に入らない。
-    /// borrow は `result` ブロック内で完結させ、drop 後に `drop_engine` を呼ぶ（二重借用 panic 防止）。
-    pub(crate) fn engine_end_session(&self) {
-        let session = self.engine_session.get();
-        if session == 0 {
+        if !prepare_debounce_redraw(self.partial_preedit_redraw_pending.get(), || {
+            self.redraw_partial_preedit_if_needed(&ctx)
+        }) {
+            self.arm_partial_preedit_redraw_retry();
             return;
         }
-        // INV1: owe している応答を読み切ってから送る。
-        // Why not(従来どおりドレインせず送って失敗に任せる): desync はしない — `request_within` は
-        // pending 中の送信を I/O 前に `InvalidInput` で弾く（client.rs の規律チェック）ので、従来形は
-        // 必ず `end_session_failed` → `drop_engine` に落ちていた。問題は EndSession が届かないまま
-        // 接続が切れ、次打鍵が再接続＋StartSession（`ensure_engine` のフルコースは最悪 ~1.15s）を
-        // 払うこと。先にドレインすれば接続とセッションを保ったまま EndSession を届けられる。
-        // 代償は打鍵スレッドの追加ブロックで、owe 中の composition 終端に限り最悪
-        // IPC_TIMEOUT_FAST（ドレイン）＋同（送信）。空振り（StillPending）ならその待ちは丸ごと
-        // 無駄になるが、250ms で応答を返せない engine なら再接続は避けられない。
-        // Why not(StillPending を据え置いて次の要求で再ドレイン — insert/live_convert 形):
-        // composition 終端の呼び出しには同じセッションへ送る次の機会が無く、`ensure_engine →
-        // engine_end_session → ensure_session` でセッションを張り直す呼び方（`start_commit_undo` /
-        // `start_reconvert`）では `engine_session` を 0 にしないと直後の `ensure_session` が
-        // 早期 return して古いセッション（残り読み入り）を再利用する（defect#2）。どちらの
-        // 呼ばれ方でも据え置きは選べない。接続を捨てれば --persist サーバの切断ハンドラが
-        // 孤児セッションを掃除する（drop_engine のドキュメント参照）。
-        // Why not(client 不在でもドレインを通す): ドレイン対象は `self.client` 上の滞留フレームで、
-        // LLM ワーカへ move 中は読む先が無い。それでも通すと PENDING_MAX 超過枝が `Dropped` を
-        // 返し、下の `DrainOutcome::Dropped => return` で「復帰時に送り直す」None 枝に届かず
-        // セッション id を落とす。なお `pending_since` は client が Some のときしか立たない
-        // （`engine_insert`/`engine_live_convert` の TimedOut 枝はどちらも `guard.as_mut()?` の後）
-        // ので、その枝に入るには park 時点で `EngineClient::pending` が真だったことになり、その
-        // client は `spawn_llm_worker` の `request_within` が規律ガードで即失敗させて閉じる
-        // ＝到達手順は無い。よってこれは深層防御であり、既知の再現ケースは存在しない。
-        let parked_in_llm_worker = self.client.borrow().is_none();
-        if !parked_in_llm_worker {
-            match self.prepare_send("end_session", IPC_TIMEOUT_FAST) {
-                DrainOutcome::Proceed => {}
-                DrainOutcome::StillPending => {
-                    self.drop_engine();
-                    return;
-                }
-                DrainOutcome::Dropped => return,
-            }
+        if !self.live_enabled.get() || self.local_clauses.borrow().is_some() {
+            return;
         }
-        let result = {
-            let mut guard = self.client.borrow_mut();
-            guard.as_mut().map(|client| {
-                timed_request(client, &Request::EndSession { session }, IPC_TIMEOUT_FAST, "end_session")
-            })
+        let configuration = self.configuration_generation.get();
+        let connection = self.background_input.connection_generation();
+        if !snapshot_configuration_is_acknowledged(
+            configuration,
+            self.acknowledged_configuration_generation.get(),
+            connection,
+            self.acknowledged_snapshot_connection_generation.get(),
+        ) {
+            if !self.snapshot_configuration_pending.get() {
+                self.arm_snapshot_status_poll();
+            }
+            return;
+        }
+        let intent = self.state.borrow_mut().live_snapshot(
+            configuration,
+            connection,
+            self.left_context.borrow().clone(),
+        );
+        let Some(crate::input_module::BackgroundIntent::LiveSnapshot { snapshot }) = intent else {
+            return;
         };
-        self.engine_session.set(0);
-        match result {
-            Some(r) => {
-                if !end_session_ack_accepted(&r) {
-                    tip_log(&format!("end_session failed: {r:?}"));
-                    tip_log("ev=degraded reason=end_session_failed");
-                    self.drop_engine();
-                }
-            }
-            None => {
-                // client は LLM ワーカへ move 済みで今は送れない。id を保留し、復帰時に EndSession を送る。
-                // さもないと engine 側にセッションが取り残され、ConversionService の stopComposition も
-                // 永久に走らない（sessions.isEmpty にならない）。
-                self.pending_end_session.set(session);
+        if self.background_input.try_live_snapshot(snapshot) {
+            self.arm_live_result_poll();
+        } else {
+            self.state.borrow_mut().invalidate_live_snapshot();
+        }
+    }
+
+    pub(crate) fn begin_explicit_snapshot_wait(&self) {
+        let reading = self.state.borrow().canonical_reading().to_string();
+        self.conversion_queue
+            .borrow_mut()
+            .begin(Instant::now(), Some(reading));
+        self.explicit_snapshot_pending.set(true);
+        self.explicit_status_deadline
+            .set(Some(Instant::now() + EXPLICIT_STATUS_DELAY));
+        self.submit_explicit_snapshot();
+        self.arm_snapshot_poll_timer();
+    }
+
+    fn submit_explicit_snapshot(&self) {
+        let configuration = self.configuration_generation.get();
+        let connection = self.background_input.connection_generation();
+        if !snapshot_configuration_is_acknowledged(
+            configuration,
+            self.acknowledged_configuration_generation.get(),
+            connection,
+            self.acknowledged_snapshot_connection_generation.get(),
+        ) {
+            self.arm_snapshot_status_poll();
+            return;
+        }
+        let intent = self.state.borrow_mut().explicit_snapshot(
+            configuration,
+            connection,
+            self.left_context.borrow().clone(),
+        );
+        let Some(crate::input_module::BackgroundIntent::LiveSnapshot { snapshot }) = intent else {
+            self.cancel_explicit_snapshot_wait();
+            return;
+        };
+        if self.background_input.try_live_snapshot(snapshot) {
+            self.arm_live_result_poll();
+        } else {
+            self.state.borrow_mut().invalidate_live_snapshot();
+        }
+    }
+
+    pub(crate) fn cancel_explicit_snapshot_wait(&self) {
+        if !self.explicit_snapshot_pending.get() && !self.explicit_status_visible.get() {
+            return;
+        }
+        self.explicit_snapshot_pending.set(false);
+        self.explicit_status_deadline.set(None);
+        self.hide_explicit_snapshot_status();
+        self.state.borrow_mut().invalidate_live_snapshot();
+        self.disarm_snapshot_poll_if_idle();
+    }
+
+    pub(crate) fn hide_explicit_snapshot_status(&self) {
+        if self.explicit_status_visible.replace(false) {
+            self.candidate_ui.borrow_mut().hide();
+            // A host may post CandidateList behavior for the status row while EndUIElement is
+            // in flight. It must not be replayed against the real candidates shown next.
+            self.behavior_outbox.borrow_mut().take();
+            self.selection_dirty.set(false);
+        }
+    }
+
+    pub(crate) fn show_conversion_queue_notice(&self, context: &ITfContext, message: &str) {
+        let anchor = self.caret_point(context);
+        let theme = self.appearance.borrow_mut().current_theme();
+        self.candidate_ui
+            .borrow_mut()
+            .show(&[message.to_string()], 0, anchor, theme);
+        self.explicit_status_visible.set(true);
+    }
+
+    fn show_explicit_snapshot_status_if_due(&self) {
+        if !should_show_explicit_status(
+            self.explicit_snapshot_pending.get(),
+            self.explicit_status_visible.get(),
+            self.explicit_status_deadline.get(),
+            Instant::now(),
+            self.snapshot_version_mismatch.get(),
+        ) {
+            return;
+        }
+        let Some(context) = self.current_context.borrow().clone() else {
+            return;
+        };
+        let anchor = self.caret_point(&context);
+        let theme = self.appearance.borrow_mut().current_theme();
+        self.candidate_ui.borrow_mut().show(
+            &[EXPLICIT_RECONNECTING_TEXT.to_string()],
+            0,
+            anchor,
+            theme,
+        );
+        self.explicit_status_visible.set(true);
+    }
+
+    fn arm_live_result_poll(&self) {
+        self.live_result_deadline
+            .set(Some(Instant::now() + LIVE_RESULT_TIMEOUT));
+        self.arm_snapshot_poll_timer();
+    }
+
+    fn arm_snapshot_status_poll(&self) {
+        let represented = current_snapshot_configuration_is_represented(
+            self.configuration_generation.get(),
+            self.background_input
+                .desired_snapshot_configuration_generation(),
+        );
+        let pending = represented && !self.snapshot_version_mismatch.get();
+        self.snapshot_configuration_pending.set(pending);
+        if pending {
+            self.arm_snapshot_poll_timer();
+        } else {
+            self.disarm_snapshot_poll_if_idle();
+        }
+    }
+
+    fn arm_snapshot_poll_timer(&self) {
+        let monitor_configured_link = (self.live_enabled.get()
+            || self.explicit_snapshot_pending.get())
+            && self.state.borrow().composing
+            && !self.snapshot_version_mismatch.get()
+            && current_snapshot_configuration_is_represented(
+                self.configuration_generation.get(),
+                self.background_input
+                    .desired_snapshot_configuration_generation(),
+            );
+        let Some(interval) = snapshot_poll_interval(
+            self.live_result_deadline.get().is_some()
+                || self.local_clause_loading()
+                || self.local_clause_redraw_deadline.get().is_some()
+                || self.display_end_context.borrow().is_some()
+                || self.conversion_queue.borrow().waiting
+                || self.clause_worker.learning_pending()
+                || self.receipt_outbox.borrow().as_ref().is_some_and(|outbox| outbox.pending()),
+            self.snapshot_configuration_pending.get(),
+            monitor_configured_link,
+        ) else {
+            self.disarm_live_result_poll();
+            return;
+        };
+        if self.live_result_timer.get() != 0 && self.snapshot_poll_interval_ms.get() == interval {
+            return;
+        }
+        let old = self.live_result_timer.replace(0);
+        if old != 0 {
+            LIVE_RESULT_OWNERS.with(|owners| {
+                owners.borrow_mut().remove(old);
+            });
+            unsafe {
+                let _ = KillTimer(None, old);
             }
         }
+        let id = unsafe { SetTimer(None, 0, interval, Some(live_result_poll_proc)) };
+        if id == 0 {
+            self.snapshot_poll_interval_ms.set(0);
+            self.live_result_deadline.set(None);
+            self.snapshot_configuration_pending.set(false);
+            self.state.borrow_mut().invalidate_live_snapshot();
+        } else {
+            LIVE_RESULT_OWNERS.with(|owners| {
+                owners
+                    .borrow_mut()
+                    .insert(id, self as *const TextService_Impl);
+            });
+            self.live_result_timer.set(id);
+            self.snapshot_poll_interval_ms.set(interval);
+        }
+    }
+
+    pub(crate) fn arm_clause_poll(&self) {
+        self.arm_snapshot_poll_timer();
+    }
+
+    fn finish_live_result_wait(&self) {
+        self.live_result_deadline.set(None);
+        self.arm_snapshot_poll_timer();
+    }
+
+    fn disarm_snapshot_poll_if_idle(&self) {
+        if !self.snapshot_configuration_pending.get() && self.live_result_deadline.get().is_none()
+            && self.local_clause_redraw_deadline.get().is_none()
+            && self.display_end_context.borrow().is_none()
+            && !self.clause_worker.learning_pending()
+            && !self.receipt_outbox.borrow().as_ref().is_some_and(|outbox| outbox.pending()) {
+            self.disarm_live_result_poll();
+        }
+    }
+
+    fn disarm_live_result_poll(&self) {
+        let id = self.live_result_timer.replace(0);
+        if id != 0 {
+            LIVE_RESULT_OWNERS.with(|owners| {
+                owners.borrow_mut().remove(id);
+            });
+            unsafe {
+                let _ = KillTimer(None, id);
+            }
+        }
+        self.live_result_deadline.set(None);
+        self.snapshot_configuration_pending.set(false);
+        self.snapshot_poll_interval_ms.set(0);
+        self.explicit_snapshot_pending.set(false);
+        self.explicit_status_deadline.set(None);
+        self.hide_explicit_snapshot_status();
+    }
+
+    fn poll_live_result(&self) {
+        let capacity_context = self.display_end_context.borrow_mut().take();
+        if let Some(context) = capacity_context { self.end_display_at_capacity(&context); }
+        self.poll_receipt_notice();
+        self.poll_local_clause_redraw();
+        self.poll_local_clause_results();
+        while let Some(status) = self.background_input.try_snapshot_status() {
+            let learning_identity = match &status {
+                crate::background_input::SnapshotStatus::Configured { learning_identity, .. } => learning_identity.clone(),
+                _ => None,
+            };
+            let current_configuration = self.configuration_generation.get();
+            let current_connection = self.background_input.connection_generation();
+            let composing = self.state.borrow().composing;
+            let Some(action) = snapshot_status_action(
+                status,
+                current_configuration,
+                current_connection,
+                composing,
+            ) else {
+                continue;
+            };
+            match action {
+                SnapshotStatusAction::Configured {
+                    schedule_conversion,
+                } => {
+                    self.apply_configured_learning_identity(learning_identity);
+                    self.acknowledged_configuration_generation
+                        .set(current_configuration);
+                    self.acknowledged_snapshot_connection_generation
+                        .set(current_connection);
+                    self.snapshot_configuration_pending.set(false);
+                    self.snapshot_version_mismatch.set(false);
+                    let replay_pending =
+                        self.state.borrow_mut().rebind_expected_snapshot_connection(
+                            current_configuration,
+                            current_connection,
+                        );
+                    if self.explicit_snapshot_pending.get() {
+                        if !replay_pending {
+                            self.submit_explicit_snapshot();
+                        }
+                    } else if schedule_conversion && !replay_pending {
+                        self.arm_debounce();
+                    }
+                }
+                SnapshotStatusAction::Invalidated => {
+                    self.apply_configured_learning_identity(None);
+                    self.acknowledged_configuration_generation.set(0);
+                    self.acknowledged_snapshot_connection_generation.set(0);
+                    self.snapshot_configuration_pending.set(
+                        current_snapshot_configuration_is_represented(
+                            current_configuration,
+                            self.background_input
+                                .desired_snapshot_configuration_generation(),
+                        ),
+                    );
+                    self.live_result_deadline.set(None);
+                    self.state.borrow_mut().invalidate_live_display();
+                }
+                SnapshotStatusAction::VersionMismatch {
+                    actual,
+                    actual_boot,
+                } => {
+                    self.apply_configured_learning_identity(None);
+                    self.acknowledged_configuration_generation.set(0);
+                    self.acknowledged_snapshot_connection_generation.set(0);
+                    self.apply_snapshot_ui_wait_state(snapshot_ui_version_mismatch(
+                        self.snapshot_ui_wait_state(),
+                    ));
+                    self.state.borrow_mut().invalidate_live_snapshot();
+                    self.state.borrow_mut().invalidate_live_display();
+                    self.disarm_snapshot_poll_if_idle();
+                    tip_log(&format!(
+                        "ev=snapshot_identity ok=false wire_got={actual:?} wire_want={PROTO_VERSION} boot_got={actual_boot:?} boot_want={} action=latched",
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                }
+            }
+        }
+        if self.snapshot_configuration_pending.get()
+            && !current_snapshot_configuration_is_represented(
+                self.configuration_generation.get(),
+                self.background_input
+                    .desired_snapshot_configuration_generation(),
+            )
+        {
+            self.snapshot_configuration_pending.set(false);
+        }
+        while let Some(result) = self.background_input.try_result() {
+            if !snapshot_result_is_current(
+                result.identity,
+                self.acknowledged_configuration_generation.get(),
+                self.acknowledged_snapshot_connection_generation.get(),
+                self.background_input.connection_generation(),
+            ) {
+                continue;
+            }
+            if result.enhancement
+                && self
+                    .local_clauses
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|m| m.user_driven)
+            {
+                continue;
+            }
+            let local_snapshot = if result.purpose == crate::input_module::SnapshotPurpose::Explicit
+            {
+                crate::clause_conversion::ClauseConversion::from_snapshot(
+                    ipc::clause::SnapshotIdentity {
+                        composition: result.identity.composition,
+                        revision: result.identity.revision,
+                        configuration_generation: result.identity.configuration_generation,
+                        connection_generation: result.identity.connection_generation,
+                    },
+                    result.baseline,
+                    result.clause_data.clone(),
+                    &result.text,
+                )
+                .ok()
+                .map(|mut model| {
+                    model.learning_identity = result.learning_identity.clone();
+                    if let Some(outbox) = self.receipt_outbox.borrow().as_ref() {
+                        outbox.invalidate_model(&mut model);
+                    }
+                    model
+                })
+                .filter(|model| {
+                    model.reading
+                        == ipc::clause::normalize_reading(self.state.borrow().canonical_reading())
+                })
+            } else {
+                None
+            };
+            if result.purpose == crate::input_module::SnapshotPurpose::Explicit
+                && local_snapshot.is_none()
+            {
+                continue;
+            }
+            if let Some(proposal) = result.auto_commit.clone() {
+                let output =
+                    self.state
+                        .borrow_mut()
+                        .handle(crate::input_module::InputEvent::Engine(
+                            crate::input_module::EngineResult::LiveAutoCommitProposal(proposal),
+                        ));
+                let Some(operation @ crate::input_module::ImmediateOperation::Commit { .. }) =
+                    output.immediate
+                else {
+                    continue;
+                };
+                let Some(context) = self.current_context.borrow().clone() else {
+                    self.state.borrow_mut().complete(&operation, false);
+                    continue;
+                };
+                self.apply_auto_commit_proposal(&context, operation, &result.text);
+                self.finish_live_result_wait();
+                return;
+            }
+            let mut accepted_candidate_remaining = None;
+            let engine_result = match result.purpose {
+                crate::input_module::SnapshotPurpose::Live => {
+                    crate::input_module::EngineResult::LiveSnapshot {
+                        identity: result.identity,
+                        text: result.text,
+                    }
+                }
+                crate::input_module::SnapshotPurpose::Explicit => {
+                    accepted_candidate_remaining =
+                        Some(result.candidate_remaining.unwrap_or_default());
+                    crate::input_module::EngineResult::ExplicitSnapshot {
+                        identity: result.identity,
+                        candidates: vec![result.text.clone()],
+                    }
+                }
+            };
+            let output = self
+                .state
+                .borrow_mut()
+                .handle(crate::input_module::InputEvent::Engine(engine_result));
+            match output.immediate {
+                Some(crate::input_module::ImmediateOperation::SetPreedit { text }) => {
+                    let context = self.current_context.borrow().clone();
+                    self.apply_live_preedit(&text, || {
+                        context.as_ref().is_some_and(|context| {
+                            self.run_preedit(context, &self.widen_display_text(&text))
+                        })
+                    });
+                }
+                Some(crate::input_module::ImmediateOperation::ShowCandidates {
+                    values,
+                    selected,
+                    ..
+                }) => {
+                    if let Some(model) = local_snapshot {
+                        *self.local_clauses.borrow_mut() = Some(model);
+                        self.hide_explicit_snapshot_status();
+                        let context = self.current_context.borrow().clone();
+                        if let Some(context) = context.as_ref() {
+                            self.render_local_edit(context);
+                        }
+                        self.explicit_snapshot_pending.set(false);
+                        self.explicit_status_deadline.set(None);
+                        self.conversion_queue.borrow_mut().resolved();
+                        if let Some(context) = context {
+                            self.drain_conversion_actions(&context);
+                        }
+                        continue;
+                    }
+                    *self.explicit_snapshot_candidate_remaining.borrow_mut() =
+                        accepted_candidate_remaining.unwrap_or_default();
+                    let Some(context) = self.current_context.borrow().clone() else {
+                        continue;
+                    };
+                    self.show_explicit_candidates(&context, &values, selected);
+                }
+                _ => continue,
+            }
+            if result.enhancement {
+                self.finish_live_result_wait();
+                return;
+            }
+            self.explicit_snapshot_pending.set(false);
+            self.explicit_status_deadline.set(None);
+            self.hide_explicit_snapshot_status();
+        }
+        if self
+            .live_result_deadline
+            .get()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.finish_live_result_wait();
+            self.state.borrow_mut().invalidate_live_snapshot();
+            // P1(clause-nav): explicit snapshot 応答の永久欠落（タイムアウト）で待ちを
+            // 解除する。finish_live_result_wait は deadline しか消さず、poll は pending を
+            // 監視条件に含むため、ここで解除しないと pending が残り←→を食い続ける
+            // （P1 の保護は「待ちが成功するまで」で、失敗後は従来動作へ戻す）。
+            if self.explicit_snapshot_pending.get() {
+                self.explicit_snapshot_pending.set(false);
+                self.explicit_status_deadline.set(None);
+                self.hide_explicit_snapshot_status();
+                self.disarm_snapshot_poll_if_idle();
+            }
+        }
+        self.show_explicit_snapshot_status_if_due();
+        self.arm_snapshot_poll_timer();
+    }
+
+    /// Composition callbacks must never wait for EndSession I/O. Closing the persistent pipe is
+    /// the lifecycle signal; EngineHost's connection ownership performs the corresponding cleanup.
+    pub(crate) fn engine_end_session(&self) {
+        if self.engine_session.get() == 0 {
+            return;
+        }
+        // Pipe close is the non-blocking EndSession signal. The persistent host owns connection
+        // sessions and performs cleanup from onDisconnect; waiting for a request/response here
+        // would put engine load and pipe delay back on commit/focus callbacks.
+        self.drop_engine();
     }
 
     /// 再変換訂正の通知。確定は呼び出し前に完了しているため、失敗しても確定動作に影響しない。
@@ -2394,7 +4654,10 @@ impl TextService_Impl {
         }
         let result = {
             let mut guard = self.client.borrow_mut();
-            let client = match guard.as_mut() { Some(c) => c, None => return };
+            let client = match guard.as_mut() {
+                Some(c) => c,
+                None => return,
+            };
             timed_request(
                 client,
                 &Request::RecordCorrection {
@@ -2406,36 +4669,10 @@ impl TextService_Impl {
             )
         };
         match result {
-            Ok(_) => {}   // Ok。旧エンジンは Error を返すがどちらも無視(記録は best-effort)
+            Ok(Response::Ok) => tip_log("ev=reconvert_correction_ack"),
+            Ok(_) => {} // 記録拒否は変換本体へ波及させない。
             Err(_) => {
                 tip_log("ev=degraded reason=record_correction_failed");
-                self.drop_engine();
-            }
-        }
-    }
-
-    /// client 復帰後（on_llm_outcome）に、保留していた EndSession を送って取り残しを掃除する。
-    /// Bug 1: engine_end_session と同じ ack 判定（`end_session_ack_accepted`）を使い、受理外なら
-    /// 接続を破棄して応答フレームの滞留を防ぐ。
-    /// Why not(engine_end_session と同じ送信前ドレインも入れる): ここへ来る client は
-    /// `spawn_llm_worker` が **`request_within` 成功時だけ**返したものなので owe を持たない
-    /// （失敗時は client を返さず、on_llm_outcome の Err 枝が drop_engine するのでここへ来ない）。
-    /// borrow は `result` ブロック内で完結させ、drop 後に `drop_engine` を呼ぶ（二重借用 panic 防止）。
-    fn flush_pending_end_session(&self) {
-        let session = self.pending_end_session.replace(0);
-        if session == 0 {
-            return;
-        }
-        let result = {
-            let mut guard = self.client.borrow_mut();
-            guard.as_mut().map(|client| {
-                timed_request(client, &Request::EndSession { session }, IPC_TIMEOUT_FAST, "end_session")
-            })
-        };
-        if let Some(r) = result {
-            if !end_session_ack_accepted(&r) {
-                tip_log(&format!("flush end_session failed: {r:?}"));
-                tip_log("ev=degraded reason=end_session_failed");
                 self.drop_engine();
             }
         }
@@ -2451,9 +4688,634 @@ impl TextService_Impl {
         VARIANT::from(self.da_target_atom.get() as i32)
     }
 
-    /// preedit を `text` にする編集セッションを同期実行する。失敗は no-op。
-    pub(crate) fn run_preedit(&self, ctx: &ITfContext, text: &str) {
-        self.run_preedit_with_target(ctx, text, None);
+    fn da_prediction_variant(&self) -> VARIANT {
+        VARIANT::from(self.da_prediction_atom.get() as i32)
+    }
+
+    pub(crate) fn prediction_ghost_visible(&self) -> bool {
+        self.prediction_composition.borrow().is_some()
+    }
+
+    pub(crate) fn prediction_ghost_actionable(&self) -> bool {
+        self.prediction_ghost_visible()
+            && self.prediction_finish_pending.get().is_none()
+            && self.prediction_state.borrow().ghost().is_some()
+            && prediction_mode_allows_display(self.is_direct_mode(), self.ephemeral_kana.get())
+    }
+
+    pub(crate) fn prediction_cleanup_in_progress(&self) -> bool {
+        self.prediction_ghost_visible() && self.prediction_finish_pending.get().is_some()
+    }
+
+    fn prediction_owner_is_focused(&self) -> bool {
+        match (
+            self.prediction_context.borrow().as_ref(),
+            self.layout_sink_ctx.borrow().as_ref(),
+        ) {
+            (Some(owner), Some(focused)) => com_identity_eq(owner, focused),
+            _ => false,
+        }
+    }
+
+    fn mark_prediction_tsf_failure_for(&self, ctx: &ITfContext) {
+        *self.prediction_failed_context.borrow_mut() = Some(ctx.clone());
+    }
+
+    fn mark_prediction_tsf_failure_for_owner(&self) {
+        if let Some(ctx) = self
+            .prediction_context
+            .borrow()
+            .clone()
+            .or_else(|| self.layout_sink_ctx.borrow().clone())
+        {
+            self.mark_prediction_tsf_failure_for(&ctx);
+        }
+    }
+
+    fn prediction_failed_for(&self, ctx: &ITfContext) -> bool {
+        self.prediction_failed_context
+            .borrow()
+            .as_ref()
+            .is_some_and(|failed| com_identity_eq(failed, ctx))
+    }
+
+    pub(crate) fn retry_prediction_cleanup_on_input(&self) {
+        if self.prediction_cleanup_in_progress() {
+            // 上限到達／SetTimer失敗後でも次打鍵を安全点として再武装する。
+            // 打鍵自体は本来の IME/host 判定へ進めるため、永久入力ロックにならない。
+            self.arm_prediction_finish_retry(true);
+        }
+    }
+
+    pub(crate) fn cancel_deferred_prediction_preserved_on_input(&self) {
+        self.prediction_deferred_preserved.borrow_mut().clear();
+    }
+
+    pub(crate) fn defer_prediction_preserved_key(&self, context: Option<ITfContext>, guid: GUID) {
+        let mut deferred = self.prediction_deferred_preserved.borrow_mut();
+        // reconvert / feedback は連打しても一度で意味が足りる。GUID 種類数で自然に有界。
+        if deferred.iter().any(|event| event.guid == guid) {
+            return;
+        }
+        deferred.push_back(DeferredPredictionPreservedKey { context, guid });
+    }
+
+    pub(crate) fn flush_deferred_prediction_preserved_keys_if_ready(&self) {
+        if self.prediction_ghost_visible() {
+            return;
+        }
+        let events = std::mem::take(&mut *self.prediction_deferred_preserved.borrow_mut());
+        let sink: ITfKeyEventSink = self.to_interface();
+        for event in events {
+            let result = unsafe { sink.OnPreservedKey(event.context.as_ref(), &event.guid) };
+            if result.is_err() {
+                tip_log("ev=prediction_preserved_replay result=failed");
+            }
+        }
+    }
+
+    fn resume_preedit_after_prediction_cleanup(&self) {
+        if !self.partial_preedit_redraw_pending.get() {
+            return;
+        }
+        let Some(ctx) = self.current_context.borrow().clone() else {
+            return;
+        };
+        // ghost cleanup は composition 表面を外から書き換える非継ぎ足しイベント。
+        self.state.borrow_mut().invalidate_live_display();
+        if self.redraw_partial_preedit_if_needed(&ctx) {
+            self.arm_debounce();
+        } else {
+            self.arm_partial_preedit_redraw_retry();
+        }
+    }
+
+    fn next_prediction_anchor(&self) -> crate::prediction_state::PredictionAnchor {
+        let next = self.prediction_anchor_gen.get().saturating_add(1);
+        self.prediction_anchor_gen.set(next);
+        crate::prediction_state::PredictionAnchor::new(next)
+    }
+
+    fn prediction_now() -> crate::prediction_state::Timestamp {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+        crate::prediction_state::Timestamp::from_millis(
+            elapsed.as_millis().min(u64::MAX as u128) as u64
+        )
+    }
+
+    pub(crate) fn on_explicit_prediction_commit(
+        &self,
+        source: crate::prediction_state::CommitSource,
+        text: &str,
+    ) {
+        if !self.prediction_enabled.get() || text.is_empty() {
+            return;
+        }
+        let context = self
+            .current_context
+            .borrow()
+            .clone()
+            .or_else(|| self.layout_sink_ctx.borrow().clone());
+        let Some(context) = context else {
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
+            tip_log("ev=prediction_unavailable state=no_context");
+            return;
+        };
+        // InputScope の取得不能は通常欄を誤って無効化しないよう許可し、次の確定で再照会する。
+        // 明示された password/PIN と keyboard-disabled context だけを抑止する。
+        if prediction_scope_is_sensitive(
+            query_context_keyboard_disabled(&context),
+            self.query_context_is_password(&context),
+        ) {
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
+            tip_log("ev=prediction_unavailable state=sensitive_scope");
+            return;
+        }
+        self.cancel_prediction_slot();
+        let should_request = {
+            let mut state = self.prediction_state.borrow_mut();
+            state.on_commit(
+                source,
+                text,
+                self.next_prediction_anchor(),
+                Self::prediction_now(),
+            );
+            state.has_activity()
+        };
+        self.prediction_commit_edit_deadline.set(Some(
+            Instant::now() + Duration::from_millis(u64::from(PREDICTION_DEBOUNCE_MS)),
+        ));
+        if should_request {
+            self.arm_prediction_poll(PREDICTION_DEBOUNCE_MS);
+            tip_log("ev=prediction_request stage=debounce");
+        } else {
+            self.disarm_prediction_poll();
+            tip_log("ev=prediction_wait state=context_buffered");
+        }
+    }
+
+    fn cancel_prediction_slot(&self) {
+        if let Some(slot) = self.prediction_slot.borrow_mut().take() {
+            slot.cancel();
+        }
+    }
+
+    pub(crate) fn invalidate_prediction(&self, reason: crate::prediction_state::Invalidation) {
+        self.prediction_commit_edit_deadline.set(None);
+        self.cancel_prediction_slot();
+        self.prediction_state.borrow_mut().invalidate(reason);
+    }
+
+    fn arm_prediction_poll(&self, delay_ms: u32) {
+        self.disarm_prediction_poll();
+        PREDICTION_POLL_TS.with(|p| p.set(self as *const TextService_Impl));
+        let id = unsafe { SetTimer(None, 0, delay_ms, Some(prediction_poll_timer_proc)) };
+        if id == 0 {
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
+            tip_log("ev=prediction_unavailable state=timer_failed");
+        } else {
+            self.prediction_poll_timer.set(id);
+        }
+    }
+
+    fn disarm_prediction_poll(&self) {
+        let id = self.prediction_poll_timer.replace(0);
+        if id != 0 {
+            unsafe {
+                let _ = KillTimer(None, id);
+            }
+        }
+    }
+
+    fn fire_prediction_poll(&self, id: usize) {
+        if self.prediction_poll_timer.get() != id {
+            return;
+        }
+        self.prediction_poll_timer.set(0);
+        // An edit arriving after the debounce is no longer the commit's trailing
+        // notification; it must invalidate the request like any other edit.
+        self.prediction_commit_edit_deadline.set(None);
+        if !prediction_mode_allows_display(self.is_direct_mode(), self.ephemeral_kana.get()) {
+            if self.prediction_ghost_visible() {
+                let _ = self.dismiss_prediction_ghost(false);
+            } else {
+                self.invalidate_prediction(crate::prediction_state::Invalidation::ModeChanged);
+            }
+            tip_log("ev=prediction_invalidate source=mode_poll");
+            return;
+        }
+        let now = Self::prediction_now();
+        let outcome = self
+            .prediction_slot
+            .borrow()
+            .as_ref()
+            .and_then(|slot| slot.take());
+        if let Some(outcome) = outcome {
+            self.cancel_prediction_slot();
+            tip_log(&format!(
+                "ev=prediction_result duration_ms={}",
+                outcome.duration_ms
+            ));
+            match outcome.result {
+                IpcPredictionResult::Prediction(text) => {
+                    if self
+                        .prediction_state
+                        .borrow_mut()
+                        .on_result(outcome.seq, &text, now)
+                        .is_some()
+                    {
+                        let ctx = self.layout_sink_ctx.borrow().clone();
+                        if let Some(ctx) = ctx {
+                            let _ = self.show_prediction_ghost(&ctx);
+                        }
+                    }
+                }
+                IpcPredictionResult::Unavailable(state) => {
+                    let _ = self
+                        .prediction_state
+                        .borrow_mut()
+                        .on_result(outcome.seq, "", now);
+                    tip_log(&format!("ev=prediction_unavailable state={state}"));
+                }
+                IpcPredictionResult::Failed => {
+                    let _ = self
+                        .prediction_state
+                        .borrow_mut()
+                        .on_result(outcome.seq, "", now);
+                    tip_log("ev=prediction_unavailable state=ipc_failed");
+                }
+                IpcPredictionResult::VersionMismatch {
+                    actual_proto,
+                    actual_boot,
+                } => {
+                    let _ = self
+                        .prediction_state
+                        .borrow_mut()
+                        .on_result(outcome.seq, "", now);
+                    tip_log(&format!(
+                        "ev=prediction_engine_identity_mismatch actual_proto={actual_proto:?} actual_boot={actual_boot:?} action=fail_closed"
+                    ));
+                }
+            }
+            return;
+        }
+
+        if self.prediction_state.borrow_mut().expire_pending(now) {
+            self.cancel_prediction_slot();
+            tip_log("ev=prediction_timeout");
+            return;
+        }
+        if self.prediction_slot.borrow().is_some() {
+            self.arm_prediction_poll(PREDICTION_POLL_MS);
+            return;
+        }
+        let request = self.prediction_state.borrow_mut().poll(now);
+        if let Some(request) = request {
+            let slot = PredictionSlot::new();
+            *self.prediction_slot.borrow_mut() = Some(slot.clone());
+            let pipe_name = self.pipe_name.borrow().clone();
+            if spawn_ipc_prediction_worker(pipe_name, request, slot, PREDICTION_TIMEOUT).is_err() {
+                self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
+                tip_log("ev=prediction_unavailable state=worker_spawn_failed");
+                return;
+            }
+            tip_log("ev=prediction_request stage=sent");
+            self.arm_prediction_poll(PREDICTION_POLL_MS);
+        } else if self.prediction_state.borrow().has_activity() {
+            self.arm_prediction_poll(PREDICTION_POLL_MS);
+        }
+    }
+
+    /// `PredictionState` が保持する候補を現在キャレットへ表示する。
+    // Task 4 の予測IPC結果から呼ぶまでの遷移期間だけ未使用を許可する。
+    #[allow(dead_code)]
+    pub(crate) fn show_prediction_ghost(&self, ctx: &ITfContext) -> bool {
+        if !prediction_mode_allows_display(self.is_direct_mode(), self.ephemeral_kana.get()) {
+            self.invalidate_prediction(crate::prediction_state::Invalidation::ModeChanged);
+            tip_log("ev=prediction_invalidate source=mode_show");
+            return false;
+        }
+        let sink_matches_context = self
+            .layout_sink_ctx
+            .borrow()
+            .as_ref()
+            .is_some_and(|sink_ctx| com_identity_eq(sink_ctx, ctx));
+        if self.text_edit_sink_cookie.get() == 0 || !sink_matches_context {
+            self.mark_prediction_tsf_failure_for(ctx);
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
+            tip_log("ev=prediction_disabled reason=edit_sink_context");
+            return false;
+        }
+        let slot_available = prediction_slot_available(
+            self.prediction_composition.borrow().is_some(),
+            self.prediction_finish_pending.get().is_some(),
+        );
+        if !slot_available {
+            // 別欄の旧 physical slot が回収中なら、この欄の結果は後から表示せず stale に畳む。
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
+            return false;
+        }
+        self.prediction_preserve_selection.set(false);
+        if self.prediction_failed_for(ctx)
+            || self.da_prediction_atom.get() == 0
+            || self.composition.borrow().is_some()
+            || self.composition_end_pending.get()
+            || self.showing.get()
+            || self.is_password_context(ctx)
+        {
+            return false;
+        }
+        let Some(text) = self
+            .prediction_state
+            .borrow()
+            .ghost()
+            .map(|ghost| ghost.text.clone())
+        else {
+            return false;
+        };
+        let sink: ITfCompositionSink = self.to_interface();
+        let session: ITfEditSession = StartPredictionGhost {
+            context: ctx.clone(),
+            text: HSTRING::from(text),
+            sink,
+            da_variant: self.da_prediction_variant(),
+            composition: Rc::clone(&self.prediction_composition),
+            editing: Rc::clone(&self.prediction_editing),
+            _guard: ComObjectGuard::new(),
+        }
+        .into();
+        // StartComposition 後の部分失敗でも同じ context で除去・終了を再試行できるよう、
+        // RequestEditSession より前に owner を固定する。
+        *self.prediction_context.borrow_mut() = Some(ctx.clone());
+        let applied = match unsafe {
+            ctx.RequestEditSession(
+                self.tid.get(),
+                &session,
+                TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
+            )
+        } {
+            Ok(hr) => hr.is_ok() && self.prediction_composition.borrow().is_some(),
+            Err(_) => false,
+        };
+        if applied {
+            *self.prediction_context.borrow_mut() = Some(ctx.clone());
+            // 外部の compartment 書換えも短時間で検出し、direct mode 上に ghost を残さない。
+            self.arm_prediction_poll(PREDICTION_POLL_MS);
+            tip_log("ev=prediction_show");
+        } else {
+            if self.prediction_composition.borrow().is_none() {
+                *self.prediction_context.borrow_mut() = None;
+            } else {
+                self.prediction_finish_pending.set(Some(false));
+                self.arm_prediction_finish_retry(true);
+            }
+            self.mark_prediction_tsf_failure_for(ctx);
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
+            tip_log("ev=prediction_disabled reason=tsf_show");
+        }
+        applied
+    }
+
+    fn disarm_prediction_finish_retry(&self) {
+        let id = self.prediction_retry_timer.replace(0);
+        if id != 0 {
+            unsafe {
+                let _ = KillTimer(None, id);
+            }
+        }
+        self.prediction_retry_count.set(0);
+    }
+
+    /// TSF ロック競合で予測 composition を終了できなかった場合の有界再試行。
+    /// owner context と composition slot は成功まで保持し、タイマは STA だけで発火する。
+    fn arm_prediction_finish_retry(&self, reset_budget: bool) {
+        if self.prediction_composition.borrow().is_none()
+            && self.prediction_deferred_preserved.borrow().is_empty()
+        {
+            *self.prediction_context.borrow_mut() = None;
+            self.prediction_finish_pending.set(None);
+            self.disarm_prediction_finish_retry();
+            return;
+        }
+        if reset_budget {
+            self.prediction_retry_count.set(0);
+        }
+        if self.prediction_retry_timer.get() != 0 {
+            return;
+        }
+        if self.prediction_retry_count.get() >= PREDICTION_RETRY_MAX {
+            tip_log("ev=prediction_cleanup retry=exhausted");
+            return;
+        }
+        let id = unsafe {
+            SetTimer(
+                None,
+                0,
+                PREDICTION_RETRY_MS,
+                Some(prediction_retry_timer_proc),
+            )
+        };
+        if id == 0 {
+            if self.prediction_owner_is_focused() {
+                self.mark_prediction_tsf_failure_for_owner();
+            }
+            tip_log("ev=prediction_cleanup retry=timer_failed");
+        } else {
+            self.prediction_retry_timer.set(id);
+        }
+    }
+
+    fn fire_prediction_finish_retry(&self, id: usize) {
+        if self.prediction_retry_timer.get() != id {
+            return;
+        }
+        self.prediction_retry_timer.set(0);
+        if self.prediction_composition.borrow().is_none() {
+            *self.prediction_context.borrow_mut() = None;
+            self.prediction_finish_pending.set(None);
+            self.prediction_retry_count.set(0);
+            self.resume_preedit_after_prediction_cleanup();
+            self.flush_deferred_prediction_preserved_keys_if_ready();
+            return;
+        }
+        let accept = self.prediction_finish_pending.get().unwrap_or(false);
+        if self.request_finish_prediction_ghost(accept, false) {
+            self.prediction_retry_count.set(0);
+            tip_log("ev=prediction_cleanup retry=success");
+            self.resume_preedit_after_prediction_cleanup();
+            self.flush_deferred_prediction_preserved_keys_if_ready();
+            return;
+        }
+        if self.prediction_owner_is_focused() {
+            self.mark_prediction_tsf_failure_for_owner();
+        }
+        self.prediction_retry_count
+            .set(self.prediction_retry_count.get().saturating_add(1));
+        self.arm_prediction_finish_retry(false);
+    }
+
+    fn request_finish_prediction_ghost(&self, accept: bool, asynchronous: bool) -> bool {
+        let Some(ctx) = self.prediction_context.borrow().clone() else {
+            return self.prediction_composition.borrow().is_none();
+        };
+        self.prediction_finish_pending.set(Some(accept));
+        let session: ITfEditSession = FinishPredictionGhost {
+            context: ctx.clone(),
+            composition: Rc::clone(&self.prediction_composition),
+            owner_context: Rc::clone(&self.prediction_context),
+            editing: Rc::clone(&self.prediction_editing),
+            failure_context: Rc::clone(&self.prediction_failed_context),
+            pending: Rc::clone(&self.prediction_finish_pending),
+            preserve_selection: self.prediction_preserve_selection.get(),
+            accept,
+            _guard: ComObjectGuard::new(),
+        }
+        .into();
+        let flags = if asynchronous {
+            TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_ASYNC.0 | TF_ES_READWRITE.0)
+        } else {
+            TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0)
+        };
+        match unsafe { ctx.RequestEditSession(self.tid.get(), &session, flags) } {
+            Ok(hr) if asynchronous => hr.is_ok(),
+            Ok(hr) => hr.is_ok() && self.prediction_composition.borrow().is_none(),
+            Err(_) => false,
+        }
+    }
+
+    pub(crate) fn accept_prediction_ghost(&self) -> bool {
+        if !self.prediction_ghost_visible() {
+            return false;
+        }
+        if !self.request_finish_prediction_ghost(true, false) {
+            // accept を後から成功させると、その間に来た入力より ghost が後置されて順序が逆転する。
+            // TSF 拒否時は予測だけを捨てる方へ降格し、通常入力を本来の IME 経路で継続させる。
+            self.prediction_finish_pending.set(Some(false));
+            self.mark_prediction_tsf_failure_for_owner();
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
+            self.arm_prediction_finish_retry(true);
+            tip_log("ev=prediction_disabled reason=tsf_accept");
+            return false;
+        }
+        let anchor = self.next_prediction_anchor();
+        let accepted = self
+            .prediction_state
+            .borrow_mut()
+            .accept_ghost(anchor, Self::prediction_now())
+            .is_some();
+        if accepted {
+            self.arm_prediction_poll(PREDICTION_DEBOUNCE_MS);
+            tip_log("ev=prediction_accept");
+        }
+        accepted
+    }
+
+    pub(crate) fn dismiss_prediction_ghost(&self, suppress_same_context: bool) -> bool {
+        if !self.prediction_ghost_visible() {
+            return false;
+        }
+        if !self.request_finish_prediction_ghost(false, false) {
+            self.mark_prediction_tsf_failure_for_owner();
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
+            self.arm_prediction_finish_retry(true);
+            tip_log("ev=prediction_disabled reason=tsf_dismiss");
+            return false;
+        }
+        if suppress_same_context {
+            self.prediction_state.borrow_mut().dismiss_ghost();
+            tip_log("ev=prediction_dismiss");
+        } else {
+            self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
+        }
+        true
+    }
+
+    fn invalidate_prediction_after_external_edit(&self) {
+        self.prediction_preserve_selection.set(true);
+        self.invalidate_prediction(crate::prediction_state::Invalidation::SelectionChanged);
+        if !self.prediction_ghost_visible() {
+            *self.prediction_context.borrow_mut() = None;
+            return;
+        }
+        if !self.request_finish_prediction_ghost(false, true) {
+            self.mark_prediction_tsf_failure_for_owner();
+            self.arm_prediction_finish_retry(true);
+            tip_log("ev=prediction_disabled reason=tsf_external_edit");
+        } else {
+            // Request の受理は DoEditSession の成功を保証しない。実行終了まで
+            // bounded timer で slot を監視し、後発失敗なら同じ owner context で再試行する。
+            self.arm_prediction_finish_retry(true);
+        }
+    }
+
+    fn abandon_prediction_for_context_change(
+        &self,
+        reason: crate::prediction_state::Invalidation,
+    ) -> bool {
+        self.prediction_deferred_preserved.borrow_mut().clear();
+        self.invalidate_prediction(reason);
+        if self.prediction_ghost_visible() && !self.request_finish_prediction_ghost(false, false) {
+            self.mark_prediction_tsf_failure_for_owner();
+            self.arm_prediction_finish_retry(true);
+            tip_log("ev=prediction_disabled reason=tsf_context_change");
+            return false;
+        }
+        *self.prediction_context.borrow_mut() = None;
+        self.prediction_finish_pending.set(None);
+        self.disarm_prediction_finish_retry();
+        true
+    }
+
+    /// preeditの本文適用を返す。装飾修復待ちでも本文適用済みならtrue。
+    pub(crate) fn run_preedit(&self, ctx: &ITfContext, text: &str) -> bool {
+        self.run_preedit_with_target(ctx, text, None)
+    }
+
+    /// Edit session 内の `StartComposition` が実際に成功した後だけ、新しい composition
+    /// lifecycle を開始する。RequestEditSession 拒否・StartComposition 前の失敗では shared
+    /// signal が立たないため、Test→Key reservation と stale callback 世代を変更しない。
+    /// OnTest/OnKey/CompositionTerminated などの同期再入入口でも先頭から呼ぶことで、caller
+    /// が RequestEditSession から戻る前の COM callout でも同じ one-shot を消費できる。
+    pub(crate) fn consume_started_composition(&self) {
+        if !self.composition_started_signal.replace(false) {
+            return;
+        }
+        self.invalidate_pending_end_test_reservation();
+        self.composition_generation
+            .set(self.composition_generation.get().wrapping_add(1));
+    }
+
+    /// 部分確定後に保留した残り読みを、旧 composition の close 完了後に一度だけ張り直す。
+    /// 戻り値 false は「まだ close/再描画できない」なので、caller は timer または次打鍵へ委ねる。
+    pub(crate) fn redraw_partial_preedit_if_needed(&self, ctx: &ITfContext) -> bool {
+        if !self.partial_preedit_redraw_pending.get() {
+            return true;
+        }
+        if !self.state.borrow().composing {
+            self.partial_preedit_redraw_pending.set(false);
+            self.partial_preedit_redraw_retries.set(0);
+            return true;
+        }
+        if self.composition_end_pending.get() && !self.finish_pending_composition(ctx) {
+            return false;
+        }
+        let text = self.live_text.borrow().clone();
+        let shown = if text.is_empty() {
+            self.last_reading.borrow().clone()
+        } else {
+            text
+        };
+        let applied = self
+            .apply_preedit_with_target(ctx, &self.widen_display_text(&shown), None)
+            .fully_applied();
+        let redrawn =
+            applied && self.composition.borrow().is_some() && !self.composition_end_pending.get();
+        if redrawn {
+            self.partial_preedit_redraw_pending.set(false);
+            self.partial_preedit_redraw_retries.set(0);
+        }
+        redrawn
     }
 
     /// `target` = 選択文節の (UTF-16 開始, 長さ)。Some なら該当区間だけ太下線属性で上書きする
@@ -2463,72 +5325,542 @@ impl TextService_Impl {
         ctx: &ITfContext,
         text: &str,
         target: Option<(usize, usize)>,
-    ) {
+    ) -> bool {
+        self.apply_preedit_with_target(ctx, text, target)
+            .body_applied()
+    }
+
+    pub(crate) fn apply_preedit_with_target(
+        &self,
+        ctx: &ITfContext,
+        text: &str,
+        target: Option<(usize, usize)>,
+    ) -> ApplyReport {
+        // A retained Commit owns this display identity and its frozen body.
+        // Background preedit work cannot replace it before queue acknowledgement.
+        if self.pending_commit.borrow().is_some() {
+            return ApplyReport::default();
+        }
+        // 前回確定は SetText 済みなので、EndComposition の再試行に失敗したまま同じ range を
+        // preedit で上書きしない。次打鍵では累積済み text を渡して再試行できる。
+        if !self.finish_pending_composition(ctx) {
+            tip_log("ev=preedit_rejected reason=pending_end");
+            return ApplyReport::default();
+        }
+        if self.preedit_apply.needs_end() {
+            if self.composition.borrow().is_none() {
+                self.preedit_apply.restart_after_end();
+            } else {
+                *self.display_end_context.borrow_mut() = Some(ctx.clone());
+                self.arm_clause_poll();
+                return ApplyReport::default();
+            }
+        }
         // atom 未登録（RegisterGUID 失敗）で target を渡すと、sub-range へ atom 0
         // （TF_INVALID_GUIDATOM）を SetValue して既定下線ごと消す — 太下線を諦め区間を
         // 渡さない方が「選択文節だけ下線が無い」より良い劣化。
         let target = target.filter(|_| self.da_target_atom.get() != 0);
         let sink: ITfCompositionSink = self.to_interface();
+        let composition = self.composition.borrow().clone();
+        // Derive caret only by a forward mapping from the reading. Converted
+        // surfaces have no invertible correspondence to reading positions.
+        let reading_caret = {
+            let state = self.state.borrow();
+            let editing = self.local_clauses.borrow().as_ref()
+                .is_none_or(|model| model.mode == crate::clause_conversion::OperationMode::Editing);
+            (state.composing && (state.notation_fixed.is_none()
+                || state.notation_fixed == Some(crate::keymap::Notation::Hiragana))
+                && editing && !self.showing.get())
+                .then(|| (state.canonical_reading().to_owned(), state.reading_cursor()))
+        };
+        let mixed_caret = {
+            let state = self.state.borrow();
+            self.local_clauses.borrow().as_ref().and_then(|model| {
+                let (start, end) = model.editing_range()?;
+                if model.text() != text { return None; }
+                let cursor = state.reading_cursor().max(start).min(end);
+                let prefix: String = model.reading.chars().skip(start.0 as usize).take((cursor.0 - start.0) as usize).collect();
+                let before: usize = model.clauses.iter().take_while(|clause| clause.start < start)
+                    .map(|clause| clause.surface.encode_utf16().count()).sum();
+                u32::try_from(before + prefix.encode_utf16().count()).ok().map(ipc::clause::DisplayUtf16Position)
+            })
+        };
+        let caret = mixed_caret.or_else(|| reading_caret.and_then(|(reading, cursor)| {
+            if self.widen_display_text(&reading) != text { return None; }
+            let prefix: String = reading.chars().take(cursor.0 as usize).collect();
+            u32::try_from(self.widen_display_text(&prefix).encode_utf16().count()).ok()
+                .map(ipc::clause::DisplayUtf16Position)
+        }));
+        let converted = self.local_clauses.borrow().as_ref().filter(|model|
+            model.text() == text && self.da_converted_atom.get() != 0).map_or_else(Vec::new, |model| {
+                let mut offset = 0;
+                model.clauses.iter().filter_map(|clause| {
+                    let start = offset;
+                    let len = clause.surface.encode_utf16().count();
+                    offset += len;
+                    (!matches!(clause.source, crate::clause_conversion::SurfaceSource::Reading)).then_some((start, len))
+                }).collect()
+            });
+        let request = self.preedit_apply.request_display(ctx, composition, text, target, caret, converted);
+        if request.state.outcome() == ApplyOutcome::Deferred {
+            return request.state.report();
+        }
+        request.state.prepare_request();
         let session_obj: ITfEditSession = StartOrUpdatePreedit {
-            context: ctx.clone(),
-            text: HSTRING::from(text),
+            #[cfg(feature = "tsf-test-hooks")]
+            faults: Rc::new(crate::preedit_session::PreeditFaults::default()),
+            on_complete: |request| {
+                let text_applied = request.state.take_text_applied();
+                tip_log(&format!("ev=preedit_complete operation={} outcome={:?} text_applied={text_applied} stale={}",
+                    request.identity.operation_id, request.state.outcome(), request.state.stale()));
+            },
+            capture_left_context: crate::edit_session::read_left_context,
+            apply: Rc::clone(&self.preedit_apply),
+            request: Rc::clone(&request),
             sink,
             da_variant: self.da_variant(),
-            target,
             da_target_variant: self.da_target_variant(),
+            da_converted_variant: VARIANT::from(self.da_converted_atom.get() as i32),
             composition: Rc::clone(&self.composition),
+            started: Rc::clone(&self.composition_started_signal),
             left_context_out: Rc::clone(&self.left_context),
             _guard: ComObjectGuard::new(),
         }
         .into();
-        unsafe {
-            let _ = ctx.RequestEditSession(
+        let result = unsafe {
+            ctx.RequestEditSession(
                 self.tid.get(),
                 &session_obj,
                 TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
-            );
+            )
+        };
+        match result {
+            Ok(hr) => request.state.requested(
+                0,
+                Some(hr.0),
+                windows::Win32::UI::TextServices::TF_S_ASYNC.0,
+            ),
+            Err(error) => request.state.requested(
+                error.code().0,
+                None,
+                windows::Win32::UI::TextServices::TF_S_ASYNC.0,
+            ),
+        }
+        let outcome = request.state.outcome();
+        let applied = outcome == ApplyOutcome::Applied && !request.state.stale();
+        let text_applied = request.state.text_applied();
+        tip_log(&format!("ev=preedit_apply operation={} outcome={outcome:?} text_applied={text_applied} stale={}",
+            request.identity.operation_id, request.state.stale()));
+        // Consume only the explicit StartComposition success signal.  Do this even when a later
+        // SetText/SetSelection step makes the overall session fail: the new composition lifecycle
+        // has already begun and must invalidate old callbacks/reservations.
+        self.consume_started_composition();
+        if !applied {
+            tip_log("ev=preedit_rejected");
         }
         // 読みモニタ: preedit を書いた直後に表示を同期する（打鍵/ライブ結果/部分確定の
         // 全経路がここを通る＝フックの一点化。確定/取消系は run_preedit を通らないので
-        // 各サイトが明示 hide する）。
-        self.update_reading_monitor(ctx);
+        // 各サイトが明示 hide する）。edit session 失敗時は文書の表示と乖離させない。
+        if applied {
+            self.update_reading_monitor(ctx);
+        }
+        let composition = self.composition.borrow().clone();
+        if !self.preedit_apply.is_current(&request, &composition) {
+            request.state.begin(false);
+        }
+        request.state.report()
     }
 
-    /// composition を確定文字列 `text` で確定する編集セッションを同期実行する。失敗は no-op。
-    pub(crate) fn do_commit(&self, ctx: &ITfContext, text: &str) {
+    /// composition を確定文字列 `text` で確定する編集セッションを要求する。
+    /// 戻り値は本文の書込み成功。RequestEditSessionの外側HRESULTやphrSessionの成功値だけ
+    /// では確定としない。queued CommitのDeferredは期限内で保持し、STAのpollが受領する。
+    /// その他の未実行sessionは失効させる。falseを見たcallerは読みと後続入力を保持する。
+    pub(crate) fn do_commit(&self, ctx: &ITfContext, text: &str) -> bool {
+        let pending = self.pending_commit.borrow().clone();
+        if let Some(pending) = pending {
+            if !pending.owns(ctx, self.composition_generation.get())
+                || self.composition_generation.get() != pending.generation
+                || !self.pending_commit_is(&pending)
+                || pending.request.text != text
+            {
+                return false;
+            }
+            if pending.request.state.text_applied() {
+                let inserted = pending.request.state.take_text_applied();
+                self.revoke_pending_commit();
+                if inserted && self.composition_end_pending.get() {
+                    let _ = self.finish_pending_composition(ctx);
+                }
+                return inserted;
+            }
+            if pending.waiting(Instant::now()) {
+                return false;
+            }
+            // Enter retries the same immutable body after timeout/rejection.
+            self.revoke_pending_commit();
+        }
+        self.preedit_apply.invalidate();
+        // 直前の SetText は成功済み。close-only が通るまでは新しい text を同じ composition へ
+        // SetText しない（二重確定・直前確定の置換を防ぐ）。
+        if !self.finish_pending_composition(ctx) {
+            return false;
+        }
+        self.pending_end_generation
+            .set(self.composition_generation.get());
+        self.composition_end_epoch.set(
+            self.composition_end_epoch
+                .get()
+                .checked_add(1)
+                .expect("commit epoch exhausted"),
+        );
+        let composition = self.composition.borrow().clone();
+        let request = self.preedit_apply.request(ctx, composition, text, None);
+        *self.composition_end_report.borrow_mut() = Some(Rc::clone(&request.state));
+        let queued_commit = self.replaying_conversion_queue.get()
+            && matches!(
+                self.conversion_queue.borrow().front(),
+                Some(crate::conversion_queue::ConversionAction::Commit)
+            );
+        let generation = self.composition_generation.get();
+        let deadline = queued_commit.then(|| Instant::now() + Duration::from_millis(1200));
         let session_obj: ITfEditSession = CommitText {
+            // Local clause commits use the semantic queue. Legacy entrances
+            // still own their existing learning path until their migration.
+            on_text_applied: RefCell::new(if queued_commit { self.prepare_commit_receipt(text) } else { None }),
+            #[cfg(feature = "tsf-test-hooks")]
+            fail_attributes: Rc::clone(&self.commit_fail_attributes),
+            caret: Rc::clone(&self.composition_end_caret),
+            apply: Rc::clone(&self.preedit_apply),
+            request: Rc::clone(&request),
+            executed: Cell::new(false),
+            deadline,
             context: ctx.clone(),
             text: HSTRING::from(text),
             composition: Rc::clone(&self.composition),
+            end_pending: Rc::clone(&self.composition_end_pending),
+            end_context: Rc::clone(&self.composition_end_context),
+            end_status: Rc::clone(&self.composition_end_status),
+            end_retry_count: Rc::clone(&self.composition_end_retry_count),
             _guard: ComObjectGuard::new(),
         }
         .into();
-        unsafe {
-            let _ = ctx.RequestEditSession(
+        #[cfg(feature = "tsf-test-hooks")]
+        let held = queued_commit && crate::commit_test_hook::hold(ctx, self.tid.get(), &session_obj);
+        #[cfg(not(feature = "tsf-test-hooks"))]
+        let held = false;
+        let requested = if held {
+            Ok(windows::Win32::UI::TextServices::TF_S_ASYNC)
+        } else { unsafe {
+            ctx.RequestEditSession(
                 self.tid.get(),
                 &session_obj,
                 TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
-            );
+            )
+        } };
+        match requested {
+            Ok(hr) => request.state.requested(
+                0,
+                Some(hr.0),
+                windows::Win32::UI::TextServices::TF_S_ASYNC.0,
+            ),
+            Err(error) => request.state.requested(
+                error.code().0,
+                None,
+                windows::Win32::UI::TextServices::TF_S_ASYNC.0,
+            ),
+        }
+        let learning_pending = self.receipt_outbox.borrow().as_ref().is_some_and(|outbox| outbox.pending());
+        if learning_pending {
+            self.arm_clause_poll();
+        }
+        // A positive phrSession (including TF_S_ASYNC) is not evidence that
+        // the document changed. Conversely, a later close failure cannot undo
+        // a successful body write, including a synchronous termination callback.
+        let inserted = request.state.take_text_applied();
+        let composition = self.composition.borrow().clone();
+        if !inserted
+            && request.state.outcome() == ApplyOutcome::Deferred
+            && !request.state.stale()
+            && self.preedit_apply.is_current(&request, &composition)
+            && self.composition_generation.get() == generation
+        {
+            if let Some(deadline) = deadline {
+                *self.pending_commit.borrow_mut() =
+                    Some(Rc::new(crate::pending_commit::PendingCommit {
+                        request,
+                        deadline,
+                        generation,
+                    }));
+                return false;
+            }
+        }
+        // This synchronous entry point has no completion consumer after return.
+        // Revoke only this request, so a retained late session cannot write after
+        // the caller keeps its reading for retry or switches compositions.
+        if !inserted {
+            request.state.begin(false);
+        }
+        if inserted && self.composition_end_pending.get() {
+            // SetText は成功済みなので確定自体は true のまま。最初の EndComposition が一過性に
+            // 失敗した場合を、caller が InputState/context を畳む前に close-only で一度回収する。
+            let _ = self.finish_pending_composition(ctx);
+        }
+        if !self.composition_end_pending.get() {
+            self.composition_end_report.borrow_mut().take();
+        }
+        inserted
+    }
+
+    /// TestKeyDown の結果を production state machine へ記録する。
+    ///
+    /// 正規の Test→Key は直列なので、slot が occupied の間は同じ署名でも別署名でも
+    /// `Busy`（FALSE）を返す。Replay TRUE を返すと、A の reservation 中に来た B Test が
+    /// A slot を使わないまま TRUE になり、B Key が A pair と誤結合する。
+    pub(crate) fn pending_end_test_decision(
+        &self,
+        signature: PendingEndKeySignature,
+    ) -> PendingEndTestDecision {
+        let generation = self.key_pair_generation.get();
+        let mut reservation = self.pending_end_test_reservation.borrow_mut();
+        if !self.composition_end_pending.get() {
+            // pending close が終わった後にホストが Test だけを再送することがある。旧 pair
+            // はその Test の時点で期限切れとし、将来の同じキーへ持ち越さない。
+            if reservation.is_occupied() {
+                reservation.invalidate();
+                drop(reservation);
+                self.bump_key_pair_generation();
+            }
+            return PendingEndTestDecision::Normal;
+        }
+        if reservation.is_stale(generation) {
+            reservation.invalidate();
+        }
+        if reservation.is_occupied() {
+            PendingEndTestDecision::Busy
+        } else if reservation.reserve(signature, generation) {
+            PendingEndTestDecision::Reserve
+        } else {
+            // reserve が失敗するのは同一 STA で slot が再入により埋まった場合だけ。安全側に
+            // 常に Busy を返し、通常述語へは落とさない。
+            PendingEndTestDecision::Busy
         }
     }
 
-    /// composition を確定せず終了する編集セッションを同期実行する。失敗は no-op。
-    pub(crate) fn do_cancel(&self, ctx: &ITfContext) {
+    /// OnKeyDown の reservation は署名・pair generation を検証し、結果に関係なく slot を
+    /// 必ず消費する。不一致/stale を保持すると将来の同じ VK/password/direct 入力を誤って
+    /// 食うため、peek-and-wait は許可しない。
+    pub(crate) fn take_pending_end_test(&self, signature: PendingEndKeySignature) -> bool {
+        self.pending_end_test_reservation
+            .borrow_mut()
+            .take_if_matches(signature, self.key_pair_generation.get())
+    }
+
+    /// focus/context/activation/new-composition の lifecycle 境界で pair を破棄する。
+    /// 世代を進めることで、取りこぼした古い slot が後の reservation と一致しないことも保証する。
+    pub(crate) fn invalidate_pending_end_test_reservation(&self) {
+        self.pending_end_test_reservation.borrow_mut().invalidate();
+        self.bump_key_pair_generation();
+    }
+
+    fn bump_key_pair_generation(&self) {
+        self.key_pair_generation
+            .set(self.key_pair_generation.get().wrapping_add(1));
+    }
+
+    pub(crate) fn pending_end_generation_is_current(&self) -> bool {
+        self.pending_end_generation.get() == self.composition_generation.get()
+    }
+
+    /// EndComposition の実試行結果を共通の production state machine へ適用する。
+    /// `false` は bounded retry を残して入力を一回予約する状態、`true` は close 完了または
+    /// terminal/quarantine 済みで入力を解放できる状態を表す。初回呼出しは retry_count=1
+    /// で記録され、総 EndComposition 呼出し数は COMPOSITION_END_RETRY_MAX 以下になる。
+    pub(crate) fn apply_pending_end_attempt(&self, status: CompositionEndStatus) -> bool {
+        if !self.composition_end_pending.get() {
+            return true;
+        }
+        self.composition_end_status.set(status);
+        match status {
+            CompositionEndStatus::Closed => {
+                self.clear_pending_composition_end(CompositionEndStatus::Closed);
+                true
+            }
+            CompositionEndStatus::Terminal => {
+                self.abandon_pending_composition_end("terminal");
+                true
+            }
+            CompositionEndStatus::Retryable | CompositionEndStatus::Idle => {
+                let current = self.composition_end_retry_count.get();
+                if let Some(next) = next_composition_end_retry(current) {
+                    self.composition_end_retry_count.set(next);
+                    self.composition_end_status
+                        .set(CompositionEndStatus::Retryable);
+                    tip_log("ev=composition_end_retry rejected");
+                    false
+                } else {
+                    // A still-owned caret must be repaired or explicitly
+                    // cancelled before subsequent text can be inserted.
+                    if self.composition_end_caret.borrow().is_some() {
+                        self.composition_end_status
+                            .set(CompositionEndStatus::Retryable);
+                        return false;
+                    }
+                    self.abandon_pending_composition_end("retry_exhausted");
+                    true
+                }
+            }
+        }
+    }
+
+    /// SetText 成功後に残った composition を本文へ触れずに閉じ直す。同期終了 callback が
+    /// 先に slot を落とした場合も EndCompositionOnly が成功扱いへ収束させる。
+    ///
+    /// 失敗を無期限に返し続けないことが重要である。terminal/unknown context は handle を
+    /// quarantine して入力を解放し、locked/synchronous は初回込み
+    /// `COMPOSITION_END_RETRY_MAX` 回まで再試行する。SetText はこの経路では一度も呼ばれない。
+    pub(crate) fn finish_pending_composition(&self, ctx: &ITfContext) -> bool {
+        self.finish_pending_composition_with_cancel(ctx, false)
+    }
+
+    fn finish_pending_composition_with_cancel(
+        &self,
+        ctx: &ITfContext,
+        cancel_selection: bool,
+    ) -> bool {
+        if !self.composition_end_pending.get() {
+            return true;
+        }
+        self.composition_end_status.set(CompositionEndStatus::Idle);
+        let active = Rc::new(Cell::new(true));
+        let expected_epoch = self.composition_end_epoch.get();
+        let request_context = self
+            .composition_end_context
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| ctx.clone());
+        let session_obj: ITfEditSession = EndCompositionOnly {
+            report: self.composition_end_report.borrow().clone(),
+            cancel_selection,
+            #[cfg(feature = "tsf-test-hooks")]
+            fail_attributes: Rc::clone(&self.commit_fail_attributes),
+            expected_context: request_context.clone(),
+            expected_composition: self.composition.borrow().clone(),
+            epoch: Rc::clone(&self.composition_end_epoch),
+            expected_epoch,
+            caret: Rc::clone(&self.composition_end_caret),
+            active: Rc::clone(&active),
+            executed: Cell::new(false),
+            composition: Rc::clone(&self.composition),
+            end_pending: Rc::clone(&self.composition_end_pending),
+            end_context: Rc::clone(&self.composition_end_context),
+            end_status: Rc::clone(&self.composition_end_status),
+            end_retry_count: Rc::clone(&self.composition_end_retry_count),
+            _guard: ComObjectGuard::new(),
+        }
+        .into();
+        // pending 専用 context を正とする。次打鍵が current_context を新文書へ更新済みでも、
+        // 古い composition を新文書の edit cookie で閉じようとしてはいけない。
+        let request_status = match unsafe {
+            request_context.RequestEditSession(
+                self.tid.get(),
+                &session_obj,
+                TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
+            )
+        } {
+            Ok(hr) if hr.is_ok() => CompositionEndStatus::Retryable,
+            Ok(hr) => classify_composition_end_error(hr, None),
+            Err(err) => classify_composition_end_error(err.code(), None),
+        };
+
+        // A positive request status cannot stand in for an executed close.
+        // Retained sessions must not later close a different composition.
+        active.set(false);
+        if self.composition_end_epoch.get() != expected_epoch {
+            return false;
+        }
+
+        // DoEditSession の結果（GetRange/EndComposition）を優先し、RequestEditSession の
+        // phrSession/外側 HRESULT はセッション自体が走らなかった場合の分類に使う。
+        let status = match self.composition_end_status.get() {
+            CompositionEndStatus::Idle => request_status,
+            status => status,
+        };
+        // EndCompositionOnly の実結果と RequestEditSession の外側結果を共通 state
+        // transition へ通す。予約 VK は transition では触らず、matching KeyDown まで残す。
+        let finished = self.apply_pending_end_attempt(status);
+        if !self.composition_end_pending.get() {
+            self.composition_end_report.borrow_mut().take();
+        }
+        finished
+    }
+
+    fn clear_pending_composition_end(&self, status: CompositionEndStatus) {
+        if !self.composition_end_pending.replace(false) {
+            return;
+        }
+        if status == CompositionEndStatus::Terminal {
+            if let Some(report) = self.composition_end_report.borrow().as_ref() {
+                report.begin(false);
+            }
+        }
+        *self.composition.borrow_mut() = None;
+        let retired_caret = self.composition_end_caret.borrow_mut().take();
+        drop(retired_caret);
+        *self.composition_end_context.borrow_mut() = None;
+        self.composition_end_status.set(status);
+        self.composition_end_retry_count.set(0);
+        self.composition_generation
+            .set(self.composition_generation.get().wrapping_add(1));
+        // Pending close success/quarantine is one of the few transitions that preserves an
+        // already-returned Test=TRUE pair.  Deliberately leave key-pair slot/generation untouched.
+    }
+
+    /// SetText 済み composition の close-only が終端/上限到達したときの quarantine。
+    /// 物理文書側に callback が遅れて届いても、slot を空にしておけば新しい composition
+    /// の入力を止めず、identity/generation check が新状態を巻き込まない。
+    pub(crate) fn abandon_pending_composition_end(&self, reason: &str) {
+        if !self.composition_end_pending.get() {
+            return;
+        }
+        self.clear_pending_composition_end(CompositionEndStatus::Terminal);
+        tip_log(&format!("ev=composition_end_abandon reason={reason}"));
+    }
+
+    /// composition を確定せず終了する編集セッションを同期実行する。
+    /// 巡4 T4: 戻り値は CancelComposition の成否（phrSession 判定込み — do_commit と同じ規律）。
+    /// 呼び出し側は false なら TIP 側状態を畳まない — セッション拒否時は文書上に composition が
+    /// 残るため、 Esc は「効かなかった」扱いにしてユーザの再操作に任せる。
+    /// false でも left_context/読みキャッシュの清算は行う（合成継続でも文脈汚染は防ぐ）。
+    pub(crate) fn do_cancel(&self, ctx: &ITfContext) -> bool {
+        self.revoke_pending_commit();
+        self.preedit_apply.invalidate();
+        // 確定文字列は既に SetText 済み。CancelComposition は range を空にしてしまうため、
+        // pending_end では close-only を取消成功として扱う。
+        if self.composition_end_pending.get() {
+            let ok = self.finish_pending_composition_with_cancel(ctx, true);
+            *self.left_context.borrow_mut() = None;
+            self.monitor_committed_reading.borrow_mut().clear();
+            return ok;
+        }
         let session_obj: ITfEditSession = CancelComposition {
             composition: Rc::clone(&self.composition),
             _guard: ComObjectGuard::new(),
         }
         .into();
-        unsafe {
-            let _ = ctx.RequestEditSession(
+        let ok = match unsafe {
+            ctx.RequestEditSession(
                 self.tid.get(),
                 &session_obj,
                 TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
-            );
-        }
+            )
+        } {
+            Ok(hr) => hr.is_ok(),
+            Err(_) => false,
+        };
         // U9: 合成終了（取消）— 次 composition の再捕捉まで前文書の左文脈を残さない。
         *self.left_context.borrow_mut() = None;
         self.monitor_committed_reading.borrow_mut().clear();
+        ok
     }
 
     /// 選択中の候補を preedit へ書き戻す。選択を動かす全経路（キー/ホスト Behavior/マウス）が
@@ -2550,11 +5882,12 @@ impl TextService_Impl {
         }
         // borrow は run_preedit（COM へ同期コールアウトする）より前で必ず落とす —
         // ホスト再入で drain が cand_state を borrow し直す（drain_behavior_inner 参照）。
-        let pick = {
-            let st = self.cand_state.borrow();
-            st.resolve_commit(st.selected())
+        let selected = self.cand_state.borrow().selected();
+        let output = apply_presenter_candidate_selection(&mut self.state.borrow_mut(), selected);
+        let text = match output.immediate {
+            Some(ModuleOperation::SetPreedit { text, .. }) => text,
+            _ => return,
         };
-        let Some((_, text)) = pick else { return; };
         // 候補確定は幅を変えない契約（should_widen_digits が source=candidate を除外）なので、
         // widen_display_text を通さない生の候補を出す。通すと「全角表示の preedit を半角で確定」
         // が候補経路で再発する（trigger_convert の候補窓オープン時と同じ理由）。
@@ -2567,12 +5900,59 @@ impl TextService_Impl {
     /// （不変条件: clause_nav が Some ⇒ showing。残すと次に候補窓を開いたとき
     /// 選択同期/確定が文節ビューと取り違える）。
     pub(crate) fn clear_clause_nav(&self) {
+        self.clear_clause_mouse();
+        self.local_clause_redraw_pending.set(false);
+        self.local_clause_redraw_deadline.set(None);
+        self.local_clauses.borrow_mut().take();
         self.clause_nav.borrow_mut().take();
+        self.state
+            .borrow_mut()
+            .handle(ModuleEvent::Candidates(ModuleCandidateEvent::Closed));
+    }
+
+    pub(crate) fn replace_module_candidates(&self, values: &[String], selected: usize) -> String {
+        let output = self.state.borrow_mut().handle(ModuleEvent::Candidates(
+            ModuleCandidateEvent::Replace {
+                values: values.to_vec(),
+                selected,
+                reason: ModuleCandidateReplacement::NewResult,
+            },
+        ));
+        match output.immediate {
+            Some(ModuleOperation::ShowCandidates {
+                values, selected, ..
+            }) => values[selected].clone(),
+            _ => String::new(),
+        }
+    }
+
+    pub(crate) fn module_candidate_commit(
+        &self,
+        index: Option<usize>,
+    ) -> Option<(ModuleRequestId, usize, String)> {
+        let output = match index {
+            Some(index) => resolve_absolute_flat_candidate(&mut self.state.borrow_mut(), index),
+            None => resolve_current_flat_candidate(&mut self.state.borrow_mut()),
+        };
+        match output {
+            crate::input_module::ModuleOutput {
+                eaten: true,
+                background:
+                    Some(crate::input_module::BackgroundIntent::Commit {
+                        request,
+                        candidate: Some(index),
+                        text: Some(text),
+                        ..
+                    }),
+                ..
+            } => Some((request, index, text)),
+            _ => None,
+        }
     }
 
     /// 候補表示中の←/→: 文節ナビゲーションへ入り（未開始ならエンジンが現在選択候補を種に
     /// 分解して開始）、選択文節を `offset` だけ動かす。成功なら候補窓と preedit を文節ビューへ
-    /// 差し替えて true。false（旧エンジン/劣化/被覆候補無し）は呼び出し側が従来の
+    /// 差し替えて true。false（Engine拒否/劣化/被覆候補無し）は呼び出し側が従来の
     /// 「確定して畳む」へ落とす。
     pub(crate) fn move_clause(&self, ctx: &ITfContext, offset: i32) -> bool {
         let base_index = self.cand_state.borrow().selected();
@@ -2587,17 +5967,34 @@ impl TextService_Impl {
     /// （show が cand_state を更新＝選択の唯一の真実源を維持）、preedit を全文節の連結
     /// ＋選択文節の太下線で描き直す。
     fn apply_clause_view(&self, ctx: &ITfContext, view: ClauseViewData) {
+        let output = self.state.borrow_mut().handle(ModuleEvent::Candidates(
+            ModuleCandidateEvent::Replace {
+                values: view.candidates,
+                selected: view.candidate_index,
+                reason: ModuleCandidateReplacement::UserDriven,
+            },
+        ));
+        let Some(ModuleOperation::ShowCandidates {
+            values, selected, ..
+        }) = output.immediate
+        else {
+            return;
+        };
         tip_log(&format!(
             "ev=clause_move sel={} n={} cands={}",
             view.selected,
             view.segments.len(),
-            view.candidates.len()
+            values.len()
         ));
-        *self.clause_nav.borrow_mut() =
-            Some(ClauseNav { segments: view.segments, selected: view.selected });
+        *self.clause_nav.borrow_mut() = Some(ClauseNav {
+            segments: view.segments,
+            selected: view.selected,
+        });
         let anchor = self.caret_point(ctx);
         let theme = self.appearance.borrow_mut().current_theme();
-        self.candidate_ui.borrow_mut().show(&view.candidates, view.candidate_index, anchor, theme);
+        self.candidate_ui
+            .borrow_mut()
+            .show(&values, selected, anchor, theme);
         self.run_clause_preedit(ctx);
     }
 
@@ -2614,7 +6011,9 @@ impl TextService_Impl {
                 )
             })
         };
-        let Some((text, target)) = material else { return; };
+        let Some((text, target)) = material else {
+            return;
+        };
         self.run_preedit_with_target(ctx, &text, Some(target));
     }
 
@@ -2625,8 +6024,10 @@ impl TextService_Impl {
     fn sync_clause_to_selection(&self, ctx: &ITfContext) {
         let sel = self.cand_state.borrow().selected();
         if let Some(view) = self.engine_select_clause_candidate(sel) {
-            *self.clause_nav.borrow_mut() =
-                Some(ClauseNav { segments: view.segments, selected: view.selected });
+            *self.clause_nav.borrow_mut() = Some(ClauseNav {
+                segments: view.segments,
+                selected: view.selected,
+            });
         } else {
             let text = {
                 let st = self.cand_state.borrow();
@@ -2656,6 +6057,10 @@ impl TextService_Impl {
     /// 「かなが見えているのに漢字が確定される」ズレになる（Esc の往復 1 回より表示と確定の一致
     /// を採る）。ライブ変換 OFF ならその Enter/settle も往復しないので、下の述語が両方を止める。
     pub(crate) fn restore_live_preedit(&self, ctx: &ITfContext) {
+        self.explicit_snapshot_candidates_active.set(false);
+        self.explicit_snapshot_candidate_remaining
+            .borrow_mut()
+            .clear();
         // ライブ変換 OFF / 表記固定中は engine のライブ変換を参照しない（VK_RETURN / settle と同じ規律）。
         let live = if self.should_consult_live_engine() {
             let seq = self.state.borrow_mut().bump_live_seq();
@@ -2672,11 +6077,10 @@ impl TextService_Impl {
             let reading = self.last_reading.borrow().clone();
             preedit_after_candidates_closed(live, &live_text, &reading)
         };
-        let Some(text) = material else { return; };
+        let Some(text) = material else {
+            return;
+        };
         if from_engine {
-            // 劣化素材を置き直さないと、Esc 後にエンジンが落ちたときの直確定が描き戻す前の
-            // 読みへ戻り、また表示と食い違う（`on_debounce_convert` が走ったのと同じ状態にする）。
-            self.state.borrow_mut().mark_good(&text);
             *self.live_text.borrow_mut() = text.clone();
         }
         self.run_preedit(ctx, &self.widen_display_text(&text));
@@ -2709,8 +6113,29 @@ impl TextService_Impl {
             self.live_enabled.get(),
             self.showing.get(),
         );
+        let reading = self.monitor_reading_text();
+        if !visible || reading.is_empty() {
+            self.reading_monitor.borrow_mut().hide();
+            return;
+        }
         let max_chars = self.reading_monitor_max_chars.get();
-        let reading = if self.reading_monitor_accumulate.get() {
+        // caret_point ではなく専用照会を使う理由（ev=caret ログ量産回避）は従来と同じ。
+        // 矩形が取れないフレームは None を渡し、窓側 plan_anchor が
+        // 表示中=位置保持 / 非表示=無害位置 に振り分ける。
+        let anchor = self
+            .query_monitor_anchor_rect(ctx)
+            .and_then(crate::candidate_window::caret_rect_to_anchor);
+        let theme = self.appearance.borrow_mut().current_theme();
+        self.reading_monitor
+            .borrow_mut()
+            .show_or_update(&reading, anchor, max_chars, theme);
+    }
+
+    /// 読みモニタの表示文字列（累積設定を反映）。通常更新(update_reading_monitor)と
+    /// レイアウト追従(relayout_popups_on_layout)の両方から使う単一の組立。
+    fn monitor_reading_text(&self) -> String {
+        let max_chars = self.reading_monitor_max_chars.get();
+        if self.reading_monitor_accumulate.get() {
             crate::reading_monitor::compose_monitor_text(
                 &self.monitor_committed_reading.borrow(),
                 &self.last_reading.borrow(),
@@ -2718,19 +6143,7 @@ impl TextService_Impl {
             )
         } else {
             self.last_reading.borrow().clone()
-        };
-        if !visible || reading.is_empty() {
-            self.reading_monitor.borrow_mut().hide();
-            return;
         }
-        // caret_point ではなく専用照会を使う理由（ev=caret ログ量産回避）は従来と同じ。
-        // 矩形が取れないフレームは None を渡し、窓側 plan_anchor が
-        // 表示中=位置保持 / 非表示=既定座標 に振り分ける。
-        let anchor = self
-            .query_monitor_anchor_rect(ctx)
-            .and_then(crate::candidate_window::caret_rect_to_anchor);
-        let theme = self.appearance.borrow_mut().current_theme();
-        self.reading_monitor.borrow_mut().show_or_update(&reading, anchor, max_chars, theme);
     }
 
     /// 読みモニタ用アンカー矩形（composition 先頭 → キャレットの2段試行を1セッションで）。
@@ -2755,17 +6168,173 @@ impl TextService_Impl {
         rc
     }
 
+    // ------------------------------------------------------------------
+    // UIバグ4: ITfTextLayoutSink（スクロール・リフロー追従）
+    // ------------------------------------------------------------------
+
+    /// フォーカス document の top context を `ITfTextLayoutSink` の advise 先へ貼り替える。
+    /// OnSetFocus / OnPushContext / OnPopContext の 3 点から呼ぶ（context スタックの変化は
+    /// この 3 点で捕捉できる）。同一 context なら no-op。
+    fn refresh_layout_sink_target(&self) {
+        let mgr = self.thread_mgr.borrow().clone();
+        let Some(mgr) = mgr else { return };
+        let top = unsafe { mgr.GetFocus().ok() }.and_then(|doc| unsafe { doc.GetTop().ok() });
+        self.set_layout_sink_context(top.as_ref());
+    }
+
+    /// context が前回と同一（COM 同一性）なら no-op、違えば unadvise→advise。None は unadvise のみ。
+    /// 失敗（cast/AdviseSink 拒否）は致命でない（追従が効かないだけ＝従来と同じ挙動）。
+    fn set_layout_sink_context(&self, new_ctx: Option<&ITfContext>) {
+        let same = match (self.layout_sink_ctx.borrow().as_ref(), new_ctx) {
+            (Some(prev), Some(next)) => com_identity_eq(prev, next),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        // 巡2 E4: context が変われば旧 context 帰属の保留セッションは無効 — pending を
+        // 下ろし、世代を進べて遅延発火した旧セッションの座標適用も断つ（E1/E3 と同じ
+        // 世代ガードで、投入後の focus/push/pop 切替をまたいだ汚染を防ぐ）。
+        self.layout_refresh_pending.set(false);
+        self.bump_layout_sink_gen();
+        self.unadvise_layout_sink();
+        let Some(ctx) = new_ctx else { return };
+        unsafe {
+            let Ok(source) = ctx.cast::<ITfSource>() else {
+                return;
+            };
+            let layout_sink: ITfTextLayoutSink = self.to_interface();
+            if let Ok(cookie) = source.AdviseSink(&ITfTextLayoutSink::IID, &layout_sink) {
+                self.layout_sink_cookie.set(cookie);
+            }
+            let edit_sink: ITfTextEditSink = self.to_interface();
+            if let Ok(cookie) = source.AdviseSink(&ITfTextEditSink::IID, &edit_sink) {
+                self.text_edit_sink_cookie.set(cookie);
+            }
+            if self.layout_sink_cookie.get() != 0 || self.text_edit_sink_cookie.get() != 0 {
+                *self.layout_sink_ctx.borrow_mut() = Some(ctx.clone());
+            }
+        }
+    }
+
+    /// レイアウト再照会セッションの世代を進める（Activate / Deactivate / context 負替）。
+    /// 巡3 G1: 発行はプロセスグローバルな単調カウンタから — Cell のインスタンス局所値だと
+    /// 同一 STA で TextService が作り直された際に新インスタンスが同じ数値を辿り、旧
+    /// インスタンスの滞留セッションが世代一致で通ってしまう（popup::next_fade_timer_id
+    /// と同じ発行規律）。
+    /// 巡3 G3: 世代を進める地点で pending も必ず下ろす（単一チョークポイント化）。
+    /// bump は「世界が変わる」ことを意味し、旧 pending は旧世代帰属なので無効。
+    fn bump_layout_sink_gen(&self) {
+        static ISSUER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let next = ISSUER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.layout_sink_gen.set(next);
+        self.layout_refresh_pending.set(false);
+    }
+
+    /// 候補窓または読みモニタが表示中か（OnLayoutChange で再照会する価値があるかの判定）。
+    fn popups_visible(&self) -> bool {
+        self.showing.get() || self.reading_monitor.borrow().is_visible()
+    }
+
+    /// 非同期セッション内で取得済みのアンカーへ表示中のポップアップを再配置する。
+    /// 矩形取得は既にセッション内で済んでいるため、ここでは同期 edit session を要求しない
+    /// （候補列は真実源 cand_state、読みは last_reading 系から — 通常更新と同じ組立）。
+    /// 巡1レビュー 8c2354e指摘5 + 巡2 F1: candidate_ui.borrow_mut().show() は BeginUIElement/
+    /// UpdateUIElement でホストへ COM 再入するため、OnKeyDown/debounce/llm_poll と同じ
+    /// catch_unwind + reentrancy gate（guarded）の二重保護を通す。ゲートが無いと再入した
+    /// drain_behavior が outbox を消費した後で保持中 RefCell の再借用 panic を起こし、
+    /// 「確定要求が消えた」不整合が ReentrancyGate の設計目的ごと無効化される。
+    fn relayout_popups_on_layout(
+        &self,
+        caret_anchor: Option<crate::candidate_window::CaretAnchor>,
+        monitor_anchor: Option<crate::candidate_window::CaretAnchor>,
+    ) {
+        // 巡2 F7: 握り潰しはログ付きで（catch_com と同じ規律 — 保護発動の可視性）。
+        // `.is_err()` は一時値の drop order を変えるため、COM 再入境界では形を維持する。
+        #[allow(clippy::redundant_pattern_matching)]
+        if let Err(_) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.guarded(|| self.relayout_popups_on_layout_inner(caret_anchor, monitor_anchor))
+        })) {
+            tip_log("ev=panic site=relayout");
+        }
+    }
+
+    fn relayout_popups_on_layout_inner(
+        &self,
+        caret_anchor: Option<crate::candidate_window::CaretAnchor>,
+        monitor_anchor: Option<crate::candidate_window::CaretAnchor>,
+    ) {
+        if let Some(a) = caret_anchor {
+            *self.last_valid_anchor.borrow_mut() = Some(a);
+        }
+        // 巡2 F7: 候補窓のアンカー未取得だけでは読みモニタ更新（composition 先頭矩形は
+        // 別に取れている）をスキップしない — 早期離脱はこのブロックに閉じる。
+        // 巡3 P1: anchor は if let の scrutininee で borrow() の一時 Ref が**本体終了まで
+        // 延命**される（edition 2021 の if let temporary lifetime — .clone() していても
+        // Ref は残る）。COM コールアウト中の再入 borrow_mut と衝突して panic → 保護の
+        // 無い入口では abort になるため、先に let 束縛して文末で Ref を解放する。
+        let anchor = *self.last_valid_anchor.borrow();
+        if self.showing.get() {
+            if let Some(anchor) = anchor {
+                let items = self.cand_state.borrow().items().to_vec();
+                if !items.is_empty() {
+                    let selected = self.cand_state.borrow().selected();
+                    let theme = self.appearance.borrow_mut().current_theme();
+                    // items/selected の借用は各行の文末で解放済み。COM コールアウトを
+                    // またいで保持されるのは candidate_ui の RefMut のみ（presenter の
+                    // 規律上不可避）— 再入は guarded が捌く。
+                    self.candidate_ui
+                        .borrow_mut()
+                        .show(&items, selected, anchor, theme);
+                }
+            }
+        }
+        // 読みモニタの表示条件の真実源は should_show（通常更新と同じ）。
+        let visible = crate::reading_monitor::should_show(
+            self.reading_monitor_enabled.get(),
+            self.state.borrow().composing,
+            self.live_enabled.get(),
+            self.showing.get(),
+        );
+        let reading = self.monitor_reading_text();
+        if visible && !reading.is_empty() {
+            let max_chars = self.reading_monitor_max_chars.get();
+            let theme = self.appearance.borrow_mut().current_theme();
+            self.reading_monitor.borrow_mut().show_or_update(
+                &reading,
+                monitor_anchor,
+                max_chars,
+                theme,
+            );
+        }
+    }
+
     /// キャレットアンカー（スクリーン座標）を返す。`ITfContextView::GetTextExt` で実キャレット
     /// 矩形を読み、その左下（文字を覆わない位置）＋上端（画面下端フリップ用）を返す。
-    /// 取得できない場合（レイアウト未確定・view 無し・セッション拒否など）は既定座標
-    /// `DEFAULT_CARET_POS` へ劣化する（旧 MVP 固定値。caret_top 不明＝フリップなし）。
+    /// 取得できない場合（レイアウト未確定・view 無し・セッション拒否など）は
+    /// **直近に取れた有効アンカー**を再利用し、初回（まだ一度も取れていない）だけ
+    /// Win11 Input Indicator と同じ作業領域右下（harmless_anchor）へ劣化する（UIバグ5 —
+    /// 旧実装の主モニタ左上 (200,200) は、失敗のたびポップアップが画面端へ跳ねる
+    /// 不自然さがあった。保持は同 context 内のみで、フォーカス切替でクリア）。
     /// 候補窓（ライブ変換/再変換）とモード HUD の両方がこのアンカーを使う。
     pub(crate) fn caret_point(&self, ctx: &ITfContext) -> crate::candidate_window::CaretAnchor {
         let rect = self.query_caret_rect(ctx);
-        let anchor = rect
-            .and_then(crate::candidate_window::caret_rect_to_anchor)
-            .unwrap_or(DEFAULT_CARET_POS);
-        // 診断: GetTextExt が実矩形を返したか／既定アンカーへ劣化したか＋最終アンカー座標。
+        let anchor = match rect.and_then(crate::candidate_window::caret_rect_to_anchor) {
+            Some(a) => {
+                *self.last_valid_anchor.borrow_mut() = Some(a);
+                a
+            }
+            None => self.last_valid_anchor.borrow().unwrap_or_else(|| {
+                let (hx, hy) = crate::popup::harmless_anchor();
+                crate::candidate_window::CaretAnchor {
+                    x: hx,
+                    y: hy,
+                    caret_top: None,
+                }
+            }),
+        };
+        // 診断: GetTextExt が実矩形を返したか／劣化したか＋最終アンカー座標。
         // イマーシブ検索面で矩形が退化していないか（自前窓の画面外配置の切り分け）を見る。
         match rect {
             Some(r) => tip_log(&format!(
@@ -2787,6 +6356,11 @@ impl TextService_Impl {
         let out: Rc<RefCell<Option<RECT>>> = Rc::new(RefCell::new(None));
         let sess: ITfEditSession = QueryCaretRect {
             context: ctx.clone(),
+            clause_start: self.local_clauses.borrow().as_ref().and_then(|model| {
+                let start = model.clauses.iter().take(model.selected)
+                    .map(|clause| clause.surface.encode_utf16().count()).sum();
+                self.composition.borrow().clone().map(|composition| (composition, start))
+            }),
             out: Rc::clone(&out),
             _guard: ComObjectGuard::new(),
         }
@@ -2887,14 +6461,30 @@ impl TextService_Impl {
     }
 
     /// SP5: 半角英数(直接入力)モードか。
+    /// TIP がモードを所有しているときは langbar Cell を真実にする。Obsidian 等は
+    /// `apply_default_direct` の SetValue 成功後にホストが NATIVE へ戻すため、
+    /// ライブ compartment だけを見ると設定 default_direct とタスクバー A に反して
+    /// ひらがな入力になる。
     pub(crate) fn is_direct_mode(&self) -> bool {
-        crate::conversion_mode::is_direct(self.conversion_mode_value())
+        crate::conversion_mode::effective_is_direct(
+            self.direct_mode_owned.get(),
+            self.langbar_is_direct.get(),
+            crate::conversion_mode::is_direct(self.conversion_mode_value()),
+        )
     }
 
     /// conversion-mode をひらがな⇄半角英数でトグルする（NATIVE ビット反転）。
     /// `ctx` は HUD をキャレット近傍へ出すための生きた context（OnPreservedKey の pic）。
     /// 取れない呼び出し元は `None` を渡す＝HUD は既定座標に出る。
-    pub(crate) fn toggle_conversion_mode(&self, ctx: Option<&ITfContext>) {
+    pub(crate) fn toggle_conversion_mode(&self, ctx: Option<&ITfContext>) -> bool {
+        // langbar click も preserved key と同じく、以前に延期した欄依存操作より新しいユーザー意図。
+        self.cancel_deferred_prediction_preserved_on_input();
+        self.invalidate_prediction(crate::prediction_state::Invalidation::ModeChanged);
+        if self.prediction_ghost_visible() && !self.dismiss_prediction_ghost(false) {
+            // pending accept は discard へ降格済みで、ghost は選択の右側にある。mode の論理反映を
+            // 遅らせると後続キーが旧モードで処理されるため、cleanup と独立に切替を進める。
+            tip_log("ev=mode_toggle prediction_cleanup=pending");
+        }
         // 軽微1: キー長押しのオートリピートで OnPreservedKey が連続到達しても、直近トグルから
         // MODE_TOGGLE_REPEAT_GUARD 未満なら無視する（モードが偶奇でフリッカするのを防ぐ）。
         // 兄弟の再変換が reconverting ラッチで連射を自衛しているのに倣った自衛ガード。
@@ -2902,70 +6492,174 @@ impl TextService_Impl {
         let elapsed = self.last_mode_toggle.get().map(|t| now.duration_since(t));
         if is_toggle_repeat(elapsed, MODE_TOGGLE_REPEAT_GUARD) {
             tip_log("ev=mode_toggle skip=repeat");
-            return;
+            return false;
         }
         self.last_mode_toggle.set(Some(now));
+        if self.ephemeral_kana.get() {
+            // ephemeral 中の明示トグルは NATIVE を反転して direct へ戻す操作ではなく、現在の
+            // 一時かなを「通常かな」へ昇格するユーザー意思。langbar クリックもこの共通経路を
+            // 通るため、compartment へ再書込みせず marker/表示だけを永続かなへ確定する。
+            // marker=true の不変条件は logical kana（成功 enter、または native のまま exit 失敗）。
+            self.ephemeral_kana.set(false);
+            self.direct_mode_owned.set(true);
+            tip_log("ev=mode_toggle promoted=ephemeral_kana");
+            self.update_langbar_mode(false, false, ctx);
+            return true;
+        }
         let Some(c) = self.conversion_compartment() else {
             tip_log("ev=mode_toggle skip=no_compartment");
-            return;
+            return false;
         };
-        let before = self.conversion_mode_value();
+        let live = self.conversion_mode_value();
+        let before = crate::conversion_mode::toggle_before_mode(
+            self.direct_mode_owned.get(),
+            self.langbar_is_direct.get(),
+            live,
+        );
         let next = crate::conversion_mode::toggled(before);
         let v = VARIANT::from(next as i32);
         let tid = self.tid.get();
         // 診断: SetValue の成否と、書込直後に読み戻した実値を残す（write 失敗/上書きの切り分け）。
         let set_ok = unsafe { c.SetValue(tid, &v).is_ok() };
         let after = self.conversion_mode_value();
+        if !set_ok {
+            // 書込みが成立していないのに目標値を内部だけ確定すると、langbar/HUD と打鍵ゲートが
+            // 実 compartment から分岐する。所有権を放棄し、HRESULT 失敗後の実値へ同期する。
+            self.direct_mode_owned.set(false);
+            let live_direct = crate::conversion_mode::is_direct(after);
+            // ephemeral からの明示トグルが失敗し native のままなら復帰 marker/表示を保つ。
+            // 外部変更で既に direct なら marker だけ解消し、実値 A へ収束する。
+            let retry_ephemeral = self.ephemeral_kana.get() && !live_direct;
+            if self.ephemeral_kana.get() && live_direct {
+                self.ephemeral_kana.set(false);
+            }
+            tip_log(&format!(
+                "ev=mode_toggle failed before={before:#06x} next={next:#06x} after={after:#06x} tid={tid}"
+            ));
+            self.update_langbar_mode(live_direct, retry_ephemeral, ctx);
+            return false;
+        }
+        self.direct_mode_owned.set(true);
         tip_log(&format!(
             "ev=mode_toggle direct={} set_ok={set_ok} before={before:#06x} next={next:#06x} after={after:#06x} tid={tid}",
             crate::conversion_mode::is_direct(next)
         ));
         // 言語バーの あ/A 表示を新モードへ更新する。
         self.update_langbar_mode(crate::conversion_mode::is_direct(next), false, ctx);
+        true
     }
 
     /// 言語バーのモード表示を更新する。共有フラグ langbar_is_direct/langbar_ephemeral を反映し、
     /// システムの sink へ OnUpdate を投げて GetText（あ/A/あ˙）を再取得させる。sink 未 advise /
-    /// 言語バー非表示なら no-op。`ctx` があれば HUD を実キャレット近傍へ、無ければ既定座標へ出す。
-    /// `ephemeral`: ephemeral かなモード中（F8 等の一時トリガ中）かどうか。
+    /// 言語バー非表示なら no-op。続けてモード HUD を flash する（toggle / ephemeral の通常経路）。
+    /// Activate の `apply_default_direct` だけは起動チラつき防止のため HUD を出さない
+    /// （`update_langbar_mode_no_hud`）。`ctx` があれば HUD を実キャレット近傍へ、無ければ作業領域右下
+    /// （無害位置）へ出す。`ephemeral`: ephemeral かなモード中（F8 等の一時トリガ中）かどうか。
     fn update_langbar_mode(&self, is_direct: bool, ephemeral: bool, ctx: Option<&ITfContext>) {
+        self.update_langbar_mode_inner(is_direct, ephemeral, ctx, true);
+    }
+
+    /// `update_langbar_mode` と同じ Cell / OnUpdate だが HUD は出さない。
+    /// Activate の default_direct 専用（起動時の右下フラッシュ抑制）。
+    fn update_langbar_mode_no_hud(
+        &self,
+        is_direct: bool,
+        ephemeral: bool,
+        ctx: Option<&ITfContext>,
+    ) {
+        self.update_langbar_mode_inner(is_direct, ephemeral, ctx, false);
+    }
+
+    fn update_langbar_mode_inner(
+        &self,
+        is_direct: bool,
+        ephemeral: bool,
+        ctx: Option<&ITfContext>,
+        flash_hud: bool,
+    ) {
         self.langbar_is_direct.set(is_direct);
         self.langbar_ephemeral.set(ephemeral);
-        if let Some(sink) = self.langbar_sink.borrow().as_ref() {
+        // 巡4 T6: if let の一時 Ref が OnUpdate コールアウト中も延命されるため先に束縛
+        // （relayout と同種の再入 borrow_mut 衝突対策）。
+        let sink = self.langbar_sink.borrow().clone();
+        if let Some(sink) = sink {
             unsafe {
                 let _ = sink.OnUpdate(TF_LBI_TEXT | TF_LBI_STATUS | TF_LBI_ICON);
             }
         }
-        // SP5/US: モード切替を あ/A の HUD でキャレット近傍に一瞬表示する（Win11 では langbar が
-        // 出ないため）。生きた context があれば GetTextExt で実キャレット位置に出し、無ければ既定座標。
-        let anchor = match ctx {
-            Some(ctx) => self.caret_point(ctx),
-            None => DEFAULT_CARET_POS,
-        };
-        // Task 7: 表示のたびに settings の mtime とダークモードを再評価した Theme を渡す
-        // （設定変更・OS のライト/ダーク切替が次の flash から再起動なしで反映される）。
-        let theme = self.appearance.borrow_mut().current_theme();
-        self.mode_hud
-            .borrow_mut()
-            .flash(is_direct, ephemeral, anchor.x, anchor.y, theme);
+        if flash_hud {
+            // SP5/US: モード切替を あ/A の HUD でキャレット近傍に一瞬表示する（Win11 では langbar が
+            // 出ないため）。生きた context があれば GetTextExt で実キャレット位置に出す。
+            // ctx 無し（Activate/Deactivate/focus 切替/langbar クリック等）はキャレットを持たないため、
+            // 従来 (200,200) の画面左上固定は不自然だった。Win11 Input Indicator と同じ作業領域右下へ。
+            let (x, y) = match ctx {
+                Some(ctx) => {
+                    let a = self.caret_point(ctx);
+                    (a.x, a.y)
+                }
+                None => crate::popup::harmless_anchor(),
+            };
+            // Task 7: 表示のたびに settings の mtime とダークモードを再評価した Theme を渡す
+            // （設定変更・OS のライト/ダーク切替が次の flash から再起動なしで反映される）。
+            let theme = self.appearance.borrow_mut().current_theme();
+            self.mode_hud
+                .borrow_mut()
+                .flash(is_direct, ephemeral, x, y, theme);
+        }
     }
 
     /// SP7: 活性化時に conversion-mode を半角英数(直接入力)へ初期化する（設定 default_direct=true）。
-    /// NATIVE と FULLSHAPE を落として半角を保証する（ROMAN 等は保存）。compartment 取得失敗時は劣化（何もしない）。
+    /// NATIVE と FULLSHAPE を落として半角を保証する（ROMAN 等は保存）。
+    /// 成否を返す: 成功 = compartment が取れた、かつ（値が既に direct、または SetValue 成功）
+    /// （成否判定は conversion_mode::default_direct_success）。失敗（compartment 無い/
+    /// SetValue 失敗）は direct_mode_owned を立てずに langbar Cell をライブ値へ戻し
+    /// （HUD なし）false を返す＝Activate は default_direct_applied を立てず、次回
+    /// Activate で再試行する。成功後の所有権挙動（owned=true で Cell を真実にする＝
+    /// ホストの NATIVE 戻しに合わせない）は意図的に従来どおり。
+    /// SetValue は値が変わるときだけ。表示更新は Cell が目標と不一致のときだけ（再描画チラつき防止）。
     /// Activate 内の tid/thread_mgr セット後に1度だけ呼ぶ＝以後のユーザ手動トグルは上書きしない。
-    pub(crate) fn apply_default_direct(&self) {
-        let Some(c) = self.conversion_compartment() else {
-            tip_log("ev=default_direct skip=no_compartment");
-            return;
+    pub(crate) fn apply_default_direct(&self) -> bool {
+        let c = self.conversion_compartment();
+        let current = self.conversion_mode_value();
+        let next = crate::conversion_mode::to_direct(current);
+        let needs_write = next != current;
+        let write_ok = match (&c, needs_write) {
+            (Some(c), true) => {
+                let v = VARIANT::from(next as i32);
+                let tid = self.tid.get();
+                let ok = unsafe { c.SetValue(tid, &v).is_ok() };
+                tip_log(&format!("ev=default_direct applied ok={ok}"));
+                ok
+            }
+            (Some(_), false) => {
+                tip_log("ev=default_direct skip=already_direct");
+                true
+            }
+            (None, _) => {
+                tip_log("ev=default_direct fail=no_compartment");
+                false
+            }
         };
-        let next = crate::conversion_mode::to_direct(self.conversion_mode_value());
-        let v = VARIANT::from(next as i32);
-        let tid = self.tid.get();
-        let ok = unsafe { c.SetValue(tid, &v).is_ok() };
-        tip_log(&format!("ev=default_direct applied ok={ok}"));
-        // 言語バーの あ/A 表示を初期化後のモードへ更新する。Activate 時点では合焦 context が
-        // 定まらず実キャレットが取れないため、HUD は既定座標へ出す（ctx=None）。
-        self.update_langbar_mode(crate::conversion_mode::is_direct(next), false, None);
+        if !crate::conversion_mode::default_direct_success(c.is_some(), needs_write, write_ok) {
+            return self.default_direct_fail();
+        }
+        self.direct_mode_owned.set(true);
+        let target = crate::conversion_mode::is_direct(next);
+        if crate::conversion_mode::should_notify_langbar(self.langbar_is_direct.get(), target) {
+            self.update_langbar_mode_no_hud(target, false, None);
+        }
+        true
+    }
+
+    /// apply_default_direct の失敗後始末: モード所有権を放棄し（direct_mode_owned=false ＝
+    /// is_direct_mode・打鍵ゲートは live 値を追従）、langbar Cell/表示を実 compartment の
+    /// ライブ値へ無条件で戻す（AddItem 前の楽観 A プリセットを残さない。HUD は出さない）。
+    fn default_direct_fail(&self) -> bool {
+        self.direct_mode_owned.set(false);
+        let live = self.conversion_mode_value();
+        tip_log(&format!("ev=default_direct rollback live={live:#06x}"));
+        self.update_langbar_mode_no_hud(crate::conversion_mode::is_direct(live), false, None);
+        false
     }
 
     /// ephemeral かなモード開始: direct 中にトリガキー（既定 F8）が来たら compartment を
@@ -2981,8 +6675,22 @@ impl TextService_Impl {
         let next = before | crate::conversion_mode::CONVMODE_NATIVE;
         let v = VARIANT::from(next as i32);
         let ok = unsafe { c.SetValue(self.tid.get(), &v).is_ok() };
+        let after = self.conversion_mode_value();
+        if !ok {
+            // 開始に失敗した打鍵を ephemeral 成功扱いにしない。以後は実 compartment を正とする。
+            self.ephemeral_kana.set(false);
+            self.direct_mode_owned.set(false);
+            tip_log(&format!(
+                "ev=ephemeral_enter failed next={next:#06x} after={after:#06x}"
+            ));
+            self.update_langbar_mode(crate::conversion_mode::is_direct(after), false, ctx);
+            return;
+        }
         self.ephemeral_kana.set(true);
-        tip_log(&format!("ev=ephemeral_enter set_ok={ok} next={next:#06x}"));
+        self.direct_mode_owned.set(true);
+        tip_log(&format!(
+            "ev=ephemeral_enter set_ok={ok} next={next:#06x} after={after:#06x}"
+        ));
         self.update_langbar_mode(false, true, ctx);
     }
 
@@ -2990,46 +6698,83 @@ impl TextService_Impl {
     /// direct へ SetValue ＋ フラグを落とす。立っていなければ no-op（畳んで確定/Esc/フォーカス喪失
     /// 等の全経路から冪等に呼べる。全経路配線は Task 3）。
     pub(crate) fn exit_ephemeral_to_direct(&self, ctx: Option<&ITfContext>) {
-        if !self.ephemeral_kana.get() { return; }
-        self.ephemeral_kana.set(false);
+        if !self.ephemeral_kana.get() {
+            return;
+        }
         if let Some(c) = self.conversion_compartment() {
             let next = crate::conversion_mode::to_direct(self.conversion_mode_value());
             let v = VARIANT::from(next as i32);
             let ok = unsafe { c.SetValue(self.tid.get(), &v).is_ok() };
-            tip_log(&format!("ev=ephemeral_exit set_ok={ok} next={next:#06x}"));
+            let after = self.conversion_mode_value();
+            if !ok {
+                // 失敗後も native なら復帰要求を保留し、次の冪等な exit 呼出しで再試行する。
+                // 実値が既に direct なら外部変更で目的は達成済みなので保留だけ解消する。
+                let live_direct = crate::conversion_mode::is_direct(after);
+                self.ephemeral_kana.set(!live_direct);
+                self.direct_mode_owned.set(false);
+                tip_log(&format!(
+                    "ev=ephemeral_exit failed next={next:#06x} after={after:#06x} retry={}",
+                    !live_direct
+                ));
+                self.update_langbar_mode(live_direct, !live_direct, ctx);
+                return;
+            }
+            self.ephemeral_kana.set(false);
+            self.direct_mode_owned.set(true);
+            tip_log(&format!(
+                "ev=ephemeral_exit set_ok={ok} next={next:#06x} after={after:#06x}"
+            ));
             self.update_langbar_mode(true, false, ctx);
         } else {
-            tip_log("ev=ephemeral_exit no_compartment(flag_only)");
+            // 保留を落とすと direct 復帰を二度と試せないため、取得不能時は marker を維持する。
+            tip_log("ev=ephemeral_exit no_compartment(retry)");
         }
     }
 
     /// 再変換: 直前ラテン列(or 選択)を掴んで composition 化し、g1 リプレイで候補を出す。
     pub(crate) fn start_reconvert(&self, ctx: &ITfContext) {
-        if self.reconverting.get() { return; }
+        self.preedit_apply.invalidate();
+        if !self.finish_pending_composition(ctx) {
+            tip_log("ev=reconvert_skip reason=pending_end");
+            return;
+        }
+        if self.reconverting.get() {
+            return;
+        }
         // 深層防御: 開始時に必ずクリア(採取できない経路で前回の読みと誤ペアにしない)。
         self.reconvert_reading.borrow_mut().clear();
         // 既に composition が開いている（native の打ちかけ等）なら再変換しない。
         // ReconvertStart は無条件で StartComposition しスロットを上書きするため、
         // ここで弾かないと既存 composition を EndComposition せず孤児化させてしまう。
-        if self.composition.borrow().is_some() { return; }
+        if self.composition.borrow().is_some() {
+            return;
+        }
         // 1) range 読み戻し＋非空 StartComposition（読んだラテンを out へ）。
         let out: Rc<RefCell<ReconvertCapture>> = Rc::new(RefCell::new(ReconvertCapture::default()));
         let sink: ITfCompositionSink = self.to_interface();
         let sess: ITfEditSession = ReconvertStart {
-            context: ctx.clone(), sink,
+            context: ctx.clone(),
+            sink,
             composition: Rc::clone(&self.composition),
+            started: Rc::clone(&self.composition_started_signal),
             out: Rc::clone(&out),
             left_context_out: Rc::clone(&self.left_context),
             _guard: ComObjectGuard::new(),
-        }.into();
-        unsafe {
-            let _ = ctx.RequestEditSession(self.tid.get(), &sess,
-                TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0));
         }
+        .into();
+        unsafe {
+            let _ = ctx.RequestEditSession(
+                self.tid.get(),
+                &sess,
+                TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
+            );
+        }
+        self.consume_started_composition();
         let cap = out.borrow().clone();
         match cap.kind {
-            ReconvertKind::None => return,                  // 対象なし（従来の早期 return）
-            ReconvertKind::NonKana => {                       // 漢字/混在: 合成していない。無害に離脱。
+            ReconvertKind::None => return, // 対象なし（従来の早期 return）
+            ReconvertKind::NonKana => {
+                // 漢字/混在: 合成していない。無害に離脱。
                 tip_log("ev=reconvert_skip reason=non_kana");
                 return;
             }
@@ -3038,9 +6783,10 @@ impl TextService_Impl {
         let text = cap.text.clone();
         *self.reconvert_original.borrow_mut() = text.clone();
 
-        // 新セッションを張り直してから種別ごとに変換する（セッション不変条件）。
-        self.ensure_engine();
+        // 旧 pipe を閉じてから新接続・新セッションを張る（セッション不変条件）。
+        // engine_end_session は同期 IPC を待たず client を drop するため、この順序を逆にしない。
         self.engine_end_session();
+        self.ensure_engine();
         self.ensure_session();
         let cands = match cap.kind {
             ReconvertKind::Latin => {
@@ -3052,9 +6798,13 @@ impl TextService_Impl {
                 // かな読みは insert 応答の Reading から採取する(RecordCorrection のキー)。
                 // latin_reconvert_reading の戻り値は ASCII ローマ字で、かな化はエンジン側
                 // roman2kana にしか無いため TIP では作れない。
-                let kana = self.engine_insert(&reading, InsertStyle::Kana);
-                *self.reconvert_reading.borrow_mut() = kana.unwrap_or_default();
-                self.engine_convert().unwrap_or_default()
+                match self.engine_convert_reading(&reading) {
+                    Some((kana, candidates)) => {
+                        *self.reconvert_reading.borrow_mut() = kana;
+                        candidates
+                    }
+                    None => Vec::new(),
+                }
             }
             ReconvertKind::Surface => {
                 *self.reconvert_reading.borrow_mut() = text.clone();
@@ -3067,9 +6817,18 @@ impl TextService_Impl {
             return;
         }
         self.show_reconvert_candidates(ctx, &cands);
-        // ev ログは呼び出し側で各自出す（I-3）。start_reconvert は本文（latin=）を含む従来ログを残す。
-        let kind_str = if matches!(cap.kind, ReconvertKind::Surface) { "surface" } else { "latin" };
-        tip_log(&format!("ev=reconvert_shown n={} kind={} latin={}", cands.len(), kind_str, text));
+        // ev ログは呼び出し側で各自出す（I-3）。本文は長さだけを残す。
+        let kind_str = if matches!(cap.kind, ReconvertKind::Surface) {
+            "surface"
+        } else {
+            "latin"
+        };
+        tip_log(&format!(
+            "ev=reconvert_shown n={} kind={} chars={}",
+            cands.len(),
+            kind_str,
+            text.chars().count()
+        ));
     }
 
     /// 再変換/確定取消の共有尾部: 先頭候補で preedit を張り、候補窓を表示し、`reconverting=true`
@@ -3082,7 +6841,8 @@ impl TextService_Impl {
         // key 処理経路からしか読まれないため、この順序入れ替えに他の観測者はいない。
         self.showing.set(true);
         self.reconverting.set(true);
-        self.run_preedit(ctx, &cands[0]);
+        let first = self.replace_module_candidates(cands, 0);
+        self.run_preedit(ctx, &first);
         *self.current_context.borrow_mut() = Some(ctx.clone());
         let anchor = self.caret_point(ctx);
         // Task 7: 表示ごとに settings/ダークモードを再評価した Theme を渡す。
@@ -3093,17 +6853,34 @@ impl TextService_Impl {
     /// 再変換取消: 元ラテンを復元して composition を閉じ、状態を片付ける。
     /// `ctx` は呼び出し元の生きた context を直接使う（変換失敗の早期取消では
     /// `current_context` がまだ未設定なため、ここで current_context に依存しない）。
-    pub(crate) fn cancel_reconvert(&self, ctx: &ITfContext) {
+    /// 戻り値（do_cancel と同じ規律）: false = RequestEditSession の外側失敗 or phrSession
+    /// 拒否（RestoreText が走っていない＝文書は未復元。状態もラッチも畳んでいない）。
+    /// true は RestoreText 成功とその後始末を完了した後にのみ返す。呼び出し側は false を
+    /// 「取消に失敗した」と扱い、Deactivate preflight は中断、キー経路は再操作に任せる。
+    pub(crate) fn cancel_reconvert(&self, ctx: &ITfContext) -> bool {
+        self.preedit_apply.invalidate();
         let original = self.reconvert_original.borrow().clone();
         let sess: ITfEditSession = RestoreText {
             context: ctx.clone(),
             text: HSTRING::from(original.as_str()),
             composition: Rc::clone(&self.composition),
             _guard: ComObjectGuard::new(),
-        }.into();
-        unsafe {
-            let _ = ctx.RequestEditSession(self.tid.get(), &sess,
-                TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0));
+        }
+        .into();
+        // 巡3 P3: RestoreText が拒否されたら状態を畳まない — 元テキストが文書へ復元されない
+        // のに再変換元を消すと選択文字列が消失する（phrSession も判定。F3 と同じ規律）。
+        match unsafe {
+            ctx.RequestEditSession(
+                self.tid.get(),
+                &sess,
+                TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
+            )
+        } {
+            Ok(hr) if hr.is_ok() => {}
+            _ => {
+                tip_log("ev=reconvert_cancel_rejected");
+                return false;
+            }
         }
         self.engine_end_session();
         self.reconverting.set(false);
@@ -3121,31 +6898,88 @@ impl TextService_Impl {
         *self.left_context.borrow_mut() = None;
         self.monitor_committed_reading.borrow_mut().clear();
         tip_log("ev=reconvert_cancel");
+        true
     }
 
     /// UU-4: ホストへ同期コールアウトしうる COM 区間（キー入口・タイマ発火など）をこれで包む。
     /// 区間中はゲートを立て、ホストが Behavior 経由で再入して `drain_behavior` を呼んでも借用
     /// 衝突 panic を起こさず保留させる。区間を抜けて借用が解放された安全点で、保留された
-    /// Behavior を `flush_pending_behavior` が処理する。ネスト時は最外区間だけが flush する。
-    /// `f` が panic しても RAII で区間フラグは必ず復元する（COM 入口の catch_com / タイマ proc の
-    /// catch_unwind が panic を受ける前提）。
+    /// Behavior を遅延 flush（0ms タイマ）で回収する。ネスト時は最外区間だけが予約する。
+    /// 巡3 P7/P8: 即時 flush は非同期 READ edit session の内側でも走り、TSF の規律
+    /// （READ 保持中の同期 READWRITE 要求は TF_E_SYNCHRONOUS 拒否）で do_commit が落ちるため
+    /// 遅延発火（メッセージループの次周=セッション外）に統一する。
+    /// 巡4 T1/T5: 予約は pending があるときだけ（無条件予約は「timer→drain(no-op)→再予約」の
+    /// 恒常 churn を生む）。`f` の panic 時も catch_unwind して予約してから resume する —
+    /// panic 経路で予約が飛ぶと保留が次の外部イベントまで宙吊りになる。
     pub(crate) fn guarded<T>(&self, f: impl FnOnce() -> T) -> T {
         // enter() は直前の値（=区間の中だったか）を返す。prev==false が最外区間。
         let prev = self.reentrancy.enter();
-        let flag = InOperationGuard { gate: &self.reentrancy, prev };
-        let r = f();
-        drop(flag); // 区間フラグを復元してから（借用未保持の安全点で）flush する
-        if !prev {
-            // 最外区間だけが flush する（ネストした内側 guarded は外側に任せる）。
-            self.flush_pending_behavior();
+        let flag = InOperationGuard {
+            gate: &self.reentrancy,
+            prev,
+        };
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        drop(flag); // 区間フラグを復元してから（借用未保持の安全点で）flush を予約する
+        if !prev && self.has_deferred_work() {
+            // 最外区間だけが flush を予約する（ネストした内側 guarded は外側に任せる）。
+            self.schedule_behavior_flush();
         }
-        r
+        match r {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// 巡3 P7/P8 + 巡4 T1: 保留 Behavior の回収を 0ms スレッドタイマで遅延発火する。タイマ
+    /// proc は現在のコールバック（relayout なら DoEditSession=READ ロック保持中）が完了してから
+    /// メッセージループで走るため、drain 内の同期 edit session 要求がセッション外の安全点で届く。
+    /// 巡4 T1: pending が立っているときだけ武装し、タイマID を保持して proc 側で照合する
+    /// （多重武装の防止と、Deactivate 後の旧タイマ発火切り捨て — fire_reload_retry と同型）。
+    /// SetTimer 失敗（資源枯渇。稀）時の即時 flush は READ セッション内で同期要求を出して
+    /// TF_E_SYNCHRONOUS 拒否を再発させるため行わない — ログだけ残し、次の入口で回収に任せる。
+    fn schedule_behavior_flush(&self) {
+        let was_armed = self.behavior_flush_timer.get() != 0;
+        let has_work = self.has_deferred_work();
+        if arm_deferred_work_timer(&self.behavior_flush_timer, has_work, || unsafe {
+            SetTimer(None, 0, 0, Some(behavior_flush_timer_proc))
+        }) {
+            return;
+        }
+        if has_work && !was_armed {
+            tip_log("ev=behavior_flush_arm_failed");
+        }
+    }
+
+    fn has_deferred_work(&self) -> bool {
+        deferred_work_pending(
+            self.reentrancy.has_pending(),
+            self.shadow_mismatches.borrow().has_pending(),
+        )
     }
 
     /// UU-4: 保留された Behavior 要求を、借用未保持の安全点で outbox が空になるまで実行する。
+    /// 呼び出し元は behavior_flush_timer_proc（セッション外のタイマ発火。巡6 C-1 で復帰 —
+    /// これが take_pending による pending 清算の唯一の経路）。
     /// `drain_behavior_inner` 実行中の再入も（ゲートにより）保留されるため、ループで回収する。
+    /// 巡3 P5: 上限付き — drain 内の COM コールアウトでホストが毎周再入する異常時に無限
+    /// ループしない。打ち切り時の消費済み要求は必ず実行して抜け、以降の再入は次の
+    /// 発火で回収される。
     pub(crate) fn flush_pending_behavior(&self) {
+        // 巡7 M-2: 関数内契約 — 本体の take_pending ループは in_operation を見ないため、
+        // 区間中に呼ばれると保留を下ろして強制 drain する（保護のバイパス）。proc の
+        // 事前判定に頼らずここでも守り、区間中の呼び出しは保留を残して即返す
+        // （回収は最外 guarded 脱出／外側 flush ループ／drain_behavior 尾部のいずれか）。
+        if self.reentrancy.in_operation() {
+            return;
+        }
+        let mut rounds = 0u32;
         while self.reentrancy.take_pending() {
+            rounds += 1;
+            if rounds > 8 {
+                tip_log("ev=behavior_flush_truncated");
+                self.drain_behavior_inner();
+                return;
+            }
             self.drain_behavior_inner();
         }
     }
@@ -3161,9 +6995,21 @@ impl TextService_Impl {
             return;
         }
         // 借用未保持のトップレベル。inner が区間フラグを立てるので、その中の再入は保留され、
-        // 続く flush ループで回収する。
-        self.drain_behavior_inner();
-        self.flush_pending_behavior();
+        // 続く flush 予約で（メッセージループの次周に）回収する。
+        // 巡7 M-2: inner の panic がこの尾部を飛ばすと、直前の再入で立った pending の
+        // 予約者がいなくなり次の外部イベントまで宙吊りになる — guarded と同じ
+        // catch→予約→resume 構造にする（notify 呼び出し側は握り潰すのでここが最後の窓）。
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.drain_behavior_inner();
+        }));
+        // 巡4 T1: 予約は pending があるときだけ（drain 後に保留が残っていなければ再武装しない
+        // — 「timer→drain(no-op)→再予約」の恒常 churn を断つ）。
+        if self.has_deferred_work() {
+            self.schedule_behavior_flush();
+        }
+        if let Err(payload) = r {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     /// drain の実体。区間フラグを立てて再入を保留させる。
@@ -3173,19 +7019,54 @@ impl TextService_Impl {
     /// 生きた context が無い（current_context=None）なら何もしない（劣化。panic させない）。
     fn drain_behavior_inner(&self) {
         let prev = self.reentrancy.enter();
-        let _flag = InOperationGuard { gate: &self.reentrancy, prev };
+        let _flag = InOperationGuard {
+            gate: &self.reentrancy,
+            prev,
+        };
         let action = self.behavior_outbox.borrow_mut().take();
         let sync_selection = self.selection_dirty.replace(false);
         if action.is_none() && !sync_selection {
             return;
         }
-        let Some(ctx) = self.current_context.borrow().clone() else { return; };
+        if self.explicit_status_visible.get() {
+            return;
+        }
+        let Some(ctx) = self.current_context.borrow().clone() else {
+            return;
+        };
         // 選択同期は action より先。Finalize と同時に届いた場合でも「見えている文字列を確定する」
+        if self.local_converting() {
+            let mut finalize = false;
+            {
+                let mut local = self.local_clauses.borrow_mut();
+                let model = local.as_mut().unwrap();
+                if let crate::clause_conversion::CandidateWindow::Ready { selected, .. } =
+                    &model.window
+                {
+                    let index = selected / 9 * 9 + self.cand_state.borrow().selected();
+                    if sync_selection || matches!(action, Some(BehaviorAction::Finalize)) {
+                        model.select_candidate(index);
+                    }
+                    finalize = matches!(action, Some(BehaviorAction::Finalize));
+                }
+                if matches!(action, Some(BehaviorAction::Abort)) {
+                    model.close_window();
+                }
+            }
+            if finalize {
+                self.queue_local_clause_commit(&ctx, false);
+            } else {
+                self.render_local_edit(&ctx);
+            }
+            return;
+        }
         // 順序になり、確定直前だけ preedit が古いまま、という観測可能な隙間を作らない。
         if sync_selection {
             self.sync_preedit_to_selection(&ctx);
         }
-        let Some(action) = action else { return; };
+        let Some(action) = action else {
+            return;
+        };
         match action {
             BehaviorAction::Finalize => {
                 // UU-4(#4): 保留された Finalize が「候補が既に閉じられた後」（例: Esc で hide したが
@@ -3204,12 +7085,10 @@ impl TextService_Impl {
                 // Enter（候補表示中）と同一: 選択中の候補を commit_candidate で確定する
                 // （前方一致候補なら部分確定して残り読みを継続）。選択 index は cand_state
                 // （＝選択の唯一の真実源。キーボードも Behavior::SetSelection もここを更新）から読む。
-                let pick = {
-                    let st = self.cand_state.borrow();
-                    st.resolve_commit(st.selected())
-                };
-                let Some((index, text)) = pick else { return; }; // 候補空
-                self.commit_candidate(&ctx, index, &text);
+                let Some((request, index, text)) = self.module_candidate_commit(None) else {
+                    return;
+                }; // 候補空
+                self.commit_candidate(&ctx, request, index, &text);
             }
             BehaviorAction::Abort => {
                 // Esc と同一の優先順位: 再変換中→取消 / 候補表示中→候補を閉じる /
@@ -3224,9 +7103,21 @@ impl TextService_Impl {
                     self.restore_live_preedit(&ctx);
                 } else if self.state.borrow().composing {
                     self.disarm_debounce();
-                    self.do_cancel(&ctx);
-                    self.state.borrow_mut().on_escape();
+                    let cancel = self
+                        .state
+                        .borrow_mut()
+                        .handle(ModuleEvent::Key(ModuleKeyEvent::Escape))
+                        .immediate
+                        .expect("composing Behavior abort must produce a cancel operation");
+                    // 巡4 T4: 拒否時は状態を畳まない（Esc と同じ規律）。
+                    if !self.do_cancel(&ctx) {
+                        self.state.borrow_mut().complete(&cancel, false);
+                        tip_log("ev=cancel_rejected source=behavior_abort");
+                        return;
+                    }
+                    self.state.borrow_mut().complete(&cancel, true);
                     self.engine_end_session();
+                    self.background_input.request_close();
                     self.live_text.borrow_mut().clear();
                     *self.current_context.borrow_mut() = None;
                 }
@@ -3251,11 +7142,15 @@ pub(crate) struct ReentrancyGate {
 
 impl ReentrancyGate {
     pub(crate) fn new() -> Self {
-        Self { in_operation: Cell::new(false), pending: Cell::new(false) }
+        Self {
+            in_operation: Cell::new(false),
+            pending: Cell::new(false),
+        }
     }
     /// 現在、操作区間の中か（ゲートの状態を検査するアクセサ。単体テストで区間フラグの
-    /// 遷移を確認するのに使う。production では guarded が enter/exit の戻り値で判定する）。
-    #[allow(dead_code)]
+    /// 遷移を確認するのに使う。production では guarded が enter/exit の戻り値で判定し、
+    /// behavior_flush_timer_proc が発火可否の判定に、flush_pending_behavior が区間中
+    /// 呼び出しの拒否（関数内契約）に使う）。
     pub(crate) fn in_operation(&self) -> bool {
         self.in_operation.get()
     }
@@ -3283,6 +7178,11 @@ impl ReentrancyGate {
     pub(crate) fn take_pending(&self) -> bool {
         self.pending.replace(false)
     }
+    /// 保留があるか（消費しない読み出し）。遅延 flush の再武装判断に使う — pending が無い
+    /// 要求の無駄なタイマ発火（恒常 churn）を防ぐ（巡4 T1）。
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.get()
+    }
 }
 
 /// UU-4: 区間フラグを立て、抜けたら（panic 時も Drop で）元の値へ戻す RAII。
@@ -3303,14 +7203,144 @@ pub(crate) fn drain_behavior_via_tls() {
     BEHAVIOR_TS.with(|c| {
         let p = c.get();
         if !p.is_null() {
-            unsafe { (*p).drain_behavior(); }
+            unsafe {
+                (*p).drain_behavior();
+            }
         }
+    });
+}
+
+// The installed-TIP gate invokes the existing configuration path on its STA.
+// BEHAVIOR_TS is registered at activation and cleared at deactivation/drop.
+#[cfg(feature = "tsf-test-hooks")]
+#[no_mangle]
+extern "system" fn NospacekeyTestReloadConfiguration(command: u32) -> u64 {
+    std::panic::catch_unwind(|| {
+        let pointer = BEHAVIOR_TS.with(|slot| slot.get());
+        if pointer.is_null() { return u64::MAX; }
+        let ts = unsafe { &*pointer };
+        match command {
+            0 => { ts.engine_reload_config(); 0 }
+            1 => {
+                if ts.snapshot_configuration_pending.get()
+                    || ts.acknowledged_configuration_generation.get() != ts.configuration_generation.get() {
+                    return 0;
+                }
+                ts.local_clauses.borrow().as_ref().and_then(|model| model.learning_identity.as_ref())
+                    .map_or(0, |identity| identity.learning_generation)
+            }
+            _ => u64::MAX,
+        }
+    }).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn finalize_native_clause_click_via_tls() -> bool {
+    BEHAVIOR_TS.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return false;
+        }
+        let ts = unsafe { &*pointer };
+        let ready = ts.local_clauses.borrow().as_ref().is_some_and(|m| {
+            matches!(
+                m.window,
+                crate::clause_conversion::CandidateWindow::Ready { .. }
+            )
+        });
+        if !ready {
+            return false;
+        }
+        *ts.behavior_outbox.borrow_mut() = Some(BehaviorAction::Finalize);
+        ts.drain_behavior();
+        true
+    })
+}
+
+/// 巡3 P7/P8 + 巡4 T1: schedule_behavior_flush が武装する 0ms タイマの発火口。現在のメッセージ
+/// （relayout なら DoEditSession=READ ロック保持中）が完了した後のメッセージループで呼ば
+/// れるため、drain 内の同期 edit session 要求が TSF の規律に抵触しない安全点になる。
+/// タイマID照合で現在インスタンスの武装した物だけを処理し（多重武装時代の残り・旧インスタンス
+/// の発火は切り捨て）、flush 後に保留が残っていなければ再武装しない（恒常 churn 防止）。
+unsafe extern "system" fn behavior_flush_timer_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) {
+    let _ = KillTimer(None, id);
+    let ptr = BEHAVIOR_TS.with(|c| c.get());
+    if ptr.is_null() {
+        return;
+    }
+    let ts: &TextService_Impl = unsafe { &*ptr };
+    if ts.behavior_flush_timer.get() != id {
+        return; // 自分の武装したタイマではない（差し替え後の旧発火等）— 掃除だけ済ませ無視。
+    }
+    ts.behavior_flush_timer.set(0);
+    // 巡6 C-1/I-1 + 巡8: 発火時にガード区間中（ネストしたメッセージポンプで
+    // WM_TIMER が流れ込んだ場合）なら実行も再武装もしない。flush_pending_behavior は
+    // 巡6当時 in_operation を見ず take_pending で保留を下ろすため、区間中に呼ぶと
+    // ReentrancyGate の保護をバイパスする強制 drain になった — 巡4の proc 直呼びが
+    // そうだった（巡5-B 指摘1）。巡8 で入口ガードを関数内契約に移した今、proc 側の
+    // 判定が守るのは本体でなく proc 尾部 — flush が区間中に即返しても、その後の
+    // has_pending が 0ms タイマをポンプ内で再武装してライブロックするためである。
+    // drain_behavior（notify 入口）への付け替えは take_pending の呼び出し元を消して
+    // 保留を誰も下ろせなくする（巡6 C-1）。再武装しない以上、保留の回収者は区間を
+    // 立てた主体が担う — guarded 由来は最外脱出時の予約（!prev && has_pending）、
+    // flush ループ内の inner 由来は外側の while take_pending、drain_behavior 経由の
+    // inner 由来はその尾部の再武装、打ち切り／flush 中 panic で残った pending は
+    // proc 尾部の再武装が拾う。
+    if ts.reentrancy.in_operation() {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // セッション外の安全点 — 保留を take_pending ループで回収する（上限付き）。
+        // 巡6 C-1: pending を下ろすのは flush_pending_behavior の take_pending だけ。
+        // drain_behavior への付け替えは清算者を孤立させ、outbox 空の no-op 発火が
+        // pending 残存のまま永久に再武装する恒常 churn を起こす。
+        ts.flush_pending_behavior();
+        ts.flush_shadow_mismatches();
+    }));
+    // 巡5 GLM M-3: 打ち切り（8周上限）や flush 中の panic で pending が残っていれば
+    // 再武装（宙吊り防止）。通常終了時は pending が下りているので no-op で止まる。
+    if should_rearm_deferred_work(
+        ts.reentrancy.in_operation(),
+        ts.reentrancy.has_pending(),
+        ts.shadow_mismatches.borrow().has_pending(),
+    ) {
+        ts.schedule_behavior_flush();
+    }
+}
+
+/// UIバグ4: RefreshAnchorOnLayout（非同期 READ セッション）の DoEditSession から呼ばれる
+/// 再配置の適用入口。LAYOUT_TS 経由で TextService を引く（Activate で set / Drop で null —
+/// DEBOUNCE_TS/BEHAVIOR_TS と同型の STA 生ポインタ規律）。
+/// 巡2 E1/E3 + 巡3 G3: gen はセッション投入時点の世代（プロセスグローバル発行）。投入後に
+/// Activate/Deactivate/context 負替が起きていたら（≠現在世代）旧 context の座標で現在の
+/// 表示を汚さない。pending の解除も自世代のみ — 旧世代の完了が現世代の coalescing フラグを
+/// 下ろすと「1本にまとめる」が崩れる（旧 pending は bump 時点で必ず清算済み）。
+pub(crate) fn layout_refresh_apply(
+    gen: u64,
+    caret_anchor: Option<crate::candidate_window::CaretAnchor>,
+    monitor_anchor: Option<crate::candidate_window::CaretAnchor>,
+) {
+    LAYOUT_TS.with(|p| {
+        let ptr = p.get();
+        if ptr.is_null() {
+            return;
+        }
+        let ts = unsafe { &*ptr };
+        if ts.layout_sink_gen.get() != gen {
+            tip_log("ev=layout_refresh skipped=stale_gen");
+            return;
+        }
+        ts.layout_refresh_pending.set(false);
+        ts.relayout_popups_on_layout(caret_anchor, monitor_anchor);
     });
 }
 
 /// 指定パイプ名を引数に、`NospacekeyEngineHost.exe` を**コンソール無し**で起動する。
 /// `CREATE_NO_WINDOW` を付けるので可視ウィンドウは出ない（切替時の大量ウィンドウ対策）。
-pub(crate) fn spawn_engine_hidden(exe: &std::path::Path, pipe: &str, env: &[(String, String)]) -> Option<std::process::Child> {
+pub(crate) fn spawn_engine_hidden(
+    exe: &std::path::Path,
+    pipe: &str,
+    env: &[(String, String)],
+) -> Option<std::process::Child> {
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -3325,8 +7355,14 @@ pub(crate) fn spawn_engine_hidden(exe: &std::path::Path, pipe: &str, env: &[(Str
         if logging_enabled() {
             if let Some(dir) = std::env::var_os("TEMP") {
                 let log = std::path::Path::new(&dir).join("nospacekey-engine.log");
-                if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
-                    if let Ok(f2) = f.try_clone() { cmd.stdout(Stdio::from(f)).stderr(Stdio::from(f2)); }
+                if let Ok(f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log)
+                {
+                    if let Ok(f2) = f.try_clone() {
+                        cmd.stdout(Stdio::from(f)).stderr(Stdio::from(f2));
+                    }
                 }
             }
         }
@@ -3338,17 +7374,32 @@ pub(crate) fn spawn_engine_hidden(exe: &std::path::Path, pipe: &str, env: &[(Str
         // 自体が拒否される（Job 制約であり exe の ACL ではない）。その場合は breakaway を諦めて
         // Job 内で spawn する — engine がホストの Job 道連れになるリスクより「engine が一切
         // 立たない」方が実害が大きい（道連れで死んでも次打鍵の respawn で復帰する）。
-        Err(e) if e.raw_os_error() == Some(5) => match build(CREATE_NO_WINDOW | DETACHED_PROCESS).spawn() {
-            Ok(child) => {
-                tip_log("ev=engine_spawn_retry breakaway=off ok=true");
-                Some(child)
+        Err(e) if e.raw_os_error() == Some(5) => {
+            match build(CREATE_NO_WINDOW | DETACHED_PROCESS).spawn() {
+                Ok(child) => {
+                    tip_log("ev=engine_spawn_retry breakaway=off ok=true");
+                    Some(child)
+                }
+                Err(e2) => {
+                    tip_log(&format!(
+                        "ev=engine_spawn_err os={:?} kind={:?} msg={} retry=breakaway_off",
+                        e2.raw_os_error(),
+                        e2.kind(),
+                        e2
+                    ));
+                    None
+                }
             }
-            Err(e2) => {
-                tip_log(&format!("ev=engine_spawn_err os={:?} kind={:?} msg={} retry=breakaway_off", e2.raw_os_error(), e2.kind(), e2));
-                None
-            }
-        },
-        Err(e) => { tip_log(&format!("ev=engine_spawn_err os={:?} kind={:?} msg={}", e.raw_os_error(), e.kind(), e)); None }
+        }
+        Err(e) => {
+            tip_log(&format!(
+                "ev=engine_spawn_err os={:?} kind={:?} msg={}",
+                e.raw_os_error(),
+                e.kind(),
+                e
+            ));
+            None
+        }
     }
 }
 
@@ -3367,9 +7418,14 @@ pub(crate) fn spawn_engine_only(pipe: &str) -> Option<u32> {
     }
     let exe = engine_exe_path()?;
     let s = settings::load();
-    let key_plain = if s.llm.api_key_dpapi.is_empty() { None }
-        else { settings::dpapi::decrypt(&s.llm.api_key_dpapi) };
-    let env_map = settings::resolve_env_map(&s, key_plain.as_ref().map(|z| z.as_str()), |k| std::env::var(k).ok());
+    let key_plain = if s.llm.api_key_dpapi.is_empty() {
+        None
+    } else {
+        settings::dpapi::decrypt(&s.llm.api_key_dpapi)
+    };
+    let env_map = settings::resolve_env_map(&s, key_plain.as_ref().map(|z| z.as_str()), |k| {
+        std::env::var(k).ok()
+    });
     spawn_engine_hidden(&exe, pipe, &env_map).map(|child| child.id())
 }
 
@@ -3398,17 +7454,43 @@ extern "system" fn debounce_timer_proc(_hwnd: HWND, _msg: u32, id: usize, _time:
     }));
 }
 
+extern "system" fn live_result_poll_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) {
+    let Some(ptr) = LIVE_RESULT_OWNERS.with(|owners| owners.borrow().get(id)) else {
+        unsafe {
+            let _ = KillTimer(None, id);
+        }
+        return;
+    };
+    let ts: &TextService_Impl = unsafe { &*ptr };
+    if ts.live_result_timer.get() != id {
+        LIVE_RESULT_OWNERS.with(|owners| {
+            owners.borrow_mut().remove(id);
+        });
+        unsafe {
+            let _ = KillTimer(None, id);
+        }
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ts.guarded(|| ts.poll_live_result());
+    }));
+}
+
 /// LLM 結果ポーリング proc（WM_TIMER）。STA 単一スレッドなので thread_local からインスタンスを引く。
 /// スロットに結果が入っていれば取り出して反映し、タイマを止める。
 extern "system" fn llm_poll_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) {
     let ptr = LLM_TS.with(|p| p.get());
-    if ptr.is_null() { return; }
+    if ptr.is_null() {
+        return;
+    }
     let ts: &TextService_Impl = unsafe { &*ptr };
     if ts.llm_poll_timer.get() != id {
         // この id は現在のインスタンスの物ではない（複数インスタンスが 1 STA に同居した場合等）。
         // ポーリングタイマは反復発火するので、放置すると永久に CPU を食う。確実に止める
         // （debounce_timer_proc が先頭で無条件 KillTimer するのと同じ防御）。
-        unsafe { let _ = KillTimer(None, id); }
+        unsafe {
+            let _ = KillTimer(None, id);
+        }
         return;
     }
     // UU-4(#5/#6): on_llm_outcome/abort_llm も run_preedit（同期 edit session）でホスト再入しうる
@@ -3416,7 +7498,10 @@ extern "system" fn llm_poll_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) 
     // （debounce_timer_proc と対称）。
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ts.guarded(|| {
-            let outcome = ts.llm_slot.borrow().as_ref()
+            let outcome = ts
+                .llm_slot
+                .borrow()
+                .as_ref()
                 .and_then(|s| s.lock().ok().and_then(|mut g| g.take()));
             if let Some(o) = outcome {
                 ts.disarm_llm_poll();
@@ -3430,33 +7515,421 @@ extern "system" fn llm_poll_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) 
     }));
 }
 
+/// 巡3 Z4: ReloadConfig busy 再送タイマの発火口（単発 — 先頭で自分を掃除）。
+/// engine_reload_config は IPC 送信を含む COM 区間ではないが、応答処理から drop_engine が
+/// 走りうるので panic 保護だけ入れる（タイマ proc の共通規律）。
+extern "system" fn reload_retry_timer_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) {
+    unsafe {
+        let _ = KillTimer(None, id);
+    }
+    let ptr = RELOAD_RETRY_TS.with(|p| p.get());
+    if ptr.is_null() {
+        return;
+    }
+    let ts: &TextService_Impl = unsafe { &*ptr };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ts.fire_reload_retry(id);
+    }));
+}
+
+#[cfg(test)]
+mod prediction_slot_tests {
+    use super::prediction_slot_available;
+
+    #[test]
+    fn old_physical_slot_blocks_a_new_field_until_cleanup() {
+        assert!(prediction_slot_available(false, false));
+        assert!(!prediction_slot_available(true, false));
+        assert!(!prediction_slot_available(false, true));
+        assert!(!prediction_slot_available(true, true));
+    }
+}
+
+#[cfg(test)]
+mod timer_owner_registry_tests {
+    use super::TimerOwnerRegistry;
+
+    #[test]
+    fn removing_one_timer_does_not_change_another_timer_owner() {
+        let mut owners = TimerOwnerRegistry::default();
+        owners.insert(11, "service-a");
+        owners.insert(22, "service-b");
+
+        assert_eq!(owners.remove(22), Some("service-b"));
+        assert_eq!(owners.get(11), Some("service-a"));
+        assert_eq!(owners.remove(11), Some("service-a"));
+        assert_eq!(owners.get(11), None);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_status_tests {
+    use super::{
+        current_snapshot_configuration_is_represented, should_show_explicit_status,
+        snapshot_configuration_is_acknowledged, snapshot_poll_interval, snapshot_result_is_current,
+        snapshot_status_action, snapshot_ui_begin_configuration_change,
+        snapshot_ui_version_mismatch, SnapshotStatusAction, SnapshotUiWaitState,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn explicit_reconnect_status_is_quiet_until_its_delay_and_shows_only_while_pending() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(500);
+        assert!(!should_show_explicit_status(
+            true,
+            false,
+            Some(deadline),
+            now,
+            false,
+        ));
+        assert!(should_show_explicit_status(
+            true,
+            false,
+            Some(deadline),
+            deadline,
+            false,
+        ));
+        assert!(!should_show_explicit_status(
+            false,
+            false,
+            Some(deadline),
+            deadline,
+            false,
+        ));
+        assert!(!should_show_explicit_status(
+            true,
+            true,
+            Some(deadline),
+            deadline,
+            false,
+        ));
+        assert!(!should_show_explicit_status(
+            true,
+            false,
+            Some(deadline),
+            deadline,
+            true,
+        ));
+    }
+
+    #[test]
+    fn version_mismatch_silently_terminates_due_explicit_status_and_polling() {
+        let now = Instant::now();
+        let settled = snapshot_ui_version_mismatch(SnapshotUiWaitState {
+            configuration_pending: true,
+            live_result_deadline: Some(now),
+            explicit_pending: true,
+            explicit_status_deadline: Some(now),
+            explicit_status_visible: true,
+            version_mismatch: false,
+        });
+
+        assert!(settled.version_mismatch);
+        assert!(!settled.configuration_pending);
+        assert_eq!(settled.live_result_deadline, None);
+        assert!(!settled.explicit_pending);
+        assert_eq!(settled.explicit_status_deadline, None);
+        assert!(!settled.explicit_status_visible);
+        assert!(!should_show_explicit_status(
+            settled.explicit_pending,
+            settled.explicit_status_visible,
+            settled.explicit_status_deadline,
+            now,
+            settled.version_mismatch,
+        ));
+        assert_eq!(
+            snapshot_poll_interval(
+                settled.live_result_deadline.is_some(),
+                settled.configuration_pending,
+                settled.explicit_pending,
+            ),
+            None,
+        );
+
+        let fresh = snapshot_ui_begin_configuration_change(settled);
+        assert!(!fresh.version_mismatch);
+    }
+    use crate::background_input::SnapshotStatus;
+    use crate::input_module::SnapshotIdentity;
+
+    #[test]
+    fn late_current_configuration_schedules_a_stopped_composition() {
+        assert_eq!(
+            snapshot_status_action(
+                SnapshotStatus::Configured {
+                    learning_identity: None,
+                    configuration_generation: 3,
+                    connection_epoch: 8,
+                },
+                3,
+                8,
+                true,
+            ),
+            Some(SnapshotStatusAction::Configured {
+                schedule_conversion: true,
+            })
+        );
+    }
+
+    #[test]
+    fn stale_status_and_result_epochs_are_rejected() {
+        assert_eq!(
+            snapshot_status_action(
+                SnapshotStatus::Configured {
+                    learning_identity: None,
+                    configuration_generation: 3,
+                    connection_epoch: 7,
+                },
+                3,
+                8,
+                true,
+            ),
+            None
+        );
+        let stale = SnapshotIdentity {
+            composition: 1,
+            request: 1,
+            revision: 2,
+            configuration_generation: 3,
+            connection_generation: 7,
+        };
+        assert!(!snapshot_result_is_current(stale, 3, 8, 8));
+        assert!(snapshot_result_is_current(
+            SnapshotIdentity {
+                connection_generation: 8,
+                ..stale
+            },
+            3,
+            8,
+            8,
+        ));
+    }
+
+    #[test]
+    fn stale_invalidated_status_without_a_current_desired_configuration_is_ignored() {
+        assert_eq!(
+            snapshot_status_action(
+                SnapshotStatus::Invalidated {
+                    configuration_generation: 2,
+                    connection_epoch: 8,
+                },
+                3,
+                8,
+                true,
+            ),
+            None
+        );
+        assert!(!current_snapshot_configuration_is_represented(3, 2));
+    }
+
+    #[test]
+    fn current_version_mismatch_is_classified_separately_and_stale_one_is_ignored() {
+        let current = SnapshotStatus::VersionMismatch {
+            configuration_generation: 3,
+            connection_epoch: 8,
+            actual: Some(5),
+            actual_boot: Some("old-build".into()),
+        };
+        assert_eq!(
+            snapshot_status_action(current.clone(), 3, 8, true),
+            Some(SnapshotStatusAction::VersionMismatch {
+                actual: Some(5),
+                actual_boot: Some("old-build".into()),
+            })
+        );
+        assert_eq!(snapshot_status_action(current, 4, 8, true), None);
+    }
+
+    #[test]
+    fn reconnect_monitor_is_slow_until_configured_then_live_results_are_fast() {
+        assert_eq!(snapshot_poll_interval(false, true, false), Some(250));
+        assert_eq!(snapshot_poll_interval(false, false, true), Some(250));
+        assert_eq!(snapshot_poll_interval(true, true, true), Some(15));
+        assert_eq!(snapshot_poll_interval(true, false, false), Some(15));
+        assert_eq!(snapshot_poll_interval(false, false, false), None);
+    }
+
+    #[test]
+    fn live_snapshot_requires_the_exact_acknowledged_configuration_and_connection_pair() {
+        assert!(snapshot_configuration_is_acknowledged(3, 3, 8, 8));
+        assert!(!snapshot_configuration_is_acknowledged(3, 3, 9, 8));
+        assert!(!snapshot_configuration_is_acknowledged(4, 3, 8, 8));
+        assert!(!snapshot_configuration_is_acknowledged(0, 0, 8, 8));
+    }
+}
+
+extern "system" fn prediction_retry_timer_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) {
+    unsafe {
+        let _ = KillTimer(None, id);
+    }
+    let ptr = PREDICTION_RETRY_TS.with(|p| p.get());
+    if ptr.is_null() {
+        return;
+    }
+    let ts: &TextService_Impl = unsafe { &*ptr };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ts.guarded(|| ts.fire_prediction_finish_retry(id));
+    }));
+}
+
+extern "system" fn prediction_poll_timer_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) {
+    unsafe {
+        let _ = KillTimer(None, id);
+    }
+    let ptr = PREDICTION_POLL_TS.with(|p| p.get());
+    if ptr.is_null() {
+        tip_log("ev=prediction_poll state=null_owner");
+        return;
+    }
+    let ts: &TextService_Impl = unsafe { &*ptr };
+    if ts.prediction_poll_timer.get() != id {
+        tip_log(&format!(
+            "ev=prediction_poll state=stale_timer expected={} actual={id}",
+            ts.prediction_poll_timer.get(),
+        ));
+        return;
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ts.guarded(|| ts.fire_prediction_poll(id));
+    }));
+    if result.is_err() {
+        tip_log("ev=panic site=prediction_poll");
+    }
+}
+
 /// TextService が（Deactivate を経ずに）解放された場合の保険: 武装中のデバウンスタイマを
 /// 確実に解除し、thread_local の生ポインタを無効化する（タイマ発火時の dangling 参照=UAF を防ぐ）。
 impl Drop for TextService {
     fn drop(&mut self) {
+        // 巡2 F5: Deactivate を経ない解放（二重 Activate のリーク経路等）でも sink の
+        // cookie を返却する — context 側 ITfSource に COM 参照が残るのを防ぐ保険。
+        // 巡3 G5: 不変条件 — AdviseSink は context→sink への強参照を作り、TextService は
+        // layout_sink_ctx で context を強参照するため、cookie≠0 のまま参照カウントが零に
+        // なることはなく「cookie が残ったまま Drop 到達」は論理的に起きない（到達しても
+        // 常に no-op）。将来 advise サイトを増やす際の対称性破りへの防御として残す。
+        // Drop は outer 型（&mut TextService）なので Impl ポインタは Activate で覚えさせた
+        // impl_ptr フィールド経由で比較する。
+        let me = self.impl_ptr.get();
+        self.unadvise_layout_sink();
         let id = self.debounce_timer.replace(0);
         if id != 0 {
             unsafe {
                 let _ = KillTimer(None, id);
             }
         }
-        DEBOUNCE_TS.with(|p| p.set(std::ptr::null()));
+        let live_id = self.live_result_timer.replace(0);
+        if live_id != 0 {
+            LIVE_RESULT_OWNERS.with(|owners| {
+                owners.borrow_mut().remove(live_id);
+            });
+            unsafe {
+                let _ = KillTimer(None, live_id);
+            }
+        }
         let lid = self.llm_poll_timer.replace(0);
-        if lid != 0 { unsafe { let _ = KillTimer(None, lid); } }
-        LLM_TS.with(|p| p.set(std::ptr::null()));
+        if lid != 0 {
+            unsafe {
+                let _ = KillTimer(None, lid);
+            }
+        }
+        // 巡3 Z4: busy 再送タイマも掃除し、カウンタを戻す（接続が変われば busy 状態も無関係）。
+        let rid = self.reload_retry_timer.replace(0);
+        if rid != 0 {
+            unsafe {
+                let _ = KillTimer(None, rid);
+            }
+        }
+        self.reload_retry_count.set(0);
+        // 巡4 T1: 遅延 flush タイマも掃除。
+        let bf = self.behavior_flush_timer.replace(0);
+        if bf != 0 {
+            unsafe {
+                let _ = KillTimer(None, bf);
+            }
+        }
+        let pr = self.prediction_retry_timer.replace(0);
+        if pr != 0 {
+            unsafe {
+                let _ = KillTimer(None, pr);
+            }
+        }
+        let pp = self.prediction_poll_timer.replace(0);
+        if pp != 0 {
+            unsafe {
+                let _ = KillTimer(None, pp);
+            }
+        }
+        if let Some(slot) = self.prediction_slot.borrow_mut().take() {
+            slot.cancel();
+        }
+        RELOAD_RETRY_TS.with(|p| {
+            if p.get() == me {
+                p.set(std::ptr::null());
+            }
+        });
+        PREDICTION_RETRY_TS.with(|p| {
+            if p.get() == me {
+                p.set(std::ptr::null());
+            }
+        });
+        PREDICTION_POLL_TS.with(|p| {
+            if p.get() == me {
+                p.set(std::ptr::null());
+            }
+        });
+        // 巡2 E2: 各 TLS の null 化は「自分が指しているときだけ」— 同一 STA スレッドに複数
+        // TextService が載る構成（二重 Activate のリーク等）で、旧インスタンスの Drop が
+        // 新インスタンスの TLS をワイプして追従/タイマ処理を止めないための防御。
+        DEBOUNCE_TS.with(|p| {
+            if p.get() == me {
+                p.set(std::ptr::null());
+            }
+        });
+        LLM_TS.with(|p| {
+            if p.get() == me {
+                p.set(std::ptr::null());
+            }
+        });
+        // UIバグ4: レイアウト再照会セッション用の自己ポインタも無効化。
+        LAYOUT_TS.with(|p| {
+            if p.get() == me {
+                p.set(std::ptr::null());
+            }
+        });
         // SP6a: Behavior 自己ポインタも無効化（Deactivate を経ない解放での dangling 防止）。
-        BEHAVIOR_TS.with(|p| p.set(std::ptr::null()));
+        BEHAVIOR_TS.with(|c| {
+            if c.get() == me {
+                c.set(std::ptr::null());
+            }
+        });
         // C-1: DLL 生存参照は `_guard`（ComObjectGuard）の Drop が自動で -1 する
         // （この drop 本体の後にフィールドが drop される）。全 #[implement] オブジェクトが
         // 解放されたら DllCanUnloadNow=S_OK。
     }
 }
 
-/// InputScope 配列に IS_PASSWORD が含まれるか（Spec2 パスワード欄尊重の純判定）。
-/// 値は windows crate の InputScope(i32) の生値（IS_PASSWORD = 31）。
+/// InputScope 配列に password/PIN 系 scope が含まれるか。
 pub fn scopes_contain_password(scopes: &[i32]) -> bool {
-    use windows::Win32::UI::TextServices::IS_PASSWORD;
-    scopes.contains(&IS_PASSWORD.0)
+    use windows::Win32::UI::TextServices::{
+        IS_ALPHANUMERIC_PIN, IS_ALPHANUMERIC_PIN_SET, IS_NUMERIC_PASSWORD, IS_NUMERIC_PIN,
+        IS_PASSWORD,
+    };
+    [
+        IS_PASSWORD,
+        IS_NUMERIC_PASSWORD,
+        IS_NUMERIC_PIN,
+        IS_ALPHANUMERIC_PIN,
+        IS_ALPHANUMERIC_PIN_SET,
+    ]
+    .iter()
+    .any(|scope| scopes.contains(&scope.0))
+}
+
+/// 予測へ確定済み本文を渡してよいかの sensitive-scope 判定。
+/// `None` は一過性の InputScope 照会失敗なので通常欄として扱い、呼び出し側で再照会する。
+fn prediction_scope_is_sensitive(keyboard_disabled: bool, password: Option<bool>) -> bool {
+    keyboard_disabled || password.unwrap_or(false)
 }
 
 /// compartment の VARIANT 値が「フラグ ON」か（バグ#1 の純判定）。
@@ -3480,14 +7953,17 @@ fn query_context_keyboard_disabled(ctx: &ITfContext) -> bool {
     let Ok(cm) = ctx.cast::<ITfCompartmentMgr>() else {
         return false;
     };
-    [GUID_COMPARTMENT_KEYBOARD_DISABLED, GUID_COMPARTMENT_EMPTYCONTEXT]
-        .iter()
-        .any(|guid| unsafe {
-            cm.GetCompartment(guid)
-                .and_then(|c| c.GetValue())
-                .map(|v| compartment_flag_is_set(&v))
-                .unwrap_or(false)
-        })
+    [
+        GUID_COMPARTMENT_KEYBOARD_DISABLED,
+        GUID_COMPARTMENT_EMPTYCONTEXT,
+    ]
+    .iter()
+    .any(|guid| unsafe {
+        cm.GetCompartment(guid)
+            .and_then(|c| c.GetValue())
+            .map(|v| compartment_flag_is_set(&v))
+            .unwrap_or(false)
+    })
 }
 
 /// `NOSPACEKEY_LOG` が有効(非空・"0"以外)のときだけ診断ログを出す。
@@ -3517,7 +7993,9 @@ const LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
 /// `path` のサイズが `max` を超えていれば `<path>.1` へ rename する（1世代のみ・失敗は無視）。
 /// 他プロセスが追記オープン中の rename 失敗も「ローテーションしないだけ」で無害。
 fn rotate_log_if_larger_than(path: &std::path::Path, max: u64) {
-    let too_big = std::fs::metadata(path).map(|m| m.len() > max).unwrap_or(false);
+    let too_big = std::fs::metadata(path)
+        .map(|m| m.len() > max)
+        .unwrap_or(false);
     if too_big {
         let mut rotated = path.as_os_str().to_owned();
         rotated.push(".1");
@@ -3531,7 +8009,11 @@ fn rotate_log_if_larger_than(path: &std::path::Path, max: u64) {
 fn tip_log_write_to(dir: &std::ffi::OsStr, msg: &str) {
     use std::io::Write;
     let path = std::path::Path::new(dir).join("nospacekey-tip.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         // 複数プロセスが同時追記するので、行を1回の write_all で書いて行割れを避ける。
         let _ = f.write_all(
             format!("[pid {}] ts={} {}\n", std::process::id(), epoch_ms(), msg).as_bytes(),
@@ -3560,7 +8042,11 @@ pub(crate) fn tip_log(msg: &str) {
         );
         tip_log_write_to(
             &dir,
-            &format!("ev=log_open build={}-{}", env!("CARGO_PKG_VERSION"), env!("GIT_HASH")),
+            &format!(
+                "ev=log_open build={}-{}",
+                env!("CARGO_PKG_VERSION"),
+                env!("GIT_HASH")
+            ),
         );
     });
     tip_log_write_to(&dir, msg);
@@ -3673,22 +8159,31 @@ pub(crate) fn feedback_jsonl_line(r: &LastCommit) -> String {
 
 /// feedback.jsonl のパス（`%LOCALAPPDATA%\nospacekey\feedback.jsonl` — settings.json /
 /// 学習 memory/ と同階層。ディレクトリ名の大小文字は settings::settings_path と同一）。
+/// 巡3 Z1: 空文字 LOCALAPPDATA は「無い」扱い — 通すと TIP をホストするアプリの CWD へ
+/// nospacekey\ を作って書き続ける（settings_path / dict_path と同じ規律）。
 fn feedback_path() -> Option<std::path::PathBuf> {
     std::env::var_os("LOCALAPPDATA")
-        .map(|d| std::path::PathBuf::from(d).join("nospacekey").join("feedback.jsonl"))
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            std::path::PathBuf::from(d)
+                .join("nospacekey")
+                .join("feedback.jsonl")
+        })
 }
 
 /// feedback.jsonl へ 1 行追記する（親 dir が無ければ作る）。1 レコードを 1 回の
 /// write_all で書いて行割れを避ける（tip_log と同じ流儀）。
 fn append_feedback_record(rec: &LastCommit) -> std::io::Result<()> {
     use std::io::Write;
-    let path = feedback_path().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no LOCALAPPDATA")
-    })?;
+    let path = feedback_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     f.write_all(format!("{}\n", feedback_jsonl_line(rec)).as_bytes())
 }
 
@@ -3734,11 +8229,6 @@ pub(crate) fn engine_exe_path() -> Option<std::path::PathBuf> {
     sibling_exe("NospacekeyEngineHost.exe")
 }
 
-/// SP6b: この DLL と同じディレクトリにある `NospacekeyConfig.exe`（設定 GUI）のパスを解決する。
-fn config_exe_path() -> Option<std::path::PathBuf> {
-    sibling_exe("NospacekeyConfig.exe")
-}
-
 #[cfg(test)]
 mod prespawn_tests {
     use super::should_prespawn;
@@ -3746,7 +8236,7 @@ mod prespawn_tests {
     #[test]
     fn prespawn_decision_spawns_only_when_no_client_and_not_attempted() {
         // Activate 時: client 無し・未試行なら spawn。既接続/試行済み/バックオフ中は何もしない。
-        assert!(should_prespawn(false, false, true));   // (has_client, spawn_attempted, backoff_allows)
+        assert!(should_prespawn(false, false, true)); // (has_client, spawn_attempted, backoff_allows)
         assert!(!should_prespawn(true, false, true));
         assert!(!should_prespawn(false, true, true));
         assert!(!should_prespawn(false, false, false));
@@ -3785,7 +8275,10 @@ mod uu4_reentrancy_tests {
         // 立てない（flush で無駄に inner を回さない）。
         let g = ReentrancyGate::new();
         let prev = g.enter();
-        assert!(g.signal_reentry(false), "区間中は has_action に依らず戻る(true)");
+        assert!(
+            g.signal_reentry(false),
+            "区間中は has_action に依らず戻る(true)"
+        );
         g.exit(prev);
         assert!(!g.take_pending(), "要求無しの再入は pending を立てない");
     }
@@ -3811,7 +8304,7 @@ mod uu5_reload_config_tests {
 
     #[test]
     fn frozen_llm_sends_empty_fields_even_when_enabled() {
-        // 凍結契約(docs/superpowers/specs/2026-07-21-llm-freeze-design.md): enabled=true+鍵ありでも
+        // 凍結契約(docs/design/2026-07-21-llm-freeze-design.md): enabled=true+鍵ありでも
         // llm_enabled:false+LLM系フィールド空で送る=平文キーがパイプを流れない。timeout_ms は
         // llm_enabled:false でエンジンが読まないスカラなので生値のまま。凍結前の
         // enabled_llm_carries_settings_values は再開時に spec の再開手順で復元する。
@@ -3835,6 +8328,7 @@ mod uu5_reload_config_tests {
                 llm_timeout_ms: 12000,
                 zenzai_enabled: true,
                 zenzai_weight: "C:/w.gguf".into(),
+                inline_prediction_enabled: false,
                 learning_enabled: true,
                 typo_learn_enabled: true,
                 zenzai_inference_limit: Some(1),
@@ -3850,7 +8344,12 @@ mod uu5_reload_config_tests {
         s.llm.endpoint = "https://leak".into();
         let req = build_reload_config(&s, Some("sk-should-not-leak"), |_| None);
         match req {
-            Request::ReloadConfig { llm_enabled, llm_api_key, llm_endpoint, .. } => {
+            Request::ReloadConfig {
+                llm_enabled,
+                llm_api_key,
+                llm_endpoint,
+                ..
+            } => {
                 assert!(!llm_enabled);
                 assert_eq!(llm_api_key, "");
                 assert_eq!(llm_endpoint, "", "無効時は endpoint も送らない");
@@ -3867,7 +8366,11 @@ mod uu5_reload_config_tests {
         s.zenzai.enabled = false;
         s.zenzai.weight_path = String::new();
         match build_reload_config(&s, None, |_| None) {
-            Request::ReloadConfig { zenzai_enabled, zenzai_weight, .. } => {
+            Request::ReloadConfig {
+                zenzai_enabled,
+                zenzai_weight,
+                ..
+            } => {
                 assert!(!zenzai_enabled);
                 assert_eq!(zenzai_weight, "");
             }
@@ -3881,7 +8384,10 @@ mod uu5_reload_config_tests {
         let mut s = Settings::default();
         s.zenzai.inference_limit = 0; // 手編集異常値 → クランプで 1
         match build_reload_config(&s, None, |_| None) {
-            Request::ReloadConfig { zenzai_inference_limit, .. } => {
+            Request::ReloadConfig {
+                zenzai_inference_limit,
+                ..
+            } => {
                 assert_eq!(zenzai_inference_limit, Some(1));
             }
             _ => panic!("ReloadConfig を組み立てるはず"),
@@ -3889,7 +8395,10 @@ mod uu5_reload_config_tests {
         match build_reload_config(&s, None, |k| {
             (k == "NOSPACEKEY_ZENZAI_INFERENCE_LIMIT").then(|| "5".to_string())
         }) {
-            Request::ReloadConfig { zenzai_inference_limit, .. } => {
+            Request::ReloadConfig {
+                zenzai_inference_limit,
+                ..
+            } => {
                 assert_eq!(zenzai_inference_limit, None);
             }
             _ => panic!("ReloadConfig を組み立てるはず"),
@@ -3897,7 +8406,7 @@ mod uu5_reload_config_tests {
     }
 }
 
-/// 再変換確定の RecordCorrection 送出条件(commit_candidate の reconverting 分岐から呼ぶ)。
+/// 再変換確定の RecordCorrection 送出条件（本文ACK後・接続終了前に送る）。
 /// index 0 は 1 位受諾=訂正ではない。空読みは採取できなかった劣化経路(送らない)。
 pub(crate) fn should_record_correction(index: usize, reading: &str) -> bool {
     index != 0 && !reading.is_empty()
@@ -3905,7 +8414,11 @@ pub(crate) fn should_record_correction(index: usize, reading: &str) -> bool {
 
 #[cfg(test)]
 mod a8_tests {
-    use super::{is_toggle_repeat, plan_start_session, should_log_slow, should_record_correction, Response, MODE_TOGGLE_REPEAT_GUARD, IPC_TIMEOUT_CONVERT, IPC_TIMEOUT_FAST, IPC_TIMEOUT_LIVE};
+    use super::{
+        engine_failure_event, is_toggle_repeat, plan_start_session, should_log_slow,
+        should_record_correction, Response, IPC_TIMEOUT_CONVERT, IPC_TIMEOUT_FAST,
+        IPC_TIMEOUT_LIVE, MODE_TOGGLE_REPEAT_GUARD,
+    };
     use std::time::Duration;
 
     #[test]
@@ -3919,9 +8432,49 @@ mod a8_tests {
     }
 
     #[test]
+    fn engine_failure_diagnostics_never_include_response_bodies() {
+        let sentinel = "秘密の入力と予測";
+        for response in [
+            Response::Reading {
+                reading: sentinel.into(),
+            },
+            Response::Candidates {
+                candidates: vec![sentinel.into()],
+            },
+            Response::Committed {
+                text: sentinel.into(),
+                reading: sentinel.into(),
+            },
+            Response::LlmResult {
+                seq: 1,
+                text: sentinel.into(),
+            },
+            Response::Prediction {
+                seq: 1,
+                text: sentinel.into(),
+            },
+            Response::Error {
+                message: sentinel.into(),
+            },
+        ] {
+            let event = engine_failure_event("sentinel_test", &Ok(response));
+            assert!(!event.contains(sentinel), "body leaked: {event}");
+        }
+    }
+
+    #[test]
     fn start_session_plan_adopts_session_and_drops_otherwise() {
         // 正常応答: セッション採用。
-        assert_eq!(plan_start_session(Ok(Response::Session { session: 7, proto: None })), Some(7));
+        assert_eq!(
+            plan_start_session(Ok(Response::Session {
+                engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+                learning_generation: 0,
+                session: 7,
+                proto: None,
+                boot: None,
+            })),
+            Some(7)
+        );
         // タイムアウト: 遅延 Session フレームが滞留しうるので接続破棄（恒常 1-off desync 防止）。
         assert_eq!(
             plan_start_session(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "t"))),
@@ -3929,52 +8482,59 @@ mod a8_tests {
         );
         // 切断系エラーも破棄。
         assert_eq!(
-            plan_start_session(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "b"))),
+            plan_start_session(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "b"
+            ))),
             None
         );
         // 予期しない応答型（プロトコル desync の兆候）も破棄。
         assert_eq!(
-            plan_start_session(Ok(Response::Error { message: "x".into() })),
+            plan_start_session(Ok(Response::Error {
+                message: "x".into()
+            })),
             None
         );
-    }
-
-    #[test]
-    fn end_session_ack_is_only_the_ok_response() {
-        use super::end_session_ack_accepted;
-        assert!(end_session_ack_accepted(&Ok(Response::Ok)));
-        // EndSession の ack は `Response::Ok` だけ。他 op と同じく「期待した型以外は破棄」。
-        assert!(!end_session_ack_accepted(&Ok(Response::Reading { reading: "にほんご".into() })));
-        assert!(!end_session_ack_accepted(&Ok(Response::LiveResult {
-            seq: 3, text: "日本語".into(), reading: "にほんご".into(), committed: None,
-        })));
-        assert!(!end_session_ack_accepted(&Ok(Response::Error { message: "x".into() })));
-        assert!(!end_session_ack_accepted(&Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut, "t"
-        ))));
     }
 
     #[test]
     fn handshake_decision_table() {
         use super::{decide_handshake, HandshakeAction};
-        // 一致 → 採用。
-        assert_eq!(decide_handshake(Some(super::PROTO_VERSION), false), HandshakeAction::Accept);
-        // 不一致（None=handshake 以前の旧エンジン）で未試行 → 世代交代。
-        assert_eq!(decide_handshake(None, false), HandshakeAction::ShutdownRespawn);
-        // 不一致（新しすぎる proto）で未試行 → 世代交代。
-        assert_eq!(decide_handshake(Some(999), false), HandshakeAction::ShutdownRespawn);
-        // 一度試して尚不一致 → 接続維持（無限 shutdown ループ防止）。
-        assert_eq!(decide_handshake(None, true), HandshakeAction::DegradeKeep);
+        assert_eq!(
+            decide_handshake(Some(super::PROTO_VERSION), Some(env!("CARGO_PKG_VERSION"))),
+            HandshakeAction::Accept
+        );
+        assert_eq!(decide_handshake(None, None), HandshakeAction::Reject);
+        assert_eq!(
+            decide_handshake(Some(999), Some(env!("CARGO_PKG_VERSION"))),
+            HandshakeAction::Reject
+        );
+        assert_eq!(
+            decide_handshake(Some(super::PROTO_VERSION), Some("old-build")),
+            HandshakeAction::Reject
+        );
     }
 
     #[test]
     fn toggle_repeat_suppresses_only_within_guard() {
         // 軽微1: 初回（None）は通す、閾値未満は抑止、閾値以上は通す。
         assert!(!is_toggle_repeat(None, MODE_TOGGLE_REPEAT_GUARD)); // 初回
-        assert!(is_toggle_repeat(Some(Duration::from_millis(33)), MODE_TOGGLE_REPEAT_GUARD)); // オートリピート連射 → 抑止
-        assert!(is_toggle_repeat(Some(Duration::from_millis(299)), MODE_TOGGLE_REPEAT_GUARD)); // 閾値直前 → 抑止
-        assert!(!is_toggle_repeat(Some(MODE_TOGGLE_REPEAT_GUARD), MODE_TOGGLE_REPEAT_GUARD)); // ちょうど閾値 → 通す
-        assert!(!is_toggle_repeat(Some(Duration::from_millis(500)), MODE_TOGGLE_REPEAT_GUARD)); // 意図した押し直し → 通す
+        assert!(is_toggle_repeat(
+            Some(Duration::from_millis(33)),
+            MODE_TOGGLE_REPEAT_GUARD
+        )); // オートリピート連射 → 抑止
+        assert!(is_toggle_repeat(
+            Some(Duration::from_millis(299)),
+            MODE_TOGGLE_REPEAT_GUARD
+        )); // 閾値直前 → 抑止
+        assert!(!is_toggle_repeat(
+            Some(MODE_TOGGLE_REPEAT_GUARD),
+            MODE_TOGGLE_REPEAT_GUARD
+        )); // ちょうど閾値 → 通す
+        assert!(!is_toggle_repeat(
+            Some(Duration::from_millis(500)),
+            MODE_TOGGLE_REPEAT_GUARD
+        )); // 意図した押し直し → 通す
     }
 
     #[test]
@@ -4019,7 +8579,9 @@ mod a8_tests {
             committed: None,
         }));
         // LiveResult 以外（Reading 等）→ drop しない。
-        assert!(!drained_needs_drop(&Response::Reading { reading: "にほんご".into() }));
+        assert!(!drained_needs_drop(&Response::Reading {
+            reading: "にほんご".into()
+        }));
     }
 
     /// tip 層の統合テスト（Windows 限定）。regsvr32/管理者/VM を要さず、応答を返さない
@@ -4076,7 +8638,11 @@ mod a8_tests {
             let started = Instant::now();
             let res = super::super::timed_request(
                 &mut client,
-                &ipc::protocol::Request::Insert { session: 1, text: "n".into(), style: None },
+                &ipc::protocol::Request::Insert {
+                    session: 1,
+                    text: "n".into(),
+                    style: None,
+                },
                 super::super::IPC_TIMEOUT_FAST,
                 "insert",
             );
@@ -4146,7 +8712,12 @@ mod a8_tests {
             // keep 版: 締め切り 40ms を超過 → TimedOut かつ pending。
             let r = super::super::timed_request_keep(
                 &mut client,
-                &Request::LiveConvert { session: 1, seq: 7, left_context: None, auto_commit: true },
+                &Request::LiveConvert {
+                    session: 1,
+                    seq: 7,
+                    left_context: None,
+                    auto_commit: true,
+                },
                 Duration::from_millis(40),
                 "live_convert",
             );
@@ -4218,7 +8789,12 @@ mod a7_tests {
             .expect("connect should be accepted by half-dead server");
 
         // 2) StartSession は無応答なので FAST tier で TimedOut になる（＝session 確立失敗）。
-        let res = timed_request(&mut c, &Request::StartSession, IPC_TIMEOUT_FAST, "start_session");
+        let res = timed_request(
+            &mut c,
+            &Request::StartSession,
+            IPC_TIMEOUT_FAST,
+            "start_session",
+        );
 
         unsafe {
             let _ = CloseHandle(server);
@@ -4232,7 +8808,10 @@ mod a7_tests {
         let now = Instant::now();
         let mut b = ReconnectBackoff::new();
         b.on_session_failure(now);
-        assert!(!b.probe_allowed(), "probe must be suppressed after session failure");
+        assert!(
+            !b.probe_allowed(),
+            "probe must be suppressed after session failure"
+        );
         assert!(!b.full_attempt_allowed(now + Duration::from_millis(999)));
         assert!(b.full_attempt_allowed(now + Duration::from_secs(1)));
     }
@@ -4245,8 +8824,71 @@ mod a7_tests {
         assert_eq!(resume_poll_action(1, 0, false), Some(true)); // 復帰＋idle → drop
         assert_eq!(resume_poll_action(1, 0, true), Some(false)); // 復帰＋busy → 温存
         assert_eq!(resume_poll_action(2, 1, false), Some(true)); // 連続復帰でも同じ扱い
-        // wrap 安全: 世代は等値比較のみで大小比較しないため u32::MAX → 0 のラップでも復帰扱い。
+                                                                 // wrap 安全: 世代は等値比較のみで大小比較しないため u32::MAX → 0 のラップでも復帰扱い。
         assert_eq!(resume_poll_action(0, u32::MAX, false), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod shadow_mismatch_tests {
+    use std::cell::{Cell, RefCell};
+    use std::ffi::OsStr;
+    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+
+    use super::{
+        arm_deferred_work_timer, deferred_work_pending, log_enabled_from_env,
+        observe_shadow_compare, should_rearm_deferred_work, ShadowMismatchAggregate,
+    };
+
+    #[test]
+    fn key_path_coalesces_mismatches_without_calling_the_log_sink() {
+        let aggregate = RefCell::new(ShadowMismatchAggregate::default());
+        let writes = Cell::new(0);
+        assert!(log_enabled_from_env(Some(OsStr::new("1"))));
+
+        assert!(!observe_shadow_compare(&aggregate, "にほんご", "にほんご"));
+        assert!(observe_shadow_compare(&aggregate, "にほんご", "にぼんご"));
+        assert!(observe_shadow_compare(&aggregate, "にほんご", "にぼん"));
+        assert!(aggregate.borrow().has_pending());
+        assert_eq!(writes.get(), 0);
+
+        aggregate.borrow_mut().flush_with(|event| {
+            writes.set(writes.get() + 1);
+            assert_eq!(
+                event,
+                "ev=local_kana_mismatch count=2 first_local_utf16=4 first_azookey_utf16=4 last_local_utf16=4 last_azookey_utf16=3"
+            );
+        });
+
+        assert_eq!(writes.get(), 1);
+        assert!(!aggregate.borrow().has_pending());
+    }
+
+    #[test]
+    fn shadow_only_deferred_work_rearms_after_a_nested_timer_fire() {
+        assert!(deferred_work_pending(false, true));
+        assert!(!deferred_work_pending(false, false));
+        assert!(!should_rearm_deferred_work(true, false, true));
+        assert!(should_rearm_deferred_work(false, false, true));
+    }
+
+    #[test]
+    fn first_shadow_mismatch_arms_the_shared_deferred_timer_once() {
+        let aggregate = RefCell::new(ShadowMismatchAggregate::default());
+        let timer = Cell::new(0);
+
+        assert!(!observe_shadow_compare(&aggregate, "一致", "一致"));
+        assert!(!arm_deferred_work_timer(&timer, false, || 1));
+
+        assert!(observe_shadow_compare(&aggregate, "local", "azookey"));
+        assert!(arm_deferred_work_timer(&timer, true, || unsafe {
+            SetTimer(None, 0, 1, None)
+        }));
+        let id = timer.get();
+        assert_ne!(id, 0);
+        assert!(!arm_deferred_work_timer(&timer, true, || 1));
+        assert_eq!(timer.get(), id);
+        unsafe { KillTimer(None, id) }.unwrap();
     }
 }
 
@@ -4278,14 +8920,17 @@ mod log_gate_tests {
         let body = content.split("] ").nth(1).expect("] 区切りが無い");
         assert!(body.starts_with("ts="), "ts= が pid 直後に無い: {content}");
         let ts_val: &str = body["ts=".len()..].split(' ').next().unwrap();
-        assert!(!ts_val.is_empty() && ts_val.bytes().all(|b| b.is_ascii_digit()),
-            "ts 値が数字でない: {content}");
+        assert!(
+            !ts_val.is_empty() && ts_val.bytes().all(|b| b.is_ascii_digit()),
+            "ts 値が数字でない: {content}"
+        );
         let _ = std::fs::remove_file(&logp);
     }
 
     #[test]
     fn rotation_renames_oversized_log_to_dot1_once() {
-        let dir = std::env::temp_dir().join(format!("nospacekey-rotatetest-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nospacekey-rotatetest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let logp = dir.join("nospacekey-tip.log");
@@ -4293,7 +8938,10 @@ mod log_gate_tests {
         // 上限以下: ローテーションしない。
         std::fs::write(&logp, "1234").unwrap();
         rotate_log_if_larger_than(&logp, 4);
-        assert!(logp.exists() && !rotated.exists(), "上限以下で回してはいけない");
+        assert!(
+            logp.exists() && !rotated.exists(),
+            "上限以下で回してはいけない"
+        );
         // 上限超: .1 へ rename（1世代のみ — 既存 .1 は上書き）。
         std::fs::write(&logp, "12345").unwrap();
         rotate_log_if_larger_than(&logp, 4);
@@ -4354,12 +9002,26 @@ mod feedback_tests {
 
 #[cfg(test)]
 mod input_scope_tests {
-    use super::{compartment_flag_is_set, scopes_contain_password};
+    use super::{
+        compartment_flag_is_set, prediction_mode_allows_display, prediction_scope_is_sensitive,
+        scopes_contain_password,
+    };
 
     #[test]
     fn scopes_contain_password_detects() {
-        use windows::Win32::UI::TextServices::{IS_DEFAULT, IS_PASSWORD};
+        use windows::Win32::UI::TextServices::{
+            IS_ALPHANUMERIC_PIN, IS_ALPHANUMERIC_PIN_SET, IS_DEFAULT, IS_NUMERIC_PASSWORD,
+            IS_NUMERIC_PIN, IS_PASSWORD,
+        };
         assert!(scopes_contain_password(&[IS_DEFAULT.0, IS_PASSWORD.0]));
+        for sensitive in [
+            IS_NUMERIC_PASSWORD,
+            IS_NUMERIC_PIN,
+            IS_ALPHANUMERIC_PIN,
+            IS_ALPHANUMERIC_PIN_SET,
+        ] {
+            assert!(scopes_contain_password(&[sensitive.0]));
+        }
         assert!(!scopes_contain_password(&[IS_DEFAULT.0]));
         assert!(!scopes_contain_password(&[]));
     }
@@ -4374,6 +9036,21 @@ mod input_scope_tests {
         assert!(!compartment_flag_is_set(&VARIANT::default())); // VT_EMPTY（未設定）
         assert!(!compartment_flag_is_set(&VARIANT::from(true))); // VT_BOOL は安全側 false
     }
+
+    #[test]
+    fn prediction_scope_blocks_only_confirmed_sensitive_contexts() {
+        assert!(prediction_scope_is_sensitive(true, None));
+        assert!(prediction_scope_is_sensitive(false, Some(true)));
+        assert!(!prediction_scope_is_sensitive(false, Some(false)));
+        assert!(!prediction_scope_is_sensitive(false, None));
+    }
+
+    #[test]
+    fn prediction_display_requires_stable_native_mode() {
+        assert!(prediction_mode_allows_display(false, false));
+        assert!(!prediction_mode_allows_display(true, false));
+        assert!(!prediction_mode_allows_display(false, true));
+    }
 }
 
 #[cfg(test)]
@@ -4384,9 +9061,492 @@ mod commit_undo_tests {
     fn undo_precheck_gates_all_preconditions() {
         // (armed, has_composition, has_buffer, tlen_utf16) -> Ok / 各 skip reason
         assert!(undo_precheck(true, false, true, 3).is_ok());
-        assert_eq!(undo_precheck(false, false, true, 3), Err(UndoSkip::NotArmed));
-        assert_eq!(undo_precheck(true, true, true, 3), Err(UndoSkip::CompositionOpen)); // 部分確定直後など
-        assert_eq!(undo_precheck(true, false, false, 3), Err(UndoSkip::NoBuffer));
-        assert_eq!(undo_precheck(true, false, true, 65), Err(UndoSkip::TooLong)); // 64 UTF-16 単位上限
+        assert_eq!(
+            undo_precheck(false, false, true, 3),
+            Err(UndoSkip::NotArmed)
+        );
+        assert_eq!(
+            undo_precheck(true, true, true, 3),
+            Err(UndoSkip::CompositionOpen)
+        ); // 部分確定直後など
+        assert_eq!(
+            undo_precheck(true, false, false, 3),
+            Err(UndoSkip::NoBuffer)
+        );
+        assert_eq!(undo_precheck(true, false, true, 65), Err(UndoSkip::TooLong));
+        // 64 UTF-16 単位上限
+    }
+}
+
+#[cfg(test)]
+mod deactivate_preflight_tests {
+    use super::{deactivate_cancel_plan, DeactivateCancelPlan as Plan};
+
+    #[test]
+    fn rejected_document_cancel_still_releases_service_resources_and_keeps_original() {
+        let service = super::TextService::new().into_outer();
+        service.tid.set(123);
+        service.reconverting.set(true);
+        *service.reconvert_original.borrow_mut() = "original".into();
+        service.live_text.borrow_mut().push_str("変換中");
+        let generation = service.composition_generation.get();
+        assert!(service
+            .deactivate_with_document_cancel(|| Err(super::E_FAIL.into()))
+            .is_err());
+        assert_eq!(service.tid.get(), 0);
+        assert!(service.thread_mgr.borrow().is_none());
+        assert_eq!(
+            service.composition_generation.get(),
+            generation.wrapping_add(1)
+        );
+        assert!(service.live_text.borrow().is_empty());
+        assert!(service.reconverting.get());
+        assert_eq!(&*service.reconvert_original.borrow(), "original");
+        assert!(service.deactivate_with_document_cancel(|| Ok(())).is_ok());
+        assert!(service.reconvert_original.borrow().is_empty());
+    }
+
+    #[test]
+    fn deactivation_retains_accepted_input_as_detached_even_when_document_cancel_fails() {
+        for cancel_succeeds in [false, true] {
+            let service = super::TextService::new().into_outer();
+            *service.live_text.borrow_mut() = "日本語".into();
+            service.conversion_queue.borrow_mut().push_commit_then_insert(
+                "a".into(), crate::input_module::TextStyle::Kana, false);
+            let _ = service.deactivate_with_document_cancel(|| if cancel_succeeds { Ok(()) } else { Err(super::E_FAIL.into()) });
+            let queue = service.conversion_queue.borrow();
+            assert!(queue.owner_lost && queue.commit_failed && queue.has_commit());
+            assert_eq!(queue.unwritten_commit.as_deref(), Some("日本語"));
+        }
+    }
+
+    #[test]
+    fn live_preedit_rejection_preserves_enter_text_until_a_successful_redraw() {
+        let service = super::TextService::new().into_outer();
+        *service.live_text.borrow_mut() = "にほんご".into();
+        service.apply_live_preedit("日本語", || false);
+        assert_eq!(&*service.live_text.borrow(), "にほんご");
+        service.apply_live_preedit("日本語", || true);
+        assert_eq!(&*service.live_text.borrow(), "日本語");
+    }
+
+    #[test]
+    fn no_composition_needs_no_cancel() {
+        // composition 無し = 取消不要。context/reconvert の状態に依らず清算へ直行。
+        assert_eq!(
+            deactivate_cancel_plan(false, false, false, false),
+            Plan::Nothing
+        );
+        assert_eq!(
+            deactivate_cancel_plan(false, true, true, true),
+            Plan::Nothing
+        );
+    }
+
+    #[test]
+    fn composition_without_context_aborts_before_cleanup() {
+        // Context 不在では文書取消を拒否する。資源清算の可否とは独立。
+        assert_eq!(
+            deactivate_cancel_plan(true, false, false, false),
+            Plan::AbortNoContext
+        );
+        assert_eq!(
+            deactivate_cancel_plan(true, false, true, true),
+            Plan::AbortNoContext
+        );
+    }
+
+    #[test]
+    fn reconverting_uses_restore_text_not_cancel_composition() {
+        // 再変換中はユーザの既存テキストの上に composition がある — do_cancel は range を
+        // 空に潰すため原文が消える。RestoreText（cancel_reconvert）でなければならない。
+        assert_eq!(
+            deactivate_cancel_plan(true, true, true, false),
+            Plan::CancelReconvert
+        );
+    }
+
+    #[test]
+    fn plain_composition_uses_do_cancel() {
+        assert_eq!(
+            deactivate_cancel_plan(true, true, false, false),
+            Plan::DoCancel
+        );
+    }
+
+    #[test]
+    fn committed_pending_end_uses_close_only_even_if_reconvert_latch_is_still_set() {
+        assert_eq!(
+            deactivate_cancel_plan(true, true, true, true),
+            Plan::DoCancel
+        );
+    }
+}
+
+#[cfg(test)]
+mod deactivating_guard_tests {
+    use super::DeactivatingGuard;
+    use std::cell::Cell;
+
+    #[test]
+    fn guard_marks_interval_and_resets_on_drop() {
+        let f = Cell::new(false);
+        {
+            let _g = DeactivatingGuard::new(&f);
+            assert!(f.get(), "ガード構築直後は Deactivate 実行中");
+        }
+        assert!(!f.get(), "drop で復帰 — この後の Activate を受け入れられる");
+    }
+
+    #[test]
+    fn guard_resets_on_panic_unwind() {
+        // deactivate_inner の panic（catch_unwind が受け止める前提の unwind）でもフラグは
+        // 復帰しなければならない — 残ると以後の Activate が永久に拒否される。
+        let f = Cell::new(false);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = DeactivatingGuard::new(&f);
+            panic!("unwind through DeactivatingGuard");
+        }));
+        assert!(r.is_err(), "クロージャ内で panic したはず");
+        assert!(!f.get(), "unwind 経由の drop でもフラグは復帰する");
+    }
+}
+
+#[cfg(test)]
+mod partial_redraw_retry_tests {
+    use super::{
+        next_composition_end_retry, next_partial_redraw_retry, prepare_debounce_redraw,
+        COMPOSITION_END_RETRY_MAX, PARTIAL_REDRAW_RETRY_MAX,
+    };
+
+    #[test]
+    fn retry_sequence_stops_at_bound() {
+        let mut count = 0;
+        for expected in 1..=PARTIAL_REDRAW_RETRY_MAX {
+            count = next_partial_redraw_retry(count).expect("上限までは再試行する");
+            assert_eq!(count, expected);
+        }
+        assert_eq!(next_partial_redraw_retry(count), None);
+    }
+
+    #[test]
+    fn saturated_counter_never_wraps_into_retry() {
+        assert_eq!(next_partial_redraw_retry(u8::MAX), None);
+    }
+
+    #[test]
+    fn composition_end_retry_is_bounded() {
+        assert_eq!(next_composition_end_retry(0), Some(1));
+        assert_eq!(
+            next_composition_end_retry(COMPOSITION_END_RETRY_MAX - 2),
+            Some(COMPOSITION_END_RETRY_MAX - 1)
+        );
+        assert_eq!(
+            next_composition_end_retry(COMPOSITION_END_RETRY_MAX - 1),
+            None
+        );
+        assert_eq!(next_composition_end_retry(COMPOSITION_END_RETRY_MAX), None);
+        assert_eq!(next_composition_end_retry(u8::MAX), None);
+    }
+
+    #[test]
+    fn debounce_retries_a_pending_local_redraw_before_background_conversion() {
+        let mut redraw_calls = 0;
+        assert!(!prepare_debounce_redraw(true, || {
+            redraw_calls += 1;
+            false
+        }));
+        assert_eq!(redraw_calls, 1);
+        assert!(prepare_debounce_redraw(false, || {
+            redraw_calls += 1;
+            false
+        }));
+        assert_eq!(redraw_calls, 1);
+    }
+}
+
+#[cfg(test)]
+mod pending_end_liveness_tests {
+    use super::{
+        CompositionEndStatus, PendingEndKeyReservation, PendingEndKeySignature,
+        PendingEndTestDecision, TextService,
+    };
+
+    fn sig(context: usize, raw_vk: u32, lparam: isize, modifiers: u8) -> PendingEndKeySignature {
+        PendingEndKeySignature::synthetic(context, raw_vk, raw_vk, lparam, modifiers)
+    }
+
+    fn a() -> PendingEndKeySignature {
+        sig(1, 0x41, 0x001e0001, 0)
+    }
+
+    fn b() -> PendingEndKeySignature {
+        sig(1, 0x42, 0x00300001, 0)
+    }
+
+    #[test]
+    fn occupied_slot_returns_false_for_a_second_test_and_a_key_is_one_shot() {
+        let service = TextService::new().into_outer();
+        service.composition_end_pending.set(true);
+        assert_eq!(
+            service.pending_end_test_decision(a()),
+            PendingEndTestDecision::Reserve
+        );
+        assert_eq!(
+            service.pending_end_test_decision(b()),
+            PendingEndTestDecision::Busy
+        );
+        assert!(service.take_pending_end_test(a()));
+        assert!(!service.take_pending_end_test(a()));
+    }
+
+    #[test]
+    fn mismatched_key_discards_slot_and_future_same_vk_is_normal() {
+        let service = TextService::new().into_outer();
+        service.composition_end_pending.set(true);
+        assert_eq!(
+            service.pending_end_test_decision(a()),
+            PendingEndTestDecision::Reserve
+        );
+        assert!(!service.take_pending_end_test(b()));
+        service.composition_end_pending.set(false);
+        assert_eq!(
+            service.pending_end_test_decision(a()),
+            PendingEndTestDecision::Normal
+        );
+        assert!(!service.take_pending_end_test(a()));
+    }
+
+    #[test]
+    fn close_callback_preserves_exact_pair_once() {
+        let service = TextService::new().into_outer();
+        service.composition_end_pending.set(true);
+        assert_eq!(
+            service.pending_end_test_decision(a()),
+            PendingEndTestDecision::Reserve
+        );
+        service.composition_generation.set(7);
+        service.composition_end_pending.set(false);
+        assert!(service.take_pending_end_test(a()));
+        assert!(!service.take_pending_end_test(a()));
+    }
+
+    #[test]
+    fn lifecycle_invalidation_prevents_old_pair_from_crossing_new_composition() {
+        let service = TextService::new().into_outer();
+        service.composition_end_pending.set(true);
+        assert_eq!(
+            service.pending_end_test_decision(a()),
+            PendingEndTestDecision::Reserve
+        );
+        let generation = service.key_pair_generation.get();
+        service.invalidate_pending_end_test_reservation();
+        assert_ne!(service.key_pair_generation.get(), generation);
+        assert_eq!(
+            service.pending_end_test_decision(b()),
+            PendingEndTestDecision::Reserve
+        );
+        assert!(service.take_pending_end_test(b()));
+        assert!(!service.take_pending_end_test(a()));
+    }
+
+    #[test]
+    fn signature_and_generation_mismatch_are_consumed_not_retained() {
+        let mut reservation = PendingEndKeyReservation::default();
+        let first = a();
+        let other_context = sig(2, 0x41, first.lparam, first.modifiers);
+        let other_physical_event = sig(1, 0x41, first.lparam + 1, first.modifiers | 0x02);
+        assert!(reservation.reserve(first, 7));
+        assert!(!reservation.take_if_matches(other_context, 7));
+        assert_eq!(reservation.signature(), None);
+        assert_eq!(reservation.generation(), None);
+        assert!(reservation.reserve(first, 8));
+        assert!(!reservation.take_if_matches(other_physical_event, 8));
+        assert_eq!(reservation.signature(), None);
+        assert_eq!(reservation.generation(), None);
+
+        assert!(reservation.reserve(first, 9));
+        assert!(!reservation.take_if_matches(first, 8));
+        assert_eq!(reservation.signature(), None);
+    }
+
+    #[test]
+    fn pending_test_without_pending_expires_old_slot() {
+        let service = TextService::new().into_outer();
+        service.composition_end_pending.set(true);
+        assert_eq!(
+            service.pending_end_test_decision(a()),
+            PendingEndTestDecision::Reserve
+        );
+        service.composition_end_pending.set(false);
+        assert_eq!(
+            service.pending_end_test_decision(b()),
+            PendingEndTestDecision::Normal
+        );
+        assert!(!service.take_pending_end_test(a()));
+    }
+
+    #[test]
+    fn shared_started_signal_preflight_invalidates_reentrant_key_once() {
+        let service = TextService::new().into_outer();
+        service.composition_end_pending.set(true);
+        assert_eq!(
+            service.pending_end_test_decision(a()),
+            PendingEndTestDecision::Reserve
+        );
+        let initial_generation = service.key_pair_generation.get();
+        let initial_composition_generation = service.composition_generation.get();
+
+        // RequestEditSession rejected / StartComposition was never called: the reservation and
+        // pair generation remain unchanged, so the matching Key can still settle the pending close.
+        service.consume_started_composition();
+        assert_eq!(service.key_pair_generation.get(), initial_generation);
+        assert_eq!(
+            service.pending_end_test_reservation.borrow().signature(),
+            Some(a())
+        );
+
+        // A real StartComposition success sets the shared production signal.  An OnKey/OnTest
+        // preflight can consume it during the later COM callout, before the caller returns.
+        service.composition_started_signal.set(true);
+        service.consume_started_composition();
+        let after_success = service.key_pair_generation.get();
+        assert_ne!(after_success, initial_generation);
+        assert_eq!(
+            service.composition_generation.get(),
+            initial_composition_generation.wrapping_add(1)
+        );
+        assert_eq!(
+            service.pending_end_test_reservation.borrow().signature(),
+            None
+        );
+        assert!(!service.take_pending_end_test(a()));
+
+        // The original RequestEditSession caller consumes the same shared signal after return;
+        // the reentrant preflight already consumed it, so this is a no-op.
+        service.consume_started_composition();
+        assert_eq!(service.key_pair_generation.get(), after_success);
+        assert_eq!(
+            service.composition_generation.get(),
+            initial_composition_generation.wrapping_add(1)
+        );
+    }
+
+    #[test]
+    fn transient_retry_then_success_uses_bounded_production_transition() {
+        let service = TextService::new().into_outer();
+        service.composition_end_pending.set(true);
+        service.composition_end_retry_count.set(1); // initial EndComposition call
+
+        assert!(!service.apply_pending_end_attempt(CompositionEndStatus::Retryable));
+        assert_eq!(service.composition_end_retry_count.get(), 2);
+        assert!(service.composition_end_pending.get());
+
+        // A later transient retry succeeds without SetText or a second composition commit.
+        assert!(service.apply_pending_end_attempt(CompositionEndStatus::Closed));
+        assert!(!service.composition_end_pending.get());
+        assert_eq!(service.composition_end_retry_count.get(), 0);
+        assert_eq!(
+            service.composition_end_status.get(),
+            CompositionEndStatus::Closed
+        );
+
+        // Callback/already-closed cleanup is idempotent: a late close result cannot reopen or
+        // otherwise clear a newer state after the first transition.
+        assert!(service.apply_pending_end_attempt(CompositionEndStatus::Closed));
+    }
+
+    #[test]
+    fn terminal_and_retry_limit_quarantine_release_pending_state() {
+        let terminal = TextService::new().into_outer();
+        let report = std::rc::Rc::new(crate::apply_state::ApplyState::default());
+        report.wrote_text();
+        report.complete(windows::Win32::Foundation::E_FAIL.0);
+        assert!(report.take_text_applied());
+        *terminal.composition_end_report.borrow_mut() = Some(std::rc::Rc::clone(&report));
+        terminal.composition_end_pending.set(true);
+        terminal.composition_end_retry_count.set(1);
+        assert!(terminal.apply_pending_end_attempt(CompositionEndStatus::Terminal));
+        assert!(!terminal.composition_end_pending.get());
+        assert!(report.stale());
+        assert!(report.text_applied());
+        assert!(!report.take_text_applied());
+        assert_eq!(
+            terminal.composition_end_status.get(),
+            CompositionEndStatus::Terminal
+        );
+        assert!(terminal.apply_pending_end_attempt(CompositionEndStatus::Terminal));
+
+        let exhausted = TextService::new().into_outer();
+        exhausted.composition_end_pending.set(true);
+        exhausted.composition_end_retry_count.set(1);
+        assert!(!exhausted.apply_pending_end_attempt(CompositionEndStatus::Retryable));
+        assert_eq!(exhausted.composition_end_retry_count.get(), 2);
+        // Initial + one retry = 2; this failed attempt reaches the total-call budget of 3.
+        assert!(exhausted.apply_pending_end_attempt(CompositionEndStatus::Retryable));
+        assert!(!exhausted.composition_end_pending.get());
+        assert_eq!(exhausted.composition_end_retry_count.get(), 0);
+        assert_eq!(
+            exhausted.composition_end_status.get(),
+            CompositionEndStatus::Terminal
+        );
+        assert!(exhausted.apply_pending_end_attempt(CompositionEndStatus::Terminal));
+    }
+
+    #[test]
+    fn late_generation_is_not_current_after_quarantine() {
+        let service = TextService::new().into_outer();
+        service.composition_end_pending.set(true);
+        service
+            .pending_end_generation
+            .set(service.composition_generation.get());
+        assert!(service.pending_end_generation_is_current());
+
+        assert!(service.apply_pending_end_attempt(CompositionEndStatus::Terminal));
+        assert!(!service.pending_end_generation_is_current());
+    }
+}
+
+#[cfg(test)]
+mod prediction_commit_end_edit_tests {
+    use super::consume_expected_prediction_commit_end_edit;
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn expected_commit_end_edit_is_consumed_once() {
+        let now = Instant::now();
+        let deadline = Cell::new(Some(now + Duration::from_millis(300)));
+
+        assert!(consume_expected_prediction_commit_end_edit(
+            &deadline, false, now
+        ));
+        assert!(!consume_expected_prediction_commit_end_edit(
+            &deadline, false, now
+        ));
+    }
+
+    #[test]
+    fn selection_change_is_never_treated_as_the_committed_text_edit() {
+        let now = Instant::now();
+        let deadline = Cell::new(Some(now + Duration::from_millis(300)));
+
+        assert!(!consume_expected_prediction_commit_end_edit(
+            &deadline, true, now
+        ));
+        assert!(deadline.get().is_none());
+    }
+
+    #[test]
+    fn delayed_commit_edit_allowance_expires() {
+        let now = Instant::now();
+        let deadline = Cell::new(Some(now));
+
+        assert!(!consume_expected_prediction_commit_end_edit(
+            &deadline,
+            false,
+            now + Duration::from_millis(1),
+        ));
+        assert!(deadline.get().is_none());
     }
 }

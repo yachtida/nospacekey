@@ -1,8 +1,230 @@
 import XCTest
 import Foundation
+import KanaKanjiConverterModuleWithDefaultDictionary
 @testable import NospacekeyEngineCore
 
+private enum LearningFileSystemListResult {
+    case values([String])
+    case failure(Error)
+}
+
+private final class LearningFileSystemStub {
+    var listResults: [LearningFileSystemListResult]
+    var removeError: Error?
+    private(set) var listCallCount = 0
+    private(set) var removed: [String] = []
+
+    init(_ listResults: [LearningFileSystemListResult], removeError: Error? = nil) {
+        self.listResults = listResults
+        self.removeError = removeError
+    }
+
+    var fileSystem: LearningFileSystem {
+        LearningFileSystem(
+            list: { [self] _ in
+                listCallCount += 1
+                guard !listResults.isEmpty else { return [] }
+                switch listResults.removeFirst() {
+                case .values(let files): return files
+                case .failure(let error): throw error
+                }
+            },
+            remove: { [self] url in
+                removed.append(url.lastPathComponent)
+                if let removeError { throw removeError }
+            }
+        )
+    }
+}
+
+/// Vendor reset の実行順序と metadata preflight を同時に観測する seam。list は remove 済み
+/// の entry を次回列挙から除くので、通常の clear 成功後 verify も再現できる。
+private final class LearningFileSystemTracker {
+    let root: URL
+    var names: [String]
+    var metadataByName: [String: LearningPathMetadata]
+    var listError: Error?
+    var rootMetadata = LearningPathMetadata(isDirectory: true, isRegularFile: false,
+                                             isReparsePoint: false)
+    private(set) var removed: [String] = []
+    private(set) var resetCallCount = 0
+
+    init(root: URL, names: [String], metadataByName: [String: LearningPathMetadata] = [:]) {
+        self.root = root
+        self.names = names
+        self.metadataByName = metadataByName
+    }
+
+    var fileSystem: LearningFileSystem {
+        LearningFileSystem(
+            list: { [self] _ in
+                if let listError { throw listError }
+                return names.filter { !removed.contains($0) }
+            },
+            remove: { [self] url in removed.append(url.lastPathComponent) },
+            resetMemory: { [self] in resetCallCount += 1 },
+            metadata: { [self] url in
+                if url.path == root.path { return rootMetadata }
+                return metadataByName[url.lastPathComponent]
+                    ?? LearningPathMetadata(isDirectory: false, isRegularFile: true,
+                                             isReparsePoint: false)
+            })
+    }
+}
+
 final class ConversionServiceLearningTests: XCTestCase {
+    private func productionService(_ dir: URL) -> ConversionService {
+        ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                          learning: LearningSettings(enabled: true, memoryDir: dir),
+                          processRole: .mainClassicOnly)
+    }
+
+    private func seed(_ svc: ConversionService, session: Int,
+                      words: [String], readings: [String]) -> Candidate {
+        let reading = readings.joined()
+        _ = svc.insert(session: session, text: reading)
+        // Initialize vendor learning configuration before injecting deterministic data.
+        _ = svc.convert(session: session)
+        let candidate = Candidate(
+            text: words.joined(), value: -10, composingCount: .inputCount(reading.count),
+            lastMid: MIDData.一般.mid,
+            data: zip(words, readings).map {
+                DicdataElement(word: $0, ruby: $1, cid: CIDData.一般名詞.cid,
+                               mid: MIDData.一般.mid, value: -10)
+            })
+        svc.cacheCandidatesForTesting(session: session, candidates: [candidate], target: reading)
+        return candidate
+    }
+
+    func testProductionAdjacentClausesPersistAsCombinedEntry() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let svc = productionService(dir)
+        let sid = svc.startSession()
+        let candidate = seed(svc, session: sid, words: ["試験甲", "試験乙"], readings: ["コウ", "オツ"])
+        let view = try XCTUnwrap(svc.moveClause(session: sid, offset: 0, baseIndex: 0))
+        XCTAssertEqual(view.segments, ["試験甲", "試験乙"])
+        XCTAssertEqual(try XCTUnwrap(svc.commitClauses(session: sid)).text, candidate.text)
+        svc.endSession(session: sid)
+        svc.prepareForShutdown()
+        let correctionURL = dir.appendingPathComponent("corrections.json")
+        if FileManager.default.fileExists(atPath: correctionURL.path) {
+            try FileManager.default.removeItem(at: correctionURL)
+        }
+        let restored = productionService(dir)
+        let restoredID = restored.startSession()
+        _ = restored.insert(session: restoredID, text: "コウオツ")
+        XCTAssertEqual(try XCTUnwrap(restored.convert(session: restoredID)).first, candidate.text)
+        XCTAssertEqual(restored.cachedTopElementCountForTesting(session: restoredID), 1,
+                       "The adjacent pair must load as one learned entry, not two learned words")
+        restored.endSession(session: restoredID)
+        restored.prepareForShutdown()
+    }
+
+    func testProductionManualLearningSurvivesFullMaintenanceQueue() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let svc = productionService(dir)
+        let release = svc.beginMaintenanceHoldForTesting()
+        do {
+            defer { release() }
+            for _ in 0..<70 {
+                let sid = svc.startSession()
+                _ = seed(svc, session: sid, words: ["試験甲"], readings: ["コウ"])
+                XCTAssertNotNil(svc.commit(session: sid, index: 0))
+                svc.endSession(session: sid)
+            }
+            let sid = svc.startSession()
+            _ = seed(svc, session: sid, words: ["飽和後の学習"], readings: ["ヘイ"])
+            XCTAssertNotNil(svc.commit(session: sid, index: 0))
+            svc.endSession(session: sid)
+        }
+        svc.prepareForShutdown()
+        let correctionURL = dir.appendingPathComponent("corrections.json")
+        if FileManager.default.fileExists(atPath: correctionURL.path) {
+            try FileManager.default.removeItem(at: correctionURL)
+        }
+        let restored = productionService(dir)
+        for (reading, word) in [("コウ", "試験甲"), ("ヘイ", "飽和後の学習")] {
+            let sid = restored.startSession()
+            _ = restored.insert(session: sid, text: reading)
+            XCTAssertEqual(try XCTUnwrap(restored.convert(session: sid)).first, word)
+            restored.endSession(session: sid)
+        }
+        restored.prepareForShutdown()
+    }
+
+    func testProductionLearningShutdownRecoversRejectedWakeup() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let svc = productionService(dir)
+        let release = svc.beginMaintenanceHoldForTesting()
+        do {
+            defer { release() }
+            let full = svc.saturateCoalescedMaintenanceForTesting()
+            XCTAssertEqual(full.pending, 64)
+            XCTAssertGreaterThan(full.dropped, 0)
+            let sid = svc.startSession()
+            _ = seed(svc, session: sid, words: ["拒否後の学習"], readings: ["ヘイ"])
+            XCTAssertNotNil(svc.commit(session: sid, index: 0))
+            svc.endSession(session: sid)
+        }
+        svc.prepareForShutdown()
+        let restored = productionService(dir)
+        let sid = restored.startSession()
+        _ = restored.insert(session: sid, text: "ヘイ")
+        XCTAssertEqual(try XCTUnwrap(restored.convert(session: sid)).first, "拒否後の学習")
+        restored.endSession(session: sid)
+        restored.prepareForShutdown()
+    }
+
+    func testProductionLearningRespectsSessionAndSnapshotBoundaries() throws {
+        // The no-boundary case also verifies context survives two separate writer drains.
+        for boundary in ["none", "session", "snapshot"] {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let svc = productionService(dir)
+            let first = svc.startSession()
+            _ = seed(svc, session: first, words: ["試験甲"], readings: ["コウ"])
+            XCTAssertNotNil(svc.commit(session: first, index: 0))
+            svc.flushMaintenanceForTesting()
+            var second = first
+            if boundary == "session" {
+                // Keep the first session alive: isolation cannot rely on all-session teardown.
+                second = svc.startSession()
+            } else if boundary == "snapshot" {
+                _ = svc.snapshot([SnapshotSegment(text: "nihongo", style: nil)], explicit: true)
+            }
+            _ = seed(svc, session: second, words: ["試験乙"], readings: ["オツ"])
+            XCTAssertNotNil(svc.commit(session: second, index: 0))
+            svc.endSession(session: first)
+            if second != first { svc.endSession(session: second) }
+            svc.prepareForShutdown()
+            let restored = productionService(dir)
+            let sid = restored.startSession()
+            _ = restored.insert(session: sid, text: "コウオツ")
+            let candidates = try XCTUnwrap(restored.convert(session: sid))
+            if boundary == "none" {
+                XCTAssertEqual(candidates.first, "試験甲試験乙")
+                XCTAssertEqual(restored.cachedTopElementCountForTesting(session: sid), 1)
+            }
+            // A built-in whole-word candidate can outrank two learned words. Inspect the
+            // saved entries for the negative case instead of assuming a particular ranking.
+            XCTAssertTrue(try persistedWord("試験甲", in: dir))
+            XCTAssertTrue(try persistedWord("試験乙", in: dir))
+            XCTAssertEqual(try persistedWord("試験甲試験乙", in: dir), boundary == "none", boundary)
+            restored.endSession(session: sid)
+            restored.prepareForShutdown()
+        }
+    }
+    private func persistedWord(_ word: String, in dir: URL) throws -> Bool {
+        // Vendor Loudstxt3Builder stores each surface as UTF-8 following a tab.
+        // These fixtures use unique surfaces, distinct from their katakana readings.
+        let files = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("memory") && $0.pathExtension == "loudstxt3" }
+        XCTAssertFalse(files.isEmpty, "A missing dictionary cannot prove boundary isolation")
+        return try files.contains { try Data(contentsOf: $0).range(of: Data(("\t" + word).utf8)) != nil }
+    }
     private func makeTempDir() throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("nospacekey-learn-\(UUID().uuidString)")
@@ -12,6 +234,24 @@ final class ConversionServiceLearningTests: XCTestCase {
     private func learningService(_ dir: URL) -> ConversionService {
         ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
                           learning: LearningSettings(enabled: true, memoryDir: dir))
+    }
+    private func seamedService(_ dir: URL, stub: LearningFileSystemStub) -> ConversionService {
+        // disabled avoids KanaKanjiConverter.resetMemory touching the real filesystem; the
+        // explicit memoryDir still exercises the clearLearning directory selection.
+        ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                          learning: LearningSettings(enabled: false, memoryDir: dir),
+                          fileSystem: stub.fileSystem)
+    }
+    private func noteLearningRequest(_ service: ConversionService) {
+        let session = service.startSession()
+        _ = service.insert(session: session, text: "kisha")
+        XCTAssertNotNil(service.convert(session: session))
+    }
+    private func genericFileError() -> NSError {
+        NSError(domain: "LearningFileSystemTests", code: 1)
+    }
+    private func missingFileError() -> CocoaError {
+        CocoaError(.fileNoSuchFile)
     }
 
     /// ①+②: 確定→endSession（フラッシュ）でファイル生成、再セッションで学習が候補順位に反映。
@@ -27,7 +267,8 @@ final class ConversionServiceLearningTests: XCTestCase {
         let learned = cands[target]
         let committed = try XCTUnwrap(svc.commit(session: sid, index: target))
         XCTAssertEqual(committed.text, learned)
-        svc.endSession(session: sid) // sessions 空 → フラッシュ
+        svc.endSession(session: sid) // sessions 空 → backgroundフラッシュ
+        svc.flushMaintenanceForTesting()
         let files = try FileManager.default.contentsOfDirectory(atPath: dir.path)
         XCTAssertTrue(files.contains("memory.louds"), "endSession フラッシュで学習ファイル生成: \(files)")
         // 学習反映: 同読みを再変換すると確定した候補が先頭に来る（temporal memory の強い直近ブースト）。
@@ -36,6 +277,40 @@ final class ConversionServiceLearningTests: XCTestCase {
         let cands2 = try XCTUnwrap(svc.convert(session: sid2))
         XCTAssertEqual(cands2.first, learned, "確定候補が学習で先頭に来るはず: \(cands2)")
         svc.endSession(session: sid2)
+    }
+
+    func testProductionClauseLearningSurvivesNewService() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func service() -> ConversionService {
+            ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                              learning: LearningSettings(enabled: true, memoryDir: dir),
+                              processRole: .mainClassicOnly)
+        }
+        let svc = service()
+        let sid = svc.startSession()
+        _ = svc.insert(session: sid, text: "kyouhaiitenkidesu")
+        _ = svc.convert(session: sid)
+        let view = try XCTUnwrap(svc.moveClause(session: sid, offset: 0, baseIndex: 0))
+        XCTAssertGreaterThan(view.candidates.count, 1)
+        let reading = try XCTUnwrap(svc.clauseReadingsForTesting(session: sid)).first!
+        let recordable = Set(try XCTUnwrap(svc.clauseRecordableSurfacesForTesting(session: sid)))
+        let pick = try XCTUnwrap(view.candidates.indices.first { recordable.contains(view.candidates[$0]) && view.candidates[$0] != view.segments[0] })
+        let target = view.candidates[pick]
+        let updated = try XCTUnwrap(svc.selectClauseCandidate(session: sid, index: pick))
+        XCTAssertEqual(try XCTUnwrap(svc.commitClauses(session: sid)).text, updated.segments.joined())
+        svc.endSession(session: sid)
+        svc.prepareForShutdown()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("memory.louds").path))
+        // Verify dictionary learning independently of the correction table.
+        let corrections = dir.appendingPathComponent("corrections.json")
+        if FileManager.default.fileExists(atPath: corrections.path) { try FileManager.default.removeItem(at: corrections) }
+        let restored = service()
+        let sid2 = restored.startSession()
+        _ = restored.insert(session: sid2, text: reading)
+        XCTAssertEqual(try XCTUnwrap(restored.convert(session: sid2)).first, target)
+        restored.endSession(session: sid2)
+        restored.prepareForShutdown()
     }
 
     /// ③: clearLearning で RAM+ディスクが消える。
@@ -47,11 +322,354 @@ final class ConversionServiceLearningTests: XCTestCase {
         _ = svc.insert(session: sid, text: "kisha")
         _ = svc.convert(session: sid)
         _ = svc.commit(session: sid, index: 1)
-        svc.endSession(session: sid) // フラッシュしてファイルを作る
+        svc.endSession(session: sid) // backgroundフラッシュしてファイルを作る
+        svc.flushMaintenanceForTesting()
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).contains("memory.louds"))
         XCTAssertTrue(svc.clearLearning(), "temp dir の学習ファイルは消し切れるはず")
         let after = try FileManager.default.contentsOfDirectory(atPath: dir.path)
         XCTAssertFalse(after.contains("memory.louds"), "clearLearning でディスクの学習ファイルが消える: \(after)")
+    }
+
+    func testClearLearningRejectsInitialEnumerationFailure() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = LearningFileSystemStub([.failure(genericFileError())])
+        let svc = seamedService(dir, stub: stub)
+
+        XCTAssertFalse(svc.clearLearning())
+        XCTAssertEqual(stub.listCallCount, 1)
+        XCTAssertTrue(stub.removed.isEmpty)
+    }
+
+    func testClearLearningTreatsMissingDirectoryAsAlreadyCleared() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = LearningFileSystemStub([.failure(missingFileError())])
+        let svc = seamedService(dir, stub: stub)
+
+        XCTAssertTrue(svc.clearLearning())
+        XCTAssertEqual(stub.listCallCount, 1)
+        XCTAssertTrue(stub.removed.isEmpty)
+    }
+
+    func testClearLearningRejectsMissingDirectoryWhenVendorTemporaryMayRemain() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tracker = LearningFileSystemTracker(root: dir, names: [])
+        tracker.listError = missingFileError()
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: true, memoryDir: dir),
+                                    fileSystem: tracker.fileSystem)
+        let session = svc.startSession()
+        _ = svc.insert(session: session, text: "kisha")
+        _ = svc.convert(session: session)
+        _ = svc.commit(session: session, index: 1)
+
+        XCTAssertFalse(svc.clearLearning(),
+                       "vendor temporary が残り得る状態で root 消失を成功扱いしない")
+        XCTAssertEqual(tracker.resetCallCount, 0,
+                       "path 消失後に vendor resetMemory を呼ばない")
+    }
+
+    func testClearLearningRejectsDeleteFailure() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = LearningFileSystemStub(
+            [.values(["memory.louds"]), .values(["memory.louds"])],
+            removeError: genericFileError())
+        let svc = seamedService(dir, stub: stub)
+
+        XCTAssertFalse(svc.clearLearning())
+        XCTAssertEqual(stub.removed, ["memory.louds"])
+    }
+
+    func testClearLearningTreatsMissingDeleteAsBenign() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = LearningFileSystemStub(
+            [.values(["memory.louds"]), .values([])],
+            removeError: missingFileError())
+        let svc = seamedService(dir, stub: stub)
+
+        XCTAssertTrue(svc.clearLearning())
+        XCTAssertEqual(stub.removed, ["memory.louds"])
+    }
+
+    func testClearLearningRejectsVerificationEnumerationFailure() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = LearningFileSystemStub(
+            [.values([".pause"]), .failure(genericFileError())])
+        let svc = seamedService(dir, stub: stub)
+
+        XCTAssertFalse(svc.clearLearning())
+        XCTAssertEqual(stub.removed, [".pause"])
+    }
+
+    func testClearLearningRejectsAllowlistedResidual() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = LearningFileSystemStub(
+            [.values(["corrections.json"]), .values(["corrections.json"])])
+        let svc = seamedService(dir, stub: stub)
+
+        XCTAssertFalse(svc.clearLearning())
+        XCTAssertEqual(stub.removed, ["corrections.json"])
+    }
+
+    func testClearLearningKeepsForeignFilesAndSucceedsWhenTargetsAreGone() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = LearningFileSystemStub(
+            [.values(["memory.louds", "foreign.txt"]), .values(["foreign.txt"])])
+        let svc = seamedService(dir, stub: stub)
+
+        XCTAssertTrue(svc.clearLearning())
+        XCTAssertEqual(stub.removed, ["memory.louds"])
+    }
+
+    func testClearLearningDeletesCanonicalAsciiLearningShards() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = LearningFileSystemStub(
+            [.values(["memory0.loudstxt3", "memory1.loudstxt3", "memory0.loudstxt3.2", "foreign.txt"]),
+             .values(["foreign.txt"])])
+        let svc = seamedService(dir, stub: stub)
+
+        XCTAssertTrue(svc.clearLearning())
+        XCTAssertEqual(stub.removed,
+                       ["memory0.loudstxt3", "memory1.loudstxt3", "memory0.loudstxt3.2"])
+    }
+
+    func testClearLearningPreservesNonCanonicalShardNames() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let foreign = ["memory00.loudstxt3", "memory01.loudstxt3", "memory０.loudstxt3"]
+        let stub = LearningFileSystemStub([.values(foreign), .values(foreign)])
+        let svc = seamedService(dir, stub: stub)
+
+        XCTAssertTrue(svc.clearLearning(), "非canonical shard は学習 allowlist 対象外として保持")
+        XCTAssertTrue(stub.removed.isEmpty)
+    }
+
+    func testClearLearningPreservesOverflowShardName() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let overflow = String(Int.max) + "0"
+        let foreign = "memory\(overflow).loudstxt3"
+        let stub = LearningFileSystemStub([.values([foreign]), .values([foreign])])
+        let svc = seamedService(dir, stub: stub)
+
+        XCTAssertTrue(svc.clearLearning(), "Int 範囲外の shard は foreign として保持")
+        XCTAssertTrue(stub.removed.isEmpty)
+    }
+
+    func testClearLearningRejectsNonCanonicalShardsBeforeVendorReset() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tracker = LearningFileSystemTracker(
+            root: dir,
+            names: ["memory0.loudstxt3", "memory00.loudstxt3", "memory01.loudstxt3", "memory０.loudstxt3"])
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: true, memoryDir: dir),
+                                    fileSystem: tracker.fileSystem)
+        noteLearningRequest(svc)
+
+        XCTAssertFalse(svc.clearLearning(), "foreign shard suffix は vendor reset 前に fail-closed")
+        XCTAssertEqual(tracker.resetCallCount, 0)
+        XCTAssertTrue(tracker.removed.isEmpty)
+    }
+
+    func testClearLearningRejectsOverflowShardBeforeVendorReset() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let overflow = String(Int.max) + "0"
+        let foreign = "memory\(overflow).loudstxt3"
+        let tracker = LearningFileSystemTracker(root: dir,
+                                                names: ["memory0.loudstxt3", foreign])
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: true, memoryDir: dir),
+                                    fileSystem: tracker.fileSystem)
+        noteLearningRequest(svc)
+
+        XCTAssertFalse(svc.clearLearning(), "Int 範囲外の shard は vendor reset 前に fail-closed")
+        XCTAssertEqual(tracker.resetCallCount, 0)
+        XCTAssertTrue(tracker.removed.isEmpty)
+    }
+
+    func testClearLearningPreflightsDirectoryAndReparseTargetsBeforeDeleting() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let metadata: [String: LearningPathMetadata] = [
+            "memory.louds": LearningPathMetadata(isDirectory: true, isRegularFile: false,
+                                                  isReparsePoint: false),
+            "foreign.txt": LearningPathMetadata(isDirectory: false, isRegularFile: false,
+                                                 isReparsePoint: true),
+        ]
+        let stub = LearningFileSystem(
+            list: { _ in ["memory.louds", "foreign.txt"] },
+            remove: { url in XCTFail("unsafe target must not be removed: \(url)") },
+            metadata: { url in
+                if url == dir { return LearningPathMetadata(isDirectory: true, isRegularFile: false,
+                                                            isReparsePoint: false) }
+                return metadata[url.lastPathComponent]
+            })
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: false, memoryDir: dir),
+                                    fileSystem: stub)
+
+        XCTAssertFalse(svc.clearLearning())
+    }
+
+    func testClearLearningRejectsForeignVendorSuffixBeforeReset() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tracker = LearningFileSystemTracker(root: dir,
+                                                names: ["memory.louds", "foreign.louds"])
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: true, memoryDir: dir),
+                                    fileSystem: tracker.fileSystem)
+        noteLearningRequest(svc)
+
+        XCTAssertFalse(svc.clearLearning(), "vendor suffix の foreign entry は fail-closed")
+        XCTAssertEqual(tracker.resetCallCount, 0, "unsafe preflight 前に vendor reset しない")
+        XCTAssertTrue(tracker.removed.isEmpty, "partial deletion もしない")
+    }
+
+    func testClearLearningRejectsForeignVendorReparseBeforeReset() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tracker = LearningFileSystemTracker(
+            root: dir,
+            names: ["memory.louds", "foreign.louds"],
+            metadataByName: [
+                "foreign.louds": LearningPathMetadata(isDirectory: false, isRegularFile: false,
+                                                       isReparsePoint: true)
+            ])
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: true, memoryDir: dir),
+                                    fileSystem: tracker.fileSystem)
+        noteLearningRequest(svc)
+
+        XCTAssertFalse(svc.clearLearning(), "foreign reparse suffix は fail-closed")
+        XCTAssertEqual(tracker.resetCallCount, 0)
+        XCTAssertTrue(tracker.removed.isEmpty)
+    }
+
+    func testClearLearningRejectsAllowlistedDirectoryBeforeReset() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tracker = LearningFileSystemTracker(
+            root: dir,
+            names: ["memory.louds", "foreign.txt"],
+            metadataByName: [
+                "memory.louds": LearningPathMetadata(isDirectory: true, isRegularFile: false,
+                                                      isReparsePoint: false)
+            ])
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: true, memoryDir: dir),
+                                    fileSystem: tracker.fileSystem)
+        noteLearningRequest(svc)
+
+        XCTAssertFalse(svc.clearLearning(), "allowlist entry が directory なら fail-closed")
+        XCTAssertEqual(tracker.resetCallCount, 0)
+        XCTAssertTrue(tracker.removed.isEmpty)
+    }
+
+    func testClearLearningRejectsReparseRootBeforeReset() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tracker = LearningFileSystemTracker(root: dir, names: ["memory.louds"])
+        tracker.rootMetadata = LearningPathMetadata(isDirectory: true, isRegularFile: false,
+                                                     isReparsePoint: true)
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: true, memoryDir: dir),
+                                    fileSystem: tracker.fileSystem)
+        noteLearningRequest(svc)
+
+        XCTAssertFalse(svc.clearLearning(), "root reparse は fail-closed")
+        XCTAssertEqual(tracker.resetCallCount, 0)
+        XCTAssertTrue(tracker.removed.isEmpty)
+    }
+
+    func testClearLearningPerformsVendorResetOnlyAfterSafeEnabledRequest() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tracker = LearningFileSystemTracker(root: dir,
+                                                names: ["memory.louds", "foreign.txt"])
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: true, memoryDir: dir),
+                                    fileSystem: tracker.fileSystem)
+        noteLearningRequest(svc)
+
+        XCTAssertTrue(svc.clearLearning())
+        XCTAssertEqual(tracker.resetCallCount, 1, "同期済み actual root の safe ON reset のみ許可")
+        XCTAssertEqual(tracker.removed, ["memory.louds"], "foreign regular file は保持")
+    }
+
+    func testReloadBeforeFirstRequestNeverResetsWorkDir() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // NOSPACEKEY_MEMORY_DIR は base dir: reload 後の clear root は base + BuildInfo.version
+        // （ビルド毎の学習状態分離）。tracker の root も同じ versioned dir を指すため、
+        // 直書きでなく BuildInfo.version から組み立てる（bump で壊れない）。
+        let tracker = LearningFileSystemTracker(
+            root: dir.appendingPathComponent(BuildInfo.version), names: ["memory.louds"])
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: true, memoryDir: dir),
+                                    fileSystem: tracker.fileSystem)
+
+        XCTAssertTrue(svc.reload(overrides: ["NOSPACEKEY_LEARNING": "0", "NOSPACEKEY_ZENZAI": "off"]))
+        XCTAssertTrue(svc.reload(overrides: [
+            "NOSPACEKEY_ZENZAI": "off",
+            "NOSPACEKEY_LEARNING": "1",
+            "NOSPACEKEY_MEMORY_DIR": dir.path
+        ]))
+        XCTAssertTrue(svc.clearLearning(), "reload before first request でも disk root は clear 可能")
+        XCTAssertEqual(tracker.resetCallCount, 0, "vendor config unknown/workDir の reset はしない")
+        XCTAssertEqual(tracker.removed, ["memory.louds"])
+    }
+
+    func testReloadToOffKeepsVendorTemporaryStateAcrossOffRequest() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tracker = LearningFileSystemTracker(root: dir, names: ["memory.louds"])
+        let svc = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1),
+                                    learning: LearningSettings(enabled: true, memoryDir: dir),
+                                    fileSystem: tracker.fileSystem)
+        let session = svc.startSession()
+        _ = svc.insert(session: session, text: "kisha")
+        _ = svc.convert(session: session)
+        _ = svc.commit(session: session, index: 1)
+
+        XCTAssertTrue(svc.reload(overrides: ["NOSPACEKEY_LEARNING": "0"]))
+        // vendor の .nothing request は temporary trie を空にしない（updateConfig の early return）。
+        XCTAssertNotNil(svc.convert(session: session))
+        XCTAssertFalse(svc.clearLearning(), "OFF request 後に RAM clear 成功を偽装しない")
+        XCTAssertEqual(tracker.resetCallCount, 0)
+    }
+
+    func testClearLearningDeletesLegacyLearningMemoryFile() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = LearningFileSystemStub(
+            [.values(["learningMemory.txt", "foreign.txt"]), .values(["foreign.txt"])])
+        let svc = seamedService(dir, stub: stub)
+
+        XCTAssertTrue(svc.clearLearning())
+        XCTAssertEqual(stub.removed, ["learningMemory.txt"])
+    }
+
+    func testClearLearningClearsCorrectionMemoryEvenWhenEnumerationFails() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stub = LearningFileSystemStub([.failure(genericFileError())])
+        let svc = seamedService(dir, stub: stub)
+        svc.recordForTesting(reading: "にほんご", surface: "日本語")
+        XCTAssertNotNil(svc.correctionLookupForTesting(reading: "にほんご"))
+
+        XCTAssertFalse(svc.clearLearning())
+        XCTAssertNil(svc.correctionLookupForTesting(reading: "にほんご"))
     }
 
     /// ④: 学習 OFF（既定 .disabled）では memoryDir 相当に何も書かれない。
@@ -83,6 +701,20 @@ final class ConversionServiceLearningTests: XCTestCase {
         svc.reload(overrides: ["NOSPACEKEY_LEARNING": "0"])
         let files = try FileManager.default.contentsOfDirectory(atPath: dir.path)
         XCTAssertTrue(files.contains("memory.louds"), "OFF 切替前に保留分がフラッシュされる: \(files)")
+        svc.endSession(session: sid)
+    }
+
+    func testReloadToOffWithPendingLearningMakesClearFailClosed() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let svc = learningService(dir)
+        let sid = svc.startSession()
+        _ = svc.insert(session: sid, text: "kisha")
+        _ = svc.convert(session: sid)
+        _ = svc.commit(session: sid, index: 1)
+
+        XCTAssertTrue(svc.reload(overrides: ["NOSPACEKEY_LEARNING": "0"]))
+        XCTAssertFalse(svc.clearLearning(), "OFF 切替前 flush の成否を観測できない間は Error にする")
         svc.endSession(session: sid)
     }
 

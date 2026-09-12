@@ -4,206 +4,268 @@
 //! ここでは 5 種類のセッションを定義する:
 //!   - `StartOrUpdatePreedit` : composition を（無ければ）開始し、preedit 文字列を更新して下線属性を付与する。
 //!   - `CommitText`           : composition を確定文字列で置換し EndComposition する。
+//!   - `EndCompositionOnly`   : 確定文字列の書込み後に終了だけ失敗した composition を再度閉じる。
 //!   - `CancelComposition`    : composition を確定せず終了する。
 //!   - `ReconvertStart`       : 直前ラテン列（または選択範囲）を読み戻し、その**非空** range を composition 化する。
 //!   - `RestoreText`          : composition の range を元ラテンに戻してから閉じる（取消復元）。
+//!   - `StartPredictionGhost` / `FinishPredictionGhost`: 予測専用 composition の表示と受理／破棄。
 //!
 //! いずれも `ITfContext::RequestEditSession` から `TF_ES_SYNC | TF_ES_READWRITE` で同期実行される。
 //! `composition` は `TextService` と共有される `Rc<RefCell<Option<ITfComposition>>>` で、
 //! セッションをまたいで現在の composition を保持する。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use core::mem::ManuallyDrop;
 
-use windows::core::{implement, Interface, IUnknown, Result, BOOL, HSTRING};
-use windows::Win32::Foundation::RECT;
+use windows::core::{implement, IUnknown, Interface, Result, BOOL, HSTRING};
+use windows::Win32::Foundation::{E_FAIL, RECT};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::{VARIANT, VT_UNKNOWN};
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfContext, ITfContextComposition, ITfEditSession, ITfEditSession_Impl,
-    ITfInputScope, ITfInsertAtSelection, ITfCompositionSink, ITfProperty, ITfRange, InputScope,
-    INSERT_TEXT_AT_SELECTION_FLAGS, TF_AE_NONE, TF_ANCHOR_END, TF_ANCHOR_START,
-    TF_DEFAULT_SELECTION, TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE, GUID_PROP_ATTRIBUTE,
-    GUID_PROP_INPUTSCOPE,
+    ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
+    ITfEditSession_Impl, ITfInputScope, ITfInsertAtSelection, ITfProperty, ITfRange, InputScope,
+    GUID_PROP_ATTRIBUTE, GUID_PROP_INPUTSCOPE, TF_AE_NONE,
+    TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION,
+    TF_IAS_QUERYONLY, TF_SELECTION,
+    TF_SELECTIONSTYLE,
 };
 
 use crate::globals::ComObjectGuard;
+use crate::edit_range::shift_start_exact;
 use crate::input_state::{classify_reconvert_selection, ReconvertKind};
 
 /// `ReconvertStart` の出力。掴んだ対象文字列とその種別を呼び出し側（start_reconvert）へ返す。
 #[derive(Default, Clone)]
-pub struct ReconvertCapture { pub text: String, pub kind: ReconvertKind }
+pub struct ReconvertCapture {
+    pub text: String,
+    pub kind: ReconvertKind,
+}
+
+pub(crate) use crate::commit_session::{
+    classify_composition_end_error, composition_end_stays_pending, CommitText,
+    CompositionEndStatus, EndCompositionOnly,
+};
+
+struct PredictionEditGuard(Rc<Cell<bool>>);
+
+impl PredictionEditGuard {
+    fn enter(flag: &Rc<Cell<bool>>) -> Self {
+        flag.set(true);
+        Self(Rc::clone(flag))
+    }
+}
+
+impl Drop for PredictionEditGuard {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+/// キャレット位置へ予測専用 composition を開始し、灰色ゴースト属性を付ける。
+/// 選択範囲が非空なら本文を置換しないため拒否する。
+#[implement(ITfEditSession)]
+pub struct StartPredictionGhost {
+    pub context: ITfContext,
+    pub text: HSTRING,
+    pub sink: ITfCompositionSink,
+    pub da_variant: VARIANT,
+    pub composition: Rc<RefCell<Option<ITfComposition>>>,
+    pub editing: Rc<Cell<bool>>,
+    pub(crate) _guard: ComObjectGuard,
+}
+
+impl ITfEditSession_Impl for StartPredictionGhost_Impl {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        let _editing = PredictionEditGuard::enter(&self.editing);
+        unsafe {
+            if self.composition.borrow().is_none() {
+                let cc: ITfContextComposition = self.context.cast()?;
+                let ins: ITfInsertAtSelection = self.context.cast()?;
+                let range = ins.InsertTextAtSelection(ec, TF_IAS_QUERYONLY, &[])?;
+                if !range.IsEmpty(ec)?.as_bool() {
+                    return Err(E_FAIL.into());
+                }
+                let comp = cc.StartComposition(ec, &range, &self.sink)?;
+                *self.composition.borrow_mut() = Some(comp);
+            }
+
+            let comp = self
+                .composition
+                .borrow()
+                .clone()
+                .ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+            let apply = (|| -> Result<()> {
+                let range = comp.GetRange()?;
+                range.SetText(ec, 0, &self.text)?;
+                let prop: ITfProperty = self.context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+                prop.SetValue(ec, &range, &self.da_variant)?;
+                // ゴーストはキャレットの右側に見せるため、選択をcomposition先頭に置く。
+                range.Collapse(ec, TF_ANCHOR_START)?;
+                let mut selection = TF_SELECTION {
+                    range: ManuallyDrop::new(Some(range)),
+                    style: TF_SELECTIONSTYLE {
+                        ase: TF_AE_NONE,
+                        fInterimChar: BOOL(0),
+                    },
+                };
+                let selected = self
+                    .context
+                    .SetSelection(ec, core::slice::from_ref(&selection));
+                ManuallyDrop::drop(&mut selection.range);
+                selected
+            })();
+
+            if let Err(error) = apply {
+                // 予測本文の除去に成功する前に EndComposition すると、候補を意図せず
+                // 確定文字へ変える。除去できない場合は owner slot を保持して再試行へ回す。
+                let removed = comp
+                    .GetRange()
+                    .and_then(|range| range.SetText(ec, 0, &[]))
+                    .is_ok();
+                if removed {
+                    let ended = comp.EndComposition(ec).is_ok();
+                    if ended || self.composition.borrow().is_none() {
+                        *self.composition.borrow_mut() = None;
+                    }
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 予測専用 composition を終了する。`accept=true` は本文を残し、false は空にして破棄する。
+#[implement(ITfEditSession)]
+pub struct FinishPredictionGhost {
+    pub context: ITfContext,
+    pub composition: Rc<RefCell<Option<ITfComposition>>>,
+    pub owner_context: Rc<RefCell<Option<ITfContext>>>,
+    pub editing: Rc<Cell<bool>>,
+    /// Async edit session の失敗が属する入力欄。旧欄の遅延失敗で新欄まで停止させない。
+    pub failure_context: Rc<RefCell<Option<ITfContext>>>,
+    pub pending: Rc<Cell<Option<bool>>>,
+    pub preserve_selection: bool,
+    pub accept: bool,
+    pub(crate) _guard: ComObjectGuard,
+}
+
+impl ITfEditSession_Impl for FinishPredictionGhost_Impl {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        let _editing = PredictionEditGuard::enter(&self.editing);
+        if self.composition.borrow().is_none() {
+            *self.owner_context.borrow_mut() = None;
+            self.pending.set(None);
+            return Ok(());
+        }
+        let result = (|| -> Result<()> {
+            unsafe {
+                let comp = self
+                    .composition
+                    .borrow()
+                    .clone()
+                    .ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+                let range = comp.GetRange()?;
+                let mut saved = [TF_SELECTION {
+                    range: ManuallyDrop::new(None),
+                    style: TF_SELECTIONSTYLE {
+                        ase: TF_AE_NONE,
+                        fInterimChar: BOOL(0),
+                    },
+                }];
+                let mut fetched = 0;
+                let preserved = if self.preserve_selection && !self.accept {
+                    let result = self.context.GetSelection(
+                        ec,
+                        TF_DEFAULT_SELECTION,
+                        &mut saved,
+                        &mut fetched,
+                    );
+                    let selected_range = ManuallyDrop::take(&mut saved[0].range);
+                    result?;
+                    if fetched == 0 {
+                        return Err(E_FAIL.into());
+                    }
+                    Some((selected_range, saved[0].style))
+                } else {
+                    None
+                };
+                if !self.accept {
+                    range.SetText(ec, 0, &[])?;
+                }
+                if preserved.is_none()
+                    && range
+                        .Collapse(
+                            ec,
+                            if self.accept {
+                                TF_ANCHOR_END
+                            } else {
+                                TF_ANCHOR_START
+                            },
+                        )
+                        .is_ok()
+                {
+                    let mut selection = TF_SELECTION {
+                        range: ManuallyDrop::new(Some(range)),
+                        style: TF_SELECTIONSTYLE {
+                            ase: TF_AE_NONE,
+                            fInterimChar: BOOL(0),
+                        },
+                    };
+                    let _ = self
+                        .context
+                        .SetSelection(ec, core::slice::from_ref(&selection));
+                    ManuallyDrop::drop(&mut selection.range);
+                }
+                let result = comp.EndComposition(ec);
+                if let Some((selected_range, style)) = preserved {
+                    let mut selection = TF_SELECTION {
+                        range: ManuallyDrop::new(selected_range),
+                        style,
+                    };
+                    let restore = self
+                        .context
+                        .SetSelection(ec, core::slice::from_ref(&selection));
+                    ManuallyDrop::drop(&mut selection.range);
+                    restore?;
+                }
+                if composition_end_stays_pending(
+                    result.is_ok(),
+                    self.composition.borrow().is_some(),
+                ) {
+                    return result;
+                }
+                *self.composition.borrow_mut() = None;
+                *self.owner_context.borrow_mut() = None;
+                self.pending.set(None);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            *self.failure_context.borrow_mut() = Some(self.context.clone());
+            self.pending.set(Some(self.accept));
+        }
+        result
+    }
+}
 
 /// 挿入点 `range` の直前 64 UTF-16 単位を読み、サニタイズ済み左文脈を返す（U9）。
 /// ReconvertStart の後方スキャン（ShiftStart(-64)→GetText）と同型。読み取りは best-effort:
 /// clone/Shift/GetText いずれの失敗も None（呼び出し側は「必ず上書き」規約でスロットへ書く）。
-unsafe fn read_left_context(ec: u32, range: &ITfRange) -> Option<String> {
+pub(crate) unsafe fn read_left_context(ec: u32, range: &ITfRange) -> Option<String> {
     let scan = range.Clone().ok()?;
     // QUERYONLY の range は非空選択だと選択範囲そのものを指し得る。左文脈は「挿入開始位置の
     // 左側」なので、まず先頭へ畳んでから後方へ広げる（畳まないと選択テキスト自身を読んでしまう）。
     scan.Collapse(ec, TF_ANCHOR_START).ok()?;
     let mut moved = 0i32;
-    scan.ShiftStart(ec, -64, &mut moved, core::ptr::null()).ok()?;
+    scan.ShiftStart(ec, -64, &mut moved, core::ptr::null())
+        .ok()?;
     let mut buf = [0u16; 64];
     let mut got = 0u32;
     scan.GetText(ec, 0, &mut buf, &mut got).ok()?;
     crate::input_state::sanitize_left_context(&String::from_utf16_lossy(&buf[..got as usize]))
-}
-
-/// composition を開始/更新し preedit を `text` にして下線属性を付与するセッション。
-#[implement(ITfEditSession)]
-pub struct StartOrUpdatePreedit {
-    pub context: ITfContext,
-    pub text: HSTRING,
-    pub sink: ITfCompositionSink,
-    pub da_variant: VARIANT,
-    /// 文節ナビゲーション: 選択文節の (UTF-16 開始, UTF-16 長)。Some なら該当区間だけ
-    /// `da_target_variant`（太下線）で上書きし、選択文節を視覚化する（MS-IME の変換対象文節）。
-    pub target: Option<(usize, usize)>,
-    /// 選択文節用の表示属性 atom を内包した VARIANT（`target` が Some のときだけ使う）。
-    pub da_target_variant: VARIANT,
-    pub composition: Rc<RefCell<Option<ITfComposition>>>,
-    /// U9: composition 新規作成時に読んだ左文脈の出力先（TextService.left_context と共有）。
-    /// 取得の成否にかかわらず**必ず上書き**する（失敗=None。前文書の文脈残留を許さない — spec §2.1）。
-    pub left_context_out: Rc<RefCell<Option<String>>>,
-    // C-1: DLL_REF で生存数を数える（ホストが session を保持中の DLL アンロードによる UAF を防ぐ）。
-    pub(crate) _guard: ComObjectGuard,
-}
-
-impl ITfEditSession_Impl for StartOrUpdatePreedit_Impl {
-    fn DoEditSession(&self, ec: u32) -> Result<()> {
-        unsafe {
-            // composition がまだ無ければ、現在の選択位置に空 range を作って開始する。
-            if self.composition.borrow().is_none() {
-                let cc: ITfContextComposition = self.context.cast()?;
-                let ins: ITfInsertAtSelection = self.context.cast()?;
-                // TF_IAS_QUERYONLY: テキストは挿入せず、選択位置の range だけ得る。
-                let range = ins.InsertTextAtSelection(ec, TF_IAS_QUERYONLY, &[])?;
-                // U9: StartComposition の前に挿入点左の周辺テキストを読む（preedit 混入前）。
-                // 成否によらず必ず上書き（読めなければ None）。内容はログに出さない（len のみ）。
-                let ctx_text = read_left_context(ec, &range);
-                let len = ctx_text.as_ref().map_or(0, |s| s.chars().count());
-                *self.left_context_out.borrow_mut() = ctx_text;
-                crate::text_service::tip_log(&format!("ev=left_context len={len}"));
-                let comp = cc.StartComposition(ec, &range, &self.sink)?;
-                *self.composition.borrow_mut() = Some(comp);
-            }
-
-            // composition の range を取り出し、preedit を text で置換する。
-            let comp = self
-                .composition
-                .borrow()
-                .clone()
-                .expect("composition was just set above");
-            let crange = comp.GetRange()?;
-            crange.SetText(ec, 0, &self.text)?;
-
-            // 下線の表示属性を range（全体）に適用する（atom を内包した VARIANT を使う）。
-            // 末尾へ畳む前に適用すること（畳むと range が空になり下線が乗らない）。
-            let prop: ITfProperty = self.context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-            prop.SetValue(ec, &crange, &self.da_variant)?;
-
-            // 文節ナビゲーション: 選択文節の区間だけ太下線属性で上書きする。sub-range は
-            // 全体 range の clone を先頭へ畳み、ShiftEnd→ShiftStart の順で切り出す
-            // （逆順だと start>end の一瞬が生じ実装依存の失敗を踏む）。属性の上書きは
-            // best-effort — 失敗しても preedit 本文は既に立っているので合成は壊さない。
-            if let Some((start, len)) = self.target {
-                if len > 0 {
-                    let apply_target = || -> Result<()> {
-                        let sub = crange.Clone()?;
-                        sub.Collapse(ec, TF_ANCHOR_START)?;
-                        let mut moved = 0i32;
-                        sub.ShiftEnd(ec, (start + len) as i32, &mut moved, core::ptr::null())?;
-                        sub.ShiftStart(ec, start as i32, &mut moved, core::ptr::null())?;
-                        prop.SetValue(ec, &sub, &self.da_target_variant)
-                    };
-                    let _ = apply_target();
-                }
-            }
-
-            // preedit 更新後、キャレットを合成文字列の末尾へ移す。これをしないと多くの TSF アプリは
-            // 合成開始位置（＝打ち始めた先頭）に選択を残し、ライブ変換中ずっとカーソルが文頭に
-            // 居座ってしまう（ふつうの IME は変換済み文字列の末尾にキャレットが付く）。
-            // 確定時の `CommitText` と同じ規律: range を末尾へ畳んで SetSelection し、TF_SELECTION.range
-            // の ManuallyDrop 自参照は必ず解放する（SetSelection が必要なら内部で AddRef する）。
-            crange.Collapse(ec, TF_ANCHOR_END)?;
-            let mut sel = TF_SELECTION {
-                range: ManuallyDrop::new(Some(crange)),
-                style: TF_SELECTIONSTYLE { ase: TF_AE_NONE, fInterimChar: BOOL(0) },
-            };
-            let set = self.context.SetSelection(ec, core::slice::from_ref(&sel));
-            ManuallyDrop::drop(&mut sel.range);
-            set?;
-        }
-        Ok(())
-    }
-}
-
-/// composition を確定文字列 `text` で置換して EndComposition するセッション。
-#[implement(ITfEditSession)]
-pub struct CommitText {
-    pub context: ITfContext,
-    pub text: HSTRING,
-    pub composition: Rc<RefCell<Option<ITfComposition>>>,
-    // C-1: DLL_REF で生存数を数える。
-    pub(crate) _guard: ComObjectGuard,
-}
-
-impl ITfEditSession_Impl for CommitText_Impl {
-    fn DoEditSession(&self, ec: u32) -> Result<()> {
-        unsafe {
-            let comp = self.composition.borrow().clone();
-            match comp {
-                Some(comp) => {
-                    // composition の range を確定文字列で置換する。
-                    let crange = comp.GetRange()?;
-                    crange.SetText(ec, 0, &self.text)?;
-                    // 確定後、キャレットを確定文字列の末尾へ移す。range を末尾へ畳んで
-                    // 選択に設定する。これをしないと多くの TSF アプリは合成開始位置
-                    // （＝打ち始めた先頭）にキャレットを残し、次の入力が文書先頭へ挿入
-                    // されてしまう（Microsoft TSF SampleIME と同じ確定手順）。
-                    crange.Collapse(ec, TF_ANCHOR_END)?;
-                    let mut sel = TF_SELECTION {
-                        range: ManuallyDrop::new(Some(crange)),
-                        style: TF_SELECTIONSTYLE { ase: TF_AE_NONE, fInterimChar: BOOL(0) },
-                    };
-                    let set = self.context.SetSelection(ec, core::slice::from_ref(&sel));
-                    // TF_SELECTION.range は ManuallyDrop。SetSelection が必要なら内部で
-                    // AddRef するので、ここで自分の参照を必ず解放する（失敗時もリークさせない）。
-                    ManuallyDrop::drop(&mut sel.range);
-                    set?;
-                    comp.EndComposition(ec)?;
-                }
-                None => {
-                    // composition が無い経路: 選択位置へ直接テキストを挿入する（従来の劣化 commit と
-                    // shift_latin の直接確定が使う）。
-                    // レビュー M-3: dwFlags は NOQUERY でなく 0（挿入して range も返す —
-                    // Microsoft SampleIME の _InsertAtSelection と同型）を使う。NOQUERY だと
-                    // 挿入後のキャレット位置がホストの ITextStoreACP 実装依存になり、
-                    // 「。」連打の 2 打目が 1 打目の**前**に入るホストがありうる。返り値 range を
-                    // 末尾へ畳んで明示 SetSelection し、composition あり枝と同じ規律で
-                    // キャレット末尾追従（＝連打順序）を保証する。
-                    let ins: ITfInsertAtSelection = self.context.cast()?;
-                    let range = ins
-                        .InsertTextAtSelection(ec, INSERT_TEXT_AT_SELECTION_FLAGS(0), &self.text)?;
-                    range.Collapse(ec, TF_ANCHOR_END)?;
-                    let mut sel = TF_SELECTION {
-                        range: ManuallyDrop::new(Some(range)),
-                        style: TF_SELECTIONSTYLE { ase: TF_AE_NONE, fInterimChar: BOOL(0) },
-                    };
-                    // TF_SELECTION.range は ManuallyDrop。SetSelection が必要なら内部で AddRef
-                    // するので、自分の参照は必ず解放する（composition あり枝と同じ規律）。
-                    let set = self.context.SetSelection(ec, core::slice::from_ref(&sel));
-                    ManuallyDrop::drop(&mut sel.range);
-                    set?;
-                }
-            }
-            *self.composition.borrow_mut() = None;
-        }
-        Ok(())
-    }
 }
 
 /// composition を確定せずに終了する（取消）セッション。
@@ -221,11 +283,15 @@ impl ITfEditSession_Impl for CancelComposition_Impl {
             if let Some(comp) = comp {
                 // 取消なので range の preedit を空にしてから composition を閉じる
                 // （これをしないと打ちかけのローマ字/読みが文書に残ってしまう）。
-                if let Ok(crange) = comp.GetRange() {
-                    let _ = crange.SetText(ec, 0, &[]);
-                }
+                // GetRange/SetText の失敗は Err で伝播する — preedit を除去できて
+                // いないのに Ok を返さない契約。SetText 成功後の失敗でテキストを
+                // 巻き戻すことはしない。
+                let crange = comp.GetRange()?;
+                crange.SetText(ec, 0, &[])?;
                 comp.EndComposition(ec)?;
             }
+            // 共有スロットは EndComposition が成功した経路でのみ落とす（上の `?`
+            // が Err を返したらここへは届かない）。
             *self.composition.borrow_mut() = None;
         }
         Ok(())
@@ -258,6 +324,8 @@ pub struct ReconvertStart {
     pub context: ITfContext,
     pub sink: ITfCompositionSink,
     pub composition: Rc<RefCell<Option<ITfComposition>>>,
+    /// `StartComposition` の実成功だけを caller へ返す one-shot 出力。
+    pub started: Rc<Cell<bool>>,
     pub out: Rc<RefCell<ReconvertCapture>>,
     /// U9: 再変換対象の**手前**の左文脈の出力先（TextService.left_context と共有）。
     /// キャレット経路は読み済み text_before の非ラテン prefix を書き、選択経路・早期離脱は
@@ -277,7 +345,10 @@ impl ITfEditSession_Impl for ReconvertStart_Impl {
             //    Default を導出しないので、range=None で明示構築する。
             let mut sel = [TF_SELECTION {
                 range: ManuallyDrop::new(None),
-                style: TF_SELECTIONSTYLE { ase: TF_AE_NONE, fInterimChar: BOOL(0) },
+                style: TF_SELECTIONSTYLE {
+                    ase: TF_AE_NONE,
+                    fInterimChar: BOOL(0),
+                },
             }];
             let mut fetched = 0u32;
             self.context
@@ -325,10 +396,11 @@ impl ITfEditSession_Impl for ReconvertStart_Impl {
                 *self.left_context_out.borrow_mut() = ctx_text;
                 // StartOrUpdatePreedit と同じ規律で長さのみログ（VM 受入 item7 の観測点。
                 // 内容は出さない — spec §2.5 / 最終レビュー Minor-3）。
-                crate::text_service::tip_log(&format!("ev=left_context len={ctx_len} src=reconvert"));
+                crate::text_service::tip_log(&format!(
+                    "ev=left_context len={ctx_len} src=reconvert"
+                ));
                 let r = range.Clone()?;
-                let mut m = 0i32;
-                r.ShiftStart(ec, -(span as i32), &mut m, core::ptr::null())?;
+                shift_start_exact(&r, ec, -(span as i32))?;
                 r
             };
 
@@ -357,6 +429,9 @@ impl ITfEditSession_Impl for ReconvertStart_Impl {
             if matches!(kind, ReconvertKind::Latin | ReconvertKind::Surface) {
                 let cc: ITfContextComposition = self.context.cast()?;
                 let comp = cc.StartComposition(ec, &comp_range, &self.sink)?;
+                // StartComposition's own internal reentrancy is before its success return; after
+                // that API boundary the signal precedes the local slot assignment with no COM call.
+                self.started.set(true);
                 *self.composition.borrow_mut() = Some(comp);
             }
         }
@@ -388,6 +463,8 @@ pub struct CommitUndoStart {
     pub context: ITfContext,
     pub sink: ITfCompositionSink,
     pub composition: Rc<RefCell<Option<ITfComposition>>>,
+    /// 照合 range の `StartComposition` 実成功だけを caller へ返す one-shot 出力。
+    pub started: Rc<Cell<bool>>,
     /// 照合対象の確定文字列。この UTF-16 単位数だけ ShiftStart で戻し、バイト一致を確認する。
     pub expected: String,
     /// バイト一致して StartComposition したら true。呼び出し側は false を text_mismatch と扱う。
@@ -408,7 +485,10 @@ impl ITfEditSession_Impl for CommitUndoStart_Impl {
             // 1) 既定選択を取得する（ReconvertStart と同じ ManuallyDrop 規律）。
             let mut sel = [TF_SELECTION {
                 range: ManuallyDrop::new(None),
-                style: TF_SELECTIONSTYLE { ase: TF_AE_NONE, fInterimChar: BOOL(0) },
+                style: TF_SELECTIONSTYLE {
+                    ase: TF_AE_NONE,
+                    fInterimChar: BOOL(0),
+                },
             }];
             let mut fetched = 0u32;
             self.context
@@ -460,6 +540,9 @@ impl ITfEditSession_Impl for CommitUndoStart_Impl {
             // 6) 一致 range を composition 化する。
             let cc: ITfContextComposition = self.context.cast()?;
             let comp = cc.StartComposition(ec, &comp_range, &self.sink)?;
+            // As above, only reentrancy after the StartComposition success return is observable;
+            // signal it before the local composition slot assignment and any later COM callout.
+            self.started.set(true);
             *self.composition.borrow_mut() = Some(comp);
             *self.out.borrow_mut() = true;
         }
@@ -487,28 +570,39 @@ impl ITfEditSession_Impl for RestoreText_Impl {
             let comp = self.composition.borrow().clone();
             if let Some(comp) = comp {
                 // range を元ラテンへ書き戻してから閉じる（&HSTRING は Deref で &[u16] に通る）。
-                if let Ok(crange) = comp.GetRange() {
-                    if crange.SetText(ec, 0, &self.text).is_ok() {
-                        // 復元後、キャレットを復元文字列の末尾へ移す。`CommitText` と同じ規律:
-                        // SetText 単独ではキャレットは合成開始位置（=単語の先頭）に残り、
-                        // EndComposition でアンカー（先頭）へ戻ってしまう。実機 SP5: Esc 復元後に
-                        // カーソルが単語の手前へ居座り、(a) 体感が悪い・(b) 直前が空白になって
-                        // 再変換キーが対象（直前ラテン列）を掴めなくなる。range を末尾へ畳んで
-                        // SetSelection する。失敗しても復元自体は済んでいるので EndComposition は続ける。
-                        if crange.Collapse(ec, TF_ANCHOR_END).is_ok() {
-                            let mut sel = TF_SELECTION {
-                                range: ManuallyDrop::new(Some(crange)),
-                                style: TF_SELECTIONSTYLE { ase: TF_AE_NONE, fInterimChar: BOOL(0) },
-                            };
-                            // TF_SELECTION.range は ManuallyDrop。SetSelection が必要なら内部で
-                            // AddRef するので、自分の参照は必ず解放する（CommitText と同じ規律）。
-                            let _ = self.context.SetSelection(ec, core::slice::from_ref(&sel));
-                            ManuallyDrop::drop(&mut sel.range);
-                        }
-                    }
+                // 巡4 T4: GetRange/SetText の失敗は Err で伝播する — 同期セッションでは
+                // phrSession に DoEditSession の結果が載るため、cancel_reconvert 側の早期
+                // return が効き「元テキスト未復元のまま再変換状態を破棄する」事故を防ぐ
+                // （旧実装は握り潰して常に Ok で、外側の判定が形骸化していた）。
+                let crange = comp.GetRange()?;
+                crange.SetText(ec, 0, &self.text)?;
+                // 復元後、キャレットを復元文字列の末尾へ移す。`CommitText` と同じ規律:
+                // SetText 単独ではキャレットは合成開始位置（=単語の先頭）に残り、
+                // EndComposition でアンカー（先頭）へ戻ってしまう。実機 SP5: Esc 復元後に
+                // カーソルが単語の手前へ居座り、(a) 体感が悪い・(b) 直前が空白になって
+                // 再変換キーが対象（直前ラテン列）を掴めなくなる。range を末尾へ畳んで
+                // SetSelection する。失敗しても復元自体は済んでいるので EndComposition は続ける。
+                if crange.Collapse(ec, TF_ANCHOR_END).is_ok() {
+                    let mut sel = TF_SELECTION {
+                        range: ManuallyDrop::new(Some(crange)),
+                        style: TF_SELECTIONSTYLE {
+                            ase: TF_AE_NONE,
+                            fInterimChar: BOOL(0),
+                        },
+                    };
+                    // TF_SELECTION.range は ManuallyDrop。SetSelection が必要なら内部で
+                    // AddRef するので、自分の参照は必ず解放する（CommitText と同じ規律）。
+                    let _ = self.context.SetSelection(ec, core::slice::from_ref(&sel));
+                    ManuallyDrop::drop(&mut sel.range);
                 }
+                // EndComposition の失敗は Err で伝播する — composition が閉じられて
+                // いないのに Ok を返すと、呼び出し側が再変換状態を破棄して TSF 側の
+                // composition と共有スロットの状態が食い違う。SetText 成功＝テキストは
+                // 復元済みなので、失敗時も復元済みテキストの巻き戻しはしない。
                 comp.EndComposition(ec)?;
             }
+            // 共有スロットは EndComposition が成功した経路でのみ落とす（上の `?`
+            // が Err を返したらここへは届かない）。
             *self.composition.borrow_mut() = None;
         }
         Ok(())
@@ -521,10 +615,12 @@ impl ITfEditSession_Impl for RestoreText_Impl {
 ///
 /// `GetTextExt` はアプリのレイアウトが未確定だと `TF_E_NOLAYOUT` を返す。その場合や、選択
 /// 取得・view 取得に失敗した場合は `out` を `None` のままにして抜ける＝呼び出し側
-/// （`TextService::caret_point`）が既定座標へフォールバックする（位置取得は best-effort）。
+/// （`TextService::caret_point`）が直近の有効アンカー（初回は作業領域右下の無害位置）へ
+/// フォールバックする（位置取得は best-effort。UIバグ5 の (200,200) 廃止後の契約）。
 #[implement(ITfEditSession)]
 pub struct QueryCaretRect {
     pub context: ITfContext,
+    pub clause_start: Option<(ITfComposition, usize)>,
     pub out: Rc<RefCell<Option<RECT>>>,
     // C-1: DLL_REF で生存数を数える。
     pub(crate) _guard: ComObjectGuard,
@@ -533,12 +629,30 @@ pub struct QueryCaretRect {
 impl ITfEditSession_Impl for QueryCaretRect_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
+            if let Some((composition, start)) = &self.clause_start {
+                let start = i32::try_from(*start).map_err(|_| windows::core::Error::from(E_FAIL))?;
+                let range = composition.GetRange()?;
+                range.Collapse(ec, TF_ANCHOR_START)?;
+                let mut moved = 0;
+                range.ShiftEnd(ec, start, &mut moved, core::ptr::null())?;
+                if moved != start { return Err(E_FAIL.into()); }
+                range.Collapse(ec, TF_ANCHOR_END)?;
+                let view = self.context.GetActiveView()?;
+                let mut rect = RECT::default();
+                let mut clipped = BOOL(0);
+                view.GetTextExt(ec, &range, &mut rect, &mut clipped)?;
+                *self.out.borrow_mut() = Some(rect);
+                return Ok(());
+            }
             // 既定選択（キャレット）の range を取得する。GetSelection は range の所有権を渡す
             // （AddRef 済み）ので所有クローンして TSF 側の参照（ManuallyDrop）を drop で解放する
             // ＝ReconvertStart と同じ規律（怠るとリーク、二重に扱うと UAF）。
             let mut sel = [TF_SELECTION {
                 range: ManuallyDrop::new(None),
-                style: TF_SELECTIONSTYLE { ase: TF_AE_NONE, fInterimChar: BOOL(0) },
+                style: TF_SELECTIONSTYLE {
+                    ase: TF_AE_NONE,
+                    fInterimChar: BOOL(0),
+                },
             }];
             let mut fetched = 0u32;
             self.context
@@ -549,7 +663,9 @@ impl ITfEditSession_Impl for QueryCaretRect_Impl {
             }
             let range: Option<ITfRange> = (*sel[0].range).as_ref().cloned();
             ManuallyDrop::drop(&mut sel[0].range);
-            let Some(range) = range else { return Ok(()); };
+            let Some(range) = range else {
+                return Ok(());
+            };
 
             // アクティブビューでキャレット矩形（スクリーン座標）を得る。レイアウト未確定なら
             // GetTextExt は TF_E_NOLAYOUT を返す＝out は None のまま（既定座標へフォールバック）。
@@ -604,7 +720,10 @@ impl ITfEditSession_Impl for QueryMonitorAnchorRect_Impl {
             // キャレット矩形（QueryCaretRect と同じ規律 — ManuallyDrop の解放を怠らない）。
             let mut sel = [TF_SELECTION {
                 range: ManuallyDrop::new(None),
-                style: TF_SELECTIONSTYLE { ase: TF_AE_NONE, fInterimChar: BOOL(0) },
+                style: TF_SELECTIONSTYLE {
+                    ase: TF_AE_NONE,
+                    fInterimChar: BOOL(0),
+                },
             }];
             let mut fetched = 0u32;
             self.context
@@ -615,12 +734,122 @@ impl ITfEditSession_Impl for QueryMonitorAnchorRect_Impl {
             }
             let range: Option<ITfRange> = (*sel[0].range).as_ref().cloned();
             ManuallyDrop::drop(&mut sel[0].range);
-            let Some(range) = range else { return Ok(()); };
+            let Some(range) = range else {
+                return Ok(());
+            };
             let mut rc = RECT::default();
             let mut clipped = BOOL(0);
             if view.GetTextExt(ec, &range, &mut rc, &mut clipped).is_ok() {
                 *self.out.borrow_mut() = Some(rc);
             }
+        }
+        Ok(())
+    }
+}
+
+/// UIバグ4: ホストのスクロール・リフロー（`ITfTextLayoutSink::OnLayoutChange`）で
+/// 表示中の候補窓・読みモニタをキャレットへ追従させるための再照会セッション。
+/// OnLayoutChange の COM コールバック内からは同期 edit session を要求できない
+/// （TSF の再入規律。Mozc も非同期化している）ため、`TF_ES_ASYNC | TF_ES_READ` で
+/// 投げて本セッションの内側で GetTextExt し直し、結果を
+/// `text_service::layout_refresh_apply` へ渡す。矩形の取り方（候補窓=キャレット、
+/// 読みモニタ=composition 先頭→キャレットの2段試行）は QueryCaretRect /
+/// QueryMonitorAnchorRect と同一規律。
+#[implement(ITfEditSession)]
+pub struct RefreshAnchorOnLayout {
+    pub context: ITfContext,
+    pub composition: Rc<RefCell<Option<ITfComposition>>>,
+    /// セッション投入時点のレイアウト世代（TextService::layout_sink_gen）。投入後に
+    /// Activate/Deactivate/context 貼替が起きていたら、layout_refresh_apply が旧 context
+    /// の座標を現在の表示へ適用しない（巡2 E1/E3 — TF_ES_ASYNC セッションは旧 context を
+    /// 強参照で保持したまま遅延実行されるため、投入時の世代で結果の新旧を判別する）。
+    pub gen: u64,
+    // C-1: DLL_REF で生存数を数える。
+    pub(crate) _guard: ComObjectGuard,
+}
+
+impl ITfEditSession_Impl for RefreshAnchorOnLayout_Impl {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        // 巡1レビュー 8c2354e指摘3: 全 early-return 経路で layout_refresh_apply を呼び
+        // layout_refresh_pending を必ず解除する。さもないと一度失敗したら以後の
+        // OnLayoutChange がすべて pending で無視され追従が恒久的に止まる。
+        unsafe {
+            // 失敗時も pending 解消のため None,None で apply を呼ぶ（relayout は
+            // last_valid_anchor を使うので座標が失われるわけではない）。
+            let fail = || crate::text_service::layout_refresh_apply(self.gen, None, None);
+
+            let Ok(view) = self.context.GetActiveView() else {
+                fail();
+                return Ok(());
+            };
+            // キャレット矩形（候補窓用）。GetSelection の所有権は ManuallyDrop 規律で解放。
+            let mut sel = [TF_SELECTION {
+                range: ManuallyDrop::new(None),
+                style: TF_SELECTIONSTYLE {
+                    ase: TF_AE_NONE,
+                    fInterimChar: BOOL(0),
+                },
+            }];
+            let mut fetched = 0u32;
+            if self
+                .context
+                .GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)
+                .is_err()
+            {
+                // 失敗時の range 書込は未規定 — 書かれていた場合に備え fetched==0 枝と同じく
+                // TSF 側の参照をここで解放する（対称化。事後検証 2026-08-20 の指摘）。
+                ManuallyDrop::drop(&mut sel[0].range);
+                fail();
+                return Ok(());
+            }
+            if fetched == 0 {
+                ManuallyDrop::drop(&mut sel[0].range);
+                fail();
+                return Ok(());
+            }
+            let caret_range: Option<ITfRange> = (*sel[0].range).as_ref().cloned();
+            ManuallyDrop::drop(&mut sel[0].range);
+            let Some(caret_range) = caret_range else {
+                fail();
+                return Ok(());
+            };
+            let mut rc = RECT::default();
+            let mut clipped = BOOL(0);
+            let caret = view
+                .GetTextExt(ec, &caret_range, &mut rc, &mut clipped)
+                .ok()
+                .map(|_| rc);
+
+            // composition 先頭矩形（読みモニタ用）。取れなければキャレット矩形へ落ちる
+            // （QueryMonitorAnchorRect の2段試行と同じ）。borrow は clone で落とす。
+            let head = {
+                let comp = self.composition.borrow().clone();
+                comp.and_then(|c| c.GetRange().ok())
+                    .and_then(|r| r.Clone().ok())
+                    .and_then(|start| {
+                        let _ = start.Collapse(ec, TF_ANCHOR_START);
+                        let mut hrc = RECT::default();
+                        let mut hclipped = BOOL(0);
+                        view.GetTextExt(ec, &start, &mut hrc, &mut hclipped)
+                            .ok()
+                            .filter(|_| {
+                                !(hrc.left == 0
+                                    && hrc.top == 0
+                                    && hrc.right == 0
+                                    && hrc.bottom == 0)
+                            })
+                            .map(|_| hrc)
+                    })
+            };
+            let monitor = head.or(caret);
+
+            let to_anchor =
+                |r: Option<RECT>| r.and_then(crate::candidate_window::caret_rect_to_anchor);
+            crate::text_service::layout_refresh_apply(
+                self.gen,
+                to_anchor(caret),
+                to_anchor(monitor),
+            );
         }
         Ok(())
     }
@@ -667,8 +896,7 @@ impl ITfEditSession_Impl for QueryInputScopes_Impl {
             if variant.Anonymous.Anonymous.vt != VT_UNKNOWN {
                 return Ok(());
             }
-            let unk: Option<&IUnknown> =
-                (*variant.Anonymous.Anonymous.Anonymous.punkVal).as_ref();
+            let unk: Option<&IUnknown> = (*variant.Anonymous.Anonymous.Anonymous.punkVal).as_ref();
             let Some(scope) = unk.and_then(|u| u.cast::<ITfInputScope>().ok()) else {
                 return Ok(());
             };
@@ -681,9 +909,53 @@ impl ITfEditSession_Impl for QueryInputScopes_Impl {
                     .map(|s| s.0)
                     .collect();
                 CoTaskMemFree(Some(ptr as *const core::ffi::c_void));
-                *self.out.borrow_mut() = Some(crate::text_service::scopes_contain_password(&scopes));
+                *self.out.borrow_mut() =
+                    Some(crate::text_service::scopes_contain_password(&scopes));
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod composition_end_state_tests {
+    use super::{
+        classify_composition_end_error, composition_end_stays_pending, CompositionEndStatus,
+    };
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::E_UNEXPECTED;
+    use windows::Win32::UI::TextServices::{TF_E_DISCONNECTED, TF_E_LOCKED};
+
+    #[test]
+    fn failed_end_keeps_retry_only_while_same_composition_is_tracked() {
+        assert!(composition_end_stays_pending(false, true));
+        assert!(!composition_end_stays_pending(true, true));
+        // EndComposition が Err でも同期終了 callback が slot を落としたなら再試行は不要。
+        assert!(!composition_end_stays_pending(false, false));
+    }
+
+    #[test]
+    fn unexpected_end_with_unexpected_range_is_idempotently_closed() {
+        assert_eq!(
+            classify_composition_end_error(E_UNEXPECTED, Some(E_UNEXPECTED)),
+            CompositionEndStatus::Closed,
+        );
+    }
+
+    #[test]
+    fn terminal_and_transient_end_errors_are_distinct() {
+        assert_eq!(
+            classify_composition_end_error(TF_E_DISCONNECTED, None),
+            CompositionEndStatus::Terminal,
+        );
+        assert_eq!(
+            classify_composition_end_error(TF_E_LOCKED, None),
+            CompositionEndStatus::Retryable,
+        );
+        // Unknown HRESULTs are still bounded by the caller's retry budget.
+        assert_eq!(
+            classify_composition_end_error(HRESULT(0x80004005_u32 as i32), None),
+            CompositionEndStatus::Retryable,
+        );
     }
 }
