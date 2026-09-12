@@ -2,122 +2,185 @@
 
 # nospacekey
 
-**Space を押さない。モードと戦わない。**
+日本語も、コードも。入力の流れを止めない。
 
-日本語入力の「めんどくさい」を根本から消しにいく、Windows 用のかな漢字変換 IME。
+打ちながら変換。必要なときだけ、日本語へ。
+Windows 11 向けの、ローカルで動く日本語 IME。
 
-[![Release](https://img.shields.io/github/v/release/yachtida/nospacekey)](https://github.com/yachtida/nospacekey/releases/latest)
-[![License: MIT](https://img.shields.io/github/license/yachtida/nospacekey)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Windows%2011%20x64-blue)
-
-[紹介ページ](https://yachtida.github.io/nospacekey/) ・ [ダウンロード](https://github.com/yachtida/nospacekey/releases/latest)
+[Windows 版をダウンロード](https://github.com/yachtida/nospacekey/releases/latest) · [使いはじめる](#使いはじめる) · [基本操作](#基本操作)
 
 </div>
 
----
+<!-- 実機の録画を用意できたら、ここに短いデモを1本だけ追加する。
+     ライブ変換 → 候補の修正 → F8による一時かな入力、の操作を見せる。
+     実際の表示・速度を使い、未確認の動画パスは公開しない。 -->
 
-## こんな経験、ありませんか
+## 打つそばから、日本語に。
 
-### 「ターミナルに `ｇｉｔ　ｓｔａｔｕｓ`」
-
-Slack に日本語で返信して、その手でターミナルに戻る。切り忘れた IME がコマンドを
-全角で取ってしまい、Enter を押してから気づく——
-普通の IME は「日本語モードに入れたら、切るのも自分の仕事」だからこうなります。
-
-**nospacekey は逆です。** 普段は半角英数のまま(起動時から英数で始める設定もあります)。
-日本語を打ちたくなったら <kbd>F8</kbd> — そこだけ日本語モードになり、
-**確定した瞬間に自動で半角英数へ戻ります**(一時日本語モード)。
-「モードを切り忘れる」という概念そのものがなくなるので、コミットメッセージに
-一言日本語を入れても、次のキーはちゃんとショートカットとして働きます。
-
-### 「Space、Space、Space……変換のたびに親指が忙しい」
-
-nospacekey の変換は**ライブ変換**。打つそばから変換が追いかけてきて、
-そのまま打ち続ければ文が確定していきます。Space を押すのは候補を選び直したい
-ときだけ。「文節を区切って、変換して、確定して」というリズムから解放されます。
-macOS のライブ変換に慣れた人が Windows で恋しくなる、あれです。候補が出るだけでなく
-**確定まで自動で進む**のがポイントです。
-
-### 「error: expected ';'」
-
-コメントだけ日本語で書いて、次の行の `;` が「；」になっていた。全角スペースに
-至っては diff でも見えません。nospacekey は普段が半角英数のままなので全角が
-紛れ込む隙がなく、**日本語モードの最中でも記号は半角のまま**入ります
-(全角にしたい場合は設定で選べます)。
-
-### 「こんんいちは」
-
-急いで打つと出る「同じキーの打ちすぎ」も、<kbd>Tab</kbd> 一発で修復候補が
-出ます(修正変換)。確定すれば誤読みごと学習するので、次からは普通の変換で直ります。
-
-## 機能
-
-- **ライブ変換** — 打鍵に追随して自動で変換。従来の Space 変換もそのまま使えます
-- **一時日本語モード** — <kbd>F8</kbd>(変更可)で入り、確定すると自動で半角英数へ復帰
-- **モードレス再変換** — 半角英数で打ったローマ字を、選んで後から日本語化
-- **修正変換(Tab)** — 打ち間違いを修復し、誤読みも学習
-- **Shift+英字** — 文中に英単語を混ぜるときは Shift を押しながら打つだけ
-- **Zenzai ニューラル変換** — Vulkan 対応 GPU と GGUF モデルがある場合だけ、文脈を読む変換をローカルで実行。使えない環境では古典 LOUDS 変換で動作
-- **インライン予測(alpha・既定OFF)** — 明示確定後に続きをローカル CPU で予測し、右矢印/End で受理
-- **自動アップデート確認(既定OFF)** — 有効にしたユーザーだけが新しいリリースのメタデータを確認。自動ダウンロード・自動インストールはしません
-- **設定 GUI** — キーマップのリバインド、句読点・記号の全角半角、起動時の入力モードなど
-- **プライバシーファースト** — 変換・学習・ログはすべてローカル完結、既定で外部送信ゼロ([PRIVACY.md](PRIVACY.md))。パスワード欄では変換も学習もしません
-
-## インストール
-
-現在の安定版は **v1.5.0** です。
-
-1. [Releases](https://github.com/yachtida/nospacekey/releases/latest) から `nospacekey-setup-1.5.0-devsigned.exe` をダウンロード
-2. 実行してインストール(IME の登録はマシン単位のため、管理者権限を求められます)
-3. <kbd>Win</kbd> + <kbd>Space</kbd> で「nospacekey」を選択
-
-対応環境: Windows 11 x64
-
-> [!NOTE]
-> v1.5.0 は開発用の自己署名(dev署名)で配布しているため、初回実行時に Windows SmartScreen の警告が表示されます。
-> 「詳細情報」→「実行」で続行できます。ダウンロードしたファイルは各リリース添付の
-> `SHA256SUMS.txt` で検証できます。
-
-### Zenzai(ニューラル変換)を有効にする
-
-インストーラの「Zenzai(ニューラル変換)を使用する」タスクは既定で選択されています。
-不要な場合はインストール時に解除できます。モデルは
-[zenz-v3.1-small](https://huggingface.co/Miwa-Keita/zenz-v3.1-small-gguf)(CC-BY-SA-4.0)の
-`ggml-model-Q5_K_M.gguf` で、インストール後に設定画面から取得することもできます。
-Vulkan 対応 GPU、driver、runtime、モデルの準備がそろった場合だけ有効になり、
-利用できない環境では自動で古典変換へフォールバックします。
-
-### アンインストール
-
-Windows の「設定 → アプリ」から「nospacekey」をアンインストールしてください。
-IME の登録・配置ファイルはすべて除去されます。
-
-## アーキテクチャ
-
-TSF (Text Services Framework) 層を Rust、変換エンジンホストを Swift で実装し、
-名前付きパイプの JSON IPC で接続する分離プロセス構成です。エンジンが落ちても
-入力先のアプリを巻き込まず、劣化動作(読みのまま確定)にフォールバックします。
+ライブ変換が、入力中の読みをかな漢字交じりの文章へ変えていきます。
+変換結果が合っていれば、そのまま続きを。候補を選び直したいときだけ、<kbd>Space</kbd> を使います。
 
 ```
-nospacekey\
-├─ crates/
-│  ├─ tip/          # TSF テキスト入力プロセッサ (Rust, COM) → nospacekey_tip.dll
-│  ├─ ipc/          # JSON メッセージ型・フレーミング・パイプ client
-│  ├─ settings/     # 設定の型と永続化
-│  ├─ config/       # 設定 GUI (Tauri) → NospacekeyConfig.exe
-│  └─ testbench/    # ヘッドレス受入シナリオ
-├─ engine-host/     # 変換エンジンホスト (Swift) → NospacekeyEngineHost.exe
-└─ installer/       # Inno Setup スクリプト
+日本語を打つ ──→ 入力中に変換 ──→ Enter で確定
+                       │
+                 候補を変えたいときは Space
 ```
 
-## コントリビューション
+長文入力では、先頭の文節を順次自動確定します。最後に残った入力は <kbd>Enter</kbd> で確定。
+ライブ変換をオフにして、Space で変換する使い方もできます。
 
-小規模な個人プロジェクトのため、現在 Pull Request は受け付けていません。
-不具合報告や提案は [Issue](https://github.com/yachtida/nospacekey/issues) までお寄せください。
+## 日本語は、必要なときだけ。
+
+コードやコマンドの合間に、日本語のコメントをひと言。
+一時かな入力なら、半角英数モードで <kbd>F8</kbd> を押して日本語を入力し、確定すると自動で半角英数へ戻ります。
+
+```
+半角英数 ── F8 ──→ 日本語を入力 ── Enter で確定 ──→ 半角英数
+                                                  戻す操作は不要
+```
+
+日本語を続けて書くときは、通常の日本語モードも使えます。
+一時かな入力は、いつもの入力方法を置き換えるのではなく、選べるもう一つの使い方です。
+
+## 使いはじめる
+
+対応環境：Windows 11 x64。基本のかな漢字変換に、ニューラル変換用の GPU やモデルは不要です。
+
+1. [最新リリース](https://github.com/yachtida/nospacekey/releases/latest)の Assets から、`nospacekey-setup-` で始まる .exe をダウンロードします。
+2. インストーラを実行します。IME の登録には管理者権限が必要です。
+3. <kbd>Win</kbd> + <kbd>Space</kbd> で nospacekey を選びます。
+
+> [!IMPORTANT]
+> ファイル名に `-devsigned` を含む版は、開発用証明書で署名されています。Windows SmartScreen の警告が表示される場合があります。
+> 配布元がこのリポジトリの Releases であることを確認し、実行するか判断してください。ダウンロードしたファイルは、リリース添付の `SHA256SUMS.txt` と照合できます。
+
+### 最初に試すこと
+
+まずは日本語を入力し、ライブ変換を試してみてください。ライブ変換は既定でオンです。
+
+英数を中心に使う場合は、言語バーの「設定」から 一般 → 新しいアプリの入力モード → 半角英数で始める をオンにします。新しいアプリを開き、<kbd>F8</kbd> で一時かな入力を試せます。
+
+「半角英数で始める」は既定ではオフです。日本語中心の使い方なら、変更する必要はありません。
+
+<details>
+<summary>アンインストールするには</summary>
+
+Windows の「設定 → アプリ」から nospacekey をアンインストールしてください。使用中のアプリに IME が読み込まれている場合は、Windows の再起動が必要になることがあります。
+
+</details>
+
+## 基本操作
+
+以下は既定のキー設定です。
+
+| やりたいこと | 操作 |
+| --- | --- |
+| 日本語・半角英数を切り替える | 入力していないときに <kbd>半角/全角</kbd>、または <kbd>Alt</kbd> + <kbd>;</kbd> |
+| 半角英数から、一時的に日本語を入力する | 入力開始前に <kbd>F8</kbd>。確定すると半角英数へ戻ります |
+| 入力を確定する | <kbd>Enter</kbd> |
+| 手動で変換・候補を選び直す | <kbd>Space</kbd> で文節を変換。もう一度押すと候補一覧を表示 |
+| 変換する文節を移動する | 変換中に <kbd>←</kbd> / <kbd>→</kbd> |
+| 文節の区切りを変える | 変換中に <kbd>Shift</kbd> + <kbd>←</kbd> / <kbd>→</kbd>。変更した区間は <kbd>Space</kbd> で再変換 |
+| 打ち間違いの修復候補を出す | 読みの入力中に <kbd>Tab</kbd> |
+
+F8 の役割は入力状態で変わります。上の一時かな入力は未確定文字列がないときの操作で、変換中の F8 は半角カナへの表記変換です。機能キーの割り当ては、設定の「キー設定」から変更できます。
+
+<details>
+<summary>もっと便利に使う：再変換・英字・記号・辞書・外観</summary>
+
+| 機能 | できること |
+| --- | --- |
+| モードレス再変換 | 半角英数で打ったローマ字を選択し、<kbd>変換</kbd> または <kbd>Alt</kbd> + <kbd>/</kbd> で後から日本語化 |
+| 英字の入力 | 日本語入力中に <kbd>Shift</kbd> + 英字で、英語入力モードへ。既定では確定まで英字入力が続きます |
+| 記号の幅 | ; や : などの記号は既定で半角。全角にする記号も個別に選択できます。数字・句読点の幅は別設定です |
+| 読みモニタ | ライブ変換中も、打っている読みを小窓で確認できます |
+| 学習・ユーザー辞書 | 変換履歴の学習や単語登録に対応。学習の無効化・履歴の消去もできます |
+| 外観 | ライト／ダーク、フォント、配色などを調整できます |
+
+</details>
+
+## 文脈を読む変換も、ローカルで。
+
+Zenzai は、文脈を考慮して候補を選ぶニューラル変換です。対応する Vulkan GPU・ドライバ・実行環境とモデルがそろった場合に利用できます。
+
+| 変換方式 | 必要なもの |
+| --- | --- |
+| 通常のかな漢字変換 | 本体のインストールのみ。追加モデルは不要 |
+| Zenzai ニューラル変換 | Vulkan 対応 GPU・ドライバ・実行環境と GGUF モデル |
+
+Zenzai を利用できない環境では、通常のかな漢字変換で動作します。
+
+インストーラの「Zenzai（ニューラル変換）を使用する」は既定で選択されています。不要なら解除してください。モデルは、インストール後に設定画面から取得することもできます。
+
+<details>
+<summary>インライン予測を試す（アルファ版・既定オフ）</summary>
+
+明示的に確定した文章の続きを、薄い文字で提案する機能です。<kbd>→</kbd> または <kbd>End</kbd> で受け入れ、<kbd>Esc</kbd> で閉じます。
+
+専用モデルの取得と Vulkan 対応 GPU が必要です。推論はローカルの GPU で行い、GPU を利用できない場合は予測を無効にして通常変換を続けます。設定画面から有効にできます。
+
+アルファ版のため、動作や仕様は今後変更される可能性があります。
+
+</details>
+
+## 入力内容は、あなたの PC の中に。
+
+変換・学習・予測はローカルで処理し、入力内容を外部 API へ送りません。テレメトリやクラッシュレポートの自動送信もありません。
+
+モデルの取得や更新確認では通信が発生します。自動アップデート確認は既定でオフで、有効にしても更新を自動でダウンロード・インストールすることはありません。
+
+パスワード／PIN 入力欄を検出した場合は、変換・学習・予測を行いません。詳しくは[プライバシー方針](PRIVACY.md)をご覧ください。
+
+## 不具合報告・開発について
+
+不具合や機能の提案は [Issues](https://github.com/yachtida/nospacekey/issues) へ。Windows のバージョン、nospacekey のバージョン、入力先アプリ、再現手順があると調査の助けになります。入力例に個人情報や機密情報を含めないでください。
+
+現在、Pull Request は受け付けていません。脆弱性の報告方法は [SECURITY.md](SECURITY.md) をご覧ください。
+
+<details>
+<summary>内部構成</summary>
+
+Windows の入力処理を担う TSF 層を Rust、変換エンジンホストを Swift で実装しています。両者は別プロセスで動作し、名前付きパイプの JSON IPC で通信します。
+
+```
+入力先アプリ
+    │
+    └─ TSF / TIP（Rust）
+              │ 名前付きパイプ / JSON
+              └─ 変換エンジンホスト（Swift）
+                      └─ かな漢字変換 / Zenzai
+
+設定アプリ：Tauri
+インストーラ：Inno Setup
+```
+
+| ディレクトリ | 役割 |
+| --- | --- |
+| `crates/tip` | TSF テキスト入力プロセッサ |
+| `crates/ipc` | IPC メッセージとパイプ通信 |
+| `crates/settings` | 設定の型・保存 |
+| `crates/config` | 設定 GUI |
+| `crates/testbench` | ヘッドレス受入シナリオ |
+| `engine-host` | 変換エンジンホスト |
+| `installer` | インストーラ |
+
+</details>
+
+## 謝辞・ライセンス
+
+nospacekey は [MIT License](LICENSE) で公開しています。次のプロジェクトの成果を利用しています。
+
+- [AzooKeyKanaKanjiConverter](https://github.com/azooKey/AzooKeyKanaKanjiConverter) — かな漢字変換エンジン（MIT）
+- [zenz-v3.1-small](https://huggingface.co/Miwa-Keita/zenz-v3.1-small-gguf) — Zenzai ニューラル変換モデル（CC-BY-SA-4.0）
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) — ローカル推論（MIT）
+
+第三者コンポーネントのライセンス・帰属は [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にまとめています。
+
+本プロジェクトは azooKey プロジェクトとは独立した非公式プロジェクトです。お問い合わせは、上流ではなく当リポジトリの Issues へお願いします。
 
 ## コントリビューター
 
-機能要望・不具合報告を通じて nospacekey の形作りに協力いただいた方々（Issue からのコントリビューション）:
+機能要望・不具合報告を通じて、ご協力いただいた方々：
 
 <!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section. -->
 <!-- prettier-ignore-start -->
@@ -132,23 +195,12 @@ nospacekey\
 
 <!-- markdownlint-restore -->
 <!-- prettier-ignore-end -->
-
 <!-- ALL-CONTRIBUTORS-LIST:END -->
 
-## 謝辞
+<details>
+<summary>免責事項</summary>
 
-nospacekey は次のオープンソースプロジェクトの成果の上に成り立っています。
-
-- [AzooKeyKanaKanjiConverter](https://github.com/azooKey/AzooKeyKanaKanjiConverter) (MIT) — かな漢字変換エンジン
-- [zenz-v3.1-small](https://huggingface.co/Miwa-Keita/zenz-v3.1-small-gguf) (CC-BY-SA-4.0) — Zenzai ニューラル変換モデル
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT) — ローカル LLM 推論
-
-本プロジェクトは azooKey プロジェクトとは独立した非公式プロジェクトです。
-本プロジェクトに関するお問い合わせは、上流ではなく当リポジトリの Issue へお願いします。
-
-## 免責事項
-
-nospacekey は [MIT License](LICENSE) に基づき「**現状有姿(AS IS)**」で提供される無償の
+nospacekey は [MIT License](LICENSE) に基づき「現状有姿(AS IS)」で提供される無償の
 ソフトウェアであり、明示・黙示を問わずいかなる保証も行いません。IME はシステム全体の
 文字入力に関与するという性質上、不具合により入力不能・入力内容の欠落・アプリケーションの
 異常終了などが発生する可能性があります。本ソフトウェアの使用または使用不能から生じる
@@ -157,10 +209,4 @@ nospacekey は [MIT License](LICENSE) に基づき「**現状有姿(AS IS)**」�
 利用はご自身の判断と責任でお願いします。重要な作業の前にはデータの保存・バックアップを
 推奨します。
 
-## ライセンス
-
-[MIT License](LICENSE)
-
-同梱・静的リンクする第三者コンポーネントのライセンスと帰属は
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にまとめています。
-脆弱性の報告方法は [SECURITY.md](SECURITY.md) をご覧ください。
+</details>
