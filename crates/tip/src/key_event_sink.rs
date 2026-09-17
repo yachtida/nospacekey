@@ -2604,6 +2604,7 @@ impl TextService_Impl {
         if composing {
             self.disarm_debounce();
             self.begin_explicit_snapshot_wait();
+            if self.local_converting() { self.render_local_edit(ctx); }
         }
     }
 

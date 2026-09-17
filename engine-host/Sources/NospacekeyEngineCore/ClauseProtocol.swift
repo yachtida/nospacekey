@@ -142,10 +142,12 @@ struct ClauseCandidatesRequest: Codable, Equatable, Sendable {
     let reading_start: UInt32
     let reading_end: UInt32
     let preceding_surfaces: [PrecedingSurface]
+    var include_prefix_candidates: Bool? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.key == rhs.key && sameWireText(lhs.reading, rhs.reading) && lhs.reading_start == rhs.reading_start
             && lhs.reading_end == rhs.reading_end && lhs.preceding_surfaces == rhs.preceding_surfaces
+            && (lhs.include_prefix_candidates ?? false) == (rhs.include_prefix_candidates ?? false)
     }
 
     func validate() throws {
@@ -157,8 +159,11 @@ struct ClauseCandidatesRequest: Codable, Equatable, Sendable {
     func validateCandidates(_ candidates: [ClauseCandidate]) throws {
         try validate()
         guard !candidates.isEmpty else { throw ClauseValidationError.surface }
+        let boundaries = Set(try ClauseCoordinates.legalBoundaries(reading))
         for candidate in candidates {
-            guard candidate.reading_start == reading_start, candidate.reading_end == reading_end else { throw ClauseValidationError.range }
+            guard candidate.reading_start == reading_start, candidate.reading_end > reading_start,
+                  candidate.reading_end <= reading_end, boundaries.contains(candidate.reading_end),
+                  include_prefix_candidates == true || candidate.reading_end == reading_end else { throw ClauseValidationError.range }
             guard !candidate.surface.isEmpty else { throw ClauseValidationError.surface }
             guard !candidate.token.isEmpty else { throw ClauseValidationError.token }
         }

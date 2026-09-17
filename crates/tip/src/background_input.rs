@@ -742,7 +742,7 @@ impl EngineInputTransport {
             }) => {
                 self.identity_mismatch = true;
                 crate::text_service::tip_log(&format!(
-                    "ev=input_engine_identity_mismatch expected_proto={} expected_boot={} actual_proto={actual_proto:?} actual_boot={actual_boot:?}",
+                    "ev=input_engine_identity_mismatch expected_proto={} client_build={} actual_proto={actual_proto:?} actual_boot={actual_boot:?}",
                     PROTO_VERSION,
                     env!("CARGO_PKG_VERSION")
                 ));
@@ -1332,7 +1332,7 @@ fn configure_snapshot_protocol(
     else {
         return SnapshotConfigureOutcome::RetryableFailure;
     };
-    if proto != Some(PROTO_VERSION) || boot.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
+    if !ipc::protocol::is_compatible_protocol(proto) {
         return SnapshotConfigureOutcome::VersionMismatch {
             actual: proto,
             actual_boot: boot,
@@ -1441,6 +1441,8 @@ impl SnapshotTransport for EngineSnapshotTransport {
                     })
                     .collect(),
                 explicit: snapshot.purpose == SnapshotPurpose::Explicit,
+                live_search_width: (snapshot.purpose == SnapshotPurpose::Live)
+                    .then_some(snapshot.live_search_width),
                 left_context: snapshot.left_context.clone(),
             },
             match snapshot.purpose {
@@ -1606,7 +1608,7 @@ impl EngineSnapshotEnhancementTransport {
                 }) => {
                     self.identity_mismatch = true;
                     crate::text_service::tip_log(&format!(
-                        "ev=enhancement_engine_identity_mismatch expected_proto={} expected_boot={} actual_proto={actual_proto:?} actual_boot={actual_boot:?}",
+                        "ev=enhancement_engine_identity_mismatch expected_proto={} client_build={} actual_proto={actual_proto:?} actual_boot={actual_boot:?}",
                         PROTO_VERSION,
                         env!("CARGO_PKG_VERSION")
                     ));
@@ -1843,13 +1845,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_protocol_sends_nothing_after_a_boot_identity_mismatch() {
+    fn snapshot_protocol_sends_nothing_after_a_protocol_mismatch() {
         let requests = Mutex::new(Vec::new());
         let mut responses = [Some(Response::Session {
             engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
             learning_generation: 0,
             session: 41,
-            proto: Some(PROTO_VERSION),
+            proto: Some(PROTO_VERSION - 1),
             boot: Some("old-build".into()),
         })]
         .into_iter();
@@ -1867,7 +1869,7 @@ mod tests {
         assert_eq!(
             outcome,
             SnapshotConfigureOutcome::VersionMismatch {
-                actual: Some(PROTO_VERSION),
+                actual: Some(PROTO_VERSION - 1),
                 actual_boot: Some("old-build".into()),
             }
         );
@@ -1897,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_protocol_configures_only_after_the_full_identity_matches() {
+    fn snapshot_protocol_configures_a_compatible_different_product_version() {
         let requests = Mutex::new(Vec::new());
         let mut responses = [
             Some(Response::Session {
@@ -1905,7 +1907,7 @@ mod tests {
                 learning_generation: 0,
                 session: 42,
                 proto: Some(PROTO_VERSION),
-                boot: Some(env!("CARGO_PKG_VERSION").into()),
+                boot: Some("compatible-older-build".into()),
             }),
             Some(Response::Ok),
             Some(Response::Ok),
@@ -3064,6 +3066,7 @@ mod tests {
             },
             purpose: SnapshotPurpose::Live,
             segments: vec![segment("nihon")],
+            live_search_width: 1,
             left_context: None,
         }
     }

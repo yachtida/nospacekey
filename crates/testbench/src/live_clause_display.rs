@@ -157,7 +157,7 @@ pub fn run() -> i32 {
 
     let mut eaten = true;
     for key in scenarios::typed("kyouhaiitenkidesu") { eaten &= host.feed_key(key.0); }
-    let kana = "きょうはいいあんてんきです";
+    let kana = "きょうはいいてんきです";
     let mut settled = String::new();
     for _ in 0..5 {
         host.settle_debounce();
@@ -176,6 +176,8 @@ pub fn run() -> i32 {
     let presented = wait_until(|| read_events(pid).iter().skip(events)
         .any(|event| matches!(event, Ev::ClausePresented { ready: false, .. })));
     let passed = check("space-presents-clause-view", eaten && presented, host.store.preedit());
+    let passed = check("first-space-preserves-live-text", host.store.preedit() == settled,
+        (&settled, &host.store.preedit())) && passed;
 
     let labels = probe_preedit_attributes(&host);
     let target_run = first_target_run(&labels);
@@ -184,6 +186,33 @@ pub fn run() -> i32 {
         (&host.store.preedit(), &labels)) && passed;
     passed = check("later-clauses-are-converted",
         labels.last().is_some_and(|l| l == "converted"), (&host.store.preedit(), &labels)) && passed;
+
+    let events = read_events(pid).len();
+    eaten &= host.feed_key(scenarios::SPACE.0);
+    let ready = wait_until(|| read_events(pid).iter().skip(events)
+        .any(|event| matches!(event, Ev::ClausePresented { ready: true, .. })));
+    let candidates = host.candidate_strings();
+    let selected = host.candidate_selection();
+    let selected_end = target_run.map(|(_, end)| end).unwrap_or(0);
+    let original_units = settled.encode_utf16().collect::<Vec<_>>();
+    let first_clause = String::from_utf16_lossy(&original_units[..selected_end]);
+    let suffix = String::from_utf16_lossy(&original_units[selected_end..]);
+    let expected = candidates.get(1).map(|candidate| format!("{candidate}{suffix}"));
+    passed = check("second-space-selects-second-candidate", eaten && ready
+        && candidates.first() == Some(&first_clause) && selected == 1
+        && expected.as_deref() == Some(host.store.preedit().as_str()),
+        (&candidates, selected, &host.store.preedit())) && passed;
+    // Third Space advances once again, then Esc retains that selected surface.
+    eaten &= host.feed_key(scenarios::SPACE.0);
+    let next = if candidates.len() > 2 { 2 } else { 0 };
+    let expected = candidates.get(next).map(|candidate| format!("{candidate}{suffix}"));
+    passed = check("third-space-advances-once", eaten
+        && host.candidate_selection() == next as u32
+        && expected.as_deref() == Some(host.store.preedit().as_str()),
+        (host.candidate_selection(), &host.store.preedit())) && passed;
+    eaten &= host.feed_key(scenarios::ESC.0);
+    passed = check("escape-keeps-selected-surface", eaten
+        && expected.as_deref() == Some(host.store.preedit().as_str()), host.store.preedit()) && passed;
 
     let events = read_events(pid).len();
     let writes_before_nav = host.store.text_writes.get();

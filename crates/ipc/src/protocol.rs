@@ -1,13 +1,17 @@
 use serde::{Deserialize, Serialize};
 
-/// IPC プロトコルの互換世代。TIP は StartSession 応答の `proto` とbuild identityを突合し、
-/// 不一致（欠落を含む）を検出した接続へ後続要求を送らない。
-/// **wire 互換でも、その版が依存する op を追加したら bump する** — 「互換が壊れた時だけ bump」だと
-/// 新 op が再起動まで無言で decline / no-op になる（v1.2.0 の辞書即時反映・文節ナビ・
-/// 訂正昇格で顕在化）。読み手が依存しない optional フィールドの追加
-/// （skip_serializing_if で旧形とバイト一致）では bump しない。Swift 側
-/// `ProtocolVersion.current` とミラー（一字一句一致規約）。
-pub const PROTO_VERSION: u32 = 9;
+/// IPC プロトコルの互換世代。製品バージョンとは独立して接続の互換性を判定する。
+/// TIP は StartSession 応答の `proto` 不一致（欠落を含む）を検出した接続へ後続要求を送らない。
+/// 世代を上げるのは、旧版との通信で要求・応答を解釈できない、または変換・確定・学習の
+/// 整合性を保てず、従来動作へのフォールバックもできない場合だけ。新機能の追加だけでは上げない。
+/// 省略・無視しても従来動作を維持する optional 項目（例: live_search_width）は同じ世代にする。
+/// 詳細と変更時の検証基準: docs/adr/0006-ipc-protocol-generation-policy.md。
+/// Swift 側 `ProtocolVersion.current` と同時に変更する。
+pub const PROTO_VERSION: u32 = 10;
+
+pub fn is_compatible_protocol(version: Option<u32>) -> bool {
+    version == Some(PROTO_VERSION)
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotSegment {
@@ -123,6 +127,10 @@ pub enum Request {
         segments: Vec<SnapshotSegment>,
         #[serde(default, skip_serializing_if = "is_false")]
         explicit: bool,
+        /// Classic live search width (1 or 10); omitted means the legacy width 1.
+        /// Explicit conversion always uses 10, regardless of this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_search_width: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         left_context: Option<String>,
     },
@@ -199,6 +207,9 @@ pub enum Request {
     /// persist エンジンの graceful 停止（学習 flush → 応答後 exit）。session を伴わない
     /// プロセス全体操作。アンインストーラのNospacekeyConfig.exe --stop-engineから送る。
     Shutdown,
+    /// モデル資産の置換前に使う保守停止。未確定入力を持つセッションが1つでもあれば
+    /// Errorで拒否し、空の場合だけ新規要求を閉じて応答後に停止する。
+    PrepareMaintenance,
     /// Zenzai の GPU runtime 状態を問い合わせる。モデル導入状況とは別の観測で、引数を持たない。
     QueryZenzaiStatus,
     /// 失敗 latch を明示的に解除して GPU runtime の再試行を受け付ける。応答は受理のみで、
@@ -258,7 +269,7 @@ pub enum Response {
         #[serde(flatten)]
         status: crate::clause::ReceiptStatus,
     },
-    /// StartSession 応答。wire世代とEngineHost buildの完全一致だけをTIPが採用する。
+    /// StartSession 応答。proto が互換性を表し、boot は診断用の製品バージョン。
     Session {
         session: i64,
         engine_epoch: String,
@@ -400,6 +411,7 @@ mod tests {
                 },
             ],
             explicit: false,
+            live_search_width: None,
             left_context: None,
         };
         let json = serde_json::to_string(&request).unwrap();
@@ -422,6 +434,19 @@ mod tests {
     }
 
     #[test]
+    fn live_search_width_roundtrips_and_defaults_to_legacy_when_omitted() {
+        let legacy = r#"{"method":"LiveSnapshot","params":{"composition":8,"revision":1,"configuration_generation":1,"connection_generation":1,"conversion_revision":0,"request_id":1,"segments":[{"text":"すこーぷがいなので","style":"direct"}]}}"#;
+        let mut request: Request = serde_json::from_str(legacy).unwrap();
+        let Request::LiveSnapshot { live_search_width, .. } = &mut request else { panic!("expected snapshot") };
+        assert_eq!(*live_search_width, None);
+        *live_search_width = Some(10);
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["params"]["live_search_width"], 10);
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+        assert!(is_compatible_protocol(Some(10)), "an optional search width must not disconnect existing clients");
+    }
+
+    #[test]
     fn explicit_snapshot_candidates_roundtrip_and_require_protocol_nine() {
         let request = Request::LiveSnapshot {
             conversion_revision: 0,
@@ -435,6 +460,7 @@ mod tests {
                 style: None,
             }],
             explicit: true,
+            live_search_width: None,
             left_context: None,
         };
         let json = serde_json::to_string(&request).unwrap();
@@ -455,7 +481,7 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), response);
-        assert_eq!(PROTO_VERSION, 9);
+        assert_eq!(PROTO_VERSION, 10);
     }
 
     #[test]
@@ -895,6 +921,14 @@ mod tests {
     }
 
     #[test]
+    fn prepare_maintenance_has_an_exact_unit_variant_wire_shape() {
+        let request = Request::PrepareMaintenance;
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"method":"PrepareMaintenance"}"#);
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+    }
+
+    #[test]
     fn zenzai_status_requests_roundtrip_without_params() {
         for request in [Request::QueryZenzaiStatus, Request::RetryZenzai] {
             let js = serde_json::to_string(&request).unwrap();
@@ -960,7 +994,11 @@ mod tests {
         )
         .unwrap();
         match legacy {
-            Response::ZenzaiStatus { latency_live, latency_convert, .. } => {
+            Response::ZenzaiStatus {
+                latency_live,
+                latency_convert,
+                ..
+            } => {
                 assert!(latency_live.is_none());
                 assert!(latency_convert.is_none());
             }
@@ -987,13 +1025,13 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&r).unwrap(),
             format!(
-                r#"{{"result":"Session","session":7,"engine_epoch":"11111111-1111-4111-8111-111111111111","learning_generation":6,"proto":9,"boot":"{}"}}"#,
+                r#"{{"result":"Session","session":7,"engine_epoch":"11111111-1111-4111-8111-111111111111","learning_generation":6,"proto":10,"boot":"{}"}}"#,
                 env!("CARGO_PKG_VERSION")
             )
         );
         assert_eq!(
             serde_json::from_str::<Response>(&format!(
-                r#"{{"result":"Session","session":7,"engine_epoch":"11111111-1111-4111-8111-111111111111","learning_generation":6,"proto":9,"boot":"{}"}}"#,
+                r#"{{"result":"Session","session":7,"engine_epoch":"11111111-1111-4111-8111-111111111111","learning_generation":6,"proto":10,"boot":"{}"}}"#,
                 env!("CARGO_PKG_VERSION")
             ))
             .unwrap(),
@@ -1211,6 +1249,6 @@ mod tests {
 
     #[test]
     fn explicit_snapshot_candidates_bump_protocol_generation() {
-        assert_eq!(PROTO_VERSION, 9);
+        assert_eq!(PROTO_VERSION, 10);
     }
 }

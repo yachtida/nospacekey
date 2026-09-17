@@ -49,6 +49,7 @@ struct IssuedCandidates {
     deadline: Instant,
     conversion: Option<ConvertClausesRequest>,
     rebaseline_used: bool,
+    advance: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +89,7 @@ impl ClauseRebaseline {
                 text: self.original.request.reading.clone(), style: Some("direct".into()),
             }],
             explicit: true,
+            live_search_width: None,
             left_context,
         }
     }
@@ -183,6 +185,35 @@ impl ClauseConversion {
     }
 
     pub fn reset_notation_cycle(&mut self) { self.notation_cycle = None; }
+
+    /// Freeze the applied live clauses on the first Space. A locally typed
+    /// suffix remains a reading clause until the user converts that interval.
+    pub fn promote_live_display(&self, identity: SnapshotIdentity, reading: &str, text: &str) -> Option<Self> {
+        if self.identity.composition != identity.composition
+            || self.identity.configuration_generation != identity.configuration_generation
+            || self.identity.connection_generation != identity.connection_generation
+            || self.identity.revision > identity.revision
+            || self.clauses.iter().all(|clause| clause.source == SurfaceSource::Reading) { return None; }
+        let suffix = reading.strip_prefix(&self.reading)?;
+        if text != format!("{}{suffix}", self.text()) { return None; }
+        let mut model = self.clone();
+        if !suffix.is_empty() {
+            let start = ReadingPosition(u32::try_from(self.reading.chars().count()).ok()?);
+            let end = ReadingPosition(u32::try_from(reading.chars().count()).ok()?);
+            if !ipc::clause::legal_boundaries(reading).ok()?.contains(&start) { return None; }
+            let id = model.next_clause_id?;
+            model.next_clause_id = Some(id.checked_add(1)?);
+            model.clauses.push(LocalClause { id: ClauseId(id), start, end,
+                surface: suffix.into(), source: SurfaceSource::Reading });
+            model.reading = reading.into();
+            model.sentence_token = None;
+            model.revision = model.revision.checked_add(1)?;
+        }
+        model.identity = identity;
+        model.mode = OperationMode::Converting;
+        model.user_driven = true;
+        Some(model)
+    }
 
     pub fn begin_reading_edit(&mut self, index: usize) -> LocalEditOutcome {
         let Some(clause) = self.clauses.get(index) else { return LocalEditOutcome::Unchanged; };
@@ -391,8 +422,9 @@ impl ClauseConversion {
         self.cancel_stage = CancelStage::None;
         self.boundary_request = Some(IssuedCandidates {
             request: ClauseCandidatesRequest { key: request.key, reading: request.reading.clone(),
-                reading_start: selected.start, reading_end: selected.end, preceding_surfaces: request.preceding_surfaces.clone() },
-            conversion: Some(request.clone()), deadline: now + Duration::from_millis(1200), rebaseline_used: false,
+                reading_start: selected.start, reading_end: selected.end, preceding_surfaces: request.preceding_surfaces.clone(),
+                include_prefix_candidates: true },
+            conversion: Some(request.clone()), deadline: now + Duration::from_millis(1200), rebaseline_used: false, advance: 0,
         });
         self.user_driven = true;
         Some(request)
@@ -535,18 +567,8 @@ impl ClauseConversion {
             self.end_request(key);
             return None;
         };
-        // The initial snapshot never supplies surfaces. Only this explicit,
-        // exact-interval response may replace the selected clause.
-        let clause = &clauses[0];
-        self.clauses[self.selected] = LocalClause {
-            id: clause.id, start: clause.reading_start, end: clause.reading_end, surface: clause.surface.clone(),
-            source: match clause.state {
-                ClauseState::Reading => SurfaceSource::Reading,
-                ClauseState::Converted => SurfaceSource::Candidate {
-                    token: clause.candidate_token.clone().expect("validated converted token"), explicitly_selected: false,
-                },
-            },
-        };
+        // This calculation restores an expired candidate request. Keep the
+        // visible surface as candidate 1; only selecting a candidate changes it.
         self.revision = revision;
         self.last_request_id = candidate_request_id;
         let mut next = pending;
@@ -718,13 +740,50 @@ impl ClauseConversion {
         let clause = &self.clauses[self.selected];
         let selected = candidates
             .iter()
-            .position(|c| c.surface == clause.surface)
+            .position(|c| c.surface == clause.surface && c.reading_end == clause.end)
             .unwrap_or(0);
         self.window = CandidateWindow::Ready {
             clause: clause.id,
             candidates,
             selected,
         };
+    }
+
+    /// The surface already shown is the first choice of a fresh list. Cache
+    /// this order so closing/reopening the window does not reorder user choices.
+    fn anchor_candidates(&self, id: ClauseId, candidates: &mut Vec<ClauseCandidate>) {
+        let Some(clause) = self.clauses.iter().find(|c| c.id == id) else { return; };
+        if clause.source == SurfaceSource::Reading { return; }
+        let anchor = candidates.iter().position(|c| c.surface == clause.surface && c.reading_end == clause.end)
+            .map(|index| candidates.remove(index))
+            .unwrap_or_else(|| ClauseCandidate {
+                surface: clause.surface.clone(),
+                token: match &clause.source {
+                    SurfaceSource::Candidate { token, .. } => token.clone(),
+                    _ => String::new(), // Local-only entry; never sent as an engine token.
+                },
+                reading_start: clause.start,
+                reading_end: clause.end,
+            });
+        candidates.retain(|c| c.surface != anchor.surface || c.reading_end != anchor.reading_end);
+        candidates.insert(0, anchor);
+    }
+
+    /// A Space that opens the list also moves once. Preserve that intent across
+    /// asynchronous replies (including a rebaseline), without replaying the key.
+    pub fn cycle_candidate(&mut self, request_id: u64, direction: i32, now: Instant)
+        -> Option<ClauseCandidatesRequest> {
+        if matches!(self.window, CandidateWindow::Ready { .. }) {
+            self.advance_candidate(direction);
+            return None;
+        }
+        let request = self.open_candidates(request_id, now);
+        if let Some(request) = &request {
+            self.issued.get_mut(&request.key.request_id).unwrap().advance = direction;
+        } else if matches!(self.window, CandidateWindow::Ready { .. }) {
+            self.advance_candidate(direction);
+        }
+        request
     }
 
     /// Caller allocates IDs from the connection owner's counter shared with initial snapshots.
@@ -766,6 +825,7 @@ impl ClauseConversion {
             reading_start: c.start,
             reading_end: c.end,
             preceding_surfaces: preceding,
+            include_prefix_candidates: true,
         };
         self.issued.insert(
             request_id,
@@ -774,6 +834,7 @@ impl ClauseConversion {
                 deadline: now + Duration::from_millis(1200),
                 conversion: None,
                 rebaseline_used: false,
+                advance: 0,
             },
         );
         self.window = CandidateWindow::Loading(key);
@@ -850,17 +911,22 @@ impl ClauseConversion {
                 self.end_request(key);
                 false
             }
-            ClauseCandidatesStatus::Ready { candidates } => {
+            ClauseCandidatesStatus::Ready { mut candidates } => {
                 if issued.request.validate_candidates(&candidates).is_err() {
                     self.end_request(key);
                     return false;
                 }
+                let advance = issued.advance;
+                let start = issued.request.reading_start;
+                let end = issued.request.reading_end;
+                let preceding = issued.request.preceding_surfaces.clone();
+                self.anchor_candidates(key.clause_id, &mut candidates);
                 self.cache.insert(
                     key.clause_id,
                     CachedCandidates {
-                        start: issued.request.reading_start,
-                        end: issued.request.reading_end,
-                        preceding: issued.request.preceding_surfaces.clone(),
+                        start,
+                        end,
+                        preceding,
                         candidates: candidates.clone(),
                     },
                 );
@@ -872,6 +938,7 @@ impl ClauseConversion {
                     && self.window == CandidateWindow::Loading(key)
                 {
                     self.open_ready(candidates);
+                    if advance != 0 { self.advance_candidate(advance); }
                     true
                 } else {
                     false
@@ -906,8 +973,8 @@ impl ClauseConversion {
         let CandidateWindow::Ready {
             clause,
             candidates,
-            selected,
-        } = &mut self.window
+            ..
+        } = &self.window
         else {
             return false;
         };
@@ -916,7 +983,7 @@ impl ClauseConversion {
         };
         let Some(c) = self
             .clauses
-            .get_mut(self.selected)
+            .get(self.selected)
             .filter(|c| c.id == *clause)
         else {
             return false;
@@ -924,15 +991,39 @@ impl ClauseConversion {
         let Some(revision) = self.revision.checked_add(1) else {
             return false;
         };
-        *selected = index;
-        c.surface = candidate.surface.clone();
-        c.source = SurfaceSource::Candidate {
-            token: candidate.token.clone(),
-            explicitly_selected: true,
-        };
-        if c.start == ReadingPosition(0) && c.end.0 as usize == self.reading.chars().count() {
-            self.sentence_token = Some(candidate.token.clone());
+        // The list keeps its original interval while cycling. A shorter choice
+        // splits off Reading; choosing a longer one replaces only that suffix.
+        let Some(cached) = self.cache.get(clause) else { return false; };
+        let end = cached.end;
+        let Some(last) = self.clauses.iter().enumerate().skip(self.selected)
+            .find_map(|(i, c)| (c.end == end).then_some(i)) else { return false; };
+        let changed_boundary = c.end != candidate.reading_end;
+        let mut replacement = c.clone();
+        replacement.end = candidate.reading_end;
+        replacement.surface = candidate.surface.clone();
+        replacement.source = if candidate.token.is_empty() { SurfaceSource::LocalSurface }
+            else { SurfaceSource::Candidate {
+                token: candidate.token.clone(),
+                explicitly_selected: true,
+            } };
+        let mut replacements = vec![replacement];
+        let mut next_id = self.next_clause_id;
+        if changed_boundary && candidate.reading_end < end {
+            let Some(id) = next_id else { return false; };
+            let Some(next) = id.checked_add(1) else { return false; };
+            next_id = Some(next);
+            let Some(surface) = ipc::clause::reading_slice(&self.reading, candidate.reading_end, end) else { return false; };
+            replacements.push(LocalClause { id: ClauseId(id), start: candidate.reading_end, end,
+                surface, source: SurfaceSource::Reading });
         }
+        if changed_boundary { self.sentence_token = None; }
+        if c.start == ReadingPosition(0) && candidate.reading_end.0 as usize == self.reading.chars().count() {
+            self.sentence_token = (!candidate.token.is_empty()).then(|| candidate.token.clone());
+        }
+        let replace_end = if changed_boundary { last + 1 } else { self.selected + 1 };
+        self.clauses.splice(self.selected..replace_end, replacements);
+        self.next_clause_id = next_id;
+        if let CandidateWindow::Ready { selected, .. } = &mut self.window { *selected = index; }
         self.revision = revision;
         self.user_driven = true;
         self.issued.clear();
@@ -1003,7 +1094,7 @@ mod tests {
         m.transform_kana(ReadingPosition(0), ReadingPosition(1), crate::keymap::Notation::Katakana);
         m.move_clause(1);
         let now = Instant::now();
-        let old = m.open_candidates(10, now).unwrap();
+        let old = m.cycle_candidate(10, 1, now).unwrap();
         let attempt = m.prepare_rebaseline(old.key, 11, 12, now).unwrap();
         let convert = m.accept_rebaseline(&attempt, &rebaseline_response(&attempt), learning("new", 1), now).unwrap();
         assert_eq!(m.text(), "ニ本");
@@ -1011,7 +1102,7 @@ mod tests {
             surface: "歩".into(), state: ClauseState::Converted, candidate_token: Some("new-token".into()) };
         let next = m.accept_rebased_conversion(convert.key, ipc::clause::ConvertClausesStatus::Ready { clauses: vec![converted] },
             Some(learning("new", 1)), 13, now + Duration::from_millis(500)).unwrap();
-        assert_eq!(m.text(), "ニ歩");
+        assert_eq!(m.text(), "ニ本", "rebaseline must retain the surface that anchors candidate 1");
         assert_eq!(m.clauses[0].source, SurfaceSource::LocalSurface);
         assert_eq!(next.preceding_surfaces[0].surface, "ニ");
         assert_eq!(next.key.conversion_revision, convert.key.conversion_revision + 1);
@@ -1020,7 +1111,9 @@ mod tests {
         assert!(!m.accept_candidates(old.key, ready(&old, &["古い"]), now));
         assert!(m.accept_candidates_with_identity(next.key, ready(&next, &["歩", "補"]), Some(learning("new", 1)),
             now + Duration::from_millis(1199)));
-        assert!(matches!(m.window, CandidateWindow::Ready { selected: 0, .. }));
+        assert!(matches!(m.window, CandidateWindow::Ready { selected: 1, .. }));
+        assert_eq!(m.page().unwrap().0[0].surface, "本");
+        assert_eq!(m.text(), "ニ歩");
     }
 
     #[test]
@@ -1082,7 +1175,7 @@ mod tests {
                 composition: 1, revision: 2, configuration_generation: 3, connection_generation: 5,
                 conversion_revision: before.revision, request_id: 11,
                 segments: vec![ipc::protocol::SnapshotSegment { text: "にほ".into(), style: Some("direct".into()) }],
-                explicit: true, left_context: Some("前文".into()),
+                explicit: true, live_search_width: None, left_context: Some("前文".into()),
             });
             let request = m.accept_rebaseline(&attempt, &rebaseline_response(&attempt), learning("new", 1), now).unwrap();
             assert_eq!(m.text(), before.text());
@@ -1266,6 +1359,165 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn shorter_candidates_preserve_suffix_and_cycle_back_to_full_range() {
+        let mut m = model();
+        m.reading = "がぞうのようにする".into();
+        m.clauses[0].end = ReadingPosition(7);
+        m.clauses[0].surface = "画像のように".into();
+        m.clauses[1].start = ReadingPosition(7);
+        m.clauses[1].end = ReadingPosition(9);
+        m.clauses[1].surface = "する".into();
+        m.sentence_token = Some("whole-sentence".into());
+        let following = m.clauses[1].clone();
+        let now = Instant::now();
+        let request = m.open_candidates(2, now).unwrap();
+        let ClauseCandidatesStatus::Ready { mut candidates } = ready(&request, &["画像のように", "画像の", "画像"]) else { unreachable!() };
+        candidates[1].reading_end = ReadingPosition(4);
+        candidates[2].reading_end = ReadingPosition(3);
+        assert!(m.accept_candidates(request.key, ClauseCandidatesStatus::Ready { candidates }, now));
+        assert!(m.advance_candidate(1));
+        assert_eq!(m.text(), "画像のようにする");
+        assert_eq!(m.clauses[0].end, ReadingPosition(4));
+        assert_eq!(m.clauses[1].surface, "ように");
+        assert_eq!(m.clauses[1].source, SurfaceSource::Reading);
+        assert_eq!(m.clauses[2], following);
+        assert_eq!(m.sentence_token, None);
+        let suffix_id = m.clauses[1].id;
+        assert!(m.advance_candidate(1));
+        assert_eq!(m.clauses[1].surface, "のように");
+        assert_ne!(m.clauses[1].id, suffix_id);
+        assert!(m.advance_candidate(1));
+        assert_eq!(m.clauses.len(), 2);
+        assert_eq!(m.clauses[0].end, ReadingPosition(7));
+        assert_eq!(m.clauses[1], following);
+        assert!(m.select_candidate(1));
+        m.close_window();
+        let shorter = m.open_candidates(3, now).unwrap();
+        assert_eq!(shorter.reading_end, ReadingPosition(4), "closed prefix selection must not reuse the old full-range cache");
+        m.move_clause(1);
+        let suffix = m.open_boundary_conversion(4, now).unwrap();
+        assert_eq!(suffix.clauses, vec![ClauseRange { id: m.clauses[1].id,
+            reading_start: ReadingPosition(4), reading_end: ReadingPosition(7) }]);
+        assert_eq!(m.reading, "がぞうのようにする");
+    }
+
+    #[test]
+    fn same_surface_prefix_keeps_its_range_and_exhausted_split_is_atomic() {
+        let mut m = model();
+        m.clauses.truncate(1);
+        m.reading = "ああ".into();
+        m.clauses[0].end = ReadingPosition(2);
+        m.clauses[0].surface = "亜".into();
+        let now = Instant::now();
+        let request = m.open_candidates(2, now).unwrap();
+        let ClauseCandidatesStatus::Ready { mut candidates } = ready(&request, &["亜", "亜"]) else { unreachable!() };
+        candidates[0].reading_end = ReadingPosition(1);
+        assert!(m.accept_candidates(request.key, ClauseCandidatesStatus::Ready { candidates }, now));
+        let (page, selected) = m.page().unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(selected, 0);
+        assert_eq!(page[0].reading_end, ReadingPosition(2));
+        let before = m.clauses.clone();
+        let revision = m.revision;
+        m.next_clause_id = Some(u64::MAX);
+        assert!(!m.select_candidate(1));
+        assert_eq!(m.clauses, before);
+        assert_eq!(m.revision, revision);
+        assert_eq!(m.page().unwrap().1, 0);
+        m.next_clause_id = Some(3);
+        assert!(m.select_candidate(1));
+        assert_eq!(m.text(), "亜あ");
+        assert_eq!(m.clauses[0].end, ReadingPosition(1));
+        assert_eq!(m.escape(), LocalEditOutcome::Changed);
+        assert_eq!(m.escape(), LocalEditOutcome::Changed);
+        assert_eq!(m.text(), "ああ");
+    }
+
+    #[test]
+    fn space_candidates_start_with_displayed_surface_then_visit_second_choice() {
+        let mut m = model();
+        m.clauses.truncate(1);
+        m.reading = "おしたら".into();
+        m.clauses[0].end = ReadingPosition(4);
+        m.clauses[0].surface = "推したら".into();
+        let now = Instant::now();
+        let request = m.open_candidates(2, now).unwrap();
+        assert!(m.accept_candidates(request.key,
+            ready(&request, &["押したら", "推したら", "おしたら"]), now));
+        let (page, selected) = m.page().unwrap();
+        assert_eq!(selected, 0, "the displayed conversion is always candidate 1");
+        assert_eq!(page.iter().map(|c| c.surface.as_str()).collect::<Vec<_>>(),
+            ["推したら", "押したら", "おしたら"]);
+        assert_eq!(m.text(), "推したら");
+        assert!(m.advance_candidate(1));
+        assert_eq!(m.page().unwrap().1, 1);
+        assert_eq!(m.text(), "押したら", "Space must not skip to おしたら");
+    }
+
+    #[test]
+    fn opening_space_moves_once_after_reply_and_reopening_keeps_the_order() {
+        let mut m = model();
+        let now = Instant::now();
+        let request = m.cycle_candidate(2, 1, now).unwrap();
+        assert_eq!(m.text(), "日本", "no change while candidates are loading");
+        let reply = ready(&request, &["二", "日", "に"]);
+        assert!(m.accept_candidates(request.key, reply.clone(), now));
+        assert_eq!((m.text(), m.page().unwrap().1), ("二本".into(), 1));
+        assert!(matches!(&m.clauses[0].source, SurfaceSource::Candidate { token, explicitly_selected: true } if token == "2-0"));
+        assert!(!m.accept_candidates(request.key, reply, now), "duplicate reply cannot move twice");
+        m.close_window();
+        assert!(m.cycle_candidate(3, 1, now).is_none(), "reopen uses the cached order");
+        assert_eq!((m.text(), m.page().unwrap().1), ("に本".into(), 2));
+        assert!(m.cycle_candidate(4, 1, now).is_none());
+        assert_eq!((m.text(), m.page().unwrap().1), ("日本".into(), 0));
+    }
+
+    #[test]
+    fn absent_live_surface_stays_selectable_without_inventing_a_learning_token() {
+        let mut m = model();
+        m.invalidate_learning();
+        let now = Instant::now();
+        let request = m.cycle_candidate(2, 1, now).unwrap();
+        assert!(m.accept_candidates(request.key, ready(&request, &["二", "に"]), now));
+        assert_eq!((m.text(), m.page().unwrap().1), ("二本".into(), 1));
+        m.advance_candidate(-1);
+        assert_eq!(m.text(), "日本");
+        assert_eq!(m.clauses[0].source, SurfaceSource::LocalSurface);
+        assert!(m.sentence_token.is_none());
+    }
+
+    #[test]
+    fn cancelled_opening_space_does_not_advance_a_later_window() {
+        let mut m = model();
+        let now = Instant::now();
+        let old = m.cycle_candidate(2, 1, now).unwrap();
+        m.close_window();
+        let new = m.open_candidates(3, now).unwrap();
+        assert!(!m.accept_candidates(old.key, ready(&old, &["二", "日"]), now));
+        assert!(m.accept_candidates(new.key, ready(&new, &["二", "日"]), now));
+        assert_eq!((m.text(), m.page().unwrap().1), ("日本".into(), 0));
+    }
+
+    #[test]
+    fn live_promotion_keeps_clause_boundaries_and_a_locally_typed_suffix() {
+        let m = model();
+        let identity = SnapshotIdentity { revision: m.identity.revision + 1, ..m.identity };
+        let promoted = m.promote_live_display(identity, "にほです", "日本です").unwrap();
+        assert_eq!(promoted.text(), "日本です");
+        assert_eq!(promoted.clauses[..2], m.clauses);
+        assert_eq!(promoted.clauses[2].source, SurfaceSource::Reading);
+        assert_eq!((promoted.clauses[2].start, promoted.clauses[2].end), (ReadingPosition(2), ReadingPosition(4)));
+        assert!(promoted.sentence_token.is_none());
+        assert!(m.promote_live_display(identity, "にほです", "二歩です").is_none());
+        assert!(m.promote_live_display(identity, "にです", "日です").is_none());
+        assert!(m.promote_live_display(SnapshotIdentity { composition: 2, ..identity }, "にほ", "日本").is_none());
+        assert!(m.promote_live_display(SnapshotIdentity { connection_generation: 5, ..identity }, "にほ", "日本").is_none());
+        let reading = ClauseConversion::from_reading(identity, "にほ".into()).unwrap();
+        assert!(reading.promote_live_display(identity, "にほ", "にほ").is_none(),
+            "a reading-only fallback still needs explicit conversion on first Space");
     }
 
     #[test]
@@ -1702,7 +1954,7 @@ mod tests {
         assert_eq!(m.learning_identity, Some(identity(2)));
         assert!(m.sentence_token.is_none());
         assert!(m.clauses.iter().all(|clause| clause.source == SurfaceSource::LocalSurface));
-        assert!(m.select_candidate(0));
+        assert!(m.select_candidate(1));
         assert_eq!(m.text(), "二本");
         assert!(matches!(m.clauses[0].source, SurfaceSource::Candidate { .. }));
         m.move_clause(1);
@@ -1726,7 +1978,7 @@ mod tests {
         m.refresh_learning_identity(ipc::client::EngineLearningIdentity { engine_epoch: "old".into(), learning_generation: 9 });
         assert_eq!(m.learning_identity, Some(fresh));
         assert_eq!(m.window, window);
-        assert!(m.select_candidate(0));
+        assert!(m.select_candidate(1));
         assert_eq!(m.text(), "二本");
     }
 
@@ -1793,7 +2045,7 @@ mod tests {
         let b = m.open_candidates(3, now).unwrap();
         assert!(m.accept_candidates(b.key, ready(&b, &["穂", "本"]), now));
         assert!(!m.accept_candidates(a.key, ready(&a, &["二", "日"]), now));
-        assert_eq!(m.page().unwrap().0[1].surface, "本");
+        assert_eq!(m.page().unwrap().0[0].surface, "本");
         assert_eq!(
             m.text(),
             "日本",
@@ -1801,7 +2053,7 @@ mod tests {
         );
         m.move_clause(-1);
         assert!(m.open_candidates(4, now).is_none());
-        assert_eq!(m.page().unwrap().0[0].surface, "二");
+        assert_eq!(m.page().unwrap().0[0].surface, "日");
     }
     #[test]
     fn cancel_reopen_and_terminal_failure_never_accept_old_ready() {
@@ -1847,7 +2099,7 @@ mod tests {
         m.move_clause(-1);
         let a = m.open_candidates(3, now).unwrap();
         m.accept_candidates(a.key, ready(&a, &["二"]), now);
-        assert!(m.select_candidate(0));
+        assert!(m.select_candidate(1));
         assert_eq!(m.text(), "二本");
         assert_eq!(m.revision, 1);
         m.move_clause(1);
@@ -1864,7 +2116,7 @@ mod tests {
             r.key,
             ready(
                 &r,
-                &["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+                &["日", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
             ),
             now,
         );
@@ -1875,6 +2127,6 @@ mod tests {
         assert_eq!(m.page().unwrap().1, 0);
         m.select_candidate(10);
         m.advance_candidate(1);
-        assert_eq!(m.text(), "0本");
+        assert_eq!(m.text(), "日本");
     }
 }

@@ -8,8 +8,15 @@ edition = "2021"
 name = "NospacekeyConfig"
 path = "src/main.rs"
 
+[features]
+# Release/deploy scripts invoke Cargo directly, so they must embed the UI
+# without relying on the Tauri CLI to enable its production protocol.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+sha2 = "0.10"
 
 [dependencies]
 settings = { path = "../settings" }

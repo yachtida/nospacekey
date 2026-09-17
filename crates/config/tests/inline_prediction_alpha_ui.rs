@@ -7,14 +7,14 @@ fn read(rel: &str) -> String {
 
 #[test]
 fn settings_identifies_inline_prediction_as_alpha() {
-    let html = read("ui/index.html");
+    let page = read("frontend/src/pages/EnginePage.tsx");
 
     assert!(
-        html.contains("<h2>インライン予測（アルファ版）</h2>"),
+        page.contains("アルファ版") && page.contains("<h2>インライン予測</h2>"),
         "インライン予測の見出しにアルファ版表示が必要"
     );
     assert!(
-        html.contains("アルファ版機能です。動作や仕様は今後変更される可能性があります。"),
-        "アルファ版であることの利用者向け説明が必要"
+        page.contains("Zenzaiとは独立した専用モデル"),
+        "アルファ版の独立したモデル状態を説明する必要がある"
     );
 }

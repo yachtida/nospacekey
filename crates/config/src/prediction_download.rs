@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tauri::Emitter;
 
 pub(crate) const MODEL_FILENAME: &str = "llm-jp-3-150m-q8_0-c060ca9.gguf";
@@ -35,17 +35,33 @@ const TOKENIZER_URL: &str = concat!(
 const PROGRESS_EVENT: &str = "prediction-download-progress";
 
 static DOWNLOADING: AtomicBool = AtomicBool::new(false);
+static ACTIVE_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+static ACTIVATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-struct DownloadGuard;
+pub(crate) fn invalidate_activation_intent() {
+    ACTIVATION_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+fn begin_activation_intent() -> u64 {
+    ACTIVATION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn activation_intent_is_current(generation: u64) -> bool {
+    ACTIVATION_GENERATION.load(Ordering::SeqCst) == generation
+}
+
+struct DownloadGuard(u64);
 impl Drop for DownloadGuard {
     fn drop(&mut self) {
+        let _ = ACTIVE_ATTEMPT.compare_exchange(self.0, 0, Ordering::SeqCst, Ordering::SeqCst);
         DOWNLOADING.store(false, Ordering::SeqCst);
     }
 }
 
 #[derive(Clone, serde::Serialize)]
 struct Progress {
+    attempt_id: u64,
     file: &'static str,
     received: u64,
     total: Option<u64>,
@@ -133,8 +149,17 @@ pub fn prediction_model_status() -> PredictionModelStatus {
 }
 
 #[tauri::command]
-pub fn cancel_prediction_model_download() {
+pub fn cancel_prediction_model_download(attempt_id: u64) -> bool {
+    if ACTIVE_ATTEMPT.load(Ordering::SeqCst) != attempt_id {
+        return false;
+    }
     CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+    crate::operation_state::request_cancel(
+        crate::operation_state::ModelKind::Prediction,
+        attempt_id,
+    );
+    invalidate_activation_intent();
+    true
 }
 
 async fn download_artifact(
@@ -183,11 +208,17 @@ async fn download_artifact(
             let _ = app.emit(
                 PROGRESS_EVENT,
                 Progress {
+                    attempt_id: ACTIVE_ATTEMPT.load(Ordering::SeqCst),
                     file: label,
                     received,
                     total,
                     percent,
                 },
+            );
+            crate::operation_state::progress(
+                crate::operation_state::ModelKind::Prediction,
+                ACTIVE_ATTEMPT.load(Ordering::SeqCst),
+                percent,
             );
         }
     }
@@ -219,130 +250,197 @@ fn rollback_install(destination: &Path, backup: Option<&Path>) -> Result<(), Str
     Ok(())
 }
 
-fn persist_prediction_enabled_with<L, S>(
+fn persist_prediction_enabled_with<L, S, E>(
     lock: &std::sync::Mutex<()>,
     load: L,
     save: S,
-) -> Result<(), String>
+    should_enable: E,
+) -> Result<bool, String>
 where
     L: FnOnce() -> Result<settings::Settings, String>,
     S: FnOnce(&settings::Settings) -> Result<(), String>,
+    E: FnOnce() -> bool,
 {
     let _settings_guard = lock
         .lock()
         .map_err(|_| "設定ロックを取得できませんでした".to_string())?;
+    let enabled = should_enable();
+    if !enabled {
+        return Ok(false);
+    }
     let mut current = load()?;
     current.inline_prediction.enabled = true;
-    save(&current)
+    save(&current)?;
+    Ok(true)
 }
 
 #[tauri::command]
 pub async fn download_prediction_model(
     app: tauri::AppHandle,
     lock: tauri::State<'_, crate::logic::SettingsLock>,
+    activate: bool,
+    attempt_id: u64,
 ) -> Result<String, String> {
     if DOWNLOADING.swap(true, Ordering::SeqCst) {
         return Err("インライン予測モデルは既にダウンロード中です。".into());
     }
-    let _guard = DownloadGuard;
+    if attempt_id == 0 {
+        DOWNLOADING.store(false, Ordering::SeqCst);
+        return Err("操作IDが不正です。".into());
+    }
+    ACTIVE_ATTEMPT.store(attempt_id, Ordering::SeqCst);
+    let _guard = DownloadGuard(attempt_id);
     CANCEL_REQUESTED.store(false, Ordering::SeqCst);
-    let destination = local_model_dir().ok_or("LOCALAPPDATA が解決できません。")?;
-    let parent = destination.parent().ok_or("保存先パスが不正です。")?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("保存先フォルダを作成できません: {error}"))?;
-    let stage = tempfile::Builder::new()
-        .prefix("prediction-download-")
-        .tempdir_in(parent)
-        .map_err(|error| format!("一時フォルダを作成できません: {error}"))?;
-
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("nospacekey-config/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .read_timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|error| format!("HTTP クライアントを初期化できません: {error}"))?;
-    download_artifact(
-        &client,
-        &app,
-        MODEL_URL,
-        &stage.path().join(MODEL_FILENAME),
-        "モデル",
-        MODEL_LEN,
-        MODEL_SHA256,
-    )
-    .await?;
-    download_artifact(
-        &client,
-        &app,
-        TOKENIZER_URL,
-        &stage.path().join(TOKENIZER_FILENAME),
-        "tokenizer",
-        TOKENIZER_LEN,
-        TOKENIZER_SHA256,
-    )
-    .await?;
-    std::fs::write(stage.path().join(VERIFIED_FILENAME), VERIFIED_CONTENT)
-        .map_err(|error| format!("検証記録を保存できません: {error}"))?;
-
-    let stop_code = tauri::async_runtime::spawn_blocking(crate::commands::stop_engine)
-        .await
-        .map_err(|error| format!("エンジン停止処理を完了できませんでした: {error}"))?;
-    if stop_code != 0 {
-        return Err("エンジンの停止を確認できませんでした。".into());
-    }
-    let pipe = ipc::client::stable_pipe_name();
-    let _lease = crate::commands::EngineAbsenceLease::acquire(&pipe)
-        .map_err(|error| format!("エンジンの停止を確認できませんでした: {error}"))?;
-    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
-        return Err("キャンセルしました。".into());
-    }
-
-    let backup_holder = tempfile::Builder::new()
-        .prefix("prediction-backup-")
-        .tempdir_in(parent)
-        .map_err(|error| format!("退避先を作成できません: {error}"))?;
-    let backup = backup_holder.path().to_path_buf();
-    std::fs::remove_dir(&backup).map_err(|error| format!("退避先を準備できません: {error}"))?;
-    let had_previous = destination.exists();
-    if had_previous {
-        std::fs::rename(&destination, &backup)
-            .map_err(|error| format!("旧モデルを退避できません: {error}"))?;
-    }
-    if let Err(error) = std::fs::rename(stage.path(), &destination) {
-        let restore = if had_previous {
-            std::fs::rename(&backup, &destination)
-                .map_err(|restore| format!("旧モデルも復元できません: {restore}"))
-        } else {
-            Ok(())
-        };
-        return match restore {
-            Ok(()) => Err(format!("モデルを配置できません: {error}")),
-            Err(restore) => Err(format!("モデルを配置できません: {error}; {restore}")),
-        };
-    }
-
-    // apply_settings や Zenzai の導入と同じ安全な mutation 経路を使う。
-    // lock poison や読み取り拒否時に panic／既定値での上書きを起こさない。
-    let save_result = persist_prediction_enabled_with(
-        &lock.0,
-        || {
-            settings::load_for_mutation()
-                .map_err(crate::commands::settings_mutation_error_for_download)
-        },
-        |settings| settings::save(settings).map_err(|error| error.to_string()),
+    let activation_generation = activate.then(begin_activation_intent);
+    let operation = crate::operation_state::OperationGuard::begin(
+        crate::operation_state::ModelKind::Prediction,
+        attempt_id,
+        activate,
     );
-    if let Err(error) = save_result {
-        return match rollback_install(&destination, had_previous.then_some(backup.as_path())) {
-            Ok(()) => Err(format!("設定を保存できません: {error}")),
-            Err(rollback) => Err(format!(
-                "設定を保存できません: {error}; rollback失敗: {rollback}"
-            )),
+    let result = async {
+        let destination = local_model_dir().ok_or("LOCALAPPDATA が解決できません。")?;
+        let parent = destination.parent().ok_or("保存先パスが不正です。")?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("保存先フォルダを作成できません: {error}"))?;
+        let stage = tempfile::Builder::new()
+            .prefix("prediction-download-")
+            .tempdir_in(parent)
+            .map_err(|error| format!("一時フォルダを作成できません: {error}"))?;
+
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("nospacekey-config/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .read_timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|error| format!("HTTP クライアントを初期化できません: {error}"))?;
+        download_artifact(
+            &client,
+            &app,
+            MODEL_URL,
+            &stage.path().join(MODEL_FILENAME),
+            "モデル",
+            MODEL_LEN,
+            MODEL_SHA256,
+        )
+        .await?;
+        download_artifact(
+            &client,
+            &app,
+            TOKENIZER_URL,
+            &stage.path().join(TOKENIZER_FILENAME),
+            "tokenizer",
+            TOKENIZER_LEN,
+            TOKENIZER_SHA256,
+        )
+        .await?;
+        std::fs::write(stage.path().join(VERIFIED_FILENAME), VERIFIED_CONTENT)
+            .map_err(|error| format!("検証記録を保存できません: {error}"))?;
+        operation.phase(crate::operation_state::OperationPhase::Verifying, true);
+
+        let pipe = ipc::client::stable_pipe_name();
+        let _lease = if destination.exists() {
+            operation.phase(
+                crate::operation_state::OperationPhase::PlacementWaiting,
+                true,
+            );
+            tauri::async_runtime::spawn_blocking(|| {
+                crate::commands::wait_for_engine_maintenance(|| {
+                    CANCEL_REQUESTED.load(Ordering::SeqCst)
+                })
+            })
+            .await
+            .map_err(|error| format!("エンジン保守停止を完了できませんでした: {error}"))??;
+            Some(
+                crate::commands::EngineAbsenceLease::acquire(&pipe).map_err(|error| {
+                    format!("エンジンの停止後に配置排他を取得できませんでした: {error}")
+                })?,
+            )
+        } else {
+            None
         };
+        if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            return Err("キャンセルしました。".into());
+        }
+        operation.phase(crate::operation_state::OperationPhase::Placing, false);
+
+        let backup_holder = tempfile::Builder::new()
+            .prefix("prediction-backup-")
+            .tempdir_in(parent)
+            .map_err(|error| format!("退避先を作成できません: {error}"))?;
+        let backup = backup_holder.path().to_path_buf();
+        std::fs::remove_dir(&backup).map_err(|error| format!("退避先を準備できません: {error}"))?;
+        let had_previous = destination.exists();
+        if had_previous {
+            std::fs::rename(&destination, &backup)
+                .map_err(|error| format!("旧モデルを退避できません: {error}"))?;
+        }
+        if let Err(error) = std::fs::rename(stage.path(), &destination) {
+            let restore = if had_previous {
+                std::fs::rename(&backup, &destination)
+                    .map_err(|restore| format!("旧モデルも復元できません: {restore}"))
+            } else {
+                Ok(())
+            };
+            return match restore {
+                Ok(()) => Err(format!("モデルを配置できません: {error}")),
+                Err(restore) => Err(format!("モデルを配置できません: {error}; {restore}")),
+            };
+        }
+
+        // apply_settings や Zenzai の導入と同じ安全な mutation 経路を使う。
+        // lock poison や読み取り拒否時に panic／既定値での上書きを起こさない。
+        if activation_generation.is_some_and(activation_intent_is_current) {
+            operation.phase(crate::operation_state::OperationPhase::Activating, false);
+        }
+        let save_result = persist_prediction_enabled_with(
+            &lock.0,
+            || {
+                settings::load_for_mutation()
+                    .map_err(crate::commands::settings_mutation_error_for_download)
+            },
+            |settings| {
+                crate::settings_service::persist_settings(settings)
+                    .map_err(|error| error.to_string())
+            },
+            || activation_generation.is_some_and(activation_intent_is_current),
+        );
+        let enabled_after_install = match save_result {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                return match rollback_install(
+                    &destination,
+                    had_previous.then_some(backup.as_path()),
+                ) {
+                    Ok(()) => Err(format!("設定を保存できません: {error}")),
+                    Err(rollback) => Err(format!(
+                        "設定を保存できません: {error}; rollback失敗: {rollback}"
+                    )),
+                }
+            }
+        };
+        if had_previous {
+            let _ = std::fs::remove_dir_all(&backup);
+        }
+        let message: String = if enabled_after_install {
+            "モデルを導入し、インライン予測を有効にしました。".into()
+        } else if activate {
+            "モデルを導入しました。導入中に変更された利用設定はそのまま維持しました。".into()
+        } else {
+            "モデルを取得・検証し、利用設定を変えずに配置しました。".into()
+        };
+        Ok(message)
     }
-    if had_previous {
-        let _ = std::fs::remove_dir_all(&backup);
+    .await;
+    match result {
+        Ok(message) => {
+            operation.succeed(message.clone());
+            Ok(message)
+        }
+        Err(error) => {
+            operation.fail(error.clone());
+            Err(error)
+        }
     }
-    Ok("モデルを導入し、インライン予測を有効にしました。".into())
 }
 
 #[cfg(test)]
@@ -402,6 +500,7 @@ mod tests {
                 saved.replace(Some(settings.clone()));
                 Ok(())
             },
+            || true,
         )
         .unwrap();
 
@@ -422,6 +521,7 @@ mod tests {
                 save_called.set(true);
                 Ok(())
             },
+            || true,
         );
 
         assert_eq!(result.unwrap_err(), "settings unreadable");
@@ -444,9 +544,33 @@ mod tests {
                 Ok(settings::Settings::default())
             },
             |_| Ok(()),
+            || true,
         );
 
         assert!(result.unwrap_err().contains("設定ロック"));
         assert!(!load_called.get());
+    }
+
+    #[test]
+    fn stale_activation_intent_keeps_the_latest_off_setting() {
+        let lock = std::sync::Mutex::new(());
+        let load_called = Cell::new(false);
+        let save_called = Cell::new(false);
+        let enabled = persist_prediction_enabled_with(
+            &lock,
+            || {
+                load_called.set(true);
+                Ok(settings::Settings::default())
+            },
+            |_| {
+                save_called.set(true);
+                Ok(())
+            },
+            || false,
+        )
+        .unwrap();
+        assert!(!enabled);
+        assert!(!load_called.get());
+        assert!(!save_called.get());
     }
 }

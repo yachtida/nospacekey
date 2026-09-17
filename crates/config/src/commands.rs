@@ -1,18 +1,18 @@
 //! tauri コマンド層。logic（純関数）と settings crate を繋ぐだけの薄い層に保つ。
 
+#[cfg(test)]
+use crate::logic::SettingsDto;
 use crate::logic::{
     self, DictCmdError, DictLock, EngineStatus, ExportReportDto, FieldError, ImportReportDto,
-    ListReport, MutationReport, SettingsDto,
+    ListReport, MutationReport,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 
-/// The startup worker can wait for bounded checker state-lock retries and
-/// may then perform several bounded Task Scheduler commands.  Config only
-/// waits long enough to get a coherent first DTO; a timeout still falls back
-/// to the disk truth and never forces the switch OFF.
-pub const RECONCILE_COMPLETION_WAIT: Duration = Duration::from_secs(45);
+/// The startup worker can wait for bounded checker state-lock retries and may then perform
+/// several bounded Task Scheduler commands. The React UI loads disk settings immediately and
+/// receives this event when reconciliation has finished.
 pub const STARTUP_RECONCILE_COMPLETE_EVENT: &str = "startup-reconcile-complete";
 const STARTUP_LEASE_RETRY_ATTEMPTS: usize = 2;
 const STARTUP_LEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -23,9 +23,11 @@ pub(crate) enum ReconcileCompletion {
     Pending,
     Success,
     Error,
+    #[cfg(test)]
     Timeout,
 }
 
+#[cfg(test)]
 #[derive(serde::Serialize)]
 pub struct LoadResult {
     pub dto: SettingsDto,
@@ -117,6 +119,7 @@ impl AutomaticCheckReconcileState {
             .unwrap_or(true)
     }
 
+    #[cfg(test)]
     fn forces_automatic_off(&self) -> bool {
         self.force_automatic_off
             .lock()
@@ -130,6 +133,7 @@ impl AutomaticCheckReconcileState {
         }
     }
 
+    #[cfg(test)]
     fn take_corrupt_recovered_notice(&self) -> bool {
         self.corrupt_recovered_notice
             .lock()
@@ -175,6 +179,7 @@ impl AutomaticCheckReconcileState {
         }
     }
 
+    #[cfg(test)]
     fn wait_for_completion(&self, timeout: Duration) -> ReconcileCompletion {
         let deadline = std::time::Instant::now() + timeout;
         let (mut current, poisoned) = match self.completion.lock() {
@@ -295,6 +300,7 @@ pub(crate) fn settings_mutation_error_for_download(outcome: settings::LoadOutcom
     settings_mutation_error(outcome)
 }
 
+#[cfg(test)]
 fn corrupt_recovered(outcome: settings::LoadOutcome, handoff: bool) -> bool {
     outcome == settings::LoadOutcome::Corrupt || handoff
 }
@@ -308,23 +314,121 @@ fn load_settings_for_mutation() -> Result<settings::Settings, Vec<FieldError>> {
     })
 }
 
-fn can_enable_inline_prediction(
-    requested: bool,
-    previously_enabled: bool,
-    model_ready: bool,
-) -> bool {
-    !requested || previously_enabled || model_ready
+/// 新 UI の初期読込。OS の自動更新タスク照合を待たず、まず保存済み設定を返す。
+#[tauri::command(async)]
+pub fn settings_snapshot() -> crate::settings_service::SettingsSnapshot {
+    crate::settings_service::settings_snapshot()
+}
+
+/// 型付き差分を revision 付きで保存する。通常設定だけを扱い、ネットワークや
+/// Task Scheduler、エンジン停止などの長い処理はこのコマンドへ含めない。
+#[tauri::command(async)]
+pub fn settings_patch(
+    service: tauri::State<'_, crate::settings_service::SettingsService>,
+    lock: tauri::State<'_, crate::logic::SettingsLock>,
+    request: crate::settings_service::SettingsPatchRequest,
+) -> crate::settings_service::SettingsPatchResult {
+    crate::settings_service::settings_patch(&service, &lock, request)
+}
+
+#[tauri::command(async)]
+pub fn settings_operation_status(
+    service: tauri::State<'_, crate::settings_service::SettingsService>,
+    operation_id: String,
+) -> Option<crate::settings_service::SettingsPatchResult> {
+    service.operation_status(&operation_id)
+}
+
+#[tauri::command]
+pub fn model_operation_status() -> Vec<crate::operation_state::ModelOperationStatus> {
+    crate::operation_state::statuses()
+}
+
+#[tauri::command(async)]
+pub fn keymap_catalog() -> Vec<crate::keymap_catalog::KeymapCatalogEntry> {
+    crate::keymap_catalog::catalog()
+}
+
+#[tauri::command(async)]
+pub fn settings_defaults() -> crate::settings_service::PublicSettings {
+    crate::settings_service::default_public_settings()
+}
+
+#[tauri::command(async)]
+pub fn validate_key_binding(function: String, binding: Option<String>) -> Vec<FieldError> {
+    crate::keymap_catalog::validate(function, binding)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomaticCheckChangeResult {
+    pub snapshot: crate::settings_service::SettingsSnapshot,
+    pub warning: Option<String>,
+}
+
+/// 自動確認だけの OS トランザクション。外観などの通常設定を古い DTO から復元しない。
+/// Task Scheduler を待つ間は SettingsLock を解放し、保存する瞬間に更新関連フィールドだけを
+/// 最新 Settings へ合成する。
+#[tauri::command(async)]
+pub fn set_automatic_check(
+    lock: tauri::State<'_, crate::logic::SettingsLock>,
+    reconcile: tauri::State<'_, AutomaticCheckReconcileState>,
+    enabled: bool,
+) -> Result<AutomaticCheckChangeResult, Vec<FieldError>> {
+    let previous = {
+        let _guard = lock.0.lock().map_err(|_| {
+            vec![FieldError {
+                field: "_io".into(),
+                message: "設定ロックを取得できないため、変更を保存できません。".into(),
+            }]
+        })?;
+        load_settings_for_mutation()?
+    };
+    let mut requested = previous.clone();
+    requested.update.automatic_check = enabled;
+    requested.update.automatic_check_prompt_dismissed =
+        requested.update.automatic_check_prompt_dismissed || enabled;
+
+    let warning = apply_automatic_check_transaction_with_lease(
+        &reconcile,
+        &previous,
+        &requested,
+        || nospacekey_update::scheduler::register_or_update(&checker_path()),
+        nospacekey_update::scheduler::run_now,
+        |identity| match identity {
+            Some(identity) => nospacekey_update::scheduler::delete(identity),
+            None => current_task_identity()
+                .and_then(|identity| nospacekey_update::scheduler::delete(&identity)),
+        },
+        |desired| {
+            let _guard = lock
+                .0
+                .lock()
+                .map_err(|_| "設定ロックを取得できませんでした".to_string())?;
+            let mut latest = settings::load_for_mutation().map_err(settings_mutation_error)?;
+            latest.update.automatic_check = desired.update.automatic_check;
+            latest.update.automatic_check_prompt_dismissed =
+                desired.update.automatic_check_prompt_dismissed;
+            crate::settings_service::persist_settings(&latest).map_err(|error| error.to_string())
+        },
+        acquire_update_state_lock,
+    )?;
+    if let Some(message) = warning.clone() {
+        reconcile.set_persisted_on_warning(message);
+    } else {
+        reconcile.clear_after_successful_apply();
+    }
+    Ok(AutomaticCheckChangeResult {
+        snapshot: crate::settings_service::settings_snapshot(),
+        warning,
+    })
 }
 
 // (async) 必須: 同期 command は Tauri v2 でメインスレッド実行のため、settings.json の
 // ファイル I/O が UNC/AV 介入等で遅延すると WebView ごと固まる（clear_learning_history
 // の I-1 注記と同一の規律。get_settings/apply_settings/zenzai_model_status の3つが
 // この規律から漏れていた — UIバグ調査 2026-08-16 #9）。
-#[tauri::command(async)]
-pub fn get_settings(reconcile: tauri::State<'_, AutomaticCheckReconcileState>) -> LoadResult {
-    get_settings_with_timeout(&reconcile, RECONCILE_COMPLETION_WAIT)
-}
-
+#[cfg(test)]
 fn get_settings_with_timeout(
     reconcile: &AutomaticCheckReconcileState,
     timeout: Duration,
@@ -379,59 +483,6 @@ fn get_settings_with_timeout(
 #[tauri::command(async)]
 pub fn acknowledge_corrupt_recovery_notices() {
     settings::acknowledge_corrupt_recovery_notices();
-}
-
-#[tauri::command(async)]
-pub fn apply_settings(
-    lock: tauri::State<'_, crate::logic::SettingsLock>,
-    reconcile: tauri::State<'_, AutomaticCheckReconcileState>,
-    dto: SettingsDto,
-) -> Result<(), Vec<FieldError>> {
-    // read-modify-save を他の settings.json 書き込み（モデルDL終端の weight_path 反映等）
-    // と直列化する — async 化で並行に走れるようになった分の last-writer-wins 防止。
-    let _guard = lock.0.lock().map_err(|_| {
-        vec![FieldError {
-            field: "_io".into(),
-            message: "設定ロックを取得できないため、変更を保存できません。".into(),
-        }]
-    })?;
-    // prev は適用時点のディスク上の値を読む（起動後に TIP 側で version 等が変わる可能性に備える）。
-    let prev = load_settings_for_mutation()?;
-    if !can_enable_inline_prediction(
-        dto.inline_prediction_enabled,
-        prev.inline_prediction.enabled,
-        crate::prediction_download::local_model_is_ready(),
-    ) {
-        return Err(vec![FieldError {
-            field: "inline_prediction_enabled".into(),
-            message: "インライン予測を有効にするには、先にモデルを導入してください。".into(),
-        }]);
-    }
-    let s = logic::apply_dto(dto, &prev, settings::dpapi::encrypt)?;
-    let warning = apply_automatic_check_transaction_with_lease(
-        &reconcile,
-        &prev,
-        &s,
-        || nospacekey_update::scheduler::register_or_update(&checker_path()),
-        nospacekey_update::scheduler::run_now,
-        |identity| match identity {
-            Some(identity) => nospacekey_update::scheduler::delete(identity),
-            None => current_task_identity()
-                .and_then(|identity| nospacekey_update::scheduler::delete(&identity)),
-        },
-        |settings| settings::save(settings).map_err(|error| error.to_string()),
-        acquire_update_state_lock,
-    )?;
-    if let Some(warning) = warning {
-        // A warning means the transaction was not fully successful. Preserve
-        // an existing repair/error state and report the persisted disk truth;
-        // a later clean Apply is responsible for clearing it.
-        reconcile.set_persisted_on_warning(warning);
-    } else {
-        // This includes a successful stale-OFF task deletion retry.
-        reconcile.clear_after_successful_apply();
-    }
-    Ok(())
 }
 
 /// Apply the automatic-check task/settings transaction with the OS operations
@@ -703,23 +754,6 @@ fn current_task_identity() -> Result<nospacekey_update::scheduler::TaskIdentity,
         .map(nospacekey_update::scheduler::task_identity)
 }
 
-#[tauri::command(async)]
-pub fn dismiss_automatic_check_prompt(
-    lock: tauri::State<'_, crate::logic::SettingsLock>,
-) -> Result<(), String> {
-    let _guard = lock
-        .0
-        .lock()
-        .map_err(|_| "設定ロックを取得できませんでした".to_string())?;
-    let mut current = settings::load_for_mutation().map_err(settings_mutation_error)?;
-    if current.update.automatic_check_prompt_dismissed {
-        return Ok(());
-    }
-    current.update.automatic_check_prompt_dismissed = true;
-    settings::save(&current)
-        .map_err(|error| format!("案内を閉じた状態を保存できませんでした: {error}"))
-}
-
 #[tauri::command]
 pub fn consume_update_intent(intent: tauri::State<'_, crate::activation::PendingIntent>) -> bool {
     intent.consume()
@@ -777,7 +811,8 @@ pub fn reconcile_automatic_check_task(reconcile: &AutomaticCheckReconcileState) 
                     | settings::LoadOutcome::Empty
                     | settings::LoadOutcome::Corrupt
             ) {
-                settings::save(settings).map_err(|error| error.to_string())
+                crate::settings_service::persist_settings(settings)
+                    .map_err(|error| error.to_string())
             } else {
                 Err(settings_mutation_error(outcome))
             }
@@ -1004,11 +1039,6 @@ where
     }
 }
 
-#[tauri::command]
-pub fn get_default_settings() -> SettingsDto {
-    logic::to_dto(&settings::Settings::default())
-}
-
 /// 記号個別選択グリッドの1項目(半角/全角プレビュー)。JS に写像表を持たせないための供給源
 /// （2026-08-02 spec §3）。
 #[derive(serde::Serialize)]
@@ -1017,7 +1047,7 @@ pub struct SymbolCatalogEntry {
     pub full: char,
 }
 
-/// 記号個別選択の対象29件カタログ（read-only、`get_default_settings` と同列）。
+/// 記号個別選択の対象29件カタログ（read-only）。
 #[tauri::command]
 pub fn get_symbol_catalog() -> Vec<SymbolCatalogEntry> {
     settings::symbol::symbol_targets()
@@ -1973,7 +2003,14 @@ fn query_zenzai_status() -> Result<ZenzaiRuntimeStatusDto, String> {
             reason,
             latency_live,
             latency_convert,
-        }) => zenzai_status_from_response(state, backend, device, reason, latency_live, latency_convert),
+        }) => zenzai_status_from_response(
+            state,
+            backend,
+            device,
+            reason,
+            latency_live,
+            latency_convert,
+        ),
         // An explicit engine error is not a classic state: status availability is separate.
         Ok(ipc::protocol::Response::Error { .. }) => {
             Err("Zenzai runtime の状態を取得できません（エンジンが要求を拒否）".into())
@@ -2072,6 +2109,94 @@ pub fn stop_engine() -> i32 {
         std::thread::sleep(Duration::from_millis(100));
     }
     stop_engine_exit_code(true, gone)
+}
+
+/// モデル置換専用の安全な停止。通常 Shutdown と異なり、EngineHost が未確定入力を
+/// 持つ場合や新しい op を知らない旧版の場合は停止せず配置待ちとして返す。
+#[derive(Debug)]
+enum MaintenanceStopError {
+    Busy,
+    Fatal(String),
+}
+
+impl std::fmt::Display for MaintenanceStopError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => write!(
+                formatter,
+                "入力中のためモデルの配置を待っています。未確定文字列を確定または取消してください。"
+            ),
+            Self::Fatal(message) => formatter.write_str(message),
+        }
+    }
+}
+
+fn stop_engine_for_maintenance() -> Result<(), MaintenanceStopError> {
+    use std::time::{Duration, Instant};
+
+    let pipe = ipc::client::stable_pipe_name();
+    let mut client = match ipc::client::EngineClient::connect_verified_to(
+        &pipe,
+        Duration::from_millis(250),
+        Instant::now() + Duration::from_millis(1000),
+    ) {
+        Ok(client) => client,
+        Err(ipc::client::EngineIdentityError::Mismatch { .. }) => {
+            return Err(MaintenanceStopError::Fatal("旧版の入力エンジンが動作中です。入力を確定して新版へ切り替えてから再試行してください。".into()));
+        }
+        Err(_) => return Ok(()),
+    };
+    let response = client
+        .request_within(
+            &ipc::protocol::Request::PrepareMaintenance,
+            Instant::now() + Duration::from_millis(1000),
+        )
+        .map_err(|_| MaintenanceStopError::Fatal(
+            "入力エンジンが保守停止に対応していないか応答できません。入力を確定して再試行してください。"
+                .to_string()
+        ))?;
+    if !matches!(response, ipc::protocol::Response::Ok) {
+        return Err(MaintenanceStopError::Busy);
+    }
+    drop(client);
+
+    let poll_until = Instant::now() + Duration::from_millis(3000);
+    while Instant::now() < poll_until {
+        if ipc::client::EngineClient::connect_to(&pipe, Duration::ZERO).is_err() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(MaintenanceStopError::Fatal(
+        "入力エンジンの安全な停止を確認できませんでした。少し待って再試行してください。".into(),
+    ))
+}
+
+/// 検証済みの取得物を保持したまま、未確定入力がなくなるまで配置を待つ。
+/// 取消だけは呼び出し側の取得物 cleanup に戻し、旧版・通信不能は再試行不能として返す。
+pub(crate) fn wait_for_engine_maintenance(cancelled: impl Fn() -> bool) -> Result<(), String> {
+    wait_for_engine_maintenance_with(cancelled, stop_engine_for_maintenance, || {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    })
+}
+
+fn wait_for_engine_maintenance_with(
+    cancelled: impl Fn() -> bool,
+    mut stop: impl FnMut() -> Result<(), MaintenanceStopError>,
+    mut pause: impl FnMut(),
+) -> Result<(), String> {
+    loop {
+        if cancelled() {
+            return Err("キャンセルしました。".into());
+        }
+        match stop() {
+            Ok(()) => return Ok(()),
+            Err(MaintenanceStopError::Busy) => {
+                pause();
+            }
+            Err(MaintenanceStopError::Fatal(message)) => return Err(message),
+        }
+    }
 }
 
 /// Releases ページ URL を repository から組み立てる純関数。末尾 `.git`／`/` を落として
@@ -2352,19 +2477,20 @@ fn request_clear_learning_once(c: &mut ipc::client::VerifiedEngineClient) -> Res
 mod tests {
     use super::{
         apply_automatic_check_transaction, apply_automatic_check_transaction_with_lease,
-        can_enable_inline_prediction, clear_learning_files_with,
-        collect_existing_learning_roots_with, corrupt_recovered, engine_singleton_mutex_name,
-        get_settings_with_timeout, get_symbol_catalog, has_other_same_user_session,
-        installed_versions_root_for_exe, is_allowed_external_url, is_safe_build_name,
-        known_learning_builds, learning_coordination_scope, learning_lifecycle_mutex_name,
-        learning_presence_mutex_name, open_existing_learning_directory, persist_reconcile_off,
-        persist_reconcile_off_with_status, reconcile_automatic_check_task_with_lease, releases_url,
-        run_now_succeeded, run_reconcile_worker_with, selected_learning_root_paths,
-        should_register_task, startup_reconcile_load_is_usable, startup_reconcile_load_warning,
-        stop_engine_exit_code, strict_installed_build_name, validate_no_reparse_ancestors_with,
-        zenzai_status_from_response, AutomaticCheckReconcileState, EngineAbsenceLease,
-        LearningEntry, LearningEntryKind, LearningScanError, ReconcileCompletion,
-        WindowsSessionUser, ZenzaiLatencyTierDto, ZenzaiRuntimeStatusDto,
+        clear_learning_files_with, collect_existing_learning_roots_with, corrupt_recovered,
+        engine_singleton_mutex_name, get_settings_with_timeout, get_symbol_catalog,
+        has_other_same_user_session, installed_versions_root_for_exe, is_allowed_external_url,
+        is_safe_build_name, known_learning_builds, learning_coordination_scope,
+        learning_lifecycle_mutex_name, learning_presence_mutex_name,
+        open_existing_learning_directory, persist_reconcile_off, persist_reconcile_off_with_status,
+        reconcile_automatic_check_task_with_lease, releases_url, run_now_succeeded,
+        run_reconcile_worker_with, selected_learning_root_paths, should_register_task,
+        startup_reconcile_load_is_usable, startup_reconcile_load_warning, stop_engine_exit_code,
+        strict_installed_build_name, validate_no_reparse_ancestors_with,
+        wait_for_engine_maintenance_with, zenzai_status_from_response,
+        AutomaticCheckReconcileState, EngineAbsenceLease, LearningEntry, LearningEntryKind,
+        LearningScanError, MaintenanceStopError, ReconcileCompletion, WindowsSessionUser,
+        ZenzaiLatencyTierDto, ZenzaiRuntimeStatusDto,
     };
     use std::cell::{Cell, RefCell};
     use std::ffi::OsString;
@@ -2707,14 +2833,6 @@ mod tests {
     }
 
     #[test]
-    fn inline_prediction_requires_model_only_for_off_to_on_transition() {
-        assert!(!can_enable_inline_prediction(true, false, false));
-        assert!(can_enable_inline_prediction(true, false, true));
-        assert!(can_enable_inline_prediction(true, true, false));
-        assert!(can_enable_inline_prediction(false, true, false));
-    }
-
-    #[test]
     fn symbol_catalog_returns_29_entries_excluding_dash_comma_period() {
         let catalog = get_symbol_catalog();
         assert_eq!(catalog.len(), 29);
@@ -2769,6 +2887,35 @@ mod tests {
         assert_eq!(stop_engine_exit_code(true, true), 0);
         // 送ったが 3s 以内に pipe が消えない＝診断用の失敗。
         assert_eq!(stop_engine_exit_code(true, false), 1);
+    }
+
+    #[test]
+    fn maintenance_wait_retains_work_across_busy_and_honors_cancel() {
+        let attempts = Cell::new(0);
+        let pauses = Cell::new(0);
+        wait_for_engine_maintenance_with(
+            || false,
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    Err(MaintenanceStopError::Busy)
+                } else {
+                    Ok(())
+                }
+            },
+            || pauses.set(pauses.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(pauses.get(), 2);
+
+        let error = wait_for_engine_maintenance_with(
+            || true,
+            || panic!("cancel must be checked before another stop attempt"),
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error, "キャンセルしました。");
     }
 
     #[test]
@@ -4073,8 +4220,7 @@ mod tests {
             })
         );
         assert!(
-            zenzai_status_from_response("model_path".into(), None, None, None, None, None)
-                .is_err()
+            zenzai_status_from_response("model_path".into(), None, None, None, None, None).is_err()
         );
     }
 

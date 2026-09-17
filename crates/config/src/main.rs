@@ -8,8 +8,11 @@
 mod activation;
 mod commands;
 mod download;
+mod keymap_catalog;
 mod logic;
+mod operation_state;
 mod prediction_download;
+mod settings_service;
 mod update;
 
 use tauri::{Emitter, Manager};
@@ -17,6 +20,43 @@ use windows::core::PCWSTR;
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 const CONFIG_INSTANCE_LOCK_ERROR: &str = "NOSPACEKEY_CONFIG_INSTANCE_LOCK";
+
+/// Work area に収まる論理ピクセル寸法を返す。通常は 1120x760 / 最小 640x480、
+/// 低解像度・高DPIでは最小寸法も作業領域まで縮め、画面外に固定されないようにする。
+fn window_dimensions(work_width: f64, work_height: f64) -> ((f64, f64), (f64, f64)) {
+    const MARGIN: f64 = 32.0;
+    let available_width = (work_width - MARGIN).max(1.0);
+    let available_height = (work_height - MARGIN).max(1.0);
+    let initial = (
+        1120.0_f64.min(available_width),
+        760.0_f64.min(available_height),
+    );
+    let minimum = (640.0_f64.min(initial.0), 480.0_f64.min(initial.1));
+    (initial, minimum)
+}
+
+fn fit_window_to_work_area(app: &tauri::AppHandle) {
+    use tauri::{LogicalSize, PhysicalPosition};
+
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(Some(monitor)) = window.current_monitor() else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let work = monitor.work_area();
+    let logical = work.size.to_logical::<f64>(scale);
+    let (initial, minimum) = window_dimensions(logical.width, logical.height);
+    let _ = window.set_min_size(Some(LogicalSize::new(minimum.0, minimum.1)));
+    let _ = window.set_size(LogicalSize::new(initial.0, initial.1));
+
+    let physical_width = (initial.0 * scale).round() as i32;
+    let physical_height = (initial.1 * scale).round() as i32;
+    let x = work.position.x + ((work.size.width as i32 - physical_width) / 2).max(0);
+    let y = work.position.y + ((work.size.height as i32 - physical_height) / 2).max(0);
+    let _ = window.set_position(PhysicalPosition::new(x, y));
+}
 
 /// `tauri-plugin-single-instance` の Windows mutex は既定 namespace（logon session 単位）。
 /// 同じユーザーが console/RDP 等の別 session で Config を開くと、プロセス内の
@@ -178,6 +218,7 @@ fn main() {
         .setup(|app| {
             let lease = ConfigInstanceLease::acquire()?;
             app.manage(lease);
+            fit_window_to_work_area(app.handle());
             // 設定と per-user task を起動時に照合する。外部コマンドと state
             // lock を含むため、setup/main event loop は待たず worker へ渡す。
             // ON 失敗時は OFF 保存に成功したときだけ OFF へ収束し、保存失敗時は
@@ -186,13 +227,18 @@ fn main() {
             Ok(())
         })
         .manage(logic::DictLock(std::sync::Mutex::new(())))
+        .manage(settings_service::SettingsService::default())
         .invoke_handler(tauri::generate_handler![
-            commands::get_settings,
+            commands::settings_snapshot,
+            commands::settings_patch,
+            commands::settings_operation_status,
+            commands::model_operation_status,
+            commands::keymap_catalog,
+            commands::settings_defaults,
+            commands::validate_key_binding,
+            commands::set_automatic_check,
             commands::acknowledge_corrupt_recovery_notices,
-            commands::apply_settings,
-            commands::dismiss_automatic_check_prompt,
             commands::consume_update_intent,
-            commands::get_default_settings,
             commands::get_symbol_catalog,
             commands::get_app_info,
             commands::open_settings_dir,
@@ -235,7 +281,19 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::ConfigInstanceLease;
+    use super::{window_dimensions, ConfigInstanceLease};
+
+    #[test]
+    fn window_dimensions_fit_small_work_areas_without_enforcing_an_oversized_minimum() {
+        assert_eq!(
+            window_dimensions(1920.0, 1080.0),
+            ((1120.0, 760.0), (640.0, 480.0))
+        );
+        assert_eq!(
+            window_dimensions(600.0, 450.0),
+            ((568.0, 418.0), (568.0, 418.0))
+        );
+    }
 
     #[test]
     fn config_instance_lease_excludes_other_handles_and_releases_on_drop() {

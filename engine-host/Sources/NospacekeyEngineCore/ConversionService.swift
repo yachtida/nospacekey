@@ -376,6 +376,9 @@ public final class ConversionService: @unchecked Sendable {
     }
 
     private var sessions: [Int: SessionRecord] = [:]
+    /// モデル配置の保守停止を受理した後、新しい入力セッションを開始させない。
+    /// 読み書きは EngineHost の serviceLock 下に限定する。
+    private var maintenanceShutdownPending = false
 
     /// テスト専用の観測窓（読み取りのみ）。実体は SessionRecord.typoRepairedIndices。
     /// private でなく internal にしているのはテスト専用（不変条件を「stale index が commit を
@@ -1302,6 +1305,16 @@ public final class ConversionService: @unchecked Sendable {
         connectionSessions[connection, default: []].insert(id)
         return id
     }
+
+    /// 未確定入力を持つセッションが無い場合だけ保守停止を予約する。
+    /// 予約後は EngineHost が後続要求を拒否し、応答書込後にプロセスを終了する。
+    public func beginMaintenanceShutdownIfIdle() -> Bool {
+        guard !maintenanceShutdownPending, sessions.isEmpty else { return false }
+        maintenanceShutdownPending = true
+        return true
+    }
+
+    public var isMaintenanceShutdownPending: Bool { maintenanceShutdownPending }
 
     /// `session` が `connection` の作成物かどうか（所有権チェック — UU-2）。
     /// 未知セッションは false。呼び出し側（EngineHost のハンドラ）は非所有を未知セッションと
@@ -2736,7 +2749,8 @@ public final class ConversionService: @unchecked Sendable {
     }
 
     func snapshot(_ segments: [SnapshotSegment], explicit: Bool, leftContext: String? = nil,
-                  enhancementKey: SnapshotEnhancementKey? = nil, snapshotConnection: Int = 0)
+                  enhancementKey: SnapshotEnhancementKey? = nil, snapshotConnection: Int = 0,
+                  liveSearchWidth: Int = 1)
         -> (text: String, reading: String, candidates: [String]?, candidateRemaining: [String]?, baseline: UInt64,
             autoCommit: SnapshotAutoCommitProposal?, clauseData: SnapshotClauseData)
     {
@@ -2744,7 +2758,8 @@ public final class ConversionService: @unchecked Sendable {
         converterLock.lock()
         defer { converterLock.unlock() }
         stopCompositionLocked()
-        let options = makeOptions(nBest: explicit ? 10 : 1, leftSideContext: leftContext, forceClassic: true)
+        let nBest = explicit || liveSearchWidth == 10 ? 10 : 1
+        let options = makeOptions(nBest: nBest, leftSideContext: leftContext, forceClassic: true)
         var classic = requestCandidatesLocked(composing, options: options)
         if let snapshotCandidatesForTesting { classic.mainResults = snapshotCandidatesForTesting }
         let reading = composing.convertTarget
@@ -2870,17 +2885,22 @@ public final class ConversionService: @unchecked Sendable {
         return baseline
     }
 
-    private func completeClauseCandidatesLocked(reading: String, context: String?) -> (candidates: [Candidate], modelTop: String?, promoted: Bool) {
+    private func intervalCandidatesLocked(reading: String, context: String?, includePrefixes: Bool = false) -> (candidates: [Candidate], modelTop: String?, promoted: Bool) {
         var composing = ComposingText()
         composing.insertAtCursorPosition(reading, inputStyle: .direct)
         stopCompositionLocked()
         let results = requestCandidatesLocked(composing, options: makeOptions(nBest: 100, leftSideContext: context, forceClassic: true)).mainResults
-        func covers(_ candidate: Candidate) -> Bool {
-            !candidate.text.isEmpty && ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined()).utf8.elementsEqual(reading.utf8)
+        let boundaries = Set((try? ClauseCoordinates.legalBoundaries(reading)) ?? [])
+        func matches(_ candidate: Candidate) -> Bool {
+            let ruby = ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined())
+            guard !candidate.text.isEmpty, !ruby.isEmpty else { return false }
+            if !includePrefixes { return ruby.utf8.elementsEqual(reading.utf8) }
+            return reading.unicodeScalars.starts(with: ruby.unicodeScalars)
+                && boundaries.contains(UInt32(ruby.unicodeScalars.count))
         }
-        let complete = results.filter(covers)
-        let displayed = (promoted(complete, composing: composing) ?? complete).filter(covers)
-        return (displayed, complete.first?.text, displayed.first?.text != complete.first?.text)
+        let matching = results.filter(matches)
+        let displayed = (promoted(matching, composing: composing) ?? matching).filter(matches)
+        return (displayed, matching.first?.text, displayed.first?.text != matching.first?.text)
     }
 
     private func retainClauseCandidateLocked(_ candidate: Candidate, start: UInt32, end: UInt32,
@@ -3037,13 +3057,16 @@ public final class ConversionService: @unchecked Sendable {
         let generation = currentLearningGeneration
         let reading = ClauseCoordinates.slice(request.reading, start: request.reading_start, end: request.reading_end)!
         let context = (baseline.leftContext ?? "") + request.preceding_surfaces.map(\.surface).joined()
-        let native = completeClauseCandidatesLocked(reading: reading, context: context)
+        let native = intervalCandidatesLocked(reading: reading, context: context,
+            includePrefixes: request.include_prefix_candidates == true)
         let originalSurface = baseline.clauses.first(where: { $0.reading_start == request.reading_start && $0.reading_end == request.reading_end })?.surface ?? reading
         let fullReading = request.reading_start == 0 && request.reading_end == UInt32(request.reading.unicodeScalars.count)
         let candidates = native.candidates.enumerated().compactMap { index, candidate in
-            retainClauseCandidateLocked(candidate, start: request.reading_start,
-                end: request.reading_end, generation: generation, now: now, originalSurface: originalSurface,
-                modelTop: native.modelTop, sentenceAction: fullReading
+            let end = request.reading_start + UInt32(ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined()).unicodeScalars.count)
+            let complete = end == request.reading_end
+            return retainClauseCandidateLocked(candidate, start: request.reading_start,
+                end: end, generation: generation, now: now, originalSurface: complete ? originalSurface : candidate.text,
+                modelTop: complete ? native.modelTop : candidate.text, sentenceAction: fullReading && complete
                     ? Self.sentenceAction(candidate, index: index, modelTop: native.modelTop, promoted: native.promoted) : nil)
         }
         let response: ClauseCandidatesResult
@@ -3076,7 +3099,7 @@ public final class ConversionService: @unchecked Sendable {
         var clauses: [WireClause] = []
         for range in request.clauses {
             let reading = ClauseCoordinates.slice(request.reading, start: range.reading_start, end: range.reading_end)!
-            let native = completeClauseCandidatesLocked(reading: reading, context: context)
+            let native = intervalCandidatesLocked(reading: reading, context: context)
             let candidate = native.candidates.first
             let retained = candidate.flatMap { retainClauseCandidateLocked($0, start: range.reading_start,
                 end: range.reading_end, generation: generation, now: now, originalSurface: $0.text, modelTop: native.modelTop) }

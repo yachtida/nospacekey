@@ -1131,32 +1131,6 @@ impl TsfHost {
         pump();
     }
 
-    /// 外部LLM変換（Tab）のワーカ IPC ＋ 結果ポーリングタイマ（WM_TIMER, LLM_POLL_MS≈50ms）を
-    /// 落ち着かせる（item12 用）。
-    ///
-    /// Tab→start_llm_convert は別スレッドへ EngineClient を move して LlmConvert を投げ、
-    /// UI スレッドは SetTimer(50ms) の WM_TIMER ポーリングで結果スロットを見る（llm_poll_proc）。
-    /// ヘッドレスでは feed_key の即 pump 内ではタイマがまだ発火しておらず、かつワーカも
-    /// 走り終えていない可能性がある。実ユーザの「Tab 後に少し待つ」を模し、デバウンス（60ms）
-    /// より十分長く待ちつつ pump を繰り返して、ワーカ完了＋WM_TIMER 発火→反映を確実にする。
-    /// echo モードでもワーカはプロセス spawn 済み engine への 1 往復 IPC なので余裕を見る。
-    pub fn settle_llm(&self) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            pump(); // 溜まった WM_TIMER を配送し llm_poll_proc を発火させる
-                    // preedit が「変換中…」から実結果へ置換されたら完了。
-            if !self.store.preedit().contains('…') {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-        }
-        // 念のためもう一度 pump（最後の置換 SetText を確実に store へ反映）。
-        pump();
-    }
-
     /// プロファイルを解除する（item9 用）。以降の feed_key は eaten=false になるはず。
     pub fn deactivate(&mut self) -> windows::core::Result<()> {
         if self.activated {

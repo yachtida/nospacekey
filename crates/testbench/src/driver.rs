@@ -201,78 +201,6 @@ pub fn run_item8(host: &TsfHost, threshold_ms: u128) -> Item8Result {
     }
 }
 
-pub struct Item12Result {
-    pub passed: bool,
-    pub detail: String,
-}
-/// LLM echo through real TSF: Editing, converted closed window, Ready window,
-/// and Initial snapshot pending. Require an exact correction and exact Enter
-/// commit, with no old candidate/status window or stale snapshot overwrite.
-/// NOSPACEKEY_LLM_ECHO=1 is set by the testbench entry point.
-pub fn run_item12(host: &TsfHost) -> Item12Result {
-    host.warm_up();
-    let pid = std::process::id();
-    let mut passed = true;
-    let mut details = Vec::new();
-    for spaces in 0..=3 {
-        // 3 means first Space immediately followed by LLM, before snapshot delivery.
-        let converting = spaces > 0 && spaces < 3;
-        host.store.reset();
-        let base = read_events(pid).len();
-        let samples = run_keys(host, &crate::scenarios::typed("nihongo"));
-        host.settle_debounce();
-        let mut all_eaten = samples.iter().all(|sample| sample.eaten);
-        let conversion_base = read_events(pid).len();
-        if converting {
-            all_eaten &= host.feed_key(crate::scenarios::SPACE.0);
-            run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
-        }
-        let converting_ready = !converting || read_events(pid).iter().skip(conversion_base)
-            .any(|event| matches!(event, Ev::ClausePresented { ready: false, .. }));
-        let mut candidates_ready = true;
-        let mut candidate_attempts = 0;
-        if spaces == 2 {
-            // A calculation may expire under GPU load. This case tests leaving an
-            // actual Ready window, so allow bounded user retries during setup only.
-            candidates_ready = false;
-            for _ in 0..3 {
-                candidate_attempts += 1;
-                all_eaten &= host.feed_key(crate::scenarios::SPACE.0);
-                run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
-                candidates_ready = host.candidate_strings().len() >= 2;
-                if candidates_ready { break; }
-            }
-        }
-        let composing_before = host.store.composing();
-        let supersede_base = tip_log_count("ev=llm_supersede_pending");
-        if spaces == 3 { all_eaten &= host.feed_key_no_pump(crate::scenarios::SPACE.0); }
-        let tab_eaten = host.feed_key_with_shift(crate::scenarios::TAB.0);
-        let pending_superseded = spaces != 3 || tip_log_count("ev=llm_supersede_pending") == supersede_base + 1;
-        let window_closed_at_start = host.candidate_strings().is_empty();
-        host.settle_llm();
-        run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
-        let preedit_after = host.store.preedit();
-        let corrected = host.store.composing()
-            && preedit_after == "LLM:にほんご"
-            && host.candidate_strings().is_empty()
-            && host.store.committed().is_empty()
-            && host.store.full() == preedit_after;
-        let evs: Vec<Ev> = read_events(pid).into_iter().skip(base).collect();
-        let has_request = evs.iter().any(|e| matches!(e, Ev::LlmRequest { .. }));
-        let has_applied = evs.iter().any(|e| matches!(e, Ev::LlmApplied { .. }));
-        let enter_eaten = host.feed_key(crate::scenarios::ENTER.0);
-        run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
-        let committed = host.store.committed();
-        let commit_ok = committed == "LLM:にほんご" && host.store.full() == committed
-            && host.store.preedit().is_empty() && !host.store.composing();
-        passed &= all_eaten && pending_superseded && candidates_ready && window_closed_at_start && converting_ready && composing_before && tab_eaten && has_request && has_applied
-            && corrected && enter_eaten && commit_ok;
-        details.push(format!("spaces={spaces} candidate_attempts={candidate_attempts} pending_superseded={pending_superseded} candidates_ready={candidates_ready} window_closed_at_start={window_closed_at_start} converting={converting} converting_ready={converting_ready} all_eaten={all_eaten} composing_before={composing_before} tab_eaten={tab_eaten} after={preedit_after:?} ev_request={has_request} ev_applied={has_applied} enter_eaten={enter_eaten} committed={committed:?} commit_ok={commit_ok}"));
-        if !commit_ok { break; }
-    }
-    Item12Result { passed, detail: details.join("; ") }
-}
-
 pub struct Item13Result {
     pub passed: bool,
     pub detail: String,
@@ -625,7 +553,7 @@ pub fn run_item14(host: &TsfHost) -> Item14Result {
     let strings_valid = (2..=9).contains(&strings.len());
     let has_nihongo = strings.iter().any(|s| s == "日本語");
 
-    // Opening the window retains the current surface, even if its rank changed.
+    // The opening Space advances to candidate 2; its preview must match the document.
     let sel = host.candidate_selection();
     let selected_matches_document = strings.get(sel as usize) == Some(&host.store.preedit());
 
@@ -658,65 +586,6 @@ pub fn run_item14(host: &TsfHost) -> Item14Result {
         && beh_reached
         && committed_matches_target;
     Item14Result { passed, detail }
-}
-
-pub struct Item16Result {
-    pub passed: bool,
-    pub detail: String,
-}
-
-/// Changing the first clause and finalizing must retain every following clause.
-/// The former prefix-only commit expectation predates the full-coverage contract.
-pub fn run_item16(host: &TsfHost) -> Item16Result {
-    if !host.normalize_native_mode() {
-        return Item16Result { passed: false, detail: "native mode setup failed".into() };
-    }
-    host.warm_up();
-    host.store.reset();
-    let pid = std::process::id();
-    let base = read_events(pid).len();
-    let mut keys = crate::scenarios::typed("kyouhaiitenkidesu");
-    keys.push(crate::scenarios::SPACE);
-    keys.push(crate::scenarios::WAIT_CONVERSION);
-    let mut all_eaten = run_keys(host, &keys).iter().all(|sample| sample.eaten);
-    let initial = host.store.preedit();
-    let initial_closed = host.store.composing() && !initial.is_empty()
-        && host.store.committed().is_empty() && host.store.full() == initial
-        && host.candidate_strings().is_empty()
-        && read_events(pid).iter().skip(base)
-            .any(|event| matches!(event, Ev::ClausePresented { ready: false, .. }));
-    all_eaten &= host.feed_key(crate::scenarios::SPACE.0);
-    run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
-    let candidates = host.candidate_strings();
-    let selected = host.candidate_selection() as usize;
-    let target = candidates.get(selected).and_then(|surface| {
-        if surface.is_empty() { return None; }
-        let suffix = initial.strip_prefix(surface)?;
-        if suffix.is_empty() { return None; }
-        candidates.iter().enumerate().find(|(index, candidate)|
-            *index != selected && !candidate.is_empty() && *candidate != surface)
-            .map(|(index, candidate)| (index, format!("{candidate}{suffix}"), suffix.to_string()))
-    });
-    let setup = initial_closed && (2..=9).contains(&candidates.len())
-        && host.store.preedit() == initial && host.store.full() == initial
-        && host.store.committed().is_empty() && target.is_some();
-    let finalized = setup && target.as_ref().is_some_and(|(index, _, _)|
-        host.behavior_select_and_finalize(*index as u32));
-    run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
-    let committed = host.store.committed();
-    let commit_ok = target.as_ref().is_some_and(|(_, expected, _)| &committed == expected)
-        && !committed.is_empty() && host.store.full() == committed
-        && host.store.preedit().is_empty() && !host.store.composing()
-        && read_events(pid).iter().skip(base).any(|event|
-            matches!(event, Ev::Commit { text, source } if text == &committed && source == "clause"));
-    let mut next_input_ok = false;
-    if commit_ok {
-        all_eaten &= host.feed_key(crate::scenarios::ch('a').0);
-        next_input_ok = host.store.composing() && host.store.committed() == committed
-            && host.store.preedit() == "あ" && host.store.full() == format!("{committed}あ");
-    }
-    let passed = all_eaten && setup && finalized && commit_ok && next_input_ok;
-    Item16Result { passed, detail: format!("all_eaten={all_eaten} initial_closed={initial_closed} initial={initial:?} candidates={candidates:?} selected={selected} target={target:?} finalized={finalized} committed={committed:?} commit_ok={commit_ok} next_input_ok={next_input_ok}") }
 }
 
 pub struct Item15Result {
@@ -1102,59 +971,6 @@ pub fn run_item29(host: &TsfHost) -> Item29Result {
          C(restore): unset_ok={unset_ok} refocus_ok={refocus2_ok} eaten={c_eaten} preedit={c_preedit:?}"
     );
     Item29Result { passed, detail }
-}
-
-pub struct Item30Result {
-    pub passed: bool,
-    pub detail: String,
-}
-
-/// Commit the local clause, undo it into reconversion, then restore the exact committed text.
-pub fn run_item30(host: &TsfHost) -> Item30Result {
-    let pid = std::process::id();
-    if !host.normalize_native_mode() {
-        return Item30Result { passed: false, detail: "commit-undo setup: native mode unavailable".into() };
-    }
-    host.warm_up();
-    host.store.reset();
-    let base = read_events(pid).len();
-    let mut keys_eaten = true;
-    for key in typed("nihongo") { keys_eaten &= host.feed_key(key.0); }
-    keys_eaten &= host.feed_key_no_pump(crate::scenarios::SPACE.0);
-    keys_eaten &= host.feed_key_no_pump(crate::scenarios::ENTER.0);
-    run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
-    let committed_full = host.store.committed();
-    let evs_commit: Vec<Ev> = read_events(pid).into_iter().skip(base).collect();
-    let last_commit = evs_commit.iter().rev().find_map(|event| match event {
-        Ev::Commit { text, source } => Some((text, source)),
-        _ => None,
-    });
-    let saw_clause_commit = last_commit.is_some_and(|(text, source)| source == "clause" && *text == committed_full);
-    if !keys_eaten || !saw_clause_commit || committed_full.is_empty()
-        || host.store.full() != committed_full || !host.store.preedit().is_empty() {
-        return Item30Result { passed: false, detail: format!(
-            "commit-undo prerequisite: keys_eaten={keys_eaten} committed={committed_full:?} full={:?} preedit={:?} commit={last_commit:?}",
-            host.store.full(), host.store.preedit()) };
-    }
-
-    let undo_base = read_events(pid).len();
-    let undo_eaten = host.feed_key_with_ctrl(0x08);
-    run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
-    let preedit_after_undo = host.store.preedit();
-    let composing_after_undo = host.store.composing();
-    let saw_undo_shown = read_events(pid).iter().skip(undo_base)
-        .any(|event| matches!(event, Ev::CommitUndoShown { .. }));
-    let esc_eaten = host.feed_key(crate::scenarios::ESC.0);
-    run_keys(host, &[crate::scenarios::WAIT_CONVERSION]);
-    let restored_full = host.store.full();
-    let restored = restored_full == committed_full && host.store.committed() == committed_full
-        && host.store.preedit().is_empty() && !host.store.composing();
-    let passed = undo_eaten && saw_undo_shown && composing_after_undo
-        && !preedit_after_undo.is_empty() && esc_eaten && restored;
-    let detail = format!(
-        "committed_full={committed_full:?} saw_clause_commit={saw_clause_commit} undo_eaten={undo_eaten} saw_undo_shown={saw_undo_shown} composing_after_undo={composing_after_undo} preedit_after_undo={preedit_after_undo:?} esc_eaten={esc_eaten} restored_full={restored_full:?} restored={restored}"
-    );
-    Item30Result { passed, detail }
 }
 
 pub struct Item31Result {

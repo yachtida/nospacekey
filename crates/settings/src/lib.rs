@@ -90,10 +90,19 @@ impl ZenzaiSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveSettings {
     pub enabled: bool,
+    /// Classic live search: 1 = speed, 10 = accuracy (same width as Space).
+    #[serde(default = "default_live_search_width")]
+    pub search_width: u32,
 }
+fn default_live_search_width() -> u32 { 1 }
 impl Default for LiveSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: true, search_width: default_live_search_width() }
+    }
+}
+impl LiveSettings {
+    pub fn effective_search_width(&self) -> u32 {
+        if self.search_width == 10 { 10 } else { 1 }
     }
 }
 
@@ -942,6 +951,30 @@ fn read_compatible_future_settings(text: &str) -> Settings {
         .unwrap_or_default()
 }
 
+fn latest_corrupt_backup_in(settings_file: &Path) -> Option<PathBuf> {
+    let parent = settings_file.parent()?;
+    let prefix = format!("{}.corrupt.", settings_file.file_name()?.to_string_lossy());
+    std::fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with(&prefix) || !marker_entry_is_regular(&path) {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+}
+
+/// Latest recoverable settings quarantine, for the Config diagnostic notice.
+pub fn latest_corrupt_backup_path() -> Option<PathBuf> {
+    latest_corrupt_backup_in(&settings_path()?)
+}
+
 fn parse_settings_text(text: &str) -> (Settings, LoadOutcome) {
     if text.trim().is_empty() {
         return (Settings::default(), LoadOutcome::Empty);
@@ -993,10 +1026,59 @@ fn quarantine_dest_path(path: &Path) -> PathBuf {
 pub fn save(s: &Settings) -> std::io::Result<()> {
     let path = settings_path()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
-    // シリアライズ失敗時に settings.json を空ファイルで上書きして破壊しないよう、ここで ?
-    // で中断する（to_json は unwrap_or_default で "" に落ちるため save では使わない）。
-    let json = serde_json::to_string_pretty(s).map_err(std::io::Error::other)?;
+    // 現在のファイルへ既知フィールドだけを再帰的に重ねる。同一 schema version の将来追加
+    // フィールドを、古い Config/TIP が無関係な read-modify-save で消さないためである。
+    // 読めない原本と将来 schema は、load_for_mutation を迂回した呼び出しでも上書きしない。
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let json = merged_settings_json(existing.as_deref(), s)?;
     save_atomic(&path, &json)
+}
+
+fn merged_settings_json(existing: Option<&str>, settings: &Settings) -> std::io::Result<String> {
+    let mut destination = match existing {
+        None => serde_json::Value::Object(serde_json::Map::new()),
+        Some(text) if text.trim().is_empty() => serde_json::Value::Object(serde_json::Map::new()),
+        Some(text) => {
+            let (_, outcome) = parse_settings_text(text);
+            match outcome {
+                LoadOutcome::Loaded => serde_json::from_str(text).map_err(std::io::Error::other)?,
+                LoadOutcome::UnsupportedVersion => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "settings schema is newer than this binary",
+                    ));
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "settings file must be loaded for mutation before saving",
+                    ));
+                }
+            }
+        }
+    };
+    let known = serde_json::to_value(settings).map_err(std::io::Error::other)?;
+    merge_known_fields(&mut destination, known);
+    serde_json::to_string_pretty(&destination).map_err(std::io::Error::other)
+}
+
+fn merge_known_fields(destination: &mut serde_json::Value, known: serde_json::Value) {
+    match (destination, known) {
+        (serde_json::Value::Object(destination), serde_json::Value::Object(known)) => {
+            for (key, value) in known {
+                if let Some(current) = destination.get_mut(&key) {
+                    merge_known_fields(current, value);
+                } else {
+                    destination.insert(key, value);
+                }
+            }
+        }
+        (destination, known) => *destination = known,
+    }
 }
 
 /// `save()` から抽出した汎用の原子保存ヘルパ（辞書ファイル保存でも使う想定）。
@@ -1185,6 +1267,68 @@ pub fn resolve_env_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_corrupt_backup_ignores_unrelated_and_non_regular_entries() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "nospacekey-settings-latest-corrupt-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&temp).unwrap();
+        let settings_file = temp.join("settings.json");
+        let backup = temp.join("settings.json.corrupt.1.2.3");
+        std::fs::write(&backup, b"broken").unwrap();
+        std::fs::write(temp.join("other.json.corrupt.1"), b"other").unwrap();
+        std::fs::create_dir(temp.join("settings.json.corrupt.directory")).unwrap();
+        assert_eq!(latest_corrupt_backup_in(&settings_file), Some(backup));
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn merged_save_preserves_unknown_fields_at_every_object_level() {
+        let original = r##"{
+          "version": 2,
+          "future_root": {"enabled": true},
+          "number": {"full_width": true, "future_number": 7},
+          "appearance": {
+            "theme": "auto",
+            "future_appearance": "keep",
+            "palette_light": {"bg": "#FFFFFF", "future_color": "keep"}
+          }
+        }"##;
+        let (mut settings, outcome) = parse_settings_text(original);
+        assert_eq!(outcome, LoadOutcome::Loaded);
+        settings.number.full_width = false;
+
+        let json = merged_settings_json(Some(original), &settings).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["future_root"]["enabled"], true);
+        assert_eq!(value["number"]["future_number"], 7);
+        assert_eq!(value["appearance"]["future_appearance"], "keep");
+        assert_eq!(value["appearance"]["palette_light"]["future_color"], "keep");
+        assert_eq!(value["number"]["full_width"], false);
+    }
+
+    #[test]
+    fn merged_save_refuses_corrupt_and_future_schema_sources() {
+        let settings = Settings::default();
+        assert_eq!(
+            merged_settings_json(Some("{"), &settings)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            merged_settings_json(Some(r#"{"version":999,"future":true}"#), &settings)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
     use std::ffi::OsString;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -1731,6 +1875,21 @@ mod tests {
         assert!(!result.0.llm.enabled);
         assert!(!rename_called.get());
         assert!(!copy_called.get());
+    }
+
+    #[test]
+    fn live_search_width_preserves_old_settings_and_bounds_manual_values() {
+        let old: Settings = serde_json::from_str(r#"{"version":2,"live_conversion":{"enabled":true}}"#).unwrap();
+        assert_eq!(old.live_conversion.effective_search_width(), 1);
+        for width in [1, 10] {
+            let mut settings = old.clone();
+            settings.live_conversion.search_width = width;
+            let restored: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.live_conversion.effective_search_width(), width);
+        }
+        for width in [0, 2, 9, 11, u32::MAX] {
+            assert_eq!(LiveSettings { enabled: true, search_width: width }.effective_search_width(), 1);
+        }
     }
 
     #[test]

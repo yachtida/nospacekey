@@ -116,7 +116,7 @@ final class EngineHostHandlerTests: XCTestCase {
         let obj = try JSONSerialization.jsonObject(
             with: handler(1, Data(#"{"method":"StartSession"}"#.utf8)).reply) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
-        XCTAssertEqual(obj["proto"] as? Int, 9)
+        XCTAssertEqual(obj["proto"] as? Int, 10)
         XCTAssertEqual(obj["boot"] as? String, BuildInfo.version)
     }
 
@@ -128,6 +128,23 @@ final class EngineHostHandlerTests: XCTestCase {
         let outcome = handler(1, Data(#"{"method":"Shutdown"}"#.utf8))
         XCTAssertEqual(resultTag(outcome), "Ok")
         XCTAssertTrue(outcome.exitAfterReply)
+    }
+
+    func testMaintenanceShutdownRejectsActiveInputAndStopsOnlyWhenIdle() {
+        let service = makeService()
+        let handler = makeEngineHandler(service: service, serviceLock: NSLock())
+        let started = handler(7, Data(#"{"method":"StartSession"}"#.utf8))
+        let session = sessionId(started)!
+        let request = Data(#"{"method":"PrepareMaintenance"}"#.utf8)
+        let busy = handler(9, request)
+        XCTAssertEqual(resultTag(busy), "Error")
+        XCTAssertFalse(busy.exitAfterReply)
+
+        _ = handler(7, Data(#"{"method":"EndSession","params":{"session":\#(session)}}"#.utf8))
+        let accepted = handler(9, request)
+        XCTAssertEqual(resultTag(accepted), "Ok")
+        XCTAssertTrue(accepted.exitAfterReply)
+        XCTAssertEqual(resultTag(handler(7, Data(#"{"method":"StartSession"}"#.utf8))), "Error")
     }
 
     // 通常 op は exit を要求しない（Shutdown 以外で誤って engine が落ちないことの固定）。

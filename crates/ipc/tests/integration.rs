@@ -7,6 +7,148 @@ use ipc::protocol::{Request, Response};
 use std::time::Duration;
 
 #[test]
+#[ignore = "requires a built Swift engine"]
+fn clause_prefix_candidates_over_unique_pipe() {
+    use ipc::clause::*;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let engine = IsolatedEngine::stage();
+    let pipe = isolated_pipe("clause-prefix");
+    let _child = start_engine(Command::new(engine.exe()).arg(&pipe)
+        .creation_flags(0x08000000)
+        .env("NOSPACEKEY_ZENZAI", "off")
+        .env("NOSPACEKEY_LEARNING", "0")
+        .env("NOSPACEKEY_MEMORY_DIR", engine.root.join("memory"))
+        .env("TEMP", &engine.root).env("TMP", &engine.root)
+        .stdout(Stdio::null()).stderr(Stdio::null()));
+    let mut client = EngineClient::connect_to(&pipe, Duration::from_secs(5)).unwrap();
+    let session = ipc::client::verify_session_identity(
+        client.request(&Request::StartSession).unwrap()).unwrap();
+    let snapshot = client.request(&Request::LiveSnapshot {
+        composition: 1, revision: 1, configuration_generation: 1, connection_generation: 1,
+        conversion_revision: 0, request_id: 1,
+        segments: vec![ipc::protocol::SnapshotSegment { text: "がぞうのように".into(), style: Some("direct".into()) }],
+        explicit: true, live_search_width: None, left_context: None,
+    }).unwrap();
+    let Response::SnapshotResult { baseline, .. } = snapshot else { panic!("expected snapshot"); };
+    for include_prefix_candidates in [false, true] {
+        let request = ClauseCandidatesRequest {
+            key: ClauseRequestKey {
+                identity: SnapshotIdentity { composition: 1, revision: 1, configuration_generation: 1, connection_generation: 1 },
+                baseline, conversion_revision: 0, clause_id: ClauseId(1),
+                request_id: if include_prefix_candidates { 3 } else { 2 },
+            },
+            reading: "がぞうのように".into(), reading_start: ReadingPosition(0), reading_end: ReadingPosition(7),
+            preceding_surfaces: vec![], include_prefix_candidates,
+        };
+        let response = client.request(&Request::ClauseCandidates(request.clone())).unwrap();
+        let Response::ClauseCandidatesResult { key, status: ClauseCandidatesStatus::Ready { candidates } } = response else {
+            panic!("expected candidates, got {response:?}");
+        };
+        assert_eq!(key, request.key);
+        request.validate_candidates(&candidates).unwrap();
+        assert!(candidates.iter().any(|c| c.surface == "画像のように" && c.reading_end == ReadingPosition(7)));
+        assert_eq!(candidates.iter().any(|c| c.surface == "画像の" && c.reading_end == ReadingPosition(4)), include_prefix_candidates);
+    }
+    client.request(&Request::EndSession { session }).unwrap();
+}
+
+#[test]
+#[ignore = "requires a built Swift engine"]
+fn live_search_width_over_unique_pipe() {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let engine = IsolatedEngine::stage();
+    let pipe = isolated_pipe("live-search-width");
+    let _child = start_engine(Command::new(engine.exe()).arg(&pipe)
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .env("NOSPACEKEY_ZENZAI", "off")
+        .env("NOSPACEKEY_LEARNING", "0")
+        .env("NOSPACEKEY_MEMORY_DIR", engine.root.join("memory"))
+        .env("TEMP", &engine.root).env("TMP", &engine.root)
+        .stdout(Stdio::null()).stderr(Stdio::null()));
+    let mut client = EngineClient::connect_to(&pipe, Duration::from_secs(5)).unwrap();
+    let session = ipc::client::verify_session_identity(
+        client.request(&Request::StartSession).unwrap()).unwrap();
+    for explicit in [false, true] {
+        for (index, width) in [None, Some(10), Some(1)].into_iter().enumerate() {
+            let result = client.request(&Request::LiveSnapshot {
+                composition: 1, revision: index as u64 + 1,
+                configuration_generation: 1, connection_generation: 1,
+                conversion_revision: 0, request_id: index as u64 + 1,
+                segments: vec![ipc::protocol::SnapshotSegment {
+                    text: "すこーぷがいなので".into(), style: Some("direct".into()),
+                }],
+                explicit, live_search_width: width, left_context: None,
+            }).unwrap();
+            let Response::SnapshotResult { text, candidates, .. } = result else {
+                panic!("expected snapshot, got {result:?}");
+            };
+            let expected = if explicit || width == Some(10) { "スコープ外なので" } else { "スコープ買いなので" };
+            assert_eq!(text, expected, "explicit={explicit} width={width:?}");
+            assert_eq!(candidates.is_some(), explicit);
+        }
+    }
+    client.request(&Request::EndSession { session }).unwrap();
+}
+
+/// Run in one client process across an engine replacement. An optional fixture
+/// directory lets this exercise two real product builds with the same protocol.
+#[test]
+#[ignore = "requires a built Swift engine"]
+fn compatible_engine_update_reconnects_and_converts() {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let previous = std::env::var_os("NOSPACEKEY_COMPAT_PREVIOUS_ENGINE_DIR");
+    let old = match &previous {
+        Some(directory) => IsolatedEngine::stage_from(std::path::Path::new(directory)),
+        None => IsolatedEngine::stage(),
+    };
+    let new = IsolatedEngine::stage();
+    // A synthetic session keeps the production endpoint out of this test.
+    let pipe = ipc::client::pipe_name_for_session(1_000_000 + std::process::id());
+    let mut epochs = Vec::new();
+    let mut builds = Vec::new();
+    for engine in [&old, &new] {
+        let child = start_engine(Command::new(engine.exe()).arg(&pipe)
+            .env("NOSPACEKEY_MEMORY_DIR", engine.root.join("memory"))
+            .env("NOSPACEKEY_LEARNING", "0")
+            .env("NOSPACEKEY_ZENZAI", "off")
+            .env("TEMP", &engine.root)
+            .env("TMP", &engine.root)
+            .stdout(Stdio::null()).stderr(Stdio::null()));
+        let mut client = EngineClient::connect_to(&pipe, Duration::from_secs(5)).unwrap();
+        let response = client.request(&Request::StartSession).unwrap();
+        if let Response::Session { ref boot, .. } = response {
+            builds.push(boot.clone());
+        }
+        let (session, metadata) = ipc::client::verify_session_metadata(response).unwrap();
+        epochs.push(metadata.engine_epoch);
+        for request in [
+            Request::Insert { session, text: "nihongo".into(), style: None },
+            Request::Convert { session, left_context: None },
+            Request::LiveConvert { session, seq: 1, left_context: None, auto_commit: false },
+            Request::EndSession { session },
+        ] {
+            let result = client.request_within(&request, Instant::now() + Duration::from_secs(5)).unwrap();
+            match request {
+                Request::Insert { .. } => assert!(matches!(result, Response::Reading { reading } if reading == "にほんご")),
+                Request::Convert { .. } => assert!(matches!(result, Response::Candidates { candidates } if candidates.iter().any(|value| value == "日本語"))),
+                Request::LiveConvert { .. } => assert!(matches!(result, Response::LiveResult { text, .. } if text == "日本語")),
+                _ => assert!(matches!(result, Response::Ok)),
+            }
+        }
+        drop(client);
+        drop(child);
+    }
+    assert_ne!(epochs[0], epochs[1], "replacement must have a new engine epoch");
+    if previous.is_some() {
+        assert_ne!(builds[0], builds[1], "fixture must be a different product version");
+    }
+}
+
+#[test]
 #[ignore] // 事前に engine-host を起動しておくこと
 fn convert_nihongo_returns_kanji() {
     let mut c = EngineClient::connect(Duration::from_secs(2)).unwrap();
@@ -218,6 +360,10 @@ fn isolated_pipe(label: &str) -> String {
 impl IsolatedEngine {
     fn stage() -> Self {
         let source = engine_build_dir();
+        Self::stage_from(&source)
+    }
+
+    fn stage_from(source: &std::path::Path) -> Self {
         let source_exe = source.join("NospacekeyEngineHost.exe");
         assert!(
             source_exe.is_file(),

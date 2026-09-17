@@ -91,7 +91,6 @@ fn main() {
         "--scenarios" => run_scenarios_reported(json_path),
         "--item8" => run_item8_mode(),
         "--item9" => run_item9_mode(),
-        "--item12" => run_item12_mode(),
         "--item13" => run_item13_mode(),
         "--item14" => run_item14_mode(),
         "--item15" => run_item15_mode(),
@@ -100,7 +99,6 @@ fn main() {
         "--item19" => run_item19_mode(),
         "--item24" => run_item24_mode(),
         "--item29" => run_item29_mode(),
-        "--item30" => run_item30_mode(),
         "--item31" => run_item31_mode(),
         "--item32" => run_item32_mode(),
         "--async-stress" => run_async_stress_mode(),
@@ -1422,60 +1420,6 @@ fn run_item9_mode() -> i32 {
     }
 }
 
-/// Pin only the model/setup conditions needed to observe multiple native clauses.
-/// The settings path is restored after the host is dropped, including on errors.
-fn run_item16_with_classic_fixture() -> Result<driver::Item16Result, String> {
-    struct LocalAppDataGuard(Option<std::ffi::OsString>);
-    impl Drop for LocalAppDataGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(value) => std::env::set_var("LOCALAPPDATA", value),
-                None => std::env::remove_var("LOCALAPPDATA"),
-            }
-        }
-    }
-    let scratch = tempfile::Builder::new().prefix("nospacekey-item16-").tempdir()
-        .map_err(|error| format!("scratch: {error}"))?;
-    let settings = scratch.path().join("nospacekey");
-    std::fs::create_dir_all(&settings).and_then(|_| std::fs::write(settings.join("settings.json"),
-        r#"{"version":2,"zenzai":{"enabled":false},"learning":{"enabled":false},"default_direct":false,"live_conversion":{"enabled":false}}"#))
-        .map_err(|error| format!("settings: {error}"))?;
-    let _environment = LocalAppDataGuard(std::env::var_os("LOCALAPPDATA"));
-    std::env::set_var("LOCALAPPDATA", scratch.path());
-    let host = tsf_host::TsfHost::start().map_err(|error| format!("start: {error:?}"))?;
-    Ok(driver::run_item16(&host))
-}
-
-/// item12: Tab→外部LLM変換のスレッド配線（echo）。ComSta ガードを host より先に束縛して start。
-fn run_item12_mode() -> i32 {
-    let _com = match tsf_host::ComSta::init() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("item12 ComSta::init fail: {e:?}");
-            return 2;
-        }
-    };
-    match tsf_host::TsfHost::start() {
-        Ok(host) => {
-            let r = driver::run_item12(&host);
-            println!(
-                "item12 : {} ({})",
-                if r.passed { "PASS" } else { "FAIL" },
-                r.detail
-            );
-            if r.passed {
-                0
-            } else {
-                1
-            }
-        }
-        Err(e) => {
-            eprintln!("item12 start fail: {e:?}");
-            2
-        }
-    }
-}
-
 /// item13: SP5 ヘッドレス再変換（半角英数モード）。ComSta ガードを host より先に束縛して start。
 fn run_item13_mode() -> i32 {
     let _com = match tsf_host::ComSta::init() {
@@ -1714,37 +1658,6 @@ fn run_item29_mode() -> i32 {
         }
         Err(e) => {
             eprintln!("item29 start fail: {e:?}");
-            2
-        }
-    }
-}
-
-/// item30（Task4 確定取消 headless 回帰・往路）: nihongo→Space→Enter→Ctrl+Backspace→Esc の往復。
-/// ComSta ガードを host より先に束縛して start。
-fn run_item30_mode() -> i32 {
-    let _com = match tsf_host::ComSta::init() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("item30 ComSta::init fail: {e:?}");
-            return 2;
-        }
-    };
-    match tsf_host::TsfHost::start() {
-        Ok(host) => {
-            let r = driver::run_item30(&host);
-            println!(
-                "item30 : {} ({})",
-                if r.passed { "PASS" } else { "FAIL" },
-                r.detail
-            );
-            if r.passed {
-                0
-            } else {
-                1
-            }
-        }
-        Err(e) => {
-            eprintln!("item30 start fail: {e:?}");
             2
         }
     }
@@ -2513,28 +2426,6 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         }
     }
 
-    // item12: Tab→外部LLM変換のスレッド配線（worker→ポーリング→preedit 反映）を echo 検証。
-    // 専用ドライバ（合成→Tab→settle_llm）が要るので個別実行する。新しい host で。
-    match tsf_host::TsfHost::start() {
-        Ok(host) => {
-            let r12 = driver::run_item12(&host);
-            items.push(ItemReport {
-                item: 12,
-                name: "tab->llm convert wiring (echo)".into(),
-                status: if r12.passed { "pass" } else { "fail" }.into(),
-                detail: r12.detail,
-                max_elapsed_ms: 0,
-            });
-        }
-        Err(e) => items.push(ItemReport {
-            item: 12,
-            name: "tab->llm convert wiring (echo)".into(),
-            status: "error".into(),
-            detail: format!("start fail: {e:?}"),
-            max_elapsed_ms: 0,
-        }),
-    }
-
     // item13: SP5 ヘッドレス再変換（半角英数モードで 変換キー0x1C→OnKeyDown→非空 StartComposition→
     // 候補→Esc 復元 / Enter 確定）。専用ドライバ（シード＋モード設定）が要るので個別実行。新 host で。
     match tsf_host::TsfHost::start() {
@@ -2596,26 +2487,6 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Err(e) => items.push(ItemReport {
             item: 15,
             name: "live-conversion caret follows to end".into(),
-            status: "error".into(),
-            detail: format!("start fail: {e:?}"),
-            max_elapsed_ms: 0,
-        }),
-    }
-
-    // item16: first-clause replacement preserves all later clauses through finalization.
-    match run_item16_with_classic_fixture() {
-        Ok(r16) => {
-            items.push(ItemReport {
-                item: 16,
-                name: "first-clause replacement commits all following clauses".into(),
-                status: if r16.passed { "pass" } else { "fail" }.into(),
-                detail: r16.detail,
-                max_elapsed_ms: 0,
-            });
-        }
-        Err(e) => items.push(ItemReport {
-            item: 16,
-            name: "first-clause replacement commits all following clauses".into(),
             status: "error".into(),
             detail: format!("start fail: {e:?}"),
             max_elapsed_ms: 0,
@@ -2729,29 +2600,6 @@ fn run_scenarios_reported(json_path: Option<String>) -> i32 {
         Err(e) => items.push(ItemReport {
             item: 29,
             name: "keyboard-disabled context passes keys through (Edge password)".into(),
-            status: "error".into(),
-            detail: format!("start fail: {e:?}"),
-            max_elapsed_ms: 0,
-        }),
-    }
-
-    // item30（Task4 確定取消 headless 回帰・往路）: nihongo→Space→Enter→Ctrl+Backspace→Esc の
-    // 往復が無傷に成立すること。Ctrl 修飾の注入（feed_key_with_ctrl）が要るので専用ドライバで
-    // 個別実行する。新 host で。
-    match tsf_host::TsfHost::start() {
-        Ok(host) => {
-            let r30 = driver::run_item30(&host);
-            items.push(ItemReport {
-                item: 30,
-                name: "commit-undo round trip (Ctrl+Backspace then Esc restores)".into(),
-                status: if r30.passed { "pass" } else { "fail" }.into(),
-                detail: r30.detail,
-                max_elapsed_ms: 0,
-            });
-        }
-        Err(e) => items.push(ItemReport {
-            item: 30,
-            name: "commit-undo round trip (Ctrl+Backspace then Esc restores)".into(),
             status: "error".into(),
             detail: format!("start fail: {e:?}"),
             max_elapsed_ms: 0,

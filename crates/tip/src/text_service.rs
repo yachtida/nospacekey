@@ -462,18 +462,18 @@ fn engine_failure_event(op: &str, result: &std::io::Result<Response>) -> String 
 }
 
 /// version handshake の判定（純関数）。StartSession 応答の proto（互換世代）から、この接続を
-/// どう扱うかを決める。副作用（Shutdown 送信・respawn・ログ）は呼び出し側 start_and_store が行う。
+/// どう扱うかを決める。
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum HandshakeAction {
     /// proto 一致。従来どおりセッションを採用する。
     Accept,
-    /// wire または boot identity 不一致。接続を保持せず fail-closed にする。
+    /// wire 世代不一致。接続を保持せず fail-closed にする。
     Reject,
 }
 
-/// 欠落フィールドは handshake 以前の旧エンジン。両identityの完全一致だけを採用する。
-fn decide_handshake(proto: Option<u32>, boot: Option<&str>) -> HandshakeAction {
-    if proto == Some(PROTO_VERSION) && boot == Some(env!("CARGO_PKG_VERSION")) {
+/// 製品バージョンが異なっても同じ通信仕様なら接続できる。
+fn decide_handshake(proto: Option<u32>) -> HandshakeAction {
+    if ipc::protocol::is_compatible_protocol(proto) {
         HandshakeAction::Accept
     } else {
         HandshakeAction::Reject
@@ -940,6 +940,8 @@ pub struct TextService {
     pub(crate) da_prediction_atom: Cell<u32>,
     pub(crate) showing: Cell<bool>,
     pub(crate) local_clauses: RefCell<Option<crate::clause_conversion::ClauseConversion>>,
+    /// Clause metadata for the successfully applied live display anchor.
+    live_clauses: RefCell<Option<crate::clause_conversion::ClauseConversion>>,
     pub(crate) local_clause_redraw_pending: Cell<bool>,
     pub(crate) local_clause_redraw_deadline: Cell<Option<Instant>>,
     pub(crate) conversion_queue: RefCell<crate::conversion_queue::ConversionQueue>,
@@ -1032,6 +1034,7 @@ pub struct TextService {
     /// SP6b: ライブ変換 on/off（設定）。false なら打鍵でデバウンス変換を武装せず、
     /// 読み preedit のまま Space/Enter で SP1 候補フローに任せる。Activate で1度読む(D7)。
     pub(crate) live_enabled: Cell<bool>,
+    live_search_width: Cell<u32>,
     /// 外部LLM変換(Tab)のフィーチャーフラグ（設定 `llm.enabled`）。false なら Tab を IME 機能として
     /// 扱わず素通しし、LLM 機構を一切起動しない。Activate で1度読む(D7)。既定 false（＝オフ）。
     pub(crate) llm_enabled: Cell<bool>,
@@ -1281,6 +1284,7 @@ impl TextService {
             da_prediction_atom: Cell::new(0),
             showing: Cell::new(false),
             local_clauses: RefCell::new(None),
+            live_clauses: RefCell::new(None),
             local_clause_redraw_pending: Cell::new(false),
             local_clause_redraw_deadline: Cell::new(None),
             conversion_queue: RefCell::new(crate::conversion_queue::ConversionQueue::default()),
@@ -1323,6 +1327,7 @@ impl TextService {
             reconvert_original: Rc::new(RefCell::new(String::new())),
             reconvert_reading: Rc::new(RefCell::new(String::new())),
             live_enabled: Cell::new(true),
+            live_search_width: Cell::new(1),
             llm_enabled: Cell::new(false),
             typo_enabled: Cell::new(false),
             default_direct_applied: Cell::new(false),
@@ -1610,6 +1615,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // SP6b/SP7 の設定反映（settings は F-1 のため上の PreserveKey 登録前に読み込み済み）。
         let live_on = s.live_conversion.enabled;
         self.live_enabled.set(live_on);
+        self.live_search_width.set(s.live_conversion.effective_search_width());
         // 外部LLM変換(Shift+Tab)のフィーチャーフラグ。開発凍結中(settings::LLM_CONVERT_FROZEN)に
         // つき settings 由来の有効化は実効判定で無視する。NOSPACEKEY_LLM_ECHO(engine の echo/診断
         // モード)が立つときだけ dev/テスト用に有効化: production では誰も設定せず(resolve_env_map
@@ -1780,7 +1786,8 @@ impl TextService_Impl {
         self.deactivate_with_document_cancel(|| self.cancel_deactivating_document())
     }
 
-    fn apply_live_preedit(&self, text: &str, apply: impl FnOnce() -> bool) {
+    fn apply_live_preedit(&self, text: &str,
+        model: Option<crate::clause_conversion::ClauseConversion>, apply: impl FnOnce() -> bool) {
         let applied = apply();
         if applied {
             *self.live_text.borrow_mut() = text.to_owned();
@@ -1792,6 +1799,12 @@ impl TextService_Impl {
             },
             applied,
         );
+        if applied {
+            if let Some(model) = model.filter(|model|
+                self.state.borrow().live_display_anchor_matches(&model.reading, &model.text())) {
+                *self.live_clauses.borrow_mut() = Some(model);
+            }
+        }
     }
 
     fn deactivate_with_document_cancel(&self, cancel: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -2800,7 +2813,7 @@ impl TextService_Impl {
                 // version handshake は接続確立時（fresh StartSession）にだけ効かせる。proto はエンジン
                 // プロセスの属性で、一度確立した接続の途中では変わらないため、既存接続に StartSession を
                 // 貼り直す ensure_session 側では判定しない（この start_and_store が全 fresh 接続経路の合流点）。
-                match decide_handshake(proto, boot.as_deref()) {
+                match decide_handshake(proto) {
                     HandshakeAction::Accept => {
                         self.engine_session.set(session);
                         self.store_fresh_client(c);
@@ -2818,7 +2831,7 @@ impl TextService_Impl {
                     }
                     HandshakeAction::Reject => {
                         tip_log(&format!(
-                            "ev=engine_identity ok=false wire_got={proto:?} wire_want={PROTO_VERSION} boot_got={boot:?} boot_want={} action=fail_closed",
+                            "ev=engine_identity ok=false wire_got={proto:?} wire_want={PROTO_VERSION} boot_got={boot:?} client_build={} action=fail_closed",
                             env!("CARGO_PKG_VERSION")
                         ));
                         drop(c);
@@ -4168,9 +4181,10 @@ impl TextService_Impl {
             connection,
             self.left_context.borrow().clone(),
         );
-        let Some(crate::input_module::BackgroundIntent::LiveSnapshot { snapshot }) = intent else {
+        let Some(crate::input_module::BackgroundIntent::LiveSnapshot { mut snapshot }) = intent else {
             return;
         };
+        snapshot.live_search_width = self.live_search_width.get();
         if self.background_input.try_live_snapshot(snapshot) {
             self.arm_live_result_poll();
         } else {
@@ -4179,6 +4193,23 @@ impl TextService_Impl {
     }
 
     pub(crate) fn begin_explicit_snapshot_wait(&self) {
+        let promoted = self.live_clauses.borrow().as_ref().and_then(|model| {
+            let state = self.state.borrow();
+            if !self.live_enabled.get() || !state.composing || state.notation_fixed.is_some()
+                || !state.live_display_anchor_matches(&model.reading, &model.text()) { return None; }
+            model.promote_live_display(
+                state.clause_identity(self.configuration_generation.get(), self.background_input.connection_generation()),
+                &ipc::clause::normalize_reading(state.canonical_reading()), &self.live_text.borrow())
+        });
+        if let Some(mut model) = promoted {
+            if let Some(outbox) = self.receipt_outbox.borrow().as_ref() { outbox.invalidate_model(&mut model); }
+            *self.local_clauses.borrow_mut() = Some(model);
+            self.live_clauses.borrow_mut().take();
+            self.state.borrow_mut().invalidate_live_snapshot();
+            self.state.borrow_mut().invalidate_live_display();
+            self.finish_live_result_wait();
+            return;
+        }
         let reading = self.state.borrow().canonical_reading().to_string();
         self.conversion_queue
             .borrow_mut()
@@ -4457,7 +4488,7 @@ impl TextService_Impl {
                     self.state.borrow_mut().invalidate_live_display();
                     self.disarm_snapshot_poll_if_idle();
                     tip_log(&format!(
-                        "ev=snapshot_identity ok=false wire_got={actual:?} wire_want={PROTO_VERSION} boot_got={actual_boot:?} boot_want={} action=latched",
+                        "ev=snapshot_identity ok=false wire_got={actual:?} wire_want={PROTO_VERSION} boot_got={actual_boot:?} client_build={} action=latched",
                         env!("CARGO_PKG_VERSION")
                     ));
                 }
@@ -4490,9 +4521,7 @@ impl TextService_Impl {
             {
                 continue;
             }
-            let local_snapshot = if result.purpose == crate::input_module::SnapshotPurpose::Explicit
-            {
-                crate::clause_conversion::ClauseConversion::from_snapshot(
+            let local_snapshot = crate::clause_conversion::ClauseConversion::from_snapshot(
                     ipc::clause::SnapshotIdentity {
                         composition: result.identity.composition,
                         revision: result.identity.revision,
@@ -4514,10 +4543,7 @@ impl TextService_Impl {
                 .filter(|model| {
                     model.reading
                         == ipc::clause::normalize_reading(self.state.borrow().canonical_reading())
-                })
-            } else {
-                None
-            };
+                });
             if result.purpose == crate::input_module::SnapshotPurpose::Explicit
                 && local_snapshot.is_none()
             {
@@ -4567,7 +4593,7 @@ impl TextService_Impl {
             match output.immediate {
                 Some(crate::input_module::ImmediateOperation::SetPreedit { text }) => {
                     let context = self.current_context.borrow().clone();
-                    self.apply_live_preedit(&text, || {
+                    self.apply_live_preedit(&text, local_snapshot, || {
                         context.as_ref().is_some_and(|context| {
                             self.run_preedit(context, &self.widen_display_text(&text))
                         })
@@ -5901,6 +5927,7 @@ impl TextService_Impl {
     /// 選択同期/確定が文節ビューと取り違える）。
     pub(crate) fn clear_clause_nav(&self) {
         self.clear_clause_mouse();
+        self.live_clauses.borrow_mut().take();
         self.local_clause_redraw_pending.set(false);
         self.local_clause_redraw_deadline.set(None);
         self.local_clauses.borrow_mut().take();
@@ -8501,16 +8528,12 @@ mod a8_tests {
     fn handshake_decision_table() {
         use super::{decide_handshake, HandshakeAction};
         assert_eq!(
-            decide_handshake(Some(super::PROTO_VERSION), Some(env!("CARGO_PKG_VERSION"))),
+            decide_handshake(Some(super::PROTO_VERSION)),
             HandshakeAction::Accept
         );
-        assert_eq!(decide_handshake(None, None), HandshakeAction::Reject);
+        assert_eq!(decide_handshake(None), HandshakeAction::Reject);
         assert_eq!(
-            decide_handshake(Some(999), Some(env!("CARGO_PKG_VERSION"))),
-            HandshakeAction::Reject
-        );
-        assert_eq!(
-            decide_handshake(Some(super::PROTO_VERSION), Some("old-build")),
+            decide_handshake(Some(super::PROTO_VERSION + 1)),
             HandshakeAction::Reject
         );
     }
@@ -9124,10 +9147,77 @@ mod deactivate_preflight_tests {
     fn live_preedit_rejection_preserves_enter_text_until_a_successful_redraw() {
         let service = super::TextService::new().into_outer();
         *service.live_text.borrow_mut() = "にほんご".into();
-        service.apply_live_preedit("日本語", || false);
+        service.apply_live_preedit("日本語", None, || false);
         assert_eq!(&*service.live_text.borrow(), "にほんご");
-        service.apply_live_preedit("日本語", || true);
+        service.apply_live_preedit("日本語", None, || true);
         assert_eq!(&*service.live_text.borrow(), "日本語");
+    }
+
+    #[test]
+    fn first_space_preserves_applied_live_clauses_without_requesting_reconversion() {
+        use crate::input_module::{BackgroundIntent, EngineResult, InputEvent, KeyEvent, ReplayMode, TextStyle};
+        use ipc::clause::{ClauseId, ClauseState, ReadingPosition, SnapshotClauseData, WireClause};
+        for case in ["settled", "suffix", "pending_romaji", "rejected", "disabled", "invalidated", "newer_rejected"] {
+            let service = super::TextService::new().into_outer();
+            for ch in "おしたら".chars() {
+                service.state.borrow_mut().handle(InputEvent::Key(KeyEvent::Text {
+                    ch, style: TextStyle::Kana, replay: ReplayMode::Full,
+                }));
+            }
+            let configuration = service.configuration_generation.get();
+            let connection = service.background_input.connection_generation();
+            let BackgroundIntent::LiveSnapshot { snapshot } = service.state.borrow_mut()
+                .live_snapshot(configuration, connection, None).unwrap() else { unreachable!() };
+            service.state.borrow_mut().handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+                identity: snapshot.identity, text: "推したら".into(),
+            }));
+            let model = crate::clause_conversion::ClauseConversion::from_snapshot(
+                service.state.borrow().clause_identity(configuration, connection), 5,
+                SnapshotClauseData {
+                    reading: "おしたら".into(), conversion_revision: 0, request_id: 1,
+                    sentence_token: Some("live sentence".into()),
+                    clauses: vec![WireClause { id: ClauseId(1), reading_start: ReadingPosition(0),
+                        reading_end: ReadingPosition(4), state: ClauseState::Converted,
+                        surface: "推したら".into(), candidate_token: Some("live token".into()) }],
+                }, "推したら").unwrap();
+            let mut newer = model.clone();
+            newer.clauses[0].surface = "押したら".into();
+            service.apply_live_preedit("推したら", Some(model), || case != "rejected");
+            match case {
+                "disabled" => service.live_enabled.set(false),
+                "invalidated" => service.state.borrow_mut().invalidate_live_display(),
+                "suffix" | "pending_romaji" => {
+                    let output = service.state.borrow_mut().handle(InputEvent::Key(KeyEvent::Text {
+                        ch: if case == "suffix" { 'の' } else { 'n' }, style: TextStyle::Kana, replay: ReplayMode::Full,
+                    }));
+                    let operation = output.immediate.unwrap();
+                    let crate::input_module::ImmediateOperation::SetPreedit { text } = &operation else { panic!() };
+                    *service.live_text.borrow_mut() = text.clone();
+                    service.state.borrow_mut().complete(&operation, true);
+                }
+                "newer_rejected" => {
+                    service.state.borrow_mut().handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+                        identity: snapshot.identity, text: "押したら".into(),
+                    }));
+                    service.apply_live_preedit("押したら", Some(newer), || false);
+                }
+                _ => {}
+            }
+            service.begin_explicit_snapshot_wait();
+            if matches!(case, "rejected" | "disabled" | "invalidated" | "pending_romaji") {
+                assert!(service.local_clauses.borrow().is_none(), "must not promote: {case}");
+                continue;
+            }
+            assert!(!service.explicit_snapshot_pending.get(), "first Space must reuse the visible live result");
+            let model = service.local_clauses.borrow();
+            let model = model.as_ref().expect("first Space enters clause selection");
+            assert_eq!(model.text(), if case == "suffix" { "推したらの" } else { "推したら" }, "{case}");
+            assert_eq!(model.window, crate::clause_conversion::CandidateWindow::Closed);
+            assert!(model.user_driven, "late Zenzai enhancement must not overwrite Space selection");
+            assert!(service.state.borrow_mut().handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+                identity: snapshot.identity, text: "押したら".into(),
+            })).immediate.is_none());
+        }
     }
 
     #[test]

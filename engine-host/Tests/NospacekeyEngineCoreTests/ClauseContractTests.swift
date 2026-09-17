@@ -164,4 +164,23 @@ final class ClauseContractTests: XCTestCase {
         XCTAssertNotEqual(receiptFirst, receiptSecond)
         XCTAssertEqual(try JSONDecoder().decode(CommitReceipt.self, from: JSONEncoder().encode(receiptSecond)), receiptSecond)
     }
+
+    func testPrefixCandidatesRequireOptInAndLegalNonemptyRanges() throws {
+        let wire = #"{"key":{"identity":{"composition":1,"revision":1,"configuration_generation":1,"connection_generation":1},"baseline":1,"conversion_revision":1,"clause_id":2,"request_id":1},"reading":"あか\u3099い","reading_start":1,"reading_end":4,"preceding_surfaces":[{"clause_id":1,"reading_start":0,"reading_end":1,"surface":"亜"}]}"#
+        var request = try JSONDecoder().decode(ClauseCandidatesRequest.self, from: Data(wire.utf8))
+        let prefix = ClauseCandidate(surface: "蚊", token: "prefix", reading_start: 1, reading_end: 3)
+        XCTAssertNil(request.include_prefix_candidates)
+        XCTAssertThrowsError(try request.validateCandidates([prefix]))
+        request.include_prefix_candidates = true
+        XCTAssertNoThrow(try request.validateCandidates([prefix]))
+        XCTAssertEqual(try JSONDecoder().decode(ClauseCandidatesRequest.self, from: JSONEncoder().encode(request)), request)
+        for end in [UInt32(0), 1, 2, 5] {
+            XCTAssertThrowsError(try request.validateCandidates([
+                ClauseCandidate(surface: "蚊", token: "prefix", reading_start: 1, reading_end: end)
+            ]), "end=\(end)")
+        }
+        XCTAssertThrowsError(try request.validateCandidates([
+            ClauseCandidate(surface: "蚊", token: "prefix", reading_start: 0, reading_end: 3)
+        ]))
+    }
 }

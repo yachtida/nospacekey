@@ -26,9 +26,8 @@ impl std::fmt::Display for EngineIdentityError {
                 actual_boot,
             } => write!(
                 f,
-                "engine identity mismatch: expected proto={} boot={}, actual proto={actual_proto:?} boot={actual_boot:?}",
-                crate::protocol::PROTO_VERSION,
-                env!("CARGO_PKG_VERSION")
+                "engine protocol mismatch: expected proto={}, actual proto={actual_proto:?} boot={actual_boot:?}",
+                crate::protocol::PROTO_VERSION
             ),
             Self::UnexpectedResponse(response) => {
                 write!(f, "unexpected StartSession response: {response:?}")
@@ -62,12 +61,10 @@ pub fn verify_session_metadata(
         Response::Session {
             session,
             proto,
-            boot,
             engine_epoch,
             learning_generation,
-        } if proto == Some(crate::protocol::PROTO_VERSION)
-            && boot.as_deref() == Some(env!("CARGO_PKG_VERSION")) =>
-        {
+            ..
+        } if crate::protocol::is_compatible_protocol(proto) => {
             Ok((
                 session,
                 EngineLearningIdentity {
@@ -233,14 +230,14 @@ fn open_named_pipe(pipe_path: &str) -> io::Result<File> {
         .open(pipe_path)
 }
 
-/// per-logon-session で安定な pipe 名。同一セッションの全 TIP インスタンス・engine・設定アプリが
+/// 通信の互換世代と logon session ごとに安定な pipe 名。製品更新で接続先を変えない。
+/// 同一セッションの互換 TIP インスタンス・engine・設定アプリが
 /// 同じ名を算出する（Spec2 で crates/tip/src/engine_link.rs から移設 — 設定アプリの
 /// ClearLearning が同じ engine へ届くための唯一の算出点）。
 pub fn pipe_name_for_session(session_id: u32) -> String {
     format!(
-        r"\\.\pipe\nospacekey-engine.v{}.b{}.s{session_id}",
-        crate::protocol::PROTO_VERSION,
-        env!("CARGO_PKG_VERSION")
+        r"\\.\pipe\nospacekey-engine.v{}.s{session_id}",
+        crate::protocol::PROTO_VERSION
     )
 }
 
@@ -1355,21 +1352,41 @@ mod pipe_name_tests {
     }
 
     #[test]
-    fn pipe_name_is_stable_and_session_scoped() {
+    fn compatible_update_accepts_other_product_versions_and_keeps_learning_metadata() {
+        for boot in [Some("1.5.0"), Some("2.0.0"), None] {
+            let (session, identity) = verify_session_metadata(Response::Session {
+                session: 41,
+                proto: Some(crate::protocol::PROTO_VERSION),
+                boot: boot.map(str::to_owned),
+                engine_epoch: "running-engine".into(),
+                learning_generation: 7,
+            })
+            .unwrap();
+            assert_eq!(session, 41);
+            assert_eq!(identity.engine_epoch, "running-engine");
+            assert_eq!(identity.learning_generation, 7);
+        }
+    }
+
+    #[test]
+    fn compatible_update_uses_a_protocol_scoped_endpoint() {
         assert_eq!(
             pipe_name_for_session(1),
-            concat!(
-                r"\\.\pipe\nospacekey-engine.v9.b",
-                env!("CARGO_PKG_VERSION"),
-                ".s1"
+            format!(
+                r"\\.\pipe\nospacekey-engine.v{}.s1",
+                crate::protocol::PROTO_VERSION
             )
         );
+    }
+
+    #[test]
+    fn pipe_name_is_stable_and_session_scoped() {
         assert_eq!(pipe_name_for_session(7), pipe_name_for_session(7));
         assert_ne!(pipe_name_for_session(1), pipe_name_for_session(2));
     }
 
     #[test]
-    fn session_identity_requires_exact_wire_and_boot_match() {
+    fn session_identity_rejects_incompatible_or_missing_protocol() {
         let matching = Response::Session {
             engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
             learning_generation: 0,
@@ -1391,7 +1408,7 @@ mod pipe_name_tests {
                 engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
                 learning_generation: 0,
                 session: 41,
-                proto: Some(crate::protocol::PROTO_VERSION),
+                proto: Some(crate::protocol::PROTO_VERSION - 1),
                 boot: Some("different-build".into()),
             },
             Response::Session {
@@ -1418,7 +1435,7 @@ mod pipe_name_tests {
                 engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
                 learning_generation: 0,
                 session: 9,
-                proto: Some(crate::protocol::PROTO_VERSION),
+                proto: Some(crate::protocol::PROTO_VERSION - 1),
                 boot: Some("loaded-old-build".into()),
             })
         });

@@ -37,6 +37,7 @@ pub struct SettingsDto {
     /// Zenzai 推論上限（1〜10、既定1）。範囲外は validate が弾く（timeout_ms と同パターン）。
     pub zenzai_inference_limit: u32,
     pub live_enabled: bool,
+    pub live_search_width: u32,
     /// ローカルインライン予測（既定 OFF）。
     pub inline_prediction_enabled: bool,
     pub default_direct: bool,
@@ -64,6 +65,10 @@ pub struct SettingsDto {
     /// 一本化した（キー設定ページ）。この値は keymap.ephemeral 不在時の既定の解決
     /// （TIP の default_chords / キー設定ページの既定表示）にだけ使われ、素通しで保存される。
     pub ephemeral_trigger: String,
+    /// 修正変換そのものの有効状態。旧 UI では未露出だったが、差分保存 UI では独立項目。
+    pub typo_correct_enabled: bool,
+    /// 修正変換の誤読み学習。通常の変換学習とは独立して保持する。
+    pub typo_correct_learn: bool,
     /// Shift+英字の挙動（"compose"=英語未確定モード / "commit"=大文字直接確定、既定 "compose"）。
     pub shift_latin_mode: String,
     /// カスタム辞書(ユーザー辞書)を有効にするか(既定 true)。
@@ -95,6 +100,7 @@ pub fn to_dto(s: &settings::Settings) -> SettingsDto {
         weight_path: s.zenzai.weight_path.clone(),
         zenzai_inference_limit: s.zenzai.inference_limit,
         live_enabled: s.live_conversion.enabled,
+        live_search_width: s.live_conversion.search_width,
         inline_prediction_enabled: s.inline_prediction.enabled,
         default_direct: s.default_direct,
         learning_enabled: s.learning.enabled,
@@ -113,6 +119,8 @@ pub fn to_dto(s: &settings::Settings) -> SettingsDto {
         reading_monitor_max_chars: s.reading_monitor.max_chars,
         ephemeral_enabled: s.ephemeral.enabled,
         ephemeral_trigger: s.ephemeral.trigger.clone(),
+        typo_correct_enabled: s.typo_correct.enabled,
+        typo_correct_learn: s.typo_correct.learn,
         shift_latin_mode: s.shift_latin.mode.clone(),
         user_dictionary_enabled: s.user_dictionary.enabled,
         update_include_beta: s.update.include_beta,
@@ -136,6 +144,7 @@ fn is_valid_hex(s: &str) -> bool {
 /// UI からしか来ず、UI が複数文字/空文字を生成することは構造的に無いので、
 /// defense-in-depth の黙殺で足りる（手編集 JSON からの不正入力は settings 側
 /// `de_symbol_chars` が別途フィールド内で防御する）。
+#[cfg(test)]
 fn normalize_symbol_chars(items: Vec<String>) -> std::collections::BTreeSet<char> {
     items
         .into_iter()
@@ -152,6 +161,12 @@ fn normalize_symbol_chars(items: Vec<String>) -> std::collections::BTreeSet<char
 /// DTO 全体を検証してフィールド単位のエラーを返す。空 Vec = 妥当。
 pub fn validate(dto: &SettingsDto) -> Vec<FieldError> {
     let mut errs = Vec::new();
+    if ![1, 10].contains(&dto.live_search_width) {
+        errs.push(FieldError {
+            field: "live_search_width".into(),
+            message: "ライブ変換の探索幅は速度優先（1）か精度優先（10）を選んでください。".into(),
+        });
+    }
     if !TIMEOUT_MS_RANGE.contains(&dto.timeout_ms) {
         errs.push(FieldError {
             field: "timeout_ms".into(),
@@ -259,7 +274,7 @@ pub fn validate(dto: &SettingsDto) -> Vec<FieldError> {
         &dto.ephemeral_trigger,
         dto.ephemeral_enabled,
         dto.feedback_enabled,
-        true, // typo_correct.enabled は DTO に無い(GUI 未露出)ため常に参加させる(安全側)
+        dto.typo_correct_enabled,
         settings::llm_effective(dto.llm_enabled), // 凍結中は llm_convert を衝突判定から外す
     ) {
         errs.push(FieldError {
@@ -284,6 +299,7 @@ pub fn validate(dto: &SettingsDto) -> Vec<FieldError> {
 
 /// DTO を検証し、prev（ディスク上の現行 Settings）に重ねて保存用 Settings を作る。
 /// version と「未変更の鍵 blob」は prev から引き継ぐ。encrypt は注入（テストで差し替え）。
+#[cfg(test)]
 pub fn apply_dto(
     dto: SettingsDto,
     prev: &settings::Settings,
@@ -315,6 +331,7 @@ pub fn apply_dto(
     s.zenzai.weight_path = dto.weight_path;
     s.zenzai.inference_limit = dto.zenzai_inference_limit; // validate 済み（範囲内）
     s.live_conversion.enabled = dto.live_enabled;
+    s.live_conversion.search_width = dto.live_search_width;
     s.inline_prediction.enabled = dto.inline_prediction_enabled;
     s.default_direct = dto.default_direct;
     s.learning.enabled = dto.learning_enabled;
@@ -330,6 +347,8 @@ pub fn apply_dto(
     s.reading_monitor.max_chars = s.reading_monitor.effective_max_chars();
     s.ephemeral.enabled = dto.ephemeral_enabled;
     s.ephemeral.trigger = dto.ephemeral_trigger; // validate 済み（未知値は上で Err 済み）
+    s.typo_correct.enabled = dto.typo_correct_enabled;
+    s.typo_correct.learn = dto.typo_correct_learn;
     s.shift_latin.mode = dto.shift_latin_mode; // validate 済み（同上）
     s.user_dictionary.enabled = dto.user_dictionary_enabled;
     s.update.include_beta = dto.update_include_beta;

@@ -41,6 +41,7 @@ pub struct CompositionSnapshot {
     pub purpose: SnapshotPurpose,
     pub segments: Vec<InputSegment>,
     pub left_context: Option<String>,
+    pub live_search_width: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,6 +293,7 @@ impl InputModule {
             snapshot: CompositionSnapshot {
                 identity,
                 purpose: SnapshotPurpose::Live,
+                live_search_width: 1,
                 segments: self.replay_segments(),
                 left_context,
             },
@@ -320,6 +322,7 @@ impl InputModule {
             snapshot: CompositionSnapshot {
                 identity,
                 purpose: SnapshotPurpose::Explicit,
+                live_search_width: 1,
                 segments: self.replay_segments(),
                 left_context,
             },
@@ -441,6 +444,13 @@ impl InputModule {
     pub(crate) fn invalidate_live_display(&mut self) {
         self.pending_live_display = None;
         self.live_display_anchor = None;
+    }
+
+    pub(crate) fn live_display_anchor_matches(&self, reading: &str, text: &str) -> bool {
+        // Let explicit conversion resolve unfinished romaji, including final n.
+        self.local_kana.reading_parts().1.is_empty()
+            && self.live_display_anchor.as_ref().is_some_and(|anchor|
+                anchor.reading == reading && anchor.text == text)
     }
 
     /// Immediate preedit text for a key press: the anchor text plus the local

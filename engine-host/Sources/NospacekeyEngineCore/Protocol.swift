@@ -1,11 +1,12 @@
 import Foundation
 
 /// IPC プロトコルの互換世代。Rust `ipc::protocol::PROTO_VERSION` とミラー（一字一句一致規約）。
-/// **wire 互換でも、その版が依存する op を追加したら両側同時に bump する** — 「互換が壊れた時だけ bump」だと
-/// 新 op が再起動まで無言で decline / no-op になる。読み手が依存しない optional フィールドの追加
-/// （encodeIfPresent で旧形とバイト一致）では bump しない。
+/// 世代を上げるのは、旧版との通信で要求・応答を解釈できない、または変換・確定・学習の
+/// 整合性を保てず、従来動作へのフォールバックもできない場合だけ。新機能の追加だけでは上げない。
+/// 省略・無視しても従来動作を維持する optional 項目（例: live_search_width）は同じ世代にする。
+/// 詳細と変更時の検証基準: docs/adr/0006-ipc-protocol-generation-policy.md。
 enum ProtocolVersion {
-    static let current: UInt32 = 9
+    static let current: UInt32 = 10
 }
 
 struct AutoCommitProposal: Codable, Equatable {
@@ -45,7 +46,7 @@ enum Request: Decodable {
     case liveSnapshot(composition: UInt64, revision: UInt64,
                       configurationGeneration: UInt64, connectionGeneration: UInt64,
                       segments: [SnapshotSegment], explicit: Bool, leftContext: String?,
-                      conversionRevision: UInt64, requestID: UInt64)
+                      conversionRevision: UInt64, requestID: UInt64, liveSearchWidth: Int)
     case pollSnapshotEnhancement(composition: UInt64, revision: UInt64,
                                  configurationGeneration: UInt64, connectionGeneration: UInt64,
                                  baseline: UInt64, conversionRevision: UInt64, requestID: UInt64)
@@ -62,6 +63,7 @@ enum Request: Decodable {
     // persist エンジンの graceful 停止（学習 flush → 応答後 exit）。session を伴わない
     // プロセス全体操作。Rust 側 `Request::Shutdown` と対（一字一句一致規約）。
     case shutdown
+    case prepareMaintenance
     // Zenzai runtime の sanitized 状態を問い合わせる。モデル導入状態とは別の観測。
     case queryZenzaiStatus
     // 失敗 latch の解除を伴う明示的な GPU 再試行。warm-up は engine 側で非同期に進む。
@@ -93,6 +95,7 @@ enum Request: Decodable {
         let composition: UInt64; let revision: UInt64
         let configuration_generation: UInt64; let connection_generation: UInt64
         let segments: [SnapshotSegment]; let explicit: Bool?; let left_context: String?
+        let live_search_width: Int?
         let conversion_revision: UInt64; let request_id: UInt64
     }
     private struct SnapshotEnhancementParams: Decodable {
@@ -162,7 +165,8 @@ enum Request: Decodable {
                                  configurationGeneration: p.configuration_generation,
                                  connectionGeneration: p.connection_generation,
                                  segments: p.segments, explicit: p.explicit ?? false,
-                                 leftContext: p.left_context, conversionRevision: p.conversion_revision, requestID: p.request_id)
+                                 leftContext: p.left_context, conversionRevision: p.conversion_revision, requestID: p.request_id,
+                                 liveSearchWidth: p.live_search_width ?? 1)
         case "PollSnapshotEnhancement":
             let p = try c.decode(SnapshotEnhancementParams.self, forKey: .params)
             self = .pollSnapshotEnhancement(
@@ -182,6 +186,7 @@ enum Request: Decodable {
         case "ReloadConfig": let p = try c.decode(ReloadConfigParams.self, forKey: .params); self = .reloadConfig(p)
         case "ClearLearning": self = .clearLearning
         case "Shutdown": self = .shutdown
+        case "PrepareMaintenance": self = .prepareMaintenance
         case "QueryZenzaiStatus": self = .queryZenzaiStatus
         case "RetryZenzai": self = .retryZenzai
         case "RecordCorrection":
@@ -355,7 +360,7 @@ extension Request {
         switch self {
         case .ping, .startSession, .liveSnapshot, .pollSnapshotEnhancement, .autoCommitReceipt,
              .clauseCandidates, .convertClauses, .commitReceipt,
-             .reloadConfig, .clearLearning, .shutdown, .queryZenzaiStatus,
+             .reloadConfig, .clearLearning, .shutdown, .prepareMaintenance, .queryZenzaiStatus,
              .retryZenzai, .recordCorrection,
              .reloadDictionary:
             // UU-5: ReloadConfig は session を伴わない（プロセス全体設定）。所有権ガード対象外。

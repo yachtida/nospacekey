@@ -133,6 +133,9 @@ pub struct ClauseCandidatesRequest {
     pub reading_start: ReadingPosition,
     pub reading_end: ReadingPosition,
     pub preceding_surfaces: Vec<PrecedingSurface>,
+    /// Opt in only when the client can preserve the unconsumed reading suffix.
+    #[serde(default)]
+    pub include_prefix_candidates: bool,
 }
 
 impl ClauseCandidatesRequest {
@@ -158,9 +161,13 @@ impl ClauseCandidatesRequest {
         if candidates.is_empty() {
             return Err(ClauseValidationError::Surface);
         }
+        let boundaries = legal_boundaries(&self.reading)?;
         for candidate in candidates {
             if candidate.reading_start != self.reading_start
-                || candidate.reading_end != self.reading_end
+                || candidate.reading_end <= self.reading_start
+                || candidate.reading_end > self.reading_end
+                || (!self.include_prefix_candidates && candidate.reading_end != self.reading_end)
+                || !boundaries.contains(&candidate.reading_end)
             {
                 return Err(ClauseValidationError::Range);
             }

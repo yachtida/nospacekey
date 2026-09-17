@@ -1072,7 +1072,6 @@ pub fn all() -> Vec<Scenario> {
                 k.push(WAIT_CONVERSION);
                 k.push(SPACE);
                 k.push(WAIT_CONVERSION);
-                k.push(SPACE);
                 k
             },
             expect: |_c, _f, p, evs, _l| {
@@ -1081,7 +1080,7 @@ pub fn all() -> Vec<Scenario> {
                 let list = evs.iter().find_map(|e| match e {
                     Ev::CandidatesShown { n, list, .. } if *n >= 2 && list.len() >= 2 => Some(list.clone()),
                     _ => None,
-                }).ok_or("候補が 2 件以上出ていない（3 回目の Space で sel 0→1 に動ける前提が崩れる）")?;
+                }).ok_or("候補が 2 件以上出ていない（2 回目の Space で sel 0→1 に動ける前提が崩れる）")?;
                 // 前提2: 候補 0 と 1 が別文字列であること。同一だと preedit が候補 0 のまま
                 // 固まっていても最終アサートが通り、壊れた実装のまま空振り PASS する。
                 if list[0] == list[1] {
@@ -1095,7 +1094,7 @@ pub fn all() -> Vec<Scenario> {
                     .iter()
                     .any(|e| matches!(e, Ev::CandidateMove { sel: 1 } | Ev::ClausePresented { ready: true, selected: 1 }))
                 {
-                    return Err("3 回目の Space で選択が 0→1 に動いていない（ev=candidate_move sel=1 が無い）".into());
+                    return Err("2 回目の Space で選択が 0→1 に動いていない（ev=candidate_move sel=1 が無い）".into());
                 }
                 if p != list[1] {
                     return Err(format!(
@@ -1116,7 +1115,6 @@ pub fn all() -> Vec<Scenario> {
                 k.push(WAIT_CONVERSION);
                 k.push(SPACE);
                 k.push(WAIT_CONVERSION);
-                k.push(SPACE);
                 k.push(ESC);
                 k
             },
@@ -1124,7 +1122,7 @@ pub fn all() -> Vec<Scenario> {
                 let list = evs.iter().find_map(|e| match e {
                     Ev::CandidatesShown { n, list, .. } if *n >= 2 && list.len() >= 2 => Some(list.clone()),
                     _ => None,
-                }).ok_or("候補が 2 件以上出ていない（3 回目の Space で sel 0→1 に動ける前提が崩れる）")?;
+                }).ok_or("候補が 2 件以上出ていない（2 回目の Space で sel 0→1 に動ける前提が崩れる）")?;
                 // 前提: 送った先の候補がライブ変換結果と別文字列であること。同一だと preedit が
                 // 候補のまま残っていても下のアサートが通り、壊れた実装のまま空振り PASS する。
                 if list[1] == "日本語" {
@@ -1137,7 +1135,7 @@ pub fn all() -> Vec<Scenario> {
                     .iter()
                     .any(|e| matches!(e, Ev::CandidateMove { sel: 1 } | Ev::ClausePresented { ready: true, selected: 1 }))
                 {
-                    return Err("3 回目の Space で選択が 0→1 に動いていない（ev=candidate_move sel=1 が無い）".into());
+                    return Err("2 回目の Space で選択が 0→1 に動いていない（ev=candidate_move sel=1 が無い）".into());
                 }
                 if !matches!(evs.iter().rev().find(|event| matches!(event, Ev::ClausePresented { .. })),
                     Some(Ev::ClausePresented { ready: false, .. })) {

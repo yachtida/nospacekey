@@ -8,7 +8,7 @@
 //! 「明示 weight_path → per-user → exeDir\models」で行う（UIバグ8。両側を同時に触ること）。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tauri::Emitter;
 
 /// Zenzai 既定モデルのファイル名。engine 側 `ZenzaiConfig.defaultWeightFileName` と一致させる。
@@ -27,15 +27,32 @@ const PROGRESS_EVENT: &str = "zenzai-download-progress";
 
 /// 同時ダウンロードの排他フラグ。
 static DOWNLOADING: AtomicBool = AtomicBool::new(false);
+static ACTIVE_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 /// キャンセル要求フラグ（`cancel_zenzai_download` が立て、DL 処理の各チェックポイントが
 /// 見る — 受信ループの各チャンク・send()/受信の Err 到達時・rename 前の再判定）。
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// 「ダウンロードして有効化」の世代。設定画面で後から ON/OFF を選び直した場合、
+/// 古い導入完了がその意図を上書きしない。
+static ACTIVATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn invalidate_activation_intent() {
+    ACTIVATION_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+fn begin_activation_intent() -> u64 {
+    ACTIVATION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn activation_intent_is_current(generation: u64) -> bool {
+    ACTIVATION_GENERATION.load(Ordering::SeqCst) == generation
+}
 
 /// `DOWNLOADING` を必ず戻すガード。early return / `?` / panic のいずれでも解除する
 /// （さもないと一度失敗すると以後ずっと「既にダウンロード中」で締め出される）。
-struct DownloadGuard;
+struct DownloadGuard(u64);
 impl Drop for DownloadGuard {
     fn drop(&mut self) {
+        let _ = ACTIVE_ATTEMPT.compare_exchange(self.0, 0, Ordering::SeqCst, Ordering::SeqCst);
         DOWNLOADING.store(false, Ordering::SeqCst);
     }
 }
@@ -126,6 +143,7 @@ pub fn detect_model(
 #[derive(serde::Serialize)]
 pub struct ModelStatus {
     pub installed: bool,
+    pub valid: bool,
     pub path: String,
     /// "weight_path" | "user" | "install" | ""（UI 表示・診断用）。
     pub source: String,
@@ -134,6 +152,7 @@ pub struct ModelStatus {
 /// 進捗イベントのペイロード。
 #[derive(Clone, serde::Serialize)]
 struct Progress {
+    attempt_id: u64,
     received: u64,
     total: Option<u64>,
     percent: Option<u8>,
@@ -168,13 +187,45 @@ pub fn zenzai_model_status() -> ModelStatus {
         &exe_model_path(),
         |p| p.exists(),
     ) {
-        Some((path, source)) => ModelStatus {
-            installed: true,
-            path: path.display().to_string(),
-            source: source.into(),
-        },
+        Some((path, source)) => {
+            // An explicit weight_path is user-managed and may intentionally point at a
+            // compatible model with different bytes. Managed downloads, on the other hand,
+            // must match the release artifact exactly before the UI can offer repair.
+            let valid = if source == "weight_path" {
+                std::fs::metadata(&path)
+                    .map(|metadata| metadata.is_file() && metadata.len() > 0)
+                    .unwrap_or(false)
+            } else {
+                use sha2::Digest;
+                use std::io::Read;
+                (|| -> std::io::Result<bool> {
+                    let mut file = std::fs::File::open(&path)?;
+                    let mut hasher = sha2::Sha256::new();
+                    let mut buffer = [0u8; 1024 * 1024];
+                    loop {
+                        let count = file.read(&mut buffer)?;
+                        if count == 0 {
+                            break;
+                        }
+                        hasher.update(&buffer[..count]);
+                    }
+                    Ok(sha256_hex_matches(
+                        &hex::encode(hasher.finalize()),
+                        MODEL_SHA256,
+                    ))
+                })()
+                .unwrap_or(false)
+            };
+            ModelStatus {
+                installed: true,
+                valid,
+                path: path.display().to_string(),
+                source: source.into(),
+            }
+        }
         None => ModelStatus {
             installed: false,
+            valid: false,
             path: String::new(),
             source: String::new(),
         },
@@ -185,8 +236,14 @@ pub fn zenzai_model_status() -> ModelStatus {
 /// read_timeout 発の send()/受信 Err、受信ループ後・rename 前の再判定 — で気づいて
 /// 中断・掃除する）。
 #[tauri::command]
-pub fn cancel_zenzai_download() {
+pub fn cancel_zenzai_download(attempt_id: u64) -> bool {
+    if ACTIVE_ATTEMPT.load(Ordering::SeqCst) != attempt_id {
+        return false;
+    }
     CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+    crate::operation_state::request_cancel(crate::operation_state::ModelKind::Zenzai, attempt_id);
+    invalidate_activation_intent();
+    true
 }
 
 /// Zenzai モデルを原典からダウンロードし per-user 領域へ配置、設定を更新してエンジンを再起動する。
@@ -195,6 +252,8 @@ pub fn cancel_zenzai_download() {
 pub async fn download_zenzai_model(
     app: tauri::AppHandle,
     lock: tauri::State<'_, crate::logic::SettingsLock>,
+    activate: bool,
+    attempt_id: u64,
 ) -> Result<String, String> {
     use futures_util::StreamExt;
     use sha2::{Digest, Sha256};
@@ -204,8 +263,21 @@ pub async fn download_zenzai_model(
     if DOWNLOADING.swap(true, Ordering::SeqCst) {
         return Err("既にダウンロード中です。".into());
     }
-    let _guard = DownloadGuard;
+    if attempt_id == 0 {
+        DOWNLOADING.store(false, Ordering::SeqCst);
+        return Err("操作IDが不正です。".into());
+    }
+    ACTIVE_ATTEMPT.store(attempt_id, Ordering::SeqCst);
+    let _guard = DownloadGuard(attempt_id);
     CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+    let activation_generation = activate.then(begin_activation_intent);
+    let operation = crate::operation_state::OperationGuard::begin(
+        crate::operation_state::ModelKind::Zenzai,
+        attempt_id,
+        activate,
+    );
+
+    let result = async {
 
     let localappdata = std::env::var_os("LOCALAPPDATA")
         .filter(|d| !d.is_empty())
@@ -299,11 +371,13 @@ pub async fn download_zenzai_model(
             let _ = app.emit(
                 PROGRESS_EVENT,
                 Progress {
+                    attempt_id,
                     received,
                     total,
                     percent: pct,
                 },
             );
+            operation.progress(pct);
         }
     }
     let _ = file.flush();
@@ -317,6 +391,8 @@ pub async fn download_zenzai_model(
         return Err("キャンセルしました。".into());
     }
 
+        operation.phase(crate::operation_state::OperationPhase::Verifying, true);
+
     // 整合性チェック（既知 good の SHA256 と照合）。不一致は破棄して明快に失敗。
     let actual = hex::encode(hasher.finalize());
     if !sha256_hex_matches(&actual, MODEL_SHA256) {
@@ -326,33 +402,27 @@ pub async fn download_zenzai_model(
         ));
     }
 
-    // 反映のためのエンジン停止を rename の *前* に行う。再ダウンロード時、dest は稼働中エンジンが
-    // mmap 保持しているファイルで、Windows では mmap 中のファイルへ rename すると共有違反で失敗する
-    // （＝再DLが毎回失敗する）。graceful 停止（学習 flush 済み）で mmap を解放させてから置き換える。
-    // 停止後は次の打鍵で新 settings により再 spawn され新モデルを読む。stop_engine はブロッキング
-    // （最大 3s ポーリング）なので blocking スレッドへ逃がす。
-    let stop_code = match tauri::async_runtime::spawn_blocking(crate::commands::stop_engine).await {
-        Ok(code) => code,
-        Err(e) => {
-            let _ = std::fs::remove_file(&part);
-            return Err(format!("エンジン停止処理を完了できませんでした: {e}"));
-        }
-    };
-    if stop_code != 0 {
-        let _ = std::fs::remove_file(&part);
-        return Err("エンジンの停止を確認できませんでした。少し待って再試行してください。".into());
-    }
-
-    // connect失敗だけで code=0 になる起動窓と、停止確認直後のTIPによる再spawnを同時に塞ぐ。
-    // Clear Learning の直接削除と同じ singleton object を新規作成できた場合だけ配置へ進み、
-    // rename + settings保存が終わるまで保持する。既存/作成失敗は旧engineとの混在を避けて中止。
+    // 既存の管理モデルを置換するときだけ、安全な保守停止を要求する。初回配置は稼働中資産へ
+    // 触れないので停止不要。busy/旧版では未確定入力を壊さず、配置前に明示エラーで留まる。
     let pipe = ipc::client::stable_pipe_name();
-    let _engine_absence_lease = match crate::commands::EngineAbsenceLease::acquire(&pipe) {
-        Ok(lease) => lease,
-        Err(e) => {
-            let _ = std::fs::remove_file(&part);
-            return Err(format!("エンジンの停止を確認できませんでした: {e}"));
-        }
+    let _engine_absence_lease = if dest.exists() {
+        operation.phase(
+            crate::operation_state::OperationPhase::PlacementWaiting,
+            true,
+        );
+        tauri::async_runtime::spawn_blocking(|| {
+            crate::commands::wait_for_engine_maintenance(|| {
+                CANCEL_REQUESTED.load(Ordering::SeqCst)
+            })
+        })
+            .await
+            .map_err(|e| format!("エンジン保守停止を完了できませんでした: {e}"))??;
+        Some(
+            crate::commands::EngineAbsenceLease::acquire(&pipe)
+                .map_err(|e| format!("エンジンの停止後に配置排他を取得できませんでした: {e}"))?,
+        )
+    } else {
+        None
     };
 
     // 巡4 B2 + 巡5 M-3: stop_engine 待ち（最悪約4s）の直後・rename 前にキャンセルを再判定 —
@@ -364,9 +434,10 @@ pub async fn download_zenzai_model(
         return Err("キャンセルしました。".into());
     }
 
-    // 設定を更新する前に安全な mutation loader を通す。読み取り拒否/I/O 失敗時に
-    // 既定値を保存して既存設定（特に DPAPI blob）を消さない。
-    // read-modify-save は SettingsLock で適用(apply_settings)と直列化する。
+    operation.phase(crate::operation_state::OperationPhase::Placing, false);
+
+    // 有効化を伴う場合だけ設定ロックを取り、世代を再確認する。修復／取得のみは
+    // OFF・任意 weight_path・将来スキーマの設定ファイルへ一切触れない。
     let _guard = lock
         .0
         .lock()
@@ -374,22 +445,78 @@ pub async fn download_zenzai_model(
     if CANCEL_REQUESTED.load(Ordering::SeqCst) {
         return Err("キャンセルしました。".into());
     }
-    let mut s = settings::load_for_mutation()
-        .map_err(crate::commands::settings_mutation_error_for_download)?;
-    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
-        return Err("キャンセルしました。".into());
-    }
-    s.zenzai.weight_path = dest.to_string_lossy().to_string();
-    s.zenzai.enabled = true;
+        let enable_after_install = activation_generation.is_some_and(activation_intent_is_current);
+    let mut settings_to_save = if enable_after_install {
+        let mut current = settings::load_for_mutation()
+            .map_err(crate::commands::settings_mutation_error_for_download)?;
+        current.zenzai.weight_path = dest.to_string_lossy().to_string();
+        current.zenzai.enabled = true;
+        Some(current)
+    } else {
+        None
+    };
 
-    // 本名へ原子的に置き換え（同一ボリューム内 rename）。エンジン停止済みなので dest はロックされない。
+    // Windows の rename は既存宛先を上書きしないため、旧資産を同一ディレクトリへ退避してから
+    // 配置する。設定保存までをトランザクション境界とし、失敗時は旧資産を戻す。
+    let backup = if dest.exists() {
+        let holder = tempfile::Builder::new()
+            .prefix("zenzai-backup-")
+            .tempfile_in(dir)
+            .map_err(|e| format!("旧モデルの退避先を作成できません: {e}"))?;
+        let path = holder.into_temp_path();
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("旧モデルの退避先を準備できません: {e}"))?;
+        std::fs::rename(&dest, &path).map_err(|e| format!("旧モデルを退避できません: {e}"))?;
+        Some(path)
+    } else {
+        None
+    };
     if let Err(e) = std::fs::rename(&part, &dest) {
+        if let Some(backup) = backup.as_ref() {
+            let _ = std::fs::rename(backup, &dest);
+        }
         return Err(format!("モデルの配置に失敗しました: {e}"));
     }
-    part_cleanup.disarm();
-    settings::save(&s).map_err(|e| format!("設定の保存に失敗しました: {e}"))?;
+        part_cleanup.disarm();
+        if let Some(current) = settings_to_save.take() {
+                operation.phase(crate::operation_state::OperationPhase::Activating, false);
+            if let Err(error) = crate::settings_service::persist_settings(&current) {
+            let remove_error = std::fs::remove_file(&dest).err();
+            let restore_error = backup
+                .as_ref()
+                .and_then(|old| std::fs::rename(old, &dest).err());
+            return Err(format!(
+                "モデルは検証済みですが有効化設定を保存できません: {error}{}{}",
+                remove_error
+                    .map(|e| format!("; 新モデル除去失敗: {e}"))
+                    .unwrap_or_default(),
+                restore_error
+                    .map(|e| format!("; 旧モデル復元失敗: {e}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
 
-    Ok("モデルを導入し、Zenzai を有効化しました（次の入力から反映されます）。".into())
+    let message: String = if enable_after_install {
+        "モデルを導入し、Zenzai を有効化しました（次の入力から反映されます）。".into()
+    } else if activate {
+        "モデルを導入しました。導入中に変更された利用設定はそのまま維持しました。".into()
+    } else {
+        "モデルを取得・検証し、利用設定を変えずに配置しました。".into()
+    };
+        Ok(message)
+    }
+    .await;
+    match result {
+        Ok(message) => {
+            operation.succeed(message.clone());
+            Ok(message)
+        }
+        Err(error) => {
+            operation.fail(error.clone());
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]

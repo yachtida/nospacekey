@@ -115,6 +115,9 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
             if let sid = req.sessionId, !service.connectionOwns(session: Int(sid), connection: connId) {
                 return (encodeResponse(.error("no session")), false)
             }
+            if service.isMaintenanceShutdownPending {
+                return (encodeResponse(.error("maintenance shutdown in progress")), false)
+            }
             // insert/backspace/convert/liveConvert は未知セッションのとき nil を返す（空の正当な
             // 結果と区別する）。nil は一律 .error("no session") にして TIP 側で degrade させる。
             switch req {
@@ -162,14 +165,14 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                     response = .error("no session")
                 }
             case .liveSnapshot(let composition, let revision, let configurationGeneration,
-                               let connectionGeneration, let segments, let explicit, let context, let conversionRevision, let requestID):
+                               let connectionGeneration, let segments, let explicit, let context, let conversionRevision, let requestID, let liveSearchWidth):
                 let key = ConversionService.SnapshotEnhancementKey(
                     composition: composition, revision: revision,
                     configurationGeneration: configurationGeneration,
                     connectionGeneration: connectionGeneration, conversionRevision: conversionRevision, requestID: requestID)
                 let result = service.snapshot(
                     segments, explicit: explicit, leftContext: context, enhancementKey: key,
-                    snapshotConnection: connId)
+                    snapshotConnection: connId, liveSearchWidth: liveSearchWidth)
                 response = .snapshotResult(
                     composition: composition, revision: revision,
                     configurationGeneration: configurationGeneration,
@@ -304,6 +307,15 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                 service.prepareForShutdown()
                 exitAfterReply = true
                 response = .ok
+            case .prepareMaintenance:
+                if service.beginMaintenanceShutdownIfIdle() {
+                    predictionService.shutdown()
+                    service.prepareForShutdown()
+                    exitAfterReply = true
+                    response = .ok
+                } else {
+                    response = .error("maintenance busy: active input session")
+                }
             }
         return (encodeResponse(response), exitAfterReply)
     }
@@ -355,9 +367,8 @@ private func sessionID(fromStablePipeName pipeName: String) -> UInt32? {
     return UInt32(pipeName[marker.upperBound...])
 }
 
-/// 安定 pipe 名 `\\.\pipe\nospacekey-engine.v{proto}.b{build}.s{session}`（crates/ipc の
-/// pipe_name_for_session が生成）から `{build}` 部分を抽出する。末尾 `.s{数字}` の直前の
-/// `.b` を後ろから探す — build には `.` を含められないが `+meta` は許す。形式に従わない
+/// 旧形式 `\\.\pipe\nospacekey-engine.v{proto}.b{build}.s{session}` から製品版を抽出する。
+/// 旧 TIP は製品版の完全一致を要求するため、旧接続先で異なる版を起動させない。形式に従わない
 /// pipe 名（テスト用の任意名）は nil を返し、呼び出し側は版検証を skip する。
 func pipeNameEmbeddedBuild(_ pipeName: String) -> String? {
     guard let sessionMarker = pipeName.range(of: ".s", options: .backwards),
@@ -367,6 +378,20 @@ func pipeNameEmbeddedBuild(_ pipeName: String) -> String? {
     guard let buildMarker = beforeSession.range(of: ".b", options: .backwards),
           buildMarker.upperBound < beforeSession.endIndex else { return nil }
     return String(beforeSession[buildMarker.upperBound...])
+}
+
+func enginePipeNameRejectionReason(_ pipeName: String) -> String? {
+    let prefix = #"\\.\pipe\nospacekey-engine.v"#
+    if pipeName.hasPrefix(prefix), sessionID(fromStablePipeName: pipeName) != nil {
+        let version = pipeName.dropFirst(prefix.count).prefix { $0 != "." }
+        if UInt32(version) != ProtocolVersion.current {
+            return "pipe_name_protocol_mismatch"
+        }
+    }
+    if let build = pipeNameEmbeddedBuild(pipeName), build != BuildInfo.version {
+        return "pipe_name_build_mismatch"
+    }
+    return nil
 }
 
 /// Handle の存在自体が「この user-scope/session の Engine が RAM 学習を保持し得る」証拠。
@@ -388,13 +413,10 @@ private func createLearningPresence(name: String) -> HANDLE? {
 /// ConversionService を名前付きパイプに配線して常駐する。main.swift から呼ぶ唯一の公開関数。
 /// oneShot=true なら1接続を捌いて切断したら終了する（TIP のプロセス毎一意エンジン向け）。
 public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, oneShot: Bool = false) {
-    // 版混在事故（2026-09-06）: 旧版 TIP が DLL 隣の新版 exe を旧版 pipe 名で起動でき、
-    // そのプロセスが（learning presence の名前はバイナリ実体の版で決まるため）新版の
-    // presence を占有し、新版 TIP の正当な起動まで弾いていた。pipe 名埋め込み版と自版が
-    // 不一致なら presence 等の起動ガードを取得する前に終了する — 誤った組み合わせを
-    // 拒否し、少なくとも新版側を巻き込まない。形式外の pipe 名（テスト用）は検証しない。
-    if let embedded = pipeNameEmbeddedBuild(pipeName), embedded != BuildInfo.version {
-        engineLog("ev=engine_start_blocked reason=pipe_name_build_mismatch pipe=\(pipeName) self=\(BuildInfo.version)\n")
+    // 不互換な接続先で presence を占有すると、正しい TIP の起動も妨げるため lease 取得前に拒否する。
+    // 新形式は通信世代で共有する。製品版を含む旧形式は旧 TIP の完全一致契約を維持する。
+    if let reason = enginePipeNameRejectionReason(pipeName) {
+        engineLog("ev=engine_start_blocked reason=\(reason) pipe=\(pipeName) self=\(BuildInfo.version)\n")
         return
     }
     guard let versionLease = createVersionLifetimeLease() else {

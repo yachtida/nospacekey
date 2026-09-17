@@ -1,25 +1,28 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "NospacekeyConfig",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "identifier": "jp.nospacekey.config",
   "build": {
-    "frontendDist": "ui"
+    "beforeBuildCommand": "powershell -ExecutionPolicy Bypass -File ../../scripts/build-config-ui.ps1",
+    "beforeDevCommand": "npm --prefix frontend run dev",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "frontend/dist"
   },
   "app": {
     "withGlobalTauri": true,
     "windows": [
       {
         "title": "nospacekey 設定",
-        "width": 920,
-        "height": 640,
-        "minWidth": 760,
-        "minHeight": 520,
+        "width": 1120,
+        "height": 760,
+        "minWidth": 640,
+        "minHeight": 480,
         "center": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {

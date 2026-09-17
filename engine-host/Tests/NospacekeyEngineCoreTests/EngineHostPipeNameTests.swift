@@ -5,6 +5,24 @@ import XCTest
 /// 旧版 TIP が DLL 隣の新版 exe を旧版 pipe 名で起動でき、learning presence（版はバイナリ
 /// 実体で決まる）を占有して新版 TIP の起動まで弾く事故を、起動入口の拒否で塞ぐ。
 final class EngineHostPipeNameTests: XCTestCase {
+    func testCompatibleUpdatesUseTheSameProtocolEndpoint() {
+        // Search width is optional: the endpoint used by already loaded TIPs stays valid.
+        XCTAssertNil(enginePipeNameRejectionReason(#"\\.\pipe\nospacekey-engine.v10.s1"#))
+        XCTAssertNil(enginePipeNameRejectionReason(
+            #"\\.\pipe\nospacekey-engine.v"# + "\(ProtocolVersion.current).s1"))
+        XCTAssertEqual(enginePipeNameRejectionReason(
+            #"\\.\pipe\nospacekey-engine.v"# + "\(ProtocolVersion.current + 1).s1"),
+            "pipe_name_protocol_mismatch")
+    }
+
+    func testLegacyClientsCannotOccupyAnotherBuildsPresence() {
+        let prefix = #"\\.\pipe\nospacekey-engine.v"# + "\(ProtocolVersion.current).b"
+        XCTAssertNil(enginePipeNameRejectionReason(prefix + BuildInfo.version + ".s1"))
+        XCTAssertEqual(enginePipeNameRejectionReason(prefix + "different-build.s1"),
+                       "pipe_name_build_mismatch")
+        XCTAssertNil(enginePipeNameRejectionReason(#"\\.\pipe\nospacekey-engine-test.s1"#))
+    }
+
     func testEmbeddedBuildIsExtractedFromStablePipeName() {
         // crates/ipc pipe_name_for_session の生成形式。
         XCTAssertEqual(
@@ -14,7 +32,7 @@ final class EngineHostPipeNameTests: XCTestCase {
             pipeNameEmbeddedBuild(#"\\.\pipe\nospacekey-engine.v8.b1.2.2-beta.12+e104a00.s7"#),
             "1.2.2-beta.12+e104a00")
         XCTAssertEqual(
-            pipeNameEmbeddedBuild(#"\\.\pipe\nospacekey-engine.v9.b2.0.0.s12345"#),
+            pipeNameEmbeddedBuild(#"\\.\pipe\nospacekey-engine.v10.b2.0.0.s12345"#),
             "2.0.0")
     }
 

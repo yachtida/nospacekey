@@ -212,13 +212,8 @@ impl TextService_Impl {
             let Some(model) = state.as_mut() else {
                 return;
             };
-            if matches!(model.window, CandidateWindow::Ready { .. }) {
-                model.advance_candidate(1);
-                None
-            } else {
-                request_id.and_then(|id| model.open_boundary_conversion(id, now).map(Request::ConvertClauses)
-                    .or_else(|| model.open_candidates(id, now).map(Request::ClauseCandidates)))
-            }
+            request_id.and_then(|id| model.open_boundary_conversion(id, now).map(Request::ConvertClauses)
+                .or_else(|| model.cycle_candidate(id, 1, now).map(Request::ClauseCandidates)))
         };
         if let Some(request) = request {
             let key = match &request { Request::ConvertClauses(r) => r.key, Request::ClauseCandidates(r) => r.key, _ => unreachable!() };

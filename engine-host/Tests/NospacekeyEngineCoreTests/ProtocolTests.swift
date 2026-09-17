@@ -211,7 +211,7 @@ final class ProtocolTests: XCTestCase {
     }
 
     func testSnapshotAutoCommitBumpsProtocolGeneration() {
-        XCTAssertEqual(ProtocolVersion.current, 9)
+        XCTAssertEqual(ProtocolVersion.current, 10)
     }
 
     func testSnapshotAutoCommitProposalAndReceiptWireContract() throws {
@@ -260,6 +260,15 @@ final class ProtocolTests: XCTestCase {
         // 引数なし op（Ping/ClearLearning と同型）。session を伴わない（所有権ガード対象外）。
         let req = try JSONDecoder().decode(Request.self, from: Data(#"{"method":"Shutdown"}"#.utf8))
         guard case .shutdown = req else { return XCTFail("not shutdown: \(req)") }
+        XCTAssertNil(req.sessionId)
+    }
+
+    func testDecodePrepareMaintenance() throws {
+        let req = try JSONDecoder().decode(
+            Request.self, from: Data(#"{"method":"PrepareMaintenance"}"#.utf8))
+        guard case .prepareMaintenance = req else {
+            return XCTFail("not prepareMaintenance: \(req)")
+        }
         XCTAssertNil(req.sessionId)
     }
 

@@ -116,7 +116,7 @@ struct RawCase {
 #[test]
 fn production_protocol_decodes_every_shared_fixture_without_numeric_rounding() {
     use ipc::protocol::{Request, Response, PROTO_VERSION};
-    assert_eq!(PROTO_VERSION, 9);
+    assert_eq!(PROTO_VERSION, 10);
     let data: RawFixtures = serde_json::from_str(include_str!(
         "../../../docs/design/clause-navigation-p2/wire-fixtures.json"
     ))
@@ -200,6 +200,31 @@ fn shared_request_keys_reject_bad_numbers_without_rounding_u64() {
             }
         }
     }
+}
+
+#[test]
+fn prefix_candidates_require_opt_in_and_legal_nonempty_ranges() {
+    let mut request: ClauseCandidatesRequest = serde_json::from_value(serde_json::json!({
+        "key": {"identity": {"composition": 1, "revision": 1, "configuration_generation": 1, "connection_generation": 1},
+            "baseline": 1, "conversion_revision": 1, "clause_id": 2, "request_id": 1},
+        "reading": "あか\u{3099}い", "reading_start": 1, "reading_end": 4,
+        "preceding_surfaces": [{"clause_id": 1, "reading_start": 0, "reading_end": 1, "surface": "亜"}]
+    })).unwrap();
+    let mut candidate = ClauseCandidate { surface: "蚊".into(), token: "prefix".into(),
+        reading_start: ReadingPosition(1), reading_end: ReadingPosition(3) };
+    assert!(!request.include_prefix_candidates);
+    assert!(request.validate_candidates(&[candidate.clone()]).is_err());
+    request.include_prefix_candidates = true;
+    request.validate_candidates(&[candidate.clone()]).unwrap();
+    let roundtrip: ClauseCandidatesRequest = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+    assert_eq!(roundtrip, request);
+    for end in [0, 1, 2, 5] {
+        candidate.reading_end = ReadingPosition(end);
+        assert!(request.validate_candidates(&[candidate.clone()]).is_err(), "end={end}");
+    }
+    candidate.reading_end = ReadingPosition(3);
+    candidate.reading_start = ReadingPosition(0);
+    assert!(request.validate_candidates(&[candidate]).is_err());
 }
 
 #[test]

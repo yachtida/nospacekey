@@ -85,6 +85,62 @@ final class SnapshotClauseEngineTests: XCTestCase {
         XCTAssertEqual(service.convertClauses(wrongOperation).outcome, .unavailable(.invalidRequest))
     }
 
+    func testClauseCandidatesIncludeShorterPrefix() throws {
+        let service = service()
+        let reading = "がぞうのように"
+        let snapshot = service.snapshot([SnapshotSegment(text: reading, style: "direct")], explicit: true,
+            enhancementKey: .init(composition: 8, revision: 13, configurationGeneration: 2, connectionGeneration: 5))
+        let key = ClauseRequestKey(identity: .init(composition: 8, revision: 13, configuration_generation: 2, connection_generation: 5),
+            baseline: snapshot.baseline, conversion_revision: 0, clause_id: 1, request_id: 2)
+        let request = ClauseCandidatesRequest(key: key, reading: reading, reading_start: 0,
+            reading_end: UInt32(reading.unicodeScalars.count), preceding_surfaces: [], include_prefix_candidates: true)
+        let response = service.clauseCandidates(request)
+        guard case .ready(let candidates) = response.outcome else { return XCTFail("expected candidates") }
+        try request.validateCandidates(candidates)
+        XCTAssertTrue(candidates.contains { $0.surface == "画像の" && $0.reading_end == 4 },
+            "Shorter candidates must remain available: \(candidates.map(\.surface))")
+        var legacy = request
+        legacy.include_prefix_candidates = nil
+        XCTAssertEqual(service.clauseCandidates(legacy).outcome, .unavailable(.invalidRequest),
+            "The opt-in is part of the immutable request payload")
+        let legacyKey = ClauseRequestKey(identity: key.identity, baseline: key.baseline,
+            conversion_revision: 0, clause_id: 1, request_id: 3)
+        let legacyRequest = ClauseCandidatesRequest(key: legacyKey, reading: reading, reading_start: 0,
+            reading_end: 7, preceding_surfaces: [])
+        guard case .ready(let legacyCandidates) = service.clauseCandidates(legacyRequest).outcome else {
+            return XCTFail("old clients must still receive candidates")
+        }
+        try legacyRequest.validateCandidates(legacyCandidates)
+        XCTAssertTrue(legacyCandidates.allSatisfy { $0.reading_end == 7 })
+
+        let prefix = try XCTUnwrap(candidates.first { $0.surface == "画像の" && $0.reading_end == 4 })
+        let receipt = CommitReceipt(commit_id: CommitId(client_instance: UUID().uuidString, sequence: 1),
+            engine_epoch: service.engineEpoch, learning_generation: service.currentLearningGeneration,
+            reading: reading, text: "画像のように", intervals: [
+                CommitInterval(reading_start: 0, reading_end: 4, surface: prefix.surface,
+                    learning: .candidate(token: prefix.token, explicitlySelected: true)),
+                CommitInterval(reading_start: 4, reading_end: 7, surface: "ように", learning: .none(.reading))
+            ], sentence_token: nil)
+        XCTAssertEqual(service.commitReceipt(receipt).outcome, .applied,
+            "A prefix token must consume only the prefix, not the unconverted suffix")
+    }
+
+    func testShorterCandidatesUseAbsoluteRangesAfterPrecedingClauses() throws {
+        let service = service()
+        let reading = "このぶんせつのりょう"
+        let snapshot = service.snapshot([SnapshotSegment(text: reading, style: "direct")], explicit: true,
+            enhancementKey: .init(composition: 8, revision: 13, configurationGeneration: 2, connectionGeneration: 5))
+        let key = ClauseRequestKey(identity: .init(composition: 8, revision: 13, configuration_generation: 2, connection_generation: 5),
+            baseline: snapshot.baseline, conversion_revision: 0, clause_id: 2, request_id: 2)
+        let request = ClauseCandidatesRequest(key: key, reading: reading, reading_start: 2, reading_end: 10,
+            preceding_surfaces: [PrecedingSurface(clause_id: 1, reading_start: 0, reading_end: 2, surface: "この")],
+            include_prefix_candidates: true)
+        guard case .ready(let candidates) = service.clauseCandidates(request).outcome else { return XCTFail("expected candidates") }
+        try request.validateCandidates(candidates)
+        XCTAssertTrue(candidates.contains { $0.surface == "文節" && $0.reading_start == 2 && $0.reading_end == 6 },
+            "Shorter candidates must also work away from the start of the composition: \(candidates.map(\.surface))")
+    }
+
     func testIntervalConversionKeepsRequestedBoundaryEvenWhenDictionaryWouldGroupIt() throws {
         let service = service()
         let snapshot = service.snapshot([SnapshotSegment(text: "きょうはてんき", style: "direct")], explicit: true,
