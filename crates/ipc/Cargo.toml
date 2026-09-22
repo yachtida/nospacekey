@@ -15,5 +15,7 @@ windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_RemoteDesktop",   # Spec2: current_session_id (ProcessIdToSessionId)
     "Win32_System_IO",              # overlapped Read/Write deadline glue
+    "Win32_System_SystemInformation", # shared boot clock for request admission deadlines
     "Win32_System_Threading",       # event-backed overlapped waits
+    "Win32_System_LibraryLoader",  # locate the TIP DLL or config EXE, not its host
 ] }

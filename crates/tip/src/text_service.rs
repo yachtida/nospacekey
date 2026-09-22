@@ -12,23 +12,23 @@ use crate::apply_state::{ApplyOutcome, ApplyReport};
 use crate::preedit_apply::PreeditApply;
 use crate::preedit_session::StartOrUpdatePreedit;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap};
 use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows::core::{implement, IUnknown, IUnknownImpl, Interface, Ref, Result, GUID, HSTRING};
+use windows::core::{implement, IUnknown, IUnknownImpl, Interface, Ref, Result, HSTRING};
 use windows::Win32::Foundation::{E_FAIL, HWND, RECT};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Variant::{VARIANT, VT_I4};
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, ITfCategoryMgr, ITfCompartment, ITfCompartmentMgr, ITfComposition,
     ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextView,
-    ITfDisplayAttributeProvider, ITfDocumentMgr, ITfEditRecord, ITfEditSession, ITfFnConfigure,
+    ITfDisplayAttributeProvider, ITfDocumentMgr, ITfEditSession, ITfFnConfigure,
     ITfFnConfigure_Impl, ITfFunction_Impl, ITfKeyEventSink, ITfKeystrokeMgr, ITfLangBarItemButton,
     ITfMouseSink, ITfMouseTracker,
-    ITfLangBarItemMgr, ITfLangBarItemSink, ITfSource, ITfTextEditSink, ITfTextEditSink_Impl,
+    ITfLangBarItemMgr, ITfLangBarItemSink, ITfSource,
     ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl,
     ITfTextLayoutSink, ITfTextLayoutSink_Impl, ITfThreadFocusSink, ITfThreadFocusSink_Impl,
     ITfThreadMgr, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, ITfThreadMgrEx,
@@ -45,12 +45,11 @@ use crate::candidate_uielement::BehaviorAction;
 use crate::candidate_window::CandidateUI;
 use crate::edit_session::{
     classify_composition_end_error, CancelComposition, CommitText, CommitUndoStart,
-    CompositionEndStatus, EndCompositionOnly, FinishPredictionGhost, QueryCaretRect,
+    CompositionEndStatus, EndCompositionOnly, QueryCaretRect,
     QueryInputScopes, QueryMonitorAnchorRect, ReconvertCapture, ReconvertStart, RestoreText,
-    StartPredictionGhost,
 };
 use crate::globals::{
-    ComObjectGuard, GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_PREDICTION,
+    ComObjectGuard, GUID_DISPLAY_ATTRIBUTE,
     GUID_DISPLAY_ATTRIBUTE_TARGET, GUID_DISPLAY_ATTRIBUTE_CONVERTED,
 };
 use crate::input_module::{
@@ -65,9 +64,6 @@ use crate::input_state::preedit_after_candidates_closed;
 use crate::input_state::InsertStyle;
 use crate::input_state::ReconvertKind;
 use crate::llm_worker::{spawn_llm_worker, LlmOutcome, LlmSlot};
-use crate::prediction_worker::{
-    spawn_ipc_prediction_worker, warm_prediction_artifacts, IpcPredictionResult, PredictionSlot,
-};
 
 use ipc::client::EngineClient;
 use ipc::protocol::{Request, Response, PROTO_VERSION};
@@ -314,6 +310,9 @@ pub(crate) enum PendingEndTestDecision {
 const IPC_TIMEOUT_FAST: Duration = Duration::from_millis(250); // Insert/Backspace/Commit/Start/EndSession
 const IPC_TIMEOUT_CONVERT: Duration = Duration::from_millis(1200); // Convert/Reconvert（Zenzai 推論に余裕）
 const IPC_TIMEOUT_LIVE: Duration = Duration::from_millis(400); // LiveConvert（debounce 済・遅ければ捨てる）
+/// QueryZenzaiStatus は engine の converterLock を取らない短い snapshot 読み。UI スレッドを
+/// 周期的に止めないよう通常の FAST より短くし、超過時は交互性維持のため接続ごと捨てる。
+const IPC_TIMEOUT_ZENZAI_STATUS: Duration = Duration::from_millis(100);
 
 /// A' INV5: pending（未読応答を owe）になってからこの時間を超えても drain できなければ
 /// engine 真死とみなし drop_engine する（永久劣化の暴走ガード）。
@@ -424,7 +423,7 @@ fn plan_start_session(result: std::io::Result<Response>) -> Option<i64> {
 }
 
 /// IPC failure diagnostics must describe only the response shape / I/O class. `Response` carries
-/// readings, candidates, committed text and predictions, so formatting it with `Debug` would put
+/// readings, candidates and committed text, so formatting it with `Debug` would put
 /// user input back into the log even when the caller's normal event is redacted.
 fn response_kind(response: &Response) -> &'static str {
     match response {
@@ -437,6 +436,7 @@ fn response_kind(response: &Response) -> &'static str {
         Response::Error { .. } => "error",
         Response::LiveResult { .. } => "live_result",
         Response::SnapshotResult { .. } => "snapshot_result",
+        Response::InputPredictionsResult { .. } => "input_predictions",
         Response::SnapshotEnhancement { .. } => "snapshot_enhancement",
         Response::SnapshotEnhancementPending { .. } => "snapshot_enhancement_pending",
         Response::SnapshotEnhancementUnavailable { .. } => "snapshot_enhancement_unavailable",
@@ -444,8 +444,6 @@ fn response_kind(response: &Response) -> &'static str {
         Response::ConvertClausesResult { .. } => "convert_clauses_result",
         Response::CommitReceiptAck { .. } => "commit_receipt_ack",
         Response::LlmResult { .. } => "llm_result",
-        Response::Prediction { .. } => "prediction",
-        Response::PredictionUnavailable { .. } => "prediction_unavailable",
         Response::ClauseView { .. } => "clause_view",
         Response::ZenzaiStatus { .. } => "zenzai_status",
     }
@@ -486,13 +484,8 @@ fn decide_handshake(proto: Option<u32>) -> HandshakeAction {
 /// resolve_env_map が enabled のときだけ LLM env を注入するのと同じ意味論）。zenzai_weight は
 /// 空でもそのまま送り、エンジン側が per-user → exe 隣の順で解決する（3段表）。
 ///
-/// セキュリティ注記（fable レビュー #3・許容済トレードオフ）: 平文 API キーが常駐エンジンへの
-/// 名前付きパイプを流れる。パイプ DACL は AppContainer/LPAC SID にも接続を許すため、同一ユーザの
-/// サンドボックスプロセスが起動レースでパイプ名を先取り squat すればキーを窃取しうる（env 経由の
-/// spawn では読めなかった経路）。パイプは元来入力テキスト全体を運んでおり同一ユーザ信頼が前提な
-/// こと・squat は起動レース勝利を要すること・LLM 有効化/キー変更の即時反映という機能価値から、
-/// **キー送信を維持する**判断（ユーザ承認）。将来のハードニング候補は
-/// GetNamedPipeServerProcessId によるサーバ像検証（送信前に正規エンジンか照合）。
+/// 平文 API キーを送る前に、IPC client が接続先 PID の実行ファイルを検証する。
+/// インストール先の互換エンジンまたは開発配置の隣接エンジンだけを許可し、照会不能も拒否する。
 /// なお凍結中(settings::LLM_CONVERT_FROZEN)は llm_effective_enabled が false のためキーは流れない。
 fn build_reload_config(
     s: &settings::Settings,
@@ -519,9 +512,7 @@ fn build_reload_config(
         llm_timeout_ms: s.llm.timeout_ms,
         zenzai_enabled: s.zenzai.enabled,
         zenzai_weight: s.zenzai.weight_path.clone(),
-        inline_prediction_enabled: s.inline_prediction.enabled,
         learning_enabled: s.learning.enabled,
-        typo_learn_enabled: s.typo_correct.learn,
         // D6: 診断 env が既に居るときは None（push 抑止＝spawn/reload とも env が勝つ。
         // resolve_env_map の env_lookup 抑止と対）。居なければクランプ済み値を push する。
         zenzai_inference_limit: if env_lookup("NOSPACEKEY_ZENZAI_INFERENCE_LIMIT").is_some() {
@@ -648,6 +639,52 @@ thread_local! {
     static LIVE_RESULT_OWNERS: RefCell<TimerOwnerRegistry<*const TextService_Impl>> =
         RefCell::new(TimerOwnerRegistry::default());
 }
+
+thread_local! {
+    /// Zenzai runtime 状態タイマは TextService ごとに独立する。タイマ ID→所有者を保持して、
+    /// 同じ STA に複数 TIP インスタンスが載っても別インスタンスを駆動しない。
+    static ZENZAI_STATUS_OWNERS: RefCell<TimerOwnerRegistry<*const TextService_Impl>> =
+        RefCell::new(TimerOwnerRegistry::default());
+}
+const ZENZAI_STATUS_INITIAL_POLL_MS: u32 = 100;
+const ZENZAI_STATUS_PREPARING_POLL_MS: u32 = 500;
+const ZENZAI_STATUS_ACTIVE_POLL_MS: u32 = 2_000;
+const ZENZAI_STATUS_INACTIVE_POLL_MS: u32 = 5_000;
+const ZENZAI_STATUS_CONNECT_FAST_RETRIES: u8 = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZenzaiIndicatorState {
+    Preparing,
+    GpuActive,
+    Inactive,
+}
+
+fn zenzai_indicator_state(response: &Response) -> Option<ZenzaiIndicatorState> {
+    let Response::ZenzaiStatus { state, .. } = response else {
+        return None;
+    };
+    Some(match state.as_str() {
+        "preparing" => ZenzaiIndicatorState::Preparing,
+        "gpu_active" => ZenzaiIndicatorState::GpuActive,
+        _ => ZenzaiIndicatorState::Inactive,
+    })
+}
+
+fn zenzai_status_poll_interval(state: ZenzaiIndicatorState) -> u32 {
+    match state {
+        ZenzaiIndicatorState::Preparing => ZENZAI_STATUS_PREPARING_POLL_MS,
+        ZenzaiIndicatorState::GpuActive => ZENZAI_STATUS_ACTIVE_POLL_MS,
+        ZenzaiIndicatorState::Inactive => ZENZAI_STATUS_INACTIVE_POLL_MS,
+    }
+}
+
+fn zenzai_status_reconnect_interval(connect_misses: u8) -> u32 {
+    if connect_misses <= ZENZAI_STATUS_CONNECT_FAST_RETRIES {
+        ZENZAI_STATUS_PREPARING_POLL_MS
+    } else {
+        ZENZAI_STATUS_INACTIVE_POLL_MS
+    }
+}
 const LIVE_RESULT_POLL_MS: u32 = 15;
 const SNAPSHOT_RECONNECT_POLL_MS: u32 = 250;
 const LIVE_RESULT_TIMEOUT: Duration = Duration::from_millis(2_000);
@@ -749,46 +786,9 @@ thread_local! {
         const { std::cell::Cell::new(std::ptr::null()) };
 }
 
-thread_local! {
-    /// 予測 composition 終了の bounded retry 用。Activate–Deactivate 間の STA だけで有効。
-    static PREDICTION_RETRY_TS: std::cell::Cell<*const TextService_Impl> =
-        const { std::cell::Cell::new(std::ptr::null()) };
-}
 
-thread_local! {
-    /// 予測 debounce／結果ポーリング用。Activate–Deactivate 間の STA だけで有効。
-    static PREDICTION_POLL_TS: std::cell::Cell<*const TextService_Impl> =
-        const { std::cell::Cell::new(std::ptr::null()) };
-}
 
-const PREDICTION_RETRY_MS: u32 = 50;
-const PREDICTION_RETRY_MAX: u8 = 8;
-const PREDICTION_DEBOUNCE_MS: u32 = 300;
 
-fn consume_expected_prediction_commit_end_edit(
-    deadline: &Cell<Option<Instant>>,
-    selection_changed: bool,
-    now: Instant,
-) -> bool {
-    deadline
-        .replace(None)
-        .is_some_and(|deadline| !selection_changed && now <= deadline)
-}
-const PREDICTION_POLL_MS: u32 = 15;
-const PREDICTION_TIMEOUT: Duration = Duration::from_millis(400);
-
-fn prediction_slot_available(physical_composition: bool, finish_pending: bool) -> bool {
-    !physical_composition && !finish_pending
-}
-
-fn prediction_mode_allows_display(direct: bool, ephemeral: bool) -> bool {
-    !direct && !ephemeral
-}
-
-pub(crate) struct DeferredPredictionPreservedKey {
-    pub(crate) context: Option<ITfContext>,
-    pub(crate) guid: GUID,
-}
 
 #[implement(
     ITfTextInputProcessorEx,
@@ -799,7 +799,6 @@ pub(crate) struct DeferredPredictionPreservedKey {
     ITfThreadFocusSink,
     ITfFnConfigure,
     ITfTextLayoutSink,
-    ITfTextEditSink,
     ITfMouseSink
 )]
 pub struct TextService {
@@ -820,13 +819,15 @@ pub struct TextService {
     /// クロスプロセス（別アプリへ前面が移る）でのフォーカス喪失は ITfThreadMgrEventSink::OnSetFocus
     /// では届かないため、前面（スレッド）喪失を OnKillThreadFocus で捕捉して同じ放棄リセットを焚く。
     pub(crate) thread_focus_cookie: Cell<u32>,
+    /// 現在この TSF スレッドが前面か。Zenzai 状態ポーリングを前面プロセスだけに限定し、
+    /// 非前面アプリにロード済みの TIP が同じエンジンへ問い合わせ続けるのを防ぐ。
+    pub(crate) thread_has_focus: Cell<bool>,
     /// UIバグ4: フォーカス context へ AdviseSink した `ITfTextLayoutSink` の cookie（0=未登録）。
     /// スクロール/リフローで OnLayoutChange が届き、表示中の候補窓・読みモニタを追従させる。
     /// advise 先 context を併せて保持し、フォーカス移動（OnSetFocus/OnPush/OnPopContext）で
     /// 対称的に unadvise→advise し直す。Deactivate で掃討する。
     pub(crate) layout_sink_cookie: Cell<u32>,
     /// フォーカス context の選択・本文変更を監視し、ゴーストを stale 化する edit sink。
-    pub(crate) text_edit_sink_cookie: Cell<u32>,
     pub(crate) layout_sink_ctx: RefCell<Option<ITfContext>>,
     /// OnLayoutChange 連発（スクロール中）を 1 本の非同期再照会セッションにまとめるフラグ。
     /// RefreshAnchorOnLayout::DoEditSession → layout_refresh_apply で解除する。
@@ -840,6 +841,14 @@ pub struct TextService {
     /// 巡3 Z4: ReloadConfig busy 再送の試行回数とタイマID（上限付き bounded retry）。
     pub(crate) reload_retry_count: Cell<u32>,
     pub(crate) reload_retry_timer: Cell<usize>,
+    /// 現在のユーザ設定で Zenzai 状態を表示すべきか。true の間だけ sanitized
+    /// runtime 状態をポーリングし、`gpu_active` の実状態を入力インジケータへ反映する。
+    pub(crate) zenzai_status_monitor_enabled: Cell<bool>,
+    pub(crate) zenzai_status_timer: Cell<usize>,
+    /// 表示状態だけを読む session-less 接続。変換用 client と分けることで、
+    /// LiveConvert の未回収応答に状態表示を巻き込まず、初回打鍵前でも実状態を読める。
+    pub(crate) zenzai_status_client: RefCell<Option<EngineClient>>,
+    pub(crate) zenzai_status_connect_misses: Cell<u8>,
     /// 巡4 T1: 遅延 flush タイマの ID（0=未武装）。多重武装の防止と proc 側の照合に使う。
     pub(crate) behavior_flush_timer: Cell<usize>,
     /// 自分を包む `TextService_Impl` への自己ポインタ（Activate で設定）。Drop は outer 型
@@ -871,27 +880,6 @@ pub struct TextService {
     /// A reset clears the next composition's input, not diagnostics already scheduled for flush.
     shadow_mismatches: RefCell<ShadowMismatchAggregate>,
     pub(crate) composition: Rc<RefCell<Option<ITfComposition>>>,
-    /// 通常 preedit と直交するインライン予測専用 composition。
-    pub(crate) prediction_composition: Rc<RefCell<Option<ITfComposition>>>,
-    pub(crate) prediction_context: Rc<RefCell<Option<ITfContext>>>,
-    pub(crate) prediction_editing: Rc<Cell<bool>>,
-    pub(crate) prediction_state: RefCell<crate::prediction_state::PredictionState>,
-    pub(crate) prediction_enabled: Cell<bool>,
-    pub(crate) prediction_commit_suppressed: Cell<bool>,
-    /// The host may deliver the `OnEndEdit` for an explicit IME commit after the
-    /// commit callback returns (VS Code does this). Consume that one expected edit
-    /// instead of treating the text we just committed as a later external edit.
-    pub(crate) prediction_commit_edit_deadline: Cell<Option<Instant>>,
-    pub(crate) prediction_poll_timer: Cell<usize>,
-    pub(crate) prediction_slot: RefCell<Option<Arc<PredictionSlot>>>,
-    pub(crate) prediction_failed_context: Rc<RefCell<Option<ITfContext>>>,
-    /// Some(accept) は終了 edit session の実行待ち／再試行待ち。
-    pub(crate) prediction_finish_pending: Rc<Cell<Option<bool>>>,
-    prediction_preserve_selection: Cell<bool>,
-    pub(crate) prediction_retry_timer: Cell<usize>,
-    pub(crate) prediction_retry_count: Cell<u8>,
-    pub(crate) prediction_deferred_preserved: RefCell<VecDeque<DeferredPredictionPreservedKey>>,
-    pub(crate) prediction_anchor_gen: Cell<u64>,
     /// CommitText の SetText 成功後に EndComposition だけが失敗した状態。true の間も
     /// composition handle を保持し、本文へ再度触れない close-only edit session で再試行する。
     pub(crate) composition_end_pending: Rc<Cell<bool>>,
@@ -936,8 +924,6 @@ pub struct TextService {
     pub(crate) da_target_atom: Cell<u32>,
     pub(crate) da_converted_atom: Cell<u32>,
     pub(crate) display_end_context: RefCell<Option<ITfContext>>,
-    /// インライン予測ゴースト属性 atom（0=未登録）。
-    pub(crate) da_prediction_atom: Cell<u32>,
     pub(crate) showing: Cell<bool>,
     pub(crate) local_clauses: RefCell<Option<crate::clause_conversion::ClauseConversion>>,
     /// Clause metadata for the successfully applied live display anchor.
@@ -1034,14 +1020,12 @@ pub struct TextService {
     /// SP6b: ライブ変換 on/off（設定）。false なら打鍵でデバウンス変換を武装せず、
     /// 読み preedit のまま Space/Enter で SP1 候補フローに任せる。Activate で1度読む(D7)。
     pub(crate) live_enabled: Cell<bool>,
+    pub(crate) input_prediction_enabled: Cell<bool>,
+    pub(crate) input_predictions: RefCell<crate::input_prediction::InputPredictions>,
     live_search_width: Cell<u32>,
     /// 外部LLM変換(Tab)のフィーチャーフラグ（設定 `llm.enabled`）。false なら Tab を IME 機能として
     /// 扱わず素通しし、LLM 機構を一切起動しない。Activate で1度読む(D7)。既定 false（＝オフ）。
     pub(crate) llm_enabled: Cell<bool>,
-    /// 修正変換(Tab)のフィーチャーフラグ（設定 `typo_correct.enabled`）。false なら Tab を IME 機能
-    /// として扱わず素通しする。llm_enabled と並行の独立フラグ（Shift+Tab=LLM とは無関係）。
-    /// Activate で1度読む(D7)。既定 false（Activate で settings 値へ上書きされるまでの初期値）。
-    pub(crate) typo_enabled: Cell<bool>,
     /// SP7: default_direct を「このインスタンスで1度だけ」適用したか。
     /// 真にしたら Deactivate でもリセットしない＝IME 切替往復後の再 Activate で
     /// ユーザの手動トグル（無変換）を巻き戻さない（spec §3.3「以後の手動トグルを尊重」）。
@@ -1059,6 +1043,9 @@ pub struct TextService {
     /// ephemeral かなモード中かどうかを langbar_is_direct と並行して共有するフラグ。
     /// update_langbar_mode が更新し、ModeLangBarItem の GetText/GetIcon が読む（「あ˙」表示）。
     pub(crate) langbar_ephemeral: Rc<Cell<bool>>,
+    /// `QueryZenzaiStatus` が直近に `gpu_active` を返したか。ModeLangBarItem と共有し、
+    /// GetIcon/GetText の Zenzai 装飾を設定値ではなく実ランタイム状態へ結びつける。
+    pub(crate) langbar_zenzai_gpu_active: Rc<Cell<bool>>,
     /// 言語バーアイテムへシステムが advise した更新 sink。ModeLangBarItem の AdviseSink が書き、
     /// モード切替時にここから読んで OnUpdate を呼び表示を再取得させる（item と Rc 共有）。
     pub(crate) langbar_sink: Rc<RefCell<Option<ITfLangBarItemSink>>>,
@@ -1102,15 +1089,8 @@ pub struct TextService {
     /// None=owe 無し。Some(t)=t 時点で pending 化。INV5: pending 化から `PENDING_MAX` を超えても
     /// drain できなければ engine 真死とみなし drop_engine する（永久劣化の暴走ガード）。
     pub(crate) pending_since: Cell<Option<std::time::Instant>>,
-    /// 品質ループ③: 直前確定 1 件のバッファ。commit_and_reset / apply_commit_plan が
-    /// **クリア前に**保存し、Ctrl+変換（OnPreservedKey Feedback）が
-    /// 消費して feedback.jsonl へ書く。shift_latin の直接確定（読み無し）は対象外。
-    /// F-5 改定（確定取消）: 保存条件は `feedback_enabled || arms_undo(source)` へ拡大済み
-    /// （常時保存ではない — remember_last_commit 参照）。
+    /// 確定取消の武装中だけ保持する直前確定。
     pub(crate) last_commit: RefCell<Option<LastCommit>>,
-    /// 品質ループ③: 誤変換ワンキー記録の opt-in フラグ（settings.feedback.enabled）。
-    /// Activate で1度読む（D7 — live_enabled/llm_enabled と同じ流儀）。既定 false。
-    pub(crate) feedback_enabled: Cell<bool>,
     /// Activate で実際に OS 登録した PreservedKey(Deactivate の Unpreserve と対称にするため
     /// 登録時の実物を保存する — keymap を再解決して突き合わせると設定変更でズレる)。
     pub(crate) preserved_regs: RefCell<Vec<crate::keymap::PreservedReg>>,
@@ -1149,9 +1129,6 @@ pub struct TextService {
     /// compartment 自体は enter/exit が直接 NATIVE/direct へ SetValue する — このフラグは
     /// 「direct へ戻すべき」マーカーに徹する（設計ロック: 開始トリガ節）。
     pub(crate) ephemeral_kana: Cell<bool>,
-    /// ephemeral かなの機能フラグ（settings.ephemeral.enabled）のキャッシュ。既定 true。
-    /// Activate で1度読む（Task 7、number_full_width 等と同じ D7 流儀）。
-    pub(crate) ephemeral_enabled: Cell<bool>,
     /// configurable keymap: Activate で settings から解決した全コマンドのバインド（D7 — 1回読み）。
     pub(crate) keymap: Cell<crate::keymap::Keymap>,
     /// C-1: DLL_REF で生存数を数える RAII ガード。他の全 `#[implement]` COM オブジェクトと
@@ -1165,8 +1142,7 @@ impl TextService {
     /// 残り防止）。Impl 側からは Deref でここへ届く。
     pub(crate) fn unadvise_layout_sink(&self) {
         let layout_cookie = self.layout_sink_cookie.get();
-        let edit_cookie = self.text_edit_sink_cookie.get();
-        if layout_cookie == 0 && edit_cookie == 0 {
+        if layout_cookie == 0 {
             return;
         }
         // 巡4 T6: if let scrutinee の一時 Ref はブロック末尾まで延命されるため先に束縛 —
@@ -1178,14 +1154,10 @@ impl TextService {
                     if layout_cookie != 0 {
                         let _ = source.UnadviseSink(layout_cookie);
                     }
-                    if edit_cookie != 0 {
-                        let _ = source.UnadviseSink(edit_cookie);
-                    }
                 }
             }
         }
         self.layout_sink_cookie.set(0);
-        self.text_edit_sink_cookie.set(0);
         *self.layout_sink_ctx.borrow_mut() = None;
     }
 
@@ -1215,13 +1187,17 @@ impl TextService {
             deactivating: Cell::new(false),
             thread_mgr_event_cookie: Cell::new(0),
             thread_focus_cookie: Cell::new(0),
+            thread_has_focus: Cell::new(false),
             layout_sink_cookie: Cell::new(0),
-            text_edit_sink_cookie: Cell::new(0),
             layout_sink_ctx: RefCell::new(None),
             layout_refresh_pending: Cell::new(false),
             layout_sink_gen: Cell::new(0),
             reload_retry_count: Cell::new(0),
             reload_retry_timer: Cell::new(0),
+            zenzai_status_monitor_enabled: Cell::new(false),
+            zenzai_status_timer: Cell::new(0),
+            zenzai_status_client: RefCell::new(None),
+            zenzai_status_connect_misses: Cell::new(0),
             behavior_flush_timer: Cell::new(0),
             impl_ptr: Cell::new(std::ptr::null()),
             client: RefCell::new(None),
@@ -1248,22 +1224,6 @@ impl TextService {
             explicit_snapshot_candidate_remaining: RefCell::new(Vec::new()),
             shadow_mismatches: RefCell::new(ShadowMismatchAggregate::default()),
             composition: Rc::new(RefCell::new(None)),
-            prediction_composition: Rc::new(RefCell::new(None)),
-            prediction_context: Rc::new(RefCell::new(None)),
-            prediction_editing: Rc::new(Cell::new(false)),
-            prediction_state: RefCell::new(crate::prediction_state::PredictionState::default()),
-            prediction_enabled: Cell::new(false),
-            prediction_commit_suppressed: Cell::new(false),
-            prediction_commit_edit_deadline: Cell::new(None),
-            prediction_poll_timer: Cell::new(0),
-            prediction_slot: RefCell::new(None),
-            prediction_failed_context: Rc::new(RefCell::new(None)),
-            prediction_finish_pending: Rc::new(Cell::new(None)),
-            prediction_preserve_selection: Cell::new(false),
-            prediction_retry_timer: Cell::new(0),
-            prediction_retry_count: Cell::new(0),
-            prediction_deferred_preserved: RefCell::new(VecDeque::new()),
-            prediction_anchor_gen: Cell::new(0),
             composition_end_pending: Rc::new(Cell::new(false)),
             composition_end_context: Rc::new(RefCell::new(None)),
             composition_end_status: Rc::new(Cell::new(CompositionEndStatus::Idle)),
@@ -1281,7 +1241,6 @@ impl TextService {
             da_target_atom: Cell::new(0),
             da_converted_atom: Cell::new(0),
             display_end_context: RefCell::new(None),
-            da_prediction_atom: Cell::new(0),
             showing: Cell::new(false),
             local_clauses: RefCell::new(None),
             live_clauses: RefCell::new(None),
@@ -1327,13 +1286,15 @@ impl TextService {
             reconvert_original: Rc::new(RefCell::new(String::new())),
             reconvert_reading: Rc::new(RefCell::new(String::new())),
             live_enabled: Cell::new(true),
+            input_prediction_enabled: Cell::new(true),
+            input_predictions: RefCell::new(Default::default()),
             live_search_width: Cell::new(1),
             llm_enabled: Cell::new(false),
-            typo_enabled: Cell::new(false),
             default_direct_applied: Cell::new(false),
             direct_mode_owned: Cell::new(false),
             langbar_is_direct: Rc::new(Cell::new(false)),
             langbar_ephemeral: Rc::new(Cell::new(false)),
+            langbar_zenzai_gpu_active: Rc::new(Cell::new(false)),
             langbar_sink: Rc::new(RefCell::new(None)),
             langbar_item: RefCell::new(None),
             langbar_on_toggle: Rc::new(RefCell::new(None)),
@@ -1350,7 +1311,6 @@ impl TextService {
             resume_convert_pending: Cell::new(false),
             pending_since: Cell::new(None),
             last_commit: RefCell::new(None),
-            feedback_enabled: Cell::new(false),
             preserved_regs: RefCell::new(Vec::new()),
             number_full_width: Cell::new(true),
             punctuation_full_width: Cell::new(true),
@@ -1362,7 +1322,6 @@ impl TextService {
             shift_latin_compose: Cell::new(true),
             undo_armed: Cell::new(false),
             ephemeral_kana: Cell::new(false),
-            ephemeral_enabled: Cell::new(true),
             keymap: Cell::new(crate::keymap::Keymap::default()),
             _guard: ComObjectGuard::new(),
         }
@@ -1371,309 +1330,302 @@ impl TextService {
 
 impl ITfTextInputProcessor_Impl for TextService_Impl {
     fn Activate(&self, ptim: Ref<'_, ITfThreadMgr>, tid: u32) -> Result<()> {
-        // Medium fix: Deactivate 実行中の同期再入 Activate を最初に弾く。このチェックは
-        // tid/thread_mgr のセットを含む「一切の状態変更・登録」より前になければならない —
-        // RemoveItem 等の清算コールアウト中に Activate が混入すると、作られた新しい登録世代を
-        // 外側 Deactivate の後続清算が道連れに消す。ホストは Deactivate 完了後に改めて
-        // Activate すればよい（フラグは Deactivate の全出口で RAII 的に外れる）。
-        if self.deactivating.get() {
-            tip_log("ev=activate_rejected reason=deactivating");
-            return Err(E_FAIL.into());
-        }
-        // A rejected terminal edit must be resolved before a new activation
-        // can reuse its composition slot. No subscriptions exist during retry.
-        if self.thread_mgr.borrow().is_none()
-            && (self.composition.borrow().is_some() || self.prediction_ghost_visible())
-        {
-            let composition = self.composition.borrow().clone();
-            *self.current_context.borrow_mut() =
-                composition.as_ref().and_then(|composition| unsafe {
-                    composition
-                        .GetRange()
-                        .and_then(|range| range.GetContext())
-                        .ok()
-                });
+        crate::panic_guard::com("Activate", || {
+            // Medium fix: Deactivate 実行中の同期再入 Activate を最初に弾く。このチェックは
+            // tid/thread_mgr のセットを含む「一切の状態変更・登録」より前になければならない —
+            // RemoveItem 等の清算コールアウト中に Activate が混入すると、作られた新しい登録世代を
+            // 外側 Deactivate の後続清算が道連れに消す。ホストは Deactivate 完了後に改めて
+            // Activate すればよい（フラグは Deactivate の全出口で RAII 的に外れる）。
+            if self.deactivating.get() {
+                tip_log("ev=activate_rejected reason=deactivating");
+                return Err(E_FAIL.into());
+            }
+            // A rejected terminal edit must be resolved before a new activation
+            // can reuse its composition slot. No subscriptions exist during retry.
+            if self.thread_mgr.borrow().is_none()
+                && (self.composition.borrow().is_some())
+            {
+                let composition = self.composition.borrow().clone();
+                *self.current_context.borrow_mut() =
+                    composition.as_ref().and_then(|composition| unsafe {
+                        composition
+                            .GetRange()
+                            .and_then(|range| range.GetContext())
+                            .ok()
+                    });
+                self.tid.set(tid);
+                let _guard = DeactivatingGuard::new(&self.deactivating);
+                self.deactivate_inner()?;
+            }
+            self.consume_started_composition();
+            // Activation is a new key lifecycle.  A reservation from a previous activation must
+            // never be replayed into the new context, even if the host reuses the same VK.
+            self.invalidate_pending_end_test_reservation();
+            // 1) tid とスレッドマネージャを保持する。
+            let tm: ITfThreadMgr = ptim.ok()?.clone();
             self.tid.set(tid);
-            let _guard = DeactivatingGuard::new(&self.deactivating);
-            self.deactivate_inner()?;
-        }
-        self.consume_started_composition();
-        // Activation is a new key lifecycle.  A reservation from a previous activation must
-        // never be replayed into the new context, even if the host reuses the same VK.
-        self.invalidate_pending_end_test_reservation();
-        // 1) tid とスレッドマネージャを保持する。
-        let tm: ITfThreadMgr = ptim.ok()?.clone();
-        self.tid.set(tid);
-        *self.thread_mgr.borrow_mut() = Some(tm.clone());
+            *self.thread_mgr.borrow_mut() = Some(tm.clone());
+            self.thread_has_focus
+                .set(unsafe { tm.GetFocus().is_ok() });
 
-        // 診断: イマーシブ（検索/Store）ホストかを記録する。検索面では自前候補窓は上位 DWM
-        // バンドの下で不可視になるため、host へインライン描画を委ねる integratable IF が要る。
-        // ※「イマーシブだから自前描画を止める」だけは候補が完全に消える退行と検証で判明したので、
-        //   ここでは記録のみに留め、描画戦略の切替は host の pbShow と integratable IF に委ねる。
-        if let Ok(ex) = tm.cast::<ITfThreadMgrEx>() {
-            if let Ok(flags) = unsafe { ex.GetActiveFlags() } {
+            // 診断: イマーシブ（検索/Store）ホストかを記録する。検索面では自前候補窓は上位 DWM
+            // バンドの下で不可視になるため、host へインライン描画を委ねる integratable IF が要る。
+            // ※「イマーシブだから自前描画を止める」だけは候補が完全に消える退行と検証で判明したので、
+            //   ここでは記録のみに留め、描画戦略の切替は host の pbShow と integratable IF に委ねる。
+            if let Ok(ex) = tm.cast::<ITfThreadMgrEx>() {
+                if let Ok(flags) = unsafe { ex.GetActiveFlags() } {
+                    tip_log(&format!(
+                        "ev=activate_flags raw=0x{:08X} immersive={}",
+                        flags,
+                        flags & TF_TMF_IMMERSIVEMODE != 0
+                    ));
+                }
+            }
+
+            // キーイベントシンクを advise（自分自身を ITfKeyEventSink として渡す）。
+            let ksm: ITfKeystrokeMgr = tm.cast()?;
+            let sink: ITfKeyEventSink = self.to_interface();
+            unsafe {
+                ksm.AdviseKeyEventSink(tid, &sink, true)?;
+            }
+
+            // フォーカス変更（別ウィンドウ/アプリ切替）を捕捉する ITfThreadMgrEventSink を advise する。
+            // ホスト依存で、別ウィンドウへフォーカスが移ると live preedit は文書へ確定/破棄されるが
+            // ITfCompositionSink::OnCompositionTerminated が呼ばれないことがある。その場合 OnSetFocus で
+            // 検知してエンジンセッション（前の読み）を畳む。怠ると次入力が古い読みへ連結される
+            // （にほんご → 別窓クリック → aiueo で にほんごあいうえお＝日本語あいうえお のデータ残留）。
+            // 失敗は致命でない（focus 起点のリセットが働かないだけ）。
+            // cookie==0 ガード: ITfSource::AdviseSink は AdviseKeyEventSink と違い再 advise を弾かず
+            // 毎回新 cookie を返すため、ガード無しだと二重 Activate で前の cookie を取りこぼし self への
+            // 強参照を 1 つリークする（現状は上の AdviseKeyEventSink の `?` で二重 Activate が先に中断
+            // されるため到達しないが、防御的に）。
+            if self.thread_mgr_event_cookie.get() == 0 {
+                if let Ok(source) = tm.cast::<ITfSource>() {
+                    let tmes: ITfThreadMgrEventSink = self.to_interface();
+                    if let Ok(cookie) = unsafe { source.AdviseSink(&ITfThreadMgrEventSink::IID, &tmes) }
+                    {
+                        self.thread_mgr_event_cookie.set(cookie);
+                    }
+                    // クロスプロセス（別アプリへ前面が移る）でのフォーカス喪失は、スレッド内 doc フォーカス
+                    // 変化を通知する ITfThreadMgrEventSink::OnSetFocus では届かないことがある。前面（スレッド）
+                    // フォーカス喪失は ITfThreadFocusSink::OnKillThreadFocus が通知するので併せて advise し、
+                    // 同じ放棄リセットを焚く（実機の別窓クリックはこちらが主経路）。
+                    let tfs: ITfThreadFocusSink = self.to_interface();
+                    if let Ok(cookie) = unsafe { source.AdviseSink(&ITfThreadFocusSink::IID, &tfs) } {
+                        self.thread_focus_cookie.set(cookie);
+                    }
+                }
+                // フォーカス sink の advise 結果を残す。OnKillThreadFocus の実配送はクロスプロセス前面
+                // 喪失でしか起きずヘッドレスでは焚けないが、ITfThreadFocusSink の advise 配線退行は
+                // この行で検出できる（item18 が thread_advised=true を必須条件にする）。
                 tip_log(&format!(
-                    "ev=activate_flags raw=0x{:08X} immersive={}",
-                    flags,
-                    flags & TF_TMF_IMMERSIVEMODE != 0
+                    "ev=focus_sinks mgr_advised={} thread_advised={}",
+                    self.thread_mgr_event_cookie.get() != 0,
+                    self.thread_focus_cookie.get() != 0
                 ));
             }
-        }
 
-        // キーイベントシンクを advise（自分自身を ITfKeyEventSink として渡す）。
-        let ksm: ITfKeystrokeMgr = tm.cast()?;
-        let sink: ITfKeyEventSink = self.to_interface();
-        unsafe {
-            ksm.AdviseKeyEventSink(tid, &sink, true)?;
-        }
+            // 巡1レビュー 8c2354e指摘1+2: LAYOUT_TS は debounce のライフサイクルと独立に Activate で
+            // 設定する（ライブ変換 OFF でも変換で候補窓は出る=追従が必要）。sink も Activate 時点で
+            // 現在フォーカス中の document へ初期適用する（OnSetFocus はフォーカス「変化」にのみ発火し、
+            // Activate 時点で既にフォーカス済みの document では再配送されない）。
+            // 巡2 E3: 世代も進める — 前ライフサイクルで投入済みの非同期セッションが再 Activate 後に
+            // 発火しても、旧世代の座標が現在の self へ適用されないようにする。
+            LAYOUT_TS.with(|p| p.set(self as *const TextService_Impl));
+            self.impl_ptr.set(self as *const TextService_Impl);
+            self.bump_layout_sink_gen();
+            self.refresh_layout_sink_target();
 
-        // フォーカス変更（別ウィンドウ/アプリ切替）を捕捉する ITfThreadMgrEventSink を advise する。
-        // ホスト依存で、別ウィンドウへフォーカスが移ると live preedit は文書へ確定/破棄されるが
-        // ITfCompositionSink::OnCompositionTerminated が呼ばれないことがある。その場合 OnSetFocus で
-        // 検知してエンジンセッション（前の読み）を畳む。怠ると次入力が古い読みへ連結される
-        // （にほんご → 別窓クリック → aiueo で にほんごあいうえお＝日本語あいうえお のデータ残留）。
-        // 失敗は致命でない（focus 起点のリセットが働かないだけ）。
-        // cookie==0 ガード: ITfSource::AdviseSink は AdviseKeyEventSink と違い再 advise を弾かず
-        // 毎回新 cookie を返すため、ガード無しだと二重 Activate で前の cookie を取りこぼし self への
-        // 強参照を 1 つリークする（現状は上の AdviseKeyEventSink の `?` で二重 Activate が先に中断
-        // されるため到達しないが、防御的に）。
-        if self.thread_mgr_event_cookie.get() == 0 {
-            if let Ok(source) = tm.cast::<ITfSource>() {
-                let tmes: ITfThreadMgrEventSink = self.to_interface();
-                if let Ok(cookie) = unsafe { source.AdviseSink(&ITfThreadMgrEventSink::IID, &tmes) }
-                {
-                    self.thread_mgr_event_cookie.set(cookie);
+            // SP6b/SP7: 設定を活性化時に1度だけ読む（engine 流の「起動時に1回」=D7）。
+            // UU-7: load_reporting で読み取り要因を診断ログに残す。AppContainer/LPAC ホスト（検索窓）
+            // から settings.json が権限で読めないと Loaded ではなく PermissionDenied になり、
+            // 「検索窓でだけ設定が既定に戻る」症状を実機ログで切り分けられる（従来は握り潰しで不可視）。
+            let (s, load_outcome) = settings::load_reporting();
+            self.begin_configuration_change();
+            tip_log(&format!("ev=settings_load outcome={load_outcome:?}"));
+            self.number_full_width.set(s.number.full_width);
+            self.punctuation_full_width.set(s.punctuation.full_width);
+            self.symbol_overlay.set(s.symbol.symbol_overlay());
+            self.symbol_chars.set(s.symbol.effective_chars());
+            self.reading_monitor_enabled.set(s.reading_monitor.enabled);
+            self.reading_monitor_accumulate
+                .set(s.reading_monitor.accumulate);
+            self.reading_monitor_max_chars
+                .set(s.reading_monitor.effective_max_chars());
+            self.shift_latin_compose
+                .set(crate::key_event_sink::shift_latin_is_compose(
+                    &s.shift_latin.mode,
+                ));
+            self.keymap.set(crate::keymap::Keymap::from_settings(&s));
+
+            // SP5/keymap: モードトグル/再変換/フィードバックの PreservedKey を keymap から登録する。
+            // 既定は従来どおり JIS+US 二重登録、明示バインドは単一登録、無効は未登録。
+            // 登録の成否は per-key でログに残す(実機で「無変換が効かない」「カスタムキーが
+            // OS に拒否された(bare 0x1C の 0x80040506 前例)」を診断するため)。
+            {
+                let regs = crate::keymap::build_preserved_regs(&self.keymap.get());
+                for r in &regs {
+                    let pk = TF_PRESERVEDKEY {
+                        uVKey: r.vk,
+                        uModifiers: r.modifiers,
+                    };
+                    let d: Vec<u16> = r.desc.encode_utf16().collect();
+                    let res = unsafe { ksm.PreserveKey(tid, &r.guid, &pk, &d) };
+                    let hr = res.as_ref().err().map(|e| e.code().0 as u32).unwrap_or(0);
+                    tip_log(&format!(
+                        "ev=preservekey desc={:?} vk={:#04x} mods={:#x} ok={} hr={hr:#010x}",
+                        r.desc,
+                        r.vk,
+                        r.modifiers,
+                        res.is_ok()
+                    ));
                 }
-                // クロスプロセス（別アプリへ前面が移る）でのフォーカス喪失は、スレッド内 doc フォーカス
-                // 変化を通知する ITfThreadMgrEventSink::OnSetFocus では届かないことがある。前面（スレッド）
-                // フォーカス喪失は ITfThreadFocusSink::OnKillThreadFocus が通知するので併せて advise し、
-                // 同じ放棄リセットを焚く（実機の別窓クリックはこちらが主経路）。
-                let tfs: ITfThreadFocusSink = self.to_interface();
-                if let Ok(cookie) = unsafe { source.AdviseSink(&ITfThreadFocusSink::IID, &tfs) } {
-                    self.thread_focus_cookie.set(cookie);
+                *self.preserved_regs.borrow_mut() = regs;
+            }
+
+            // 2) 表示属性 GUID を登録して atom を保持する（失敗しても致命的ではない）。
+            unsafe {
+                if let Ok(cat) = CoCreateInstance::<_, ITfCategoryMgr>(
+                    &CLSID_TF_CategoryMgr,
+                    None,
+                    CLSCTX_INPROC_SERVER,
+                ) {
+                    if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE) {
+                        self.da_atom.set(atom);
+                    }
+                    if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_TARGET) {
+                        self.da_target_atom.set(atom);
+                    }
+                    if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_CONVERTED) {
+                        self.da_converted_atom.set(atom);
+                    }
                 }
             }
-            // フォーカス sink の advise 結果を残す。OnKillThreadFocus の実配送はクロスプロセス前面
-            // 喪失でしか起きずヘッドレスでは焚けないが、ITfThreadFocusSink の advise 配線退行は
-            // この行で検出できる（item18 が thread_advised=true を必須条件にする）。
-            tip_log(&format!(
-                "ev=focus_sinks mgr_advised={} thread_advised={}",
-                self.thread_mgr_event_cookie.get() != 0,
-                self.thread_focus_cookie.get() != 0
-            ));
-        }
 
-        // 巡1レビュー 8c2354e指摘1+2: LAYOUT_TS は debounce のライフサイクルと独立に Activate で
-        // 設定する（ライブ変換 OFF でも変換で候補窓は出る=追従が必要）。sink も Activate 時点で
-        // 現在フォーカス中の document へ初期適用する（OnSetFocus はフォーカス「変化」にのみ発火し、
-        // Activate 時点で既にフォーカス済みの document では再配送されない）。
-        // 巡2 E3: 世代も進める — 前ライフサイクルで投入済みの非同期セッションが再 Activate 後に
-        // 発火しても、旧世代の座標が現在の self へ適用されないようにする。
-        LAYOUT_TS.with(|p| p.set(self as *const TextService_Impl));
-        PREDICTION_RETRY_TS.with(|p| p.set(self as *const TextService_Impl));
-        PREDICTION_POLL_TS.with(|p| p.set(self as *const TextService_Impl));
-        self.impl_ptr.set(self as *const TextService_Impl);
-        self.bump_layout_sink_gen();
-        self.refresh_layout_sink_target();
+            // SP6a: UIElement マネージャを presenter へ渡す（取得失敗なら None=フォールバック自前描画）。
+            let ui_mgr: Option<ITfUIElementMgr> = tm.cast::<ITfUIElementMgr>().ok();
+            self.candidate_ui.borrow_mut().set_ui_mgr(ui_mgr);
 
-        // SP6b/SP7: 設定を活性化時に1度だけ読む（engine 流の「起動時に1回」=D7）。
-        // F-1: feedback の PreserveKey 登録可否（opt-in）を決めるため、登録より**前**に読む。
-        // UU-7: load_reporting で読み取り要因を診断ログに残す。AppContainer/LPAC ホスト（検索窓）
-        // から settings.json が権限で読めないと Loaded ではなく PermissionDenied になり、
-        // 「検索窓でだけ設定が既定に戻る」症状を実機ログで切り分けられる（従来は握り潰しで不可視）。
-        let (s, load_outcome) = settings::load_reporting();
-        self.begin_configuration_change();
-        tip_log(&format!("ev=settings_load outcome={load_outcome:?}"));
-        // 品質ループ③: 誤変換ワンキー記録の opt-in（既定 false）。Activate で1度読む（D7）。
-        // Deactivate の Unpreserve と remember_last_commit（F-5）のゲートにも使う。
-        self.feedback_enabled.set(s.feedback.enabled);
-        self.prediction_enabled.set(s.inline_prediction.enabled);
-        if s.inline_prediction.enabled && warm_prediction_artifacts().is_err() {
-            tip_log("ev=prediction_unavailable state=warm_worker_spawn_failed");
-        }
-        self.number_full_width.set(s.number.full_width);
-        self.punctuation_full_width.set(s.punctuation.full_width);
-        self.symbol_overlay.set(s.symbol.symbol_overlay());
-        self.symbol_chars.set(s.symbol.effective_chars());
-        self.reading_monitor_enabled.set(s.reading_monitor.enabled);
-        self.reading_monitor_accumulate
-            .set(s.reading_monitor.accumulate);
-        self.reading_monitor_max_chars
-            .set(s.reading_monitor.effective_max_chars());
-        self.shift_latin_compose
-            .set(crate::key_event_sink::shift_latin_is_compose(
-                &s.shift_latin.mode,
-            ));
-        self.ephemeral_enabled.set(s.ephemeral.enabled);
-        self.keymap.set(crate::keymap::Keymap::from_settings(&s));
-
-        // SP5/keymap: モードトグル/再変換/フィードバックの PreservedKey を keymap から登録する。
-        // 既定は従来どおり JIS+US 二重登録、明示バインドは単一登録、無効は未登録。
-        // 登録の成否は per-key でログに残す(実機で「無変換が効かない」「カスタムキーが
-        // OS に拒否された(bare 0x1C の 0x80040506 前例)」を診断するため)。
-        {
-            let regs = crate::keymap::build_preserved_regs(&self.keymap.get(), s.feedback.enabled);
-            for r in &regs {
-                let pk = TF_PRESERVEDKEY {
-                    uVKey: r.vk,
-                    uModifiers: r.modifiers,
+            // SP5/US: 言語バーへ あ/A モードインジケータを追加する（ITfLangBarItemButton）。
+            // 無変換/Alt+; で conversion-mode が切り替わってもユーザが現在モードを視認できるように。
+            // 二重 Activate ガード: 既に item があれば再追加しない（item と Rc 共有状態を取りこぼさない）。
+            if self.langbar_item.borrow().is_none() {
+                // default_direct 適用予定かつ compartment が取れるときだけ AddItem 前に A を出す。
+                // 取れなければ live 読みのまま（失敗時に表示A・入力あ を残さない）。
+                let will_be_direct = crate::conversion_mode::should_apply_default_direct(
+                    s.default_direct,
+                    self.default_direct_applied.get(),
+                );
+                let compartment_available = self.conversion_compartment().is_some();
+                self.langbar_is_direct
+                    .set(crate::conversion_mode::langbar_direct_for_additem(
+                        will_be_direct,
+                        compartment_available,
+                        self.is_direct_mode(),
+                    ));
+                let item: ITfLangBarItemButton = crate::langbar::ModeLangBarItem::new(
+                    self.langbar_is_direct.clone(),
+                    self.langbar_ephemeral.clone(),
+                    self.langbar_zenzai_gpu_active.clone(),
+                    self.langbar_sink.clone(),
+                    self.langbar_on_toggle.clone(),
+                )
+                .into();
+                let added = if let Ok(lbim) = tm.cast::<ITfLangBarItemMgr>() {
+                    unsafe { lbim.AddItem(&item).is_ok() }
+                } else {
+                    false
                 };
-                let d: Vec<u16> = r.desc.encode_utf16().collect();
-                let res = unsafe { ksm.PreserveKey(tid, &r.guid, &pk, &d) };
-                let hr = res.as_ref().err().map(|e| e.code().0 as u32).unwrap_or(0);
-                tip_log(&format!(
-                    "ev=preservekey desc={:?} vk={:#04x} mods={:#x} ok={} hr={hr:#010x}",
-                    r.desc,
-                    r.vk,
-                    r.modifiers,
-                    res.is_ok()
-                ));
+                if added {
+                    *self.langbar_item.borrow_mut() = Some(item);
+                    // 右クリックメニュー「切替」用のトグル closure を格納する。自身の COM 参照を owned で
+                    // 捕まえ、呼ばれるたびに cast_object_ref で &TextService_Impl を復元して、打鍵と同じ
+                    // dispatch_mode_toggle を通す。active/pending composition の settle を迂回して compartment
+                    // だけ切り替えてはいけない。通常 composition は current_context、pending-only は
+                    // dispatch 内で専用 owner context を使う。
+                    // 参照循環（closure→COM 参照→TextService→この Rc→closure）は Deactivate で None にして断つ。
+                    // to_interface は #[implement] に列挙した interface のみ可（ComObjectInterface 境界）。
+                    // このオブジェクトは ITfTextInputProcessorEx を実装しているのでそれを owned で握る。
+                    let self_com: ITfTextInputProcessorEx = self.to_interface();
+                    *self.langbar_on_toggle.borrow_mut() = Some(Box::new(move || {
+                        // cast_object_ref は QI 相当で &TextService_Impl を返す（0.62 の supported API）。
+                        if let Ok(ts) = self_com.cast_object_ref::<crate::text_service::TextService>() {
+                            let ctx = ts.current_context.borrow().clone();
+                            ts.dispatch_mode_toggle(ctx.as_ref());
+                        }
+                    }));
+                }
+                tip_log(&format!("ev=langbar_additem ok={added}"));
             }
-            *self.preserved_regs.borrow_mut() = regs;
-        }
 
-        // 2) 表示属性 GUID を登録して atom を保持する（失敗しても致命的ではない）。
-        unsafe {
-            if let Ok(cat) = CoCreateInstance::<_, ITfCategoryMgr>(
-                &CLSID_TF_CategoryMgr,
-                None,
-                CLSCTX_INPROC_SERVER,
-            ) {
-                if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE) {
-                    self.da_atom.set(atom);
-                }
-                if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_TARGET) {
-                    self.da_target_atom.set(atom);
-                }
-                if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_CONVERTED) {
-                    self.da_converted_atom.set(atom);
-                }
-                if let Ok(atom) = cat.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_PREDICTION) {
-                    self.da_prediction_atom.set(atom);
-                }
-            }
-        }
+            // SP6a: Behavior(ホスト発)の drain を起こすため自己ポインタを立てる（Deactivate で落とす）。
+            BEHAVIOR_TS.with(|c| c.set(self as *const TextService_Impl));
 
-        // SP6a: UIElement マネージャを presenter へ渡す（取得失敗なら None=フォールバック自前描画）。
-        let ui_mgr: Option<ITfUIElementMgr> = tm.cast::<ITfUIElementMgr>().ok();
-        self.candidate_ui.borrow_mut().set_ui_mgr(ui_mgr);
-
-        // SP5/US: 言語バーへ あ/A モードインジケータを追加する（ITfLangBarItemButton）。
-        // 無変換/Alt+; で conversion-mode が切り替わってもユーザが現在モードを視認できるように。
-        // 二重 Activate ガード: 既に item があれば再追加しない（item と Rc 共有状態を取りこぼさない）。
-        if self.langbar_item.borrow().is_none() {
-            // default_direct 適用予定かつ compartment が取れるときだけ AddItem 前に A を出す。
-            // 取れなければ live 読みのまま（失敗時に表示A・入力あ を残さない）。
-            let will_be_direct = crate::conversion_mode::should_apply_default_direct(
+            // SP6b/SP7 の設定反映（settings は F-1 のため上の PreserveKey 登録前に読み込み済み）。
+            let live_on = s.live_conversion.enabled;
+            self.live_enabled.set(live_on);
+            self.input_prediction_enabled.set(s.input_prediction_enabled);
+            self.live_search_width.set(s.live_conversion.effective_search_width());
+            // 外部LLM変換(Shift+Tab)のフィーチャーフラグ。開発凍結中(settings::LLM_CONVERT_FROZEN)に
+            // つき settings 由来の有効化は実効判定で無視する。NOSPACEKEY_LLM_ECHO(engine の echo/診断
+            // モード)が立つときだけ dev/テスト用に有効化: production では誰も設定せず(resolve_env_map
+            // は echo を出さない)、headless ハーネス item12(Shift+Tab→LLM 配線の echo 検証)はこれで
+            // 通る=凍結中も配線コードの回帰を検出できる。
+            // Why not(この1点で閉じる理由): 実行時の LLM 発動可否は Cell self.llm_enabled に集約されて
+            // おり(set は init の false とここだけ)、resolve_action / start_llm_convert ガード /
+            // Shift+Tab 素通し判定は全てこの Cell を読む。Cell を経由しない LLM 経路や第2の set
+            // サイトを足すと凍結が漏れる。
+            let llm_on = settings::llm_effective_enabled(&s)
+                || std::env::var_os("NOSPACEKEY_LLM_ECHO").is_some();
+            self.llm_enabled.set(llm_on);
+            // 修正変換(Tab)のフィーチャーフラグ。既定 ON。off なら Tab は IME 機能として扱わず素通しする
+            // （llm_enabled と独立 — Shift+Tab の外部LLM変換には無関係）。
+            // SP7: default_direct なら起動時の conversion-mode を半角英数(直接入力)へ初期化。
+            // このインスタンスで1度だけ適用する（default_direct_applied ガード）。Deactivate でも
+            // リセットしないので、IME 切替で再 Activate されてもユーザの手動トグルを巻き戻さない。
+            // 適用に失敗した間は applied を立てない＝次回 Activate で再試行する（成功が1度だけ）。
+            if crate::conversion_mode::should_apply_default_direct(
                 s.default_direct,
                 self.default_direct_applied.get(),
-            );
-            let compartment_available = self.conversion_compartment().is_some();
-            self.langbar_is_direct
-                .set(crate::conversion_mode::langbar_direct_for_additem(
-                    will_be_direct,
-                    compartment_available,
-                    self.is_direct_mode(),
-                ));
-            let item: ITfLangBarItemButton = crate::langbar::ModeLangBarItem::new(
-                self.langbar_is_direct.clone(),
-                self.langbar_ephemeral.clone(),
-                self.langbar_sink.clone(),
-                self.langbar_on_toggle.clone(),
-            )
-            .into();
-            let added = if let Ok(lbim) = tm.cast::<ITfLangBarItemMgr>() {
-                unsafe { lbim.AddItem(&item).is_ok() }
-            } else {
-                false
-            };
-            if added {
-                *self.langbar_item.borrow_mut() = Some(item);
-                // 右クリックメニュー「切替」用のトグル closure を格納する。自身の COM 参照を owned で
-                // 捕まえ、呼ばれるたびに cast_object_ref で &TextService_Impl を復元して、打鍵と同じ
-                // dispatch_mode_toggle を通す。active/pending composition の settle を迂回して compartment
-                // だけ切り替えてはいけない。通常 composition は current_context、pending-only は
-                // dispatch 内で専用 owner context を使う。
-                // 参照循環（closure→COM 参照→TextService→この Rc→closure）は Deactivate で None にして断つ。
-                // to_interface は #[implement] に列挙した interface のみ可（ComObjectInterface 境界）。
-                // このオブジェクトは ITfTextInputProcessorEx を実装しているのでそれを owned で握る。
-                let self_com: ITfTextInputProcessorEx = self.to_interface();
-                *self.langbar_on_toggle.borrow_mut() = Some(Box::new(move || {
-                    // cast_object_ref は QI 相当で &TextService_Impl を返す（0.62 の supported API）。
-                    if let Ok(ts) = self_com.cast_object_ref::<crate::text_service::TextService>() {
-                        let ctx = ts.current_context.borrow().clone();
-                        ts.dispatch_mode_toggle(ctx.as_ref());
-                    }
-                }));
+            ) && self.apply_default_direct()
+            {
+                self.default_direct_applied.set(true);
             }
-            tip_log(&format!("ev=langbar_additem ok={added}"));
-        }
 
-        // SP6a: Behavior(ホスト発)の drain を起こすため自己ポインタを立てる（Deactivate で落とす）。
-        BEHAVIOR_TS.with(|c| c.set(self as *const TextService_Impl));
+            // 3) エンジン**接続**は「最初の打鍵時」に遅延確立する（ensure_engine）。
+            //    cold start ②: プロセス自体は本メソッド末尾で先行起動する（prespawn_engine —
+            //    singleton＋SpawnGuard 直列化で切替の大量起動にはならない。従来の「活性化では
+            //    起こさない」設計を、初回打鍵の重い一拍の解消のため意図的に変更）。
+            tip_log("Activate");
+            tip_log(&format!(
+                "ev=activate live_conversion={live_on} llm={llm_on} default_direct={}",
+                s.default_direct
+            ));
 
-        // SP6b/SP7 の設定反映（settings は F-1 のため上の PreserveKey 登録前に読み込み済み）。
-        let live_on = s.live_conversion.enabled;
-        self.live_enabled.set(live_on);
-        self.live_search_width.set(s.live_conversion.effective_search_width());
-        // 外部LLM変換(Shift+Tab)のフィーチャーフラグ。開発凍結中(settings::LLM_CONVERT_FROZEN)に
-        // つき settings 由来の有効化は実効判定で無視する。NOSPACEKEY_LLM_ECHO(engine の echo/診断
-        // モード)が立つときだけ dev/テスト用に有効化: production では誰も設定せず(resolve_env_map
-        // は echo を出さない)、headless ハーネス item12(Shift+Tab→LLM 配線の echo 検証)はこれで
-        // 通る=凍結中も配線コードの回帰を検出できる。
-        // Why not(この1点で閉じる理由): 実行時の LLM 発動可否は Cell self.llm_enabled に集約されて
-        // おり(set は init の false とここだけ)、resolve_action / start_llm_convert ガード /
-        // Shift+Tab 素通し判定は全てこの Cell を読む。Cell を経由しない LLM 経路や第2の set
-        // サイトを足すと凍結が漏れる。
-        let llm_on = settings::llm_effective_enabled(&s)
-            || std::env::var_os("NOSPACEKEY_LLM_ECHO").is_some();
-        self.llm_enabled.set(llm_on);
-        // 修正変換(Tab)のフィーチャーフラグ。既定 ON。off なら Tab は IME 機能として扱わず素通しする
-        // （llm_enabled と独立 — Shift+Tab の外部LLM変換には無関係）。
-        self.typo_enabled.set(s.typo_correct.enabled);
-        // SP7: default_direct なら起動時の conversion-mode を半角英数(直接入力)へ初期化。
-        // このインスタンスで1度だけ適用する（default_direct_applied ガード）。Deactivate でも
-        // リセットしないので、IME 切替で再 Activate されてもユーザの手動トグルを巻き戻さない。
-        // 適用に失敗した間は applied を立てない＝次回 Activate で再試行する（成功が1度だけ）。
-        if crate::conversion_mode::should_apply_default_direct(
-            s.default_direct,
-            self.default_direct_applied.get(),
-        ) && self.apply_default_direct()
-        {
-            self.default_direct_applied.set(true);
-        }
-
-        // 3) エンジン**接続**は「最初の打鍵時」に遅延確立する（ensure_engine）。
-        //    cold start ②: プロセス自体は本メソッド末尾で先行起動する（prespawn_engine —
-        //    singleton＋SpawnGuard 直列化で切替の大量起動にはならない。従来の「活性化では
-        //    起こさない」設計を、初回打鍵の重い一拍の解消のため意図的に変更）。
-        tip_log("Activate");
-        tip_log(&format!(
-            "ev=activate live_conversion={live_on} llm={llm_on} typo={} default_direct={} feedback={}",
-            s.typo_correct.enabled, s.default_direct, s.feedback.enabled
-        ));
-
-        // A7: 電源復帰通知を購読する（既に Some なら再登録しない＝二重 Activate 防御。cookie ガードと
-        // 同じ流儀）。register 直後に世代を同期しないと、Deactivate→再 Activate（IME 切替往復）で
-        // 新 PowerEvents の gen=0 と旧 last_resume_gen がズレ、初打鍵に偽 resume 反映が出る（I-2）。
-        if self.power_notify.borrow().is_none() {
-            *self.power_notify.borrow_mut() = crate::power::register(self.engine_pipe_name());
-            if let Some(h) = self.power_notify.borrow().as_ref() {
-                self.last_resume_gen.set(h.events().resume_gen());
+            // A7: 電源復帰通知を購読する（既に Some なら再登録しない＝二重 Activate 防御。cookie ガードと
+            // 同じ流儀）。register 直後に世代を同期しないと、Deactivate→再 Activate（IME 切替往復）で
+            // 新 PowerEvents の gen=0 と旧 last_resume_gen がズレ、初打鍵に偽 resume 反映が出る（I-2）。
+            if self.power_notify.borrow().is_none() {
+                *self.power_notify.borrow_mut() = crate::power::register(self.engine_pipe_name());
+                if let Some(h) = self.power_notify.borrow().as_ref() {
+                    self.last_resume_gen.set(h.events().resume_gen());
+                }
+                self.resume_convert_pending.set(false);
             }
-            self.resume_convert_pending.set(false);
-        }
 
-        // cold start ②: IME 切替（Activate）の時点でエンジンを先行起動しておく。
-        // 接続はしない（初回打鍵の ensure_engine の 200ms 接続が即成功する状態を作るだけ）。
-        self.prespawn_engine();
-        self.queue_snapshot_configuration(&s);
+            // cold start ②: IME 切替（Activate）の時点でエンジンを先行起動しておく。
+            // 接続はしない（初回打鍵の ensure_engine の 200ms 接続が即成功する状態を作るだけ）。
+            self.prespawn_engine();
+            // 変換用接続は初回打鍵まで遅延したまま、別の session-less 接続で
+            // 既に稼働している共有 GPU runtime の表示だけを追従する。
+            self.configure_zenzai_status_monitor(s.zenzai.enabled);
+            self.queue_snapshot_configuration(&s);
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn Deactivate(&self) -> Result<()> {
-        self.preedit_apply.invalidate();
         // Medium fix: ネスト Deactivate（清算の COM コールアウト中にホストが同期再入する）は
         // 二重清算をしない — 外側の Deactivate が継続中なので即座に戻る（冪等）。
         if self.deactivating.get() {
@@ -1687,7 +1639,10 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // UnadviseSink/SetValue/hide/destroy）を含む入口で、relayout の show() 中の同期再入で
         // 保持中 RefCell の再借用 panic が起きうる — thunk に保護が無く abort になるため、
         // 他入口と同じ規律で包む。
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.deactivate_inner()));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.preedit_apply.invalidate();
+            self.deactivate_inner()
+        }));
         match r {
             Ok(result) => result,
             Err(_) => {
@@ -1815,13 +1770,6 @@ impl TextService_Impl {
     }
 
     fn cancel_deactivating_document(&self) -> Result<()> {
-        // 通常 preedit と別 slot の予測ゴーストも、登録解除より前に本文を消して閉じる。
-        if !self
-            .abandon_prediction_for_context_change(crate::prediction_state::Invalidation::Disabled)
-        {
-            tip_log("ev=deactivate_document_cancel_failed reason=prediction_cancel_rejected");
-            return Err(E_FAIL.into());
-        }
         // Document cancellation precedes resource teardown, but failure only
         // preserves the composition/restoration material. It never skips teardown.
         // A committed pending-end composition uses its dedicated owner context.
@@ -2005,6 +1953,8 @@ impl TextService_Impl {
         // ⚠この契約は --persist モード限定（oneShot は NamedPipeServer が onDisconnect を呼ばず
         // 学習 flush も走らない）。本 TIP の spawn は常に --persist（spawn_engine_hidden）なので
         // 現行経路では成立するが、oneShot を再有効化する改修はここを再考すること（レビュー I-1）。
+        self.thread_has_focus.set(false);
+        self.configure_zenzai_status_monitor(false);
         self.drop_engine();
         // 次の活性化で（エンジンが死んでいれば）起動し直せるようにする。
         self.spawn_attempted.set(false);
@@ -2096,19 +2046,8 @@ impl TextService_Impl {
             }
         }
         self.reload_retry_count.set(0);
-        self.disarm_prediction_finish_retry();
-        self.disarm_prediction_poll();
-        self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
-        PREDICTION_RETRY_TS.with(|p| {
-            if p.get() == self as *const TextService_Impl {
-                p.set(std::ptr::null());
-            }
-        });
-        PREDICTION_POLL_TS.with(|p| {
-            if p.get() == self as *const TextService_Impl {
-                p.set(std::ptr::null());
-            }
-        });
+
+
         self.candidate_ui.borrow_mut().set_ui_mgr(None);
         // レイアウト sink の掃討（unadvise/pending/世代/LAYOUT_TS）は deactivate_inner の
         // 冒頭へ移動済み（panic で握り潰された場合の循環参照残存防止 — 事後検証指摘）。
@@ -2139,50 +2078,6 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
     }
 }
 
-impl ITfTextEditSink_Impl for TextService_Impl {
-    fn OnEndEdit(
-        &self,
-        pic: Ref<'_, ITfContext>,
-        _ecreadonly: u32,
-        peditrecord: Ref<'_, ITfEditRecord>,
-    ) -> Result<()> {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let in_our_write_session = pic
-                .ok()
-                .ok()
-                .and_then(|ctx| unsafe { ctx.InWriteSession(self.tid.get()).ok() })
-                .is_some_and(|inside| inside.as_bool());
-            if self.prediction_editing.get() || in_our_write_session {
-                return Ok(());
-            }
-            let has_prediction_activity = self.prediction_state.borrow().has_private_state()
-                || self.prediction_ghost_visible();
-            if !has_prediction_activity {
-                return Ok(());
-            }
-            let selection_changed = peditrecord
-                .ok()
-                .ok()
-                .and_then(|record| unsafe { record.GetSelectionStatus().ok() })
-                .is_some_and(|changed| changed.as_bool());
-            if self.consume_expected_prediction_commit_end_edit(selection_changed) {
-                tip_log("ev=prediction_commit_edit state=settled");
-                return Ok(());
-            }
-            tip_log(&format!("ev=prediction_invalidate source=external_edit selection_changed={selection_changed}"));
-            // OnEndEdit 内から同期 edit session は要求できないため、range除去だけ非同期に積む。
-            self.invalidate_prediction_after_external_edit();
-            Ok(())
-        }));
-        match result {
-            Ok(result) => result,
-            Err(_) => {
-                tip_log("ev=panic site=OnEndEdit");
-                Ok(())
-            }
-        }
-    }
-}
 
 impl ITfCompositionSink_Impl for TextService_Impl {
     fn OnCompositionTerminated(
@@ -2210,48 +2105,12 @@ impl ITfCompositionSink_Impl for TextService_Impl {
 }
 
 impl TextService_Impl {
-    fn consume_expected_prediction_commit_end_edit(&self, selection_changed: bool) -> bool {
-        consume_expected_prediction_commit_end_edit(
-            &self.prediction_commit_edit_deadline,
-            selection_changed,
-            Instant::now(),
-        )
-    }
 
     fn on_composition_terminated_inner(
         &self,
         _ecwrite: u32,
         pcomposition: &Ref<'_, ITfComposition>,
     ) -> Result<()> {
-        let is_prediction = match (
-            pcomposition.ok().ok(),
-            self.prediction_composition.borrow().as_ref(),
-        ) {
-            (Some(p), Some(cur)) => com_identity_eq(p, cur),
-            _ => false,
-        };
-        if is_prediction {
-            let internal = self.prediction_editing.get();
-            *self.prediction_composition.borrow_mut() = None;
-            *self.prediction_context.borrow_mut() = None;
-            self.prediction_finish_pending.set(None);
-            if self.prediction_deferred_preserved.borrow().is_empty() {
-                self.disarm_prediction_finish_retry();
-            } else {
-                // internal callback でも、timer 作成失敗後に別経路の async finish が成功した
-                // 場合がある。キューが残る限り必ず replay の安全点を予約する。
-                self.arm_prediction_finish_retry(false);
-            }
-            if !internal {
-                self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
-            }
-            tip_log(if internal {
-                "ev=prediction_comp_terminated source=internal"
-            } else {
-                "ev=prediction_comp_terminated source=host"
-            });
-            return Ok(());
-        }
         // 終了通知が現在追跡中の composition のものか確認する。フォーカス喪失 sink
         // （OnSetFocus/OnKillThreadFocus）は composition を End せずに手放す（ホストが既に確定/破棄
         // するため）。その後ユーザが戻って新しい composition を張った後で、ホストが古い（放棄した）
@@ -2338,6 +2197,7 @@ impl TextService_Impl {
     /// （`OnCompositionTerminated` と、別ウィンドウへのフォーカス喪失 `OnSetFocus` で共有）。
     /// 文書側はホストが既に確定/破棄済みなので、ここでは cancel/commit はせず**自分の状態だけ**畳む。
     pub(crate) fn reset_abandoned_composition(&self) {
+        self.clear_input_predictions();
         self.retire_conversion_owner();
         self.preedit_apply.invalidate();
         self.background_input.request_close();
@@ -2432,11 +2292,9 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         // 巡4 T6: refresh_layout_sink_target の Advise/UnadviseSink コールアウト中に同期再入しうる
         // 入口 — 保護なし入口の panic は shim 越えで abort するため、他入口と同じ規律で包む。
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.retain_input_prediction_context(None);
             self.password_ctx_key.set(0); // Spec2: context 切替で password キャッシュ無効化（ABA 対策・I-3）
-            let _ = self.abandon_prediction_for_context_change(
-                crate::prediction_state::Invalidation::FocusChanged,
-            );
-            *self.prediction_failed_context.borrow_mut() = None;
+
             // UIバグ5: context スタックが変われば旧 context の座標は無意味 — アンカー保持も破棄。
             *self.last_valid_anchor.borrow_mut() = None;
             // UIバグ4: context スタックが変われば focus の top context も変わる — sink を貼り替える。
@@ -2456,11 +2314,9 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         self.consume_started_composition();
         // 巡4 T6: OnPushContext と同じ規律。
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.retain_input_prediction_context(None);
             self.password_ctx_key.set(0); // Spec2: context 切替で password キャッシュ無効化（ABA 対策・I-3）
-            let _ = self.abandon_prediction_for_context_change(
-                crate::prediction_state::Invalidation::FocusChanged,
-            );
-            *self.prediction_failed_context.borrow_mut() = None;
+
             // UIバグ5: 同上（pop 後の context でも旧座標は無意味）。
             *self.last_valid_anchor.borrow_mut() = None;
             // UIバグ4: 同上（pop 後の top context へ追従）。
@@ -2512,33 +2368,12 @@ impl TextService_Impl {
         let new_focus_ctx = new_focus
             .as_ref()
             .and_then(|doc| unsafe { doc.GetTop() }.ok());
+        self.retain_input_prediction_context(new_focus_ctx.as_ref());
         self.preedit_apply.retain_context(new_focus_ctx.as_ref());
         // A host can end an already-written composition before this focus
         // callback. Accepted suffix input still belongs to the original field.
         if self.conversion_queue_context_changed(new_focus_ctx.as_ref()) {
             self.retire_conversion_owner();
-        }
-        // DocumentMgr ではなく top context で比較する。同じ document manager が
-        // 複数の編集欄を再利用するホストでも、欄Aの文脈／failure を欄Bへ持ち越さない。
-        let prediction_field = self
-            .prediction_context
-            .borrow()
-            .clone()
-            .or_else(|| self.layout_sink_ctx.borrow().clone());
-        let prediction_focus_is_same = match (&new_focus_ctx, &prediction_field) {
-            (Some(f), Some(o)) => com_identity_eq(f, o),
-            _ => false,
-        };
-        if !prediction_focus_is_same
-            && (self.prediction_state.borrow().has_private_state()
-                || self.prediction_ghost_visible()
-                || self.prediction_failed_context.borrow().is_some())
-        {
-            let _ = self.abandon_prediction_for_context_change(
-                crate::prediction_state::Invalidation::FocusChanged,
-            );
-            // cleanup failure は旧欄にだけ属する。新欄の予測を巻き添えで停止しない。
-            *self.prediction_failed_context.borrow_mut() = None;
         }
         // UIバグ5: キャレットアンカーの保持もフォーカス切替で破棄 — 別ドキュメントの座標は無意味。
         *self.last_valid_anchor.borrow_mut() = None;
@@ -2582,6 +2417,11 @@ impl TextService_Impl {
 
 impl ITfThreadFocusSink_Impl for TextService_Impl {
     fn OnSetThreadFocus(&self) -> Result<()> {
+        self.thread_has_focus.set(true);
+        if self.zenzai_status_monitor_enabled.get() {
+            self.zenzai_status_connect_misses.set(0);
+            self.arm_zenzai_status_poll(ZENZAI_STATUS_INITIAL_POLL_MS);
+        }
         Ok(())
     }
 
@@ -2612,6 +2452,14 @@ impl ITfThreadFocusSink_Impl for TextService_Impl {
 
 impl TextService_Impl {
     fn on_kill_thread_focus_inner(&self) -> Result<()> {
+        self.thread_has_focus.set(false);
+        self.disarm_zenzai_status_poll();
+        self.zenzai_status_client.borrow_mut().take();
+        self.zenzai_status_connect_misses.set(0);
+        // フォーカス喪失中はこの item 自体がシェルの表示対象外。OnUpdate の COM
+        // コールアウトをこの focus callback 内で増やさず、次の OnSetThreadFocus 後の
+        // status 取得で false→true の変化として通知する。
+        self.langbar_zenzai_gpu_active.set(false);
         if self.conversion_queue_context_changed(None) {
             self.retire_conversion_owner();
         }
@@ -2620,10 +2468,7 @@ impl TextService_Impl {
         // Cross-process focus loss invalidates the pair even when there is no active composition.
         self.invalidate_pending_end_test_reservation();
         *self.last_valid_anchor.borrow_mut() = None;
-        let _ = self.abandon_prediction_for_context_change(
-            crate::prediction_state::Invalidation::FocusChanged,
-        );
-        *self.prediction_failed_context.borrow_mut() = None;
+
         let has_active_input =
             self.engine_session.get() != 0 || self.composition.borrow().is_some();
         if crate::focus::should_abandon_on_focus_change(
@@ -2698,7 +2543,7 @@ impl ITfTextLayoutSink_Impl for TextService_Impl {
 }
 
 /// 2 つの COM インターフェースが同一オブジェクトを指すか（IUnknown へ QI して raw ポインタ比較）。
-fn com_identity_eq<A: Interface, B: Interface>(a: &A, b: &B) -> bool {
+pub(crate) fn com_identity_eq<A: Interface, B: Interface>(a: &A, b: &B) -> bool {
     match (a.cast::<IUnknown>(), b.cast::<IUnknown>()) {
         (Ok(x), Ok(y)) => x.as_raw() == y.as_raw(),
         _ => false,
@@ -2919,6 +2764,9 @@ impl TextService_Impl {
                 tip_log("ev=reload_config ok=true");
                 // 巡4 T5: 反映が成功したら予算を戻す（busy エピソード単位のカウントにする）。
                 self.reload_retry_count.set(0);
+                // 設定値ではなく、受理後に QueryZenzaiStatus が返す実 runtime 状態を表示する。
+                // disabled なら問い合わせ自体を止め、現在の装飾も即座に落とす。
+                self.configure_zenzai_status_monitor(s.zenzai.enabled);
             }
             Ok(Response::Error { message }) => {
                 // 応答は消費済み（交互性 OK）。Engine側の明示拒否なので接続は維持する。
@@ -2946,6 +2794,134 @@ impl TextService_Impl {
                 self.drop_engine();
             }
         }
+    }
+
+    fn configure_zenzai_status_monitor(&self, enabled: bool) {
+        let was_enabled = self.zenzai_status_monitor_enabled.replace(enabled);
+        if enabled && self.thread_has_focus.get() {
+            if !was_enabled {
+                self.zenzai_status_connect_misses.set(0);
+                self.zenzai_status_client.borrow_mut().take();
+            }
+            self.arm_zenzai_status_poll(ZENZAI_STATUS_INITIAL_POLL_MS);
+        } else {
+            self.disarm_zenzai_status_poll();
+            self.zenzai_status_client.borrow_mut().take();
+            self.zenzai_status_connect_misses.set(0);
+            self.set_zenzai_gpu_active(false);
+        }
+    }
+
+    /// Zenzai の実 runtime 状態が変わった時だけシェルへ再取得を依頼する。
+    fn set_zenzai_gpu_active(&self, active: bool) {
+        if self.langbar_zenzai_gpu_active.replace(active) == active {
+            return;
+        }
+        tip_log(&format!("ev=zenzai_indicator gpu_active={active}"));
+        let sink = self.langbar_sink.borrow().clone();
+        if let Some(sink) = sink {
+            unsafe {
+                let _ = sink.OnUpdate(TF_LBI_TEXT | TF_LBI_ICON);
+            }
+        }
+    }
+
+    fn arm_zenzai_status_poll(&self, interval_ms: u32) {
+        self.disarm_zenzai_status_poll();
+        if !self.zenzai_status_monitor_enabled.get() || !self.thread_has_focus.get() {
+            return;
+        }
+        let id = unsafe { SetTimer(None, 0, interval_ms, Some(zenzai_status_timer_proc)) };
+        if id == 0 {
+            self.set_zenzai_gpu_active(false);
+            return;
+        }
+        ZENZAI_STATUS_OWNERS.with(|owners| {
+            owners
+                .borrow_mut()
+                .insert(id, self as *const TextService_Impl);
+        });
+        self.zenzai_status_timer.set(id);
+    }
+
+    fn disarm_zenzai_status_poll(&self) {
+        let id = self.zenzai_status_timer.replace(0);
+        if id == 0 {
+            return;
+        }
+        ZENZAI_STATUS_OWNERS.with(|owners| {
+            owners.borrow_mut().remove(id);
+        });
+        unsafe {
+            let _ = KillTimer(None, id);
+        }
+    }
+
+    fn poll_zenzai_status(&self, id: usize) {
+        if self.zenzai_status_timer.get() != id {
+            return;
+        }
+        // 単発として扱う。次の間隔は取得した状態（preparing/active/inactive）で変える。
+        self.disarm_zenzai_status_poll();
+        if !self.zenzai_status_monitor_enabled.get() || !self.thread_has_focus.get() {
+            self.set_zenzai_gpu_active(false);
+            return;
+        }
+        // 変換用 client とは独立した session-less 接続なので、初回打鍵前でも
+        // 問い合わせられ、LiveConvert の未回収応答による stale 表示も起こさない。
+        if self.zenzai_status_client.borrow().is_none() {
+            match EngineClient::connect_to(&self.engine_pipe_name(), Duration::ZERO) {
+                Ok(client) => {
+                    *self.zenzai_status_client.borrow_mut() = Some(client);
+                    self.zenzai_status_connect_misses.set(0);
+                }
+                Err(_) => {
+                    self.schedule_zenzai_status_reconnect();
+                    return;
+                }
+            }
+        }
+        let result = {
+            let mut guard = self.zenzai_status_client.borrow_mut();
+            guard.as_mut().map(|client| {
+                timed_request(
+                    client,
+                    &Request::QueryZenzaiStatus,
+                    IPC_TIMEOUT_ZENZAI_STATUS,
+                    "zenzai_status",
+                )
+            })
+        };
+        let Some(result) = result else {
+            self.schedule_zenzai_status_reconnect();
+            return;
+        };
+        match result {
+            Ok(response) => {
+                let Some(state) = zenzai_indicator_state(&response) else {
+                    tip_log(&engine_failure_event("zenzai_status", &Ok(response)));
+                    self.schedule_zenzai_status_reconnect();
+                    return;
+                };
+                self.zenzai_status_connect_misses.set(0);
+                self.set_zenzai_gpu_active(state == ZenzaiIndicatorState::GpuActive);
+                self.arm_zenzai_status_poll(zenzai_status_poll_interval(state));
+            }
+            Err(error) => {
+                tip_log(&engine_failure_event("zenzai_status", &Err(error)));
+                // request-id のない交互プロトコルなので late response を残さない。
+                // 表示専用接続だけを捨て、変換用接続は巻き込まない。
+                self.schedule_zenzai_status_reconnect();
+            }
+        }
+    }
+
+    fn schedule_zenzai_status_reconnect(&self) {
+        self.zenzai_status_client.borrow_mut().take();
+        self.set_zenzai_gpu_active(false);
+        let misses = self.zenzai_status_connect_misses.get().saturating_add(1);
+        self.zenzai_status_connect_misses.set(misses);
+        self.arm_zenzai_status_poll(zenzai_status_reconnect_interval(misses));
     }
 
     /// 巡3 Z4: busy 応答を受けた ReloadConfig の遅延再送（上限付き）。0ms スレッドタイマで
@@ -3451,40 +3427,6 @@ impl TextService_Impl {
         }
     }
 
-    /// 修正変換候補を要求する（Tab）。失敗なら None（劣化）し接続を破棄する。手動キー起動なので
-    /// A7 の resume_probe 計測（復帰後最初の変換系 op）は対象外（engine_convert と異なり計測しない）。
-    pub(crate) fn engine_typo_convert(&self) -> Option<Vec<String>> {
-        if !self.reanchor_engine_from_local() {
-            return None;
-        }
-        if !self.prepare_send_or_drop("typo_convert", IPC_TIMEOUT_CONVERT) {
-            return None;
-        }
-        let session = self.engine_session.get();
-        let left_context = self.left_context.borrow().clone();
-        let result = {
-            let mut guard = self.client.borrow_mut();
-            let client = guard.as_mut()?;
-            timed_request(
-                client,
-                &Request::TypoConvert {
-                    session,
-                    left_context,
-                },
-                IPC_TIMEOUT_CONVERT,
-                "typo_convert",
-            )
-        };
-        match result {
-            Ok(Response::Candidates { candidates }) => Some(candidates),
-            other => {
-                tip_log(&engine_failure_event("typo_convert", &other));
-                tip_log("ev=degraded reason=typo_convert_failed");
-                self.drop_engine();
-                None
-            }
-        }
-    }
 
     /// 選択かな表層を1往復で再変換し候補を得る（SP5 step-6）。失敗なら None（劣化）し接続を破棄する。
     pub(crate) fn engine_reconvert_surface(&self, surface: &str) -> Option<Vec<String>> {
@@ -3795,8 +3737,9 @@ impl TextService_Impl {
     /// Space/Enter で SP1 候補フローに任せる（既存タイマがあれば畳むだけ）。
     pub(crate) fn arm_debounce(&self) {
         self.disarm_debounce();
-        if self.local_clauses.borrow().is_some() && !self.partial_preedit_redraw_pending.get() { return; }
-        if !self.live_enabled.get() && !self.partial_preedit_redraw_pending.get() {
+        if (self.local_clauses.borrow().is_some() || self.explicit_snapshot_pending.get())
+            && !self.partial_preedit_redraw_pending.get() { return; }
+        if !self.live_enabled.get() && !self.input_prediction_enabled.get() && !self.partial_preedit_redraw_pending.get() {
             return;
         }
         DEBOUNCE_TS.with(|p| p.set(self as *const TextService_Impl));
@@ -3837,18 +3780,10 @@ impl TextService_Impl {
         }
     }
 
-    /// 確定取消（Ctrl+Backspace）: undo_armed を非武装化する。F-5 改定の落とし所——
-    /// undo も feedback もできない状態（feedback_enabled=false かつ非武装化した時点）で
-    /// メモリに確定文字列を残さない。feedback opt-in 中は last_commit を消費用に残す
-    /// （record_feedback が take() する）。現状の呼び出しは settle_active_input 末尾・
-    /// on_preserved_key_impl のトグル/再変換/feedback 処理・OnSetFocus（自doc以外）・
-    /// OnKillThreadFocus（key_event_sink.rs / 本ファイル）。次キー押下での disarm
-    /// （is_pure_modifier_vk 判定）は OnKeyDown 分岐実装（後続 Task）で追加する。
+    /// 取消できなくなった時点で確定本文と読みを破棄する。
     pub(crate) fn disarm_undo(&self) {
         self.undo_armed.set(false);
-        if !self.feedback_enabled.get() {
-            *self.last_commit.borrow_mut() = None;
-        }
+        *self.last_commit.borrow_mut() = None;
     }
 
     /// 確定取消（Ctrl+Backspace）: armed 中の Ctrl+Backspace 実処理の入口。
@@ -3971,7 +3906,7 @@ impl TextService_Impl {
         if !self.llm_enabled.get() {
             return;
         }
-        if !self.state.borrow().composing || self.state.borrow().awaiting_llm() {
+        if !self.state.borrow().can_start_llm() {
             return;
         }
         // 巡11(round11): 素材(表示中テキスト)が空なら開始しない — 空 Backspace の cancel
@@ -4160,7 +4095,11 @@ impl TextService_Impl {
             self.arm_partial_preedit_redraw_retry();
             return;
         }
-        if !self.live_enabled.get() || self.local_clauses.borrow().is_some() {
+        self.submit_input_predictions(&ctx);
+        // A late prediction reply (or an already queued timer) must not replace the
+        // explicit snapshot identity while Space is waiting for its result.
+        if !self.live_enabled.get() || self.local_clauses.borrow().is_some()
+            || self.explicit_snapshot_pending.get() {
             return;
         }
         let configuration = self.configuration_generation.get();
@@ -4325,7 +4264,7 @@ impl TextService_Impl {
     }
 
     fn arm_snapshot_poll_timer(&self) {
-        let monitor_configured_link = (self.live_enabled.get()
+        let monitor_configured_link = (self.live_enabled.get() || self.input_prediction_enabled.get()
             || self.explicit_snapshot_pending.get())
             && self.state.borrow().composing
             && !self.snapshot_version_mismatch.get()
@@ -4336,6 +4275,7 @@ impl TextService_Impl {
             );
         let Some(interval) = snapshot_poll_interval(
             self.live_result_deadline.get().is_some()
+                || self.input_predictions.borrow().pending()
                 || self.local_clause_loading()
                 || self.local_clause_redraw_deadline.get().is_some()
                 || self.display_end_context.borrow().is_some()
@@ -4387,7 +4327,7 @@ impl TextService_Impl {
     }
 
     fn disarm_snapshot_poll_if_idle(&self) {
-        if !self.snapshot_configuration_pending.get() && self.live_result_deadline.get().is_none()
+        if !self.input_predictions.borrow().pending() && !self.snapshot_configuration_pending.get() && self.live_result_deadline.get().is_none()
             && self.local_clause_redraw_deadline.get().is_none()
             && self.display_end_context.borrow().is_none()
             && !self.clause_worker.learning_pending()
@@ -4415,6 +4355,7 @@ impl TextService_Impl {
     }
 
     fn poll_live_result(&self) {
+        self.expire_input_predictions();
         let capacity_context = self.display_end_context.borrow_mut().take();
         if let Some(context) = capacity_context { self.end_display_at_capacity(&context); }
         self.poll_receipt_notice();
@@ -4712,585 +4653,6 @@ impl TextService_Impl {
     /// 選択文節（太下線）属性 atom を内包した VARIANT を作る（atom 未登録なら i32(0)）。
     fn da_target_variant(&self) -> VARIANT {
         VARIANT::from(self.da_target_atom.get() as i32)
-    }
-
-    fn da_prediction_variant(&self) -> VARIANT {
-        VARIANT::from(self.da_prediction_atom.get() as i32)
-    }
-
-    pub(crate) fn prediction_ghost_visible(&self) -> bool {
-        self.prediction_composition.borrow().is_some()
-    }
-
-    pub(crate) fn prediction_ghost_actionable(&self) -> bool {
-        self.prediction_ghost_visible()
-            && self.prediction_finish_pending.get().is_none()
-            && self.prediction_state.borrow().ghost().is_some()
-            && prediction_mode_allows_display(self.is_direct_mode(), self.ephemeral_kana.get())
-    }
-
-    pub(crate) fn prediction_cleanup_in_progress(&self) -> bool {
-        self.prediction_ghost_visible() && self.prediction_finish_pending.get().is_some()
-    }
-
-    fn prediction_owner_is_focused(&self) -> bool {
-        match (
-            self.prediction_context.borrow().as_ref(),
-            self.layout_sink_ctx.borrow().as_ref(),
-        ) {
-            (Some(owner), Some(focused)) => com_identity_eq(owner, focused),
-            _ => false,
-        }
-    }
-
-    fn mark_prediction_tsf_failure_for(&self, ctx: &ITfContext) {
-        *self.prediction_failed_context.borrow_mut() = Some(ctx.clone());
-    }
-
-    fn mark_prediction_tsf_failure_for_owner(&self) {
-        if let Some(ctx) = self
-            .prediction_context
-            .borrow()
-            .clone()
-            .or_else(|| self.layout_sink_ctx.borrow().clone())
-        {
-            self.mark_prediction_tsf_failure_for(&ctx);
-        }
-    }
-
-    fn prediction_failed_for(&self, ctx: &ITfContext) -> bool {
-        self.prediction_failed_context
-            .borrow()
-            .as_ref()
-            .is_some_and(|failed| com_identity_eq(failed, ctx))
-    }
-
-    pub(crate) fn retry_prediction_cleanup_on_input(&self) {
-        if self.prediction_cleanup_in_progress() {
-            // 上限到達／SetTimer失敗後でも次打鍵を安全点として再武装する。
-            // 打鍵自体は本来の IME/host 判定へ進めるため、永久入力ロックにならない。
-            self.arm_prediction_finish_retry(true);
-        }
-    }
-
-    pub(crate) fn cancel_deferred_prediction_preserved_on_input(&self) {
-        self.prediction_deferred_preserved.borrow_mut().clear();
-    }
-
-    pub(crate) fn defer_prediction_preserved_key(&self, context: Option<ITfContext>, guid: GUID) {
-        let mut deferred = self.prediction_deferred_preserved.borrow_mut();
-        // reconvert / feedback は連打しても一度で意味が足りる。GUID 種類数で自然に有界。
-        if deferred.iter().any(|event| event.guid == guid) {
-            return;
-        }
-        deferred.push_back(DeferredPredictionPreservedKey { context, guid });
-    }
-
-    pub(crate) fn flush_deferred_prediction_preserved_keys_if_ready(&self) {
-        if self.prediction_ghost_visible() {
-            return;
-        }
-        let events = std::mem::take(&mut *self.prediction_deferred_preserved.borrow_mut());
-        let sink: ITfKeyEventSink = self.to_interface();
-        for event in events {
-            let result = unsafe { sink.OnPreservedKey(event.context.as_ref(), &event.guid) };
-            if result.is_err() {
-                tip_log("ev=prediction_preserved_replay result=failed");
-            }
-        }
-    }
-
-    fn resume_preedit_after_prediction_cleanup(&self) {
-        if !self.partial_preedit_redraw_pending.get() {
-            return;
-        }
-        let Some(ctx) = self.current_context.borrow().clone() else {
-            return;
-        };
-        // ghost cleanup は composition 表面を外から書き換える非継ぎ足しイベント。
-        self.state.borrow_mut().invalidate_live_display();
-        if self.redraw_partial_preedit_if_needed(&ctx) {
-            self.arm_debounce();
-        } else {
-            self.arm_partial_preedit_redraw_retry();
-        }
-    }
-
-    fn next_prediction_anchor(&self) -> crate::prediction_state::PredictionAnchor {
-        let next = self.prediction_anchor_gen.get().saturating_add(1);
-        self.prediction_anchor_gen.set(next);
-        crate::prediction_state::PredictionAnchor::new(next)
-    }
-
-    fn prediction_now() -> crate::prediction_state::Timestamp {
-        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-        crate::prediction_state::Timestamp::from_millis(
-            elapsed.as_millis().min(u64::MAX as u128) as u64
-        )
-    }
-
-    pub(crate) fn on_explicit_prediction_commit(
-        &self,
-        source: crate::prediction_state::CommitSource,
-        text: &str,
-    ) {
-        if !self.prediction_enabled.get() || text.is_empty() {
-            return;
-        }
-        let context = self
-            .current_context
-            .borrow()
-            .clone()
-            .or_else(|| self.layout_sink_ctx.borrow().clone());
-        let Some(context) = context else {
-            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
-            tip_log("ev=prediction_unavailable state=no_context");
-            return;
-        };
-        // InputScope の取得不能は通常欄を誤って無効化しないよう許可し、次の確定で再照会する。
-        // 明示された password/PIN と keyboard-disabled context だけを抑止する。
-        if prediction_scope_is_sensitive(
-            query_context_keyboard_disabled(&context),
-            self.query_context_is_password(&context),
-        ) {
-            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
-            tip_log("ev=prediction_unavailable state=sensitive_scope");
-            return;
-        }
-        self.cancel_prediction_slot();
-        let should_request = {
-            let mut state = self.prediction_state.borrow_mut();
-            state.on_commit(
-                source,
-                text,
-                self.next_prediction_anchor(),
-                Self::prediction_now(),
-            );
-            state.has_activity()
-        };
-        self.prediction_commit_edit_deadline.set(Some(
-            Instant::now() + Duration::from_millis(u64::from(PREDICTION_DEBOUNCE_MS)),
-        ));
-        if should_request {
-            self.arm_prediction_poll(PREDICTION_DEBOUNCE_MS);
-            tip_log("ev=prediction_request stage=debounce");
-        } else {
-            self.disarm_prediction_poll();
-            tip_log("ev=prediction_wait state=context_buffered");
-        }
-    }
-
-    fn cancel_prediction_slot(&self) {
-        if let Some(slot) = self.prediction_slot.borrow_mut().take() {
-            slot.cancel();
-        }
-    }
-
-    pub(crate) fn invalidate_prediction(&self, reason: crate::prediction_state::Invalidation) {
-        self.prediction_commit_edit_deadline.set(None);
-        self.cancel_prediction_slot();
-        self.prediction_state.borrow_mut().invalidate(reason);
-    }
-
-    fn arm_prediction_poll(&self, delay_ms: u32) {
-        self.disarm_prediction_poll();
-        PREDICTION_POLL_TS.with(|p| p.set(self as *const TextService_Impl));
-        let id = unsafe { SetTimer(None, 0, delay_ms, Some(prediction_poll_timer_proc)) };
-        if id == 0 {
-            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
-            tip_log("ev=prediction_unavailable state=timer_failed");
-        } else {
-            self.prediction_poll_timer.set(id);
-        }
-    }
-
-    fn disarm_prediction_poll(&self) {
-        let id = self.prediction_poll_timer.replace(0);
-        if id != 0 {
-            unsafe {
-                let _ = KillTimer(None, id);
-            }
-        }
-    }
-
-    fn fire_prediction_poll(&self, id: usize) {
-        if self.prediction_poll_timer.get() != id {
-            return;
-        }
-        self.prediction_poll_timer.set(0);
-        // An edit arriving after the debounce is no longer the commit's trailing
-        // notification; it must invalidate the request like any other edit.
-        self.prediction_commit_edit_deadline.set(None);
-        if !prediction_mode_allows_display(self.is_direct_mode(), self.ephemeral_kana.get()) {
-            if self.prediction_ghost_visible() {
-                let _ = self.dismiss_prediction_ghost(false);
-            } else {
-                self.invalidate_prediction(crate::prediction_state::Invalidation::ModeChanged);
-            }
-            tip_log("ev=prediction_invalidate source=mode_poll");
-            return;
-        }
-        let now = Self::prediction_now();
-        let outcome = self
-            .prediction_slot
-            .borrow()
-            .as_ref()
-            .and_then(|slot| slot.take());
-        if let Some(outcome) = outcome {
-            self.cancel_prediction_slot();
-            tip_log(&format!(
-                "ev=prediction_result duration_ms={}",
-                outcome.duration_ms
-            ));
-            match outcome.result {
-                IpcPredictionResult::Prediction(text) => {
-                    if self
-                        .prediction_state
-                        .borrow_mut()
-                        .on_result(outcome.seq, &text, now)
-                        .is_some()
-                    {
-                        let ctx = self.layout_sink_ctx.borrow().clone();
-                        if let Some(ctx) = ctx {
-                            let _ = self.show_prediction_ghost(&ctx);
-                        }
-                    }
-                }
-                IpcPredictionResult::Unavailable(state) => {
-                    let _ = self
-                        .prediction_state
-                        .borrow_mut()
-                        .on_result(outcome.seq, "", now);
-                    tip_log(&format!("ev=prediction_unavailable state={state}"));
-                }
-                IpcPredictionResult::Failed => {
-                    let _ = self
-                        .prediction_state
-                        .borrow_mut()
-                        .on_result(outcome.seq, "", now);
-                    tip_log("ev=prediction_unavailable state=ipc_failed");
-                }
-                IpcPredictionResult::VersionMismatch {
-                    actual_proto,
-                    actual_boot,
-                } => {
-                    let _ = self
-                        .prediction_state
-                        .borrow_mut()
-                        .on_result(outcome.seq, "", now);
-                    tip_log(&format!(
-                        "ev=prediction_engine_identity_mismatch actual_proto={actual_proto:?} actual_boot={actual_boot:?} action=fail_closed"
-                    ));
-                }
-            }
-            return;
-        }
-
-        if self.prediction_state.borrow_mut().expire_pending(now) {
-            self.cancel_prediction_slot();
-            tip_log("ev=prediction_timeout");
-            return;
-        }
-        if self.prediction_slot.borrow().is_some() {
-            self.arm_prediction_poll(PREDICTION_POLL_MS);
-            return;
-        }
-        let request = self.prediction_state.borrow_mut().poll(now);
-        if let Some(request) = request {
-            let slot = PredictionSlot::new();
-            *self.prediction_slot.borrow_mut() = Some(slot.clone());
-            let pipe_name = self.pipe_name.borrow().clone();
-            if spawn_ipc_prediction_worker(pipe_name, request, slot, PREDICTION_TIMEOUT).is_err() {
-                self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
-                tip_log("ev=prediction_unavailable state=worker_spawn_failed");
-                return;
-            }
-            tip_log("ev=prediction_request stage=sent");
-            self.arm_prediction_poll(PREDICTION_POLL_MS);
-        } else if self.prediction_state.borrow().has_activity() {
-            self.arm_prediction_poll(PREDICTION_POLL_MS);
-        }
-    }
-
-    /// `PredictionState` が保持する候補を現在キャレットへ表示する。
-    // Task 4 の予測IPC結果から呼ぶまでの遷移期間だけ未使用を許可する。
-    #[allow(dead_code)]
-    pub(crate) fn show_prediction_ghost(&self, ctx: &ITfContext) -> bool {
-        if !prediction_mode_allows_display(self.is_direct_mode(), self.ephemeral_kana.get()) {
-            self.invalidate_prediction(crate::prediction_state::Invalidation::ModeChanged);
-            tip_log("ev=prediction_invalidate source=mode_show");
-            return false;
-        }
-        let sink_matches_context = self
-            .layout_sink_ctx
-            .borrow()
-            .as_ref()
-            .is_some_and(|sink_ctx| com_identity_eq(sink_ctx, ctx));
-        if self.text_edit_sink_cookie.get() == 0 || !sink_matches_context {
-            self.mark_prediction_tsf_failure_for(ctx);
-            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
-            tip_log("ev=prediction_disabled reason=edit_sink_context");
-            return false;
-        }
-        let slot_available = prediction_slot_available(
-            self.prediction_composition.borrow().is_some(),
-            self.prediction_finish_pending.get().is_some(),
-        );
-        if !slot_available {
-            // 別欄の旧 physical slot が回収中なら、この欄の結果は後から表示せず stale に畳む。
-            self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
-            return false;
-        }
-        self.prediction_preserve_selection.set(false);
-        if self.prediction_failed_for(ctx)
-            || self.da_prediction_atom.get() == 0
-            || self.composition.borrow().is_some()
-            || self.composition_end_pending.get()
-            || self.showing.get()
-            || self.is_password_context(ctx)
-        {
-            return false;
-        }
-        let Some(text) = self
-            .prediction_state
-            .borrow()
-            .ghost()
-            .map(|ghost| ghost.text.clone())
-        else {
-            return false;
-        };
-        let sink: ITfCompositionSink = self.to_interface();
-        let session: ITfEditSession = StartPredictionGhost {
-            context: ctx.clone(),
-            text: HSTRING::from(text),
-            sink,
-            da_variant: self.da_prediction_variant(),
-            composition: Rc::clone(&self.prediction_composition),
-            editing: Rc::clone(&self.prediction_editing),
-            _guard: ComObjectGuard::new(),
-        }
-        .into();
-        // StartComposition 後の部分失敗でも同じ context で除去・終了を再試行できるよう、
-        // RequestEditSession より前に owner を固定する。
-        *self.prediction_context.borrow_mut() = Some(ctx.clone());
-        let applied = match unsafe {
-            ctx.RequestEditSession(
-                self.tid.get(),
-                &session,
-                TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
-            )
-        } {
-            Ok(hr) => hr.is_ok() && self.prediction_composition.borrow().is_some(),
-            Err(_) => false,
-        };
-        if applied {
-            *self.prediction_context.borrow_mut() = Some(ctx.clone());
-            // 外部の compartment 書換えも短時間で検出し、direct mode 上に ghost を残さない。
-            self.arm_prediction_poll(PREDICTION_POLL_MS);
-            tip_log("ev=prediction_show");
-        } else {
-            if self.prediction_composition.borrow().is_none() {
-                *self.prediction_context.borrow_mut() = None;
-            } else {
-                self.prediction_finish_pending.set(Some(false));
-                self.arm_prediction_finish_retry(true);
-            }
-            self.mark_prediction_tsf_failure_for(ctx);
-            self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
-            tip_log("ev=prediction_disabled reason=tsf_show");
-        }
-        applied
-    }
-
-    fn disarm_prediction_finish_retry(&self) {
-        let id = self.prediction_retry_timer.replace(0);
-        if id != 0 {
-            unsafe {
-                let _ = KillTimer(None, id);
-            }
-        }
-        self.prediction_retry_count.set(0);
-    }
-
-    /// TSF ロック競合で予測 composition を終了できなかった場合の有界再試行。
-    /// owner context と composition slot は成功まで保持し、タイマは STA だけで発火する。
-    fn arm_prediction_finish_retry(&self, reset_budget: bool) {
-        if self.prediction_composition.borrow().is_none()
-            && self.prediction_deferred_preserved.borrow().is_empty()
-        {
-            *self.prediction_context.borrow_mut() = None;
-            self.prediction_finish_pending.set(None);
-            self.disarm_prediction_finish_retry();
-            return;
-        }
-        if reset_budget {
-            self.prediction_retry_count.set(0);
-        }
-        if self.prediction_retry_timer.get() != 0 {
-            return;
-        }
-        if self.prediction_retry_count.get() >= PREDICTION_RETRY_MAX {
-            tip_log("ev=prediction_cleanup retry=exhausted");
-            return;
-        }
-        let id = unsafe {
-            SetTimer(
-                None,
-                0,
-                PREDICTION_RETRY_MS,
-                Some(prediction_retry_timer_proc),
-            )
-        };
-        if id == 0 {
-            if self.prediction_owner_is_focused() {
-                self.mark_prediction_tsf_failure_for_owner();
-            }
-            tip_log("ev=prediction_cleanup retry=timer_failed");
-        } else {
-            self.prediction_retry_timer.set(id);
-        }
-    }
-
-    fn fire_prediction_finish_retry(&self, id: usize) {
-        if self.prediction_retry_timer.get() != id {
-            return;
-        }
-        self.prediction_retry_timer.set(0);
-        if self.prediction_composition.borrow().is_none() {
-            *self.prediction_context.borrow_mut() = None;
-            self.prediction_finish_pending.set(None);
-            self.prediction_retry_count.set(0);
-            self.resume_preedit_after_prediction_cleanup();
-            self.flush_deferred_prediction_preserved_keys_if_ready();
-            return;
-        }
-        let accept = self.prediction_finish_pending.get().unwrap_or(false);
-        if self.request_finish_prediction_ghost(accept, false) {
-            self.prediction_retry_count.set(0);
-            tip_log("ev=prediction_cleanup retry=success");
-            self.resume_preedit_after_prediction_cleanup();
-            self.flush_deferred_prediction_preserved_keys_if_ready();
-            return;
-        }
-        if self.prediction_owner_is_focused() {
-            self.mark_prediction_tsf_failure_for_owner();
-        }
-        self.prediction_retry_count
-            .set(self.prediction_retry_count.get().saturating_add(1));
-        self.arm_prediction_finish_retry(false);
-    }
-
-    fn request_finish_prediction_ghost(&self, accept: bool, asynchronous: bool) -> bool {
-        let Some(ctx) = self.prediction_context.borrow().clone() else {
-            return self.prediction_composition.borrow().is_none();
-        };
-        self.prediction_finish_pending.set(Some(accept));
-        let session: ITfEditSession = FinishPredictionGhost {
-            context: ctx.clone(),
-            composition: Rc::clone(&self.prediction_composition),
-            owner_context: Rc::clone(&self.prediction_context),
-            editing: Rc::clone(&self.prediction_editing),
-            failure_context: Rc::clone(&self.prediction_failed_context),
-            pending: Rc::clone(&self.prediction_finish_pending),
-            preserve_selection: self.prediction_preserve_selection.get(),
-            accept,
-            _guard: ComObjectGuard::new(),
-        }
-        .into();
-        let flags = if asynchronous {
-            TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_ASYNC.0 | TF_ES_READWRITE.0)
-        } else {
-            TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0)
-        };
-        match unsafe { ctx.RequestEditSession(self.tid.get(), &session, flags) } {
-            Ok(hr) if asynchronous => hr.is_ok(),
-            Ok(hr) => hr.is_ok() && self.prediction_composition.borrow().is_none(),
-            Err(_) => false,
-        }
-    }
-
-    pub(crate) fn accept_prediction_ghost(&self) -> bool {
-        if !self.prediction_ghost_visible() {
-            return false;
-        }
-        if !self.request_finish_prediction_ghost(true, false) {
-            // accept を後から成功させると、その間に来た入力より ghost が後置されて順序が逆転する。
-            // TSF 拒否時は予測だけを捨てる方へ降格し、通常入力を本来の IME 経路で継続させる。
-            self.prediction_finish_pending.set(Some(false));
-            self.mark_prediction_tsf_failure_for_owner();
-            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
-            self.arm_prediction_finish_retry(true);
-            tip_log("ev=prediction_disabled reason=tsf_accept");
-            return false;
-        }
-        let anchor = self.next_prediction_anchor();
-        let accepted = self
-            .prediction_state
-            .borrow_mut()
-            .accept_ghost(anchor, Self::prediction_now())
-            .is_some();
-        if accepted {
-            self.arm_prediction_poll(PREDICTION_DEBOUNCE_MS);
-            tip_log("ev=prediction_accept");
-        }
-        accepted
-    }
-
-    pub(crate) fn dismiss_prediction_ghost(&self, suppress_same_context: bool) -> bool {
-        if !self.prediction_ghost_visible() {
-            return false;
-        }
-        if !self.request_finish_prediction_ghost(false, false) {
-            self.mark_prediction_tsf_failure_for_owner();
-            self.invalidate_prediction(crate::prediction_state::Invalidation::Disabled);
-            self.arm_prediction_finish_retry(true);
-            tip_log("ev=prediction_disabled reason=tsf_dismiss");
-            return false;
-        }
-        if suppress_same_context {
-            self.prediction_state.borrow_mut().dismiss_ghost();
-            tip_log("ev=prediction_dismiss");
-        } else {
-            self.invalidate_prediction(crate::prediction_state::Invalidation::Input);
-        }
-        true
-    }
-
-    fn invalidate_prediction_after_external_edit(&self) {
-        self.prediction_preserve_selection.set(true);
-        self.invalidate_prediction(crate::prediction_state::Invalidation::SelectionChanged);
-        if !self.prediction_ghost_visible() {
-            *self.prediction_context.borrow_mut() = None;
-            return;
-        }
-        if !self.request_finish_prediction_ghost(false, true) {
-            self.mark_prediction_tsf_failure_for_owner();
-            self.arm_prediction_finish_retry(true);
-            tip_log("ev=prediction_disabled reason=tsf_external_edit");
-        } else {
-            // Request の受理は DoEditSession の成功を保証しない。実行終了まで
-            // bounded timer で slot を監視し、後発失敗なら同じ owner context で再試行する。
-            self.arm_prediction_finish_retry(true);
-        }
-    }
-
-    fn abandon_prediction_for_context_change(
-        &self,
-        reason: crate::prediction_state::Invalidation,
-    ) -> bool {
-        self.prediction_deferred_preserved.borrow_mut().clear();
-        self.invalidate_prediction(reason);
-        if self.prediction_ghost_visible() && !self.request_finish_prediction_ghost(false, false) {
-            self.mark_prediction_tsf_failure_for_owner();
-            self.arm_prediction_finish_retry(true);
-            tip_log("ev=prediction_disabled reason=tsf_context_change");
-            return false;
-        }
-        *self.prediction_context.borrow_mut() = None;
-        self.prediction_finish_pending.set(None);
-        self.disarm_prediction_finish_retry();
-        true
     }
 
     /// preeditの本文適用を返す。装飾修復待ちでも本文適用済みならtrue。
@@ -5926,6 +5288,7 @@ impl TextService_Impl {
     /// （不変条件: clause_nav が Some ⇒ showing。残すと次に候補窓を開いたとき
     /// 選択同期/確定が文節ビューと取り違える）。
     pub(crate) fn clear_clause_nav(&self) {
+        self.clear_input_predictions();
         self.clear_clause_mouse();
         self.live_clauses.borrow_mut().take();
         self.local_clause_redraw_pending.set(false);
@@ -6134,6 +5497,7 @@ impl TextService_Impl {
     /// 外部LLM変換の待機中（preedit=🌐変換中…）も条件を満たせば表示する — 読み確認として
     /// むしろ有用で、awaiting_llm の除外条件は足さない（条件を複雑化しない — spec §表示ルール）。
     pub(crate) fn update_reading_monitor(&self, ctx: &ITfContext) {
+        if self.input_predictions.borrow().visible() { self.reading_monitor.borrow_mut().hide(); return; }
         let visible = crate::reading_monitor::should_show(
             self.reading_monitor_enabled.get(),
             self.state.borrow().composing,
@@ -6235,11 +5599,7 @@ impl TextService_Impl {
             if let Ok(cookie) = source.AdviseSink(&ITfTextLayoutSink::IID, &layout_sink) {
                 self.layout_sink_cookie.set(cookie);
             }
-            let edit_sink: ITfTextEditSink = self.to_interface();
-            if let Ok(cookie) = source.AdviseSink(&ITfTextEditSink::IID, &edit_sink) {
-                self.text_edit_sink_cookie.set(cookie);
-            }
-            if self.layout_sink_cookie.get() != 0 || self.text_edit_sink_cookie.get() != 0 {
+            if self.layout_sink_cookie.get() != 0 {
                 *self.layout_sink_ctx.borrow_mut() = Some(ctx.clone());
             }
         }
@@ -6261,7 +5621,7 @@ impl TextService_Impl {
 
     /// 候補窓または読みモニタが表示中か（OnLayoutChange で再照会する価値があるかの判定）。
     fn popups_visible(&self) -> bool {
-        self.showing.get() || self.reading_monitor.borrow().is_visible()
+        self.showing.get() || self.input_predictions.borrow().visible() || self.reading_monitor.borrow().is_visible()
     }
 
     /// 非同期セッション内で取得済みのアンカーへ表示中のポップアップを再配置する。
@@ -6302,7 +5662,8 @@ impl TextService_Impl {
         // Ref は残る）。COM コールアウト中の再入 borrow_mut と衝突して panic → 保護の
         // 無い入口では abort になるため、先に let 束縛して文末で Ref を解放する。
         let anchor = *self.last_valid_anchor.borrow();
-        if self.showing.get() {
+        let preview = self.input_predictions.borrow().visible();
+        if self.showing.get() || preview {
             if let Some(anchor) = anchor {
                 let items = self.cand_state.borrow().items().to_vec();
                 if !items.is_empty() {
@@ -6311,9 +5672,8 @@ impl TextService_Impl {
                     // items/selected の借用は各行の文末で解放済み。COM コールアウトを
                     // またいで保持されるのは candidate_ui の RefMut のみ（presenter の
                     // 規律上不可避）— 再入は guarded が捌く。
-                    self.candidate_ui
-                        .borrow_mut()
-                        .show(&items, selected, anchor, theme);
+                    if preview { self.candidate_ui.borrow_mut().show_preview(&items, anchor, theme); }
+                    else { self.candidate_ui.borrow_mut().show(&items, selected, anchor, theme); }
                 }
             }
         }
@@ -6325,7 +5685,7 @@ impl TextService_Impl {
             self.showing.get(),
         );
         let reading = self.monitor_reading_text();
-        if visible && !reading.is_empty() {
+        if visible && !preview && !reading.is_empty() {
             let max_chars = self.reading_monitor_max_chars.get();
             let theme = self.appearance.borrow_mut().current_theme();
             self.reading_monitor.borrow_mut().show_or_update(
@@ -6505,13 +5865,6 @@ impl TextService_Impl {
     /// 取れない呼び出し元は `None` を渡す＝HUD は既定座標に出る。
     pub(crate) fn toggle_conversion_mode(&self, ctx: Option<&ITfContext>) -> bool {
         // langbar click も preserved key と同じく、以前に延期した欄依存操作より新しいユーザー意図。
-        self.cancel_deferred_prediction_preserved_on_input();
-        self.invalidate_prediction(crate::prediction_state::Invalidation::ModeChanged);
-        if self.prediction_ghost_visible() && !self.dismiss_prediction_ghost(false) {
-            // pending accept は discard へ降格済みで、ghost は選択の右側にある。mode の論理反映を
-            // 遅らせると後続キーが旧モードで処理されるため、cleanup と独立に切替を進める。
-            tip_log("ev=mode_toggle prediction_cleanup=pending");
-        }
         // 軽微1: キー長押しのオートリピートで OnPreservedKey が連続到達しても、直近トグルから
         // MODE_TOGGLE_REPEAT_GUARD 未満なら無視する（モードが偶奇でフリッカするのを防ぐ）。
         // 兄弟の再変換が reconverting ラッチで連射を自衛しているのに倣った自衛ガード。
@@ -7061,6 +6414,7 @@ impl TextService_Impl {
         let Some(ctx) = self.current_context.borrow().clone() else {
             return;
         };
+        if self.input_prediction_mouse(&ctx, action, sync_selection) { return; }
         // 選択同期は action より先。Finalize と同時に届いた場合でも「見えている文字列を確定する」
         if self.local_converting() {
             let mut finalize = false;
@@ -7081,7 +6435,7 @@ impl TextService_Impl {
                 }
             }
             if finalize {
-                self.queue_local_clause_commit(&ctx, false);
+                self.queue_local_clause_commit(&ctx);
             } else {
                 self.render_local_edit(&ctx);
             }
@@ -7274,7 +6628,7 @@ pub(crate) fn finalize_native_clause_click_via_tls() -> bool {
                 crate::clause_conversion::CandidateWindow::Ready { .. }
             )
         });
-        if !ready {
+        if !ready && !ts.input_predictions.borrow().visible() {
             return false;
         }
         *ts.behavior_outbox.borrow_mut() = Some(BehaviorAction::Finalize);
@@ -7503,6 +6857,35 @@ extern "system" fn live_result_poll_proc(_hwnd: HWND, _msg: u32, id: usize, _tim
     }));
 }
 
+/// Zenzai runtime 状態の可変間隔ポーリング。問い合わせ本体とシェル更新は STA 上で行い、
+/// ID→所有者レジストリで Deactivate/Drop 後の stale 発火を切り捨てる。
+extern "system" fn zenzai_status_timer_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) {
+    let Some(ptr) = ZENZAI_STATUS_OWNERS.with(|owners| owners.borrow().get(id)) else {
+        unsafe {
+            let _ = KillTimer(None, id);
+        }
+        return;
+    };
+    let ts: &TextService_Impl = unsafe { &*ptr };
+    if ts.zenzai_status_timer.get() != id {
+        ZENZAI_STATUS_OWNERS.with(|owners| {
+            owners.borrow_mut().remove(id);
+        });
+        unsafe {
+            let _ = KillTimer(None, id);
+        }
+        return;
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ts.guarded(|| ts.poll_zenzai_status(id));
+    }));
+    if result.is_err() {
+        ts.disarm_zenzai_status_poll();
+        ts.set_zenzai_gpu_active(false);
+        tip_log("ev=panic site=zenzai_status_poll");
+    }
+}
+
 /// LLM 結果ポーリング proc（WM_TIMER）。STA 単一スレッドなので thread_local からインスタンスを引く。
 /// スロットに結果が入っていれば取り出して反映し、タイマを止める。
 extern "system" fn llm_poll_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) {
@@ -7559,18 +6942,6 @@ extern "system" fn reload_retry_timer_proc(_hwnd: HWND, _msg: u32, id: usize, _t
     }));
 }
 
-#[cfg(test)]
-mod prediction_slot_tests {
-    use super::prediction_slot_available;
-
-    #[test]
-    fn old_physical_slot_blocks_a_new_field_until_cleanup() {
-        assert!(prediction_slot_available(false, false));
-        assert!(!prediction_slot_available(true, false));
-        assert!(!prediction_slot_available(false, true));
-        assert!(!prediction_slot_available(true, true));
-    }
-}
 
 #[cfg(test)]
 mod timer_owner_registry_tests {
@@ -7586,6 +6957,68 @@ mod timer_owner_registry_tests {
         assert_eq!(owners.get(11), Some("service-a"));
         assert_eq!(owners.remove(11), Some("service-a"));
         assert_eq!(owners.get(11), None);
+    }
+}
+
+#[cfg(test)]
+mod zenzai_indicator_tests {
+    use super::{
+        zenzai_indicator_state, zenzai_status_poll_interval,
+        zenzai_status_reconnect_interval, Response, ZenzaiIndicatorState,
+        ZENZAI_STATUS_ACTIVE_POLL_MS, ZENZAI_STATUS_CONNECT_FAST_RETRIES,
+        ZENZAI_STATUS_INACTIVE_POLL_MS, ZENZAI_STATUS_PREPARING_POLL_MS,
+    };
+
+    fn status(state: &str) -> Response {
+        Response::ZenzaiStatus {
+            state: state.to_string(),
+            backend: None,
+            device: None,
+            reason: None,
+            latency_live: None,
+            latency_convert: None,
+        }
+    }
+
+    #[test]
+    fn only_gpu_active_enables_the_indicator() {
+        assert_eq!(
+            zenzai_indicator_state(&status("gpu_active")),
+            Some(ZenzaiIndicatorState::GpuActive)
+        );
+        assert_eq!(
+            zenzai_indicator_state(&status("preparing")),
+            Some(ZenzaiIndicatorState::Preparing)
+        );
+        assert_eq!(
+            zenzai_indicator_state(&status("classic")),
+            Some(ZenzaiIndicatorState::Inactive)
+        );
+        assert_eq!(zenzai_indicator_state(&Response::Ok), None);
+    }
+
+    #[test]
+    fn status_polling_is_fast_while_preparing_and_slower_when_settled() {
+        assert_eq!(
+            zenzai_status_poll_interval(ZenzaiIndicatorState::Preparing),
+            ZENZAI_STATUS_PREPARING_POLL_MS
+        );
+        assert_eq!(
+            zenzai_status_poll_interval(ZenzaiIndicatorState::GpuActive),
+            ZENZAI_STATUS_ACTIVE_POLL_MS
+        );
+        assert_eq!(
+            zenzai_status_poll_interval(ZenzaiIndicatorState::Inactive),
+            ZENZAI_STATUS_INACTIVE_POLL_MS
+        );
+        assert_eq!(
+            zenzai_status_reconnect_interval(ZENZAI_STATUS_CONNECT_FAST_RETRIES),
+            ZENZAI_STATUS_PREPARING_POLL_MS
+        );
+        assert_eq!(
+            zenzai_status_reconnect_interval(ZENZAI_STATUS_CONNECT_FAST_RETRIES + 1),
+            ZENZAI_STATUS_INACTIVE_POLL_MS
+        );
     }
 }
 
@@ -7786,44 +7219,7 @@ mod snapshot_status_tests {
     }
 }
 
-extern "system" fn prediction_retry_timer_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) {
-    unsafe {
-        let _ = KillTimer(None, id);
-    }
-    let ptr = PREDICTION_RETRY_TS.with(|p| p.get());
-    if ptr.is_null() {
-        return;
-    }
-    let ts: &TextService_Impl = unsafe { &*ptr };
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ts.guarded(|| ts.fire_prediction_finish_retry(id));
-    }));
-}
 
-extern "system" fn prediction_poll_timer_proc(_hwnd: HWND, _msg: u32, id: usize, _time: u32) {
-    unsafe {
-        let _ = KillTimer(None, id);
-    }
-    let ptr = PREDICTION_POLL_TS.with(|p| p.get());
-    if ptr.is_null() {
-        tip_log("ev=prediction_poll state=null_owner");
-        return;
-    }
-    let ts: &TextService_Impl = unsafe { &*ptr };
-    if ts.prediction_poll_timer.get() != id {
-        tip_log(&format!(
-            "ev=prediction_poll state=stale_timer expected={} actual={id}",
-            ts.prediction_poll_timer.get(),
-        ));
-        return;
-    }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ts.guarded(|| ts.fire_prediction_poll(id));
-    }));
-    if result.is_err() {
-        tip_log("ev=panic site=prediction_poll");
-    }
-}
 
 /// TextService が（Deactivate を経ずに）解放された場合の保険: 武装中のデバウンスタイマを
 /// 確実に解除し、thread_local の生ポインタを無効化する（タイマ発火時の dangling 参照=UAF を防ぐ）。
@@ -7868,6 +7264,16 @@ impl Drop for TextService {
             }
         }
         self.reload_retry_count.set(0);
+        let zenzai_timer = self.zenzai_status_timer.replace(0);
+        if zenzai_timer != 0 {
+            ZENZAI_STATUS_OWNERS.with(|owners| {
+                owners.borrow_mut().remove(zenzai_timer);
+            });
+            unsafe {
+                let _ = KillTimer(None, zenzai_timer);
+            }
+        }
+        self.langbar_zenzai_gpu_active.set(false);
         // 巡4 T1: 遅延 flush タイマも掃除。
         let bf = self.behavior_flush_timer.replace(0);
         if bf != 0 {
@@ -7875,36 +7281,13 @@ impl Drop for TextService {
                 let _ = KillTimer(None, bf);
             }
         }
-        let pr = self.prediction_retry_timer.replace(0);
-        if pr != 0 {
-            unsafe {
-                let _ = KillTimer(None, pr);
-            }
-        }
-        let pp = self.prediction_poll_timer.replace(0);
-        if pp != 0 {
-            unsafe {
-                let _ = KillTimer(None, pp);
-            }
-        }
-        if let Some(slot) = self.prediction_slot.borrow_mut().take() {
-            slot.cancel();
-        }
         RELOAD_RETRY_TS.with(|p| {
             if p.get() == me {
                 p.set(std::ptr::null());
             }
         });
-        PREDICTION_RETRY_TS.with(|p| {
-            if p.get() == me {
-                p.set(std::ptr::null());
-            }
-        });
-        PREDICTION_POLL_TS.with(|p| {
-            if p.get() == me {
-                p.set(std::ptr::null());
-            }
-        });
+
+
         // 巡2 E2: 各 TLS の null 化は「自分が指しているときだけ」— 同一 STA スレッドに複数
         // TextService が載る構成（二重 Activate のリーク等）で、旧インスタンスの Drop が
         // 新インスタンスの TLS をワイプして追従/タイマ処理を止めないための防御。
@@ -7955,7 +7338,8 @@ pub fn scopes_contain_password(scopes: &[i32]) -> bool {
 
 /// 予測へ確定済み本文を渡してよいかの sensitive-scope 判定。
 /// `None` は一過性の InputScope 照会失敗なので通常欄として扱い、呼び出し側で再照会する。
-fn prediction_scope_is_sensitive(keyboard_disabled: bool, password: Option<bool>) -> bool {
+#[cfg(test)]
+fn context_scope_is_sensitive(keyboard_disabled: bool, password: Option<bool>) -> bool {
     keyboard_disabled || password.unwrap_or(false)
 }
 
@@ -8139,106 +7523,11 @@ pub(crate) struct ClauseViewData {
     pub candidate_index: usize,
 }
 
-// ---- 品質ループ③: 誤変換ワンキー記録（直前確定バッファ → feedback.jsonl）----
-
-/// 直前確定 1 件のバッファ（誤変換ワンキー記録の対象）。sel=-1 はライブ/直接確定
-/// （候補選択なし）。commit サイトが**クリア前に**保存する（key_event_sink.rs 参照）。
+/// 確定取消の照合・復元に必要な直前確定。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LastCommit {
-    pub ts_ms: u64,
     pub reading: String,
     pub text: String,
-    pub source: String,
-    pub sel: i32,
-    pub cand_n: usize,
-}
-
-/// JSON 文字列エスケープ（RFC 8259 の必須集合: `"` `\` と制御文字 U+0000..1F）。
-/// tip は serde_json 非依存（cdylib の依存を増やさない）のため手書きで最小実装する。
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// LastCommit を 1 行 JSON（jsonl の 1 レコード、改行なし）へ直列化する純関数。
-pub(crate) fn feedback_jsonl_line(r: &LastCommit) -> String {
-    format!(
-        "{{\"ts_ms\":{},\"reading\":\"{}\",\"text\":\"{}\",\"source\":\"{}\",\"sel\":{},\"cand_n\":{}}}",
-        r.ts_ms,
-        json_escape(&r.reading),
-        json_escape(&r.text),
-        json_escape(&r.source),
-        r.sel,
-        r.cand_n
-    )
-}
-
-/// feedback.jsonl のパス（`%LOCALAPPDATA%\nospacekey\feedback.jsonl` — settings.json /
-/// 学習 memory/ と同階層。ディレクトリ名の大小文字は settings::settings_path と同一）。
-/// 巡3 Z1: 空文字 LOCALAPPDATA は「無い」扱い — 通すと TIP をホストするアプリの CWD へ
-/// nospacekey\ を作って書き続ける（settings_path / dict_path と同じ規律）。
-fn feedback_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("LOCALAPPDATA")
-        .filter(|d| !d.is_empty())
-        .map(|d| {
-            std::path::PathBuf::from(d)
-                .join("nospacekey")
-                .join("feedback.jsonl")
-        })
-}
-
-/// feedback.jsonl へ 1 行追記する（親 dir が無ければ作る）。1 レコードを 1 回の
-/// write_all で書いて行割れを避ける（tip_log と同じ流儀）。
-fn append_feedback_record(rec: &LastCommit) -> std::io::Result<()> {
-    use std::io::Write;
-    let path = feedback_path()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no LOCALAPPDATA"))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    f.write_all(format!("{}\n", feedback_jsonl_line(rec)).as_bytes())
-}
-
-impl TextService_Impl {
-    /// 品質ループ③: 誤変換ワンキー記録（Ctrl+変換 / Ctrl+/ → OnPreservedKey Feedback）。
-    /// settings.feedback.enabled（opt-in・既定 false）かつ直前確定バッファが Some のときだけ
-    /// feedback.jsonl へ 1 行追記する。バッファは**消費**する（連打で同一確定を重複記録しない）。
-    /// 診断ログには長さのみ残し、本文（reading/text）は書かない（診断ログと feedback の分離）。
-    /// パスワード欄の握り潰しは OnPreservedKey の共通ガードが先に効く（key_event_sink.rs）。
-    pub(crate) fn record_feedback(&self) {
-        if !self.feedback_enabled.get() {
-            tip_log("ev=feedback_skip reason=disabled");
-            return;
-        }
-        let rec = self.last_commit.borrow_mut().take();
-        let Some(rec) = rec else {
-            tip_log("ev=feedback_skip reason=no_last_commit");
-            return;
-        };
-        match append_feedback_record(&rec) {
-            Ok(()) => tip_log(&format!(
-                "ev=feedback_logged rlen={} tlen={}",
-                rec.reading.chars().count(),
-                rec.text.chars().count()
-            )),
-            Err(e) => tip_log(&format!("ev=feedback_write_failed kind={:?}", e.kind())),
-        }
-    }
 }
 
 /// この DLL と同じディレクトリにある兄弟 exe（`name`）のパスを解決する。
@@ -8355,9 +7644,7 @@ mod uu5_reload_config_tests {
                 llm_timeout_ms: 12000,
                 zenzai_enabled: true,
                 zenzai_weight: "C:/w.gguf".into(),
-                inline_prediction_enabled: false,
                 learning_enabled: true,
-                typo_learn_enabled: true,
                 zenzai_inference_limit: Some(1),
             }
         );
@@ -8473,10 +7760,6 @@ mod a8_tests {
                 reading: sentinel.into(),
             },
             Response::LlmResult {
-                seq: 1,
-                text: sentinel.into(),
-            },
-            Response::Prediction {
                 seq: 1,
                 text: sentinel.into(),
             },
@@ -8977,56 +8260,9 @@ mod log_gate_tests {
 }
 
 #[cfg(test)]
-mod feedback_tests {
-    use super::{feedback_jsonl_line, json_escape, LastCommit};
-
-    #[test]
-    fn feedback_record_serializes_one_line() {
-        let r = LastCommit {
-            ts_ms: 1,
-            reading: "にほんご".into(),
-            text: "二本後".into(),
-            source: "live".into(),
-            sel: -1,
-            cand_n: 0,
-        };
-        let line = feedback_jsonl_line(&r);
-        assert!(!line.contains('\n'), "jsonl は 1 レコード 1 行: {line}");
-        assert!(line.contains("\"reading\":\"にほんご\""), "got: {line}");
-        assert!(line.contains("\"text\":\"二本後\""), "got: {line}");
-        assert!(line.contains("\"sel\":-1"), "got: {line}");
-        assert_eq!(
-            line,
-            r#"{"ts_ms":1,"reading":"にほんご","text":"二本後","source":"live","sel":-1,"cand_n":0}"#
-        );
-    }
-
-    #[test]
-    fn feedback_record_escapes_json_special_chars() {
-        // 確定文字列に " や \ が入っても壊れた JSON を書かない（ラテン合成の raw 確定で現実に起きうる）。
-        let r = LastCommit {
-            ts_ms: 2,
-            reading: "a\"b\\c".into(),
-            text: "x\ny".into(),
-            source: "candidate".into(),
-            sel: 3,
-            cand_n: 9,
-        };
-        let line = feedback_jsonl_line(&r);
-        assert!(!line.contains('\n'), "改行はエスケープされる: {line}");
-        assert!(line.contains(r#""reading":"a\"b\\c""#), "got: {line}");
-        assert!(line.contains(r#""text":"x\ny""#), "got: {line}");
-        assert!(line.contains("\"sel\":3"), "got: {line}");
-        assert!(line.contains("\"cand_n\":9"), "got: {line}");
-        // 制御文字は \u00XX。
-        assert_eq!(json_escape("\u{01}"), "\\u0001");
-    }
-}
-
-#[cfg(test)]
 mod input_scope_tests {
     use super::{
-        compartment_flag_is_set, prediction_mode_allows_display, prediction_scope_is_sensitive,
+        compartment_flag_is_set, context_scope_is_sensitive,
         scopes_contain_password,
     };
 
@@ -9061,19 +8297,13 @@ mod input_scope_tests {
     }
 
     #[test]
-    fn prediction_scope_blocks_only_confirmed_sensitive_contexts() {
-        assert!(prediction_scope_is_sensitive(true, None));
-        assert!(prediction_scope_is_sensitive(false, Some(true)));
-        assert!(!prediction_scope_is_sensitive(false, Some(false)));
-        assert!(!prediction_scope_is_sensitive(false, None));
+    fn input_scope_blocks_only_confirmed_sensitive_contexts() {
+        assert!(context_scope_is_sensitive(true, None));
+        assert!(context_scope_is_sensitive(false, Some(true)));
+        assert!(!context_scope_is_sensitive(false, Some(false)));
+        assert!(!context_scope_is_sensitive(false, None));
     }
 
-    #[test]
-    fn prediction_display_requires_stable_native_mode() {
-        assert!(prediction_mode_allows_display(false, false));
-        assert!(!prediction_mode_allows_display(true, false));
-        assert!(!prediction_mode_allows_display(false, true));
-    }
 }
 
 #[cfg(test)]
@@ -9597,46 +8827,17 @@ mod pending_end_liveness_tests {
     }
 }
 
+
 #[cfg(test)]
-mod prediction_commit_end_edit_tests {
-    use super::consume_expected_prediction_commit_end_edit;
-    use std::cell::Cell;
-    use std::time::{Duration, Instant};
-
+mod undo_retention_tests {
     #[test]
-    fn expected_commit_end_edit_is_consumed_once() {
-        let now = Instant::now();
-        let deadline = Cell::new(Some(now + Duration::from_millis(300)));
-
-        assert!(consume_expected_prediction_commit_end_edit(
-            &deadline, false, now
-        ));
-        assert!(!consume_expected_prediction_commit_end_edit(
-            &deadline, false, now
-        ));
-    }
-
-    #[test]
-    fn selection_change_is_never_treated_as_the_committed_text_edit() {
-        let now = Instant::now();
-        let deadline = Cell::new(Some(now + Duration::from_millis(300)));
-
-        assert!(!consume_expected_prediction_commit_end_edit(
-            &deadline, true, now
-        ));
-        assert!(deadline.get().is_none());
-    }
-
-    #[test]
-    fn delayed_commit_edit_allowance_expires() {
-        let now = Instant::now();
-        let deadline = Cell::new(Some(now));
-
-        assert!(!consume_expected_prediction_commit_end_edit(
-            &deadline,
-            false,
-            now + Duration::from_millis(1),
-        ));
-        assert!(deadline.get().is_none());
+    fn disarming_undo_releases_committed_text_and_reading() {
+        let service = super::TextService::new().into_outer();
+        let implementation = &service;
+        implementation.undo_armed.set(true);
+        *implementation.last_commit.borrow_mut() = Some(super::LastCommit {reading: "にほんご".into(), text: "日本語".into()});
+        implementation.disarm_undo();
+        assert!(!implementation.undo_armed.get());
+        assert!(implementation.last_commit.borrow().is_none());
     }
 }

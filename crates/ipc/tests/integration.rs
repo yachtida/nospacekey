@@ -8,6 +8,91 @@ use std::time::Duration;
 
 #[test]
 #[ignore = "requires a built Swift engine"]
+fn production_connection_authenticates_a_staged_sibling_engine() {
+    if let Some(pipe) = std::env::var_os("NOSPACEKEY_IDENTITY_TEST_PIPE") {
+        let mut client = EngineClient::connect_to(pipe.to_str().unwrap(), Duration::from_secs(5)).unwrap();
+        let session = ipc::client::verify_session_identity(client.request(&Request::StartSession).unwrap()).unwrap();
+        assert!(matches!(client.request(&Request::EndSession { session }).unwrap(), Response::Ok));
+        return;
+    }
+    run_production_identity_test(None);
+}
+
+#[test]
+#[ignore = "requires a built Swift engine and Python 3; creates disposable AppContainer profiles"]
+fn sandboxed_production_connection_authenticates_a_staged_sibling_engine() {
+    for lpac in [false, true] {
+        run_production_identity_test(Some(lpac));
+    }
+}
+
+fn run_production_identity_test(sandbox: Option<bool>) {
+    use std::process::{Command, Stdio};
+    use std::os::windows::process::CommandExt;
+    let engine = IsolatedEngine::stage();
+    let pipe = ipc::client::pipe_name_for_session(2_000_000 + std::process::id());
+    let _child = start_engine(Command::new(engine.exe()).arg(&pipe)
+        .creation_flags(0x08000000)
+        .env("NOSPACEKEY_ZENZAI", "off").env("NOSPACEKEY_LEARNING", "0")
+        .env("NOSPACEKEY_MEMORY_DIR", engine.root.join("memory"))
+        .env("TEMP", &engine.root).env("TMP", &engine.root)
+        .stdout(Stdio::null()).stderr(Stdio::null()));
+    let client_exe = engine.root.join("IdentityTestClient.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &client_exe).unwrap();
+    let mut command = if let Some(lpac) = sandbox {
+        let mut command = Command::new("python");
+        command.arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/run-appcontainer-client.py")).arg(&client_exe);
+        if lpac { command.arg("--lpac"); }
+        command
+    } else {
+        let mut command = Command::new(client_exe);
+        command.args(["--ignored", "--exact", "production_connection_authenticates_a_staged_sibling_engine", "--nocapture"]);
+        command
+    };
+    let output = command
+        .creation_flags(0x08000000)
+        .env("NOSPACEKEY_IDENTITY_TEST_PIPE", &pipe).output().unwrap();
+    assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+#[ignore = "requires a built Swift engine"]
+fn snapshot_deadline_over_unique_pipe() {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let engine = IsolatedEngine::stage();
+    let pipe = isolated_pipe("snapshot-deadline");
+    let _child = start_engine(Command::new(engine.exe()).arg(&pipe).arg("--persist")
+        .creation_flags(0x08000000)
+        .env("NOSPACEKEY_ZENZAI", "off").env("NOSPACEKEY_LEARNING", "0")
+        .env("NOSPACEKEY_MEMORY_DIR", engine.root.join("memory"))
+        .env("TEMP", &engine.root).env("TMP", &engine.root)
+        .stdout(Stdio::null()).stderr(Stdio::null()));
+    let mut client = EngineClient::connect_to(&pipe, Duration::from_secs(5)).unwrap();
+    let snapshot = Request::LiveSnapshot {
+        composition: 1, revision: 1, configuration_generation: 1, connection_generation: 1,
+        conversion_revision: 0, request_id: 1,
+        segments: vec![ipc::protocol::SnapshotSegment { text: "あ".into(), style: Some("direct".into()) }],
+        explicit: true, live_search_width: None, left_context: None,
+    };
+    assert!(matches!(client.request_within(&snapshot,
+        std::time::Instant::now() + Duration::from_millis(1_200)).unwrap(), Response::SnapshotResult { .. }));
+
+    let mut raw = std::fs::OpenOptions::new().read(true).write(true).open(&pipe).unwrap();
+    let mut expired = serde_json::to_value(&snapshot).unwrap();
+    expired["deadline_tick_ms"] = 0.into();
+    ipc::framing::write_request_frame(&mut raw, &expired).unwrap();
+    let response: Response = ipc::framing::read_frame(&mut raw).unwrap();
+    assert!(matches!(response, Response::Error { message } if message.contains("expired")));
+    // Expiry rejects only that calculation; the same connection still handles legacy frames.
+    ipc::framing::write_request_frame(&mut raw, &snapshot).unwrap();
+    let response: Response = ipc::framing::read_frame(&mut raw).unwrap();
+    assert!(matches!(response, Response::SnapshotResult { .. }));
+}
+
+#[test]
+#[ignore = "requires a built Swift engine"]
 fn clause_prefix_candidates_over_unique_pipe() {
     use ipc::clause::*;
     use std::os::windows::process::CommandExt;
@@ -118,7 +203,7 @@ fn compatible_engine_update_reconnects_and_converts() {
             .env("TEMP", &engine.root)
             .env("TMP", &engine.root)
             .stdout(Stdio::null()).stderr(Stdio::null()));
-        let mut client = EngineClient::connect_to(&pipe, Duration::from_secs(5)).unwrap();
+        let mut client = EngineClient::connect_to_engine_at(&pipe, Duration::from_secs(5), engine.exe()).unwrap();
         let response = client.request(&Request::StartSession).unwrap();
         if let Response::Session { ref boot, .. } = response {
             builds.push(boot.clone());

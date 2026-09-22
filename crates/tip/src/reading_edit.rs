@@ -46,7 +46,7 @@ impl TextService_Impl {
         } else {
             input.set_reading_cursor(input.reading_cursor().max(start).min(end));
         }
-        input.notation_fixed = None;
+        input.clear_notation();
         *self.last_reading.borrow_mut() = input.canonical_reading().to_owned();
         *self.state.borrow_mut() = input;
         *self.local_clauses.borrow_mut() = Some(model);
@@ -68,7 +68,7 @@ impl TextService_Impl {
             let admitted = self.conversion_queue.borrow_mut().push_commit_then_mapped_insert(ch.to_string(), original.map(|ch| ch.to_string()), style, false);
             if admitted == crate::conversion_queue::QueueAdmission::Accepted { self.drain_conversion_actions(context); }
             else { self.show_conversion_queue_notice(context, "入力を受け付けられません。Enterで再試行、Escで取消"); }
-        } else { self.queue_local_clause_commit(context, false); }
+        } else { self.queue_local_clause_commit(context); }
         TRUE
     }
 

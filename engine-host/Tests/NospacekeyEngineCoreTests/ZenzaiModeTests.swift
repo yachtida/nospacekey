@@ -214,7 +214,7 @@ final class ZenzaiTooSlowTests: XCTestCase {
         }
         do {
             let (svc, sid, count) = prepared()
-            _ = svc.typoConvert(session: sid)
+            _ = svc.convert(session: sid)
             assertConsumed(svc, after: count)
         }
         do {
@@ -474,7 +474,7 @@ final class ZenzaiTooSlowTests: XCTestCase {
         // typoConvert: "ss" 縮約仮説あり — 仮説は forceClassic、literal も古典
         let s2 = svc.startSession()
         for ch in "shitekudassai" { _ = svc.insert(session: s2, text: String(ch)) }
-        XCTAssertFalse((svc.typoConvert(session: s2) ?? []).isEmpty)
+        XCTAssertFalse((svc.convert(session: s2) ?? []).isEmpty)
 
         // liveConvert
         let s3 = svc.startSession()
@@ -532,7 +532,7 @@ final class ZenzaiTooSlowTests: XCTestCase {
         // typoConvert（"ss" 縮約仮説あり — 仮説は forceClassic で元々監視外、literal が監視対象）
         let s2 = svc.startSession()
         for ch in "shitekudassai" { _ = svc.insert(session: s2, text: String(ch)) }
-        XCTAssertFalse((svc.typoConvert(session: s2) ?? []).isEmpty)
+        XCTAssertFalse((svc.convert(session: s2) ?? []).isEmpty)
         XCTAssertEqual(svc.zenzaiSlowWatchSkipsRemainingForTesting, 1,
                        "typoConvert literal: silent fallback 中の .on 要求は skip を消費しない")
 
@@ -598,7 +598,7 @@ final class ZenzaiTooSlowTests: XCTestCase {
 
         // typoConvert: 空読みは仮説なし → convert へ委譲（同じ空入力経路）
         let s4 = svc.startSession()
-        XCTAssertEqual(svc.typoConvert(session: s4), [])
+        XCTAssertEqual(svc.convert(session: s4), [])
         XCTAssertEqual(svc.zenzaiSlowWatchSkipsRemainingForTesting, 1,
                        "empty typoConvert must not consume skip")
 

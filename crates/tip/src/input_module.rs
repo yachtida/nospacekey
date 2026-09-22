@@ -260,13 +260,15 @@ impl std::ops::Deref for InputModule {
     }
 }
 
-impl std::ops::DerefMut for InputModule {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.state
-    }
-}
-
 impl InputModule {
+    pub(crate) fn bump_live_seq(&mut self) -> u64 { self.state.bump_live_seq() }
+
+    pub(crate) fn bump_llm_seq(&mut self) -> u64 { self.state.bump_llm_seq() }
+
+    pub(crate) fn can_start_llm(&self) -> bool {
+        self.state.composing && !self.state.awaiting_llm()
+    }
+
     pub(crate) fn canonical_segments(&self) -> Vec<InputSegment> {
         self.replay_segments()
     }
@@ -413,6 +415,12 @@ impl InputModule {
         self.invalidate_live_snapshot();
         // The remaining reading has no known surface form; anchoring the
         // committed prefix's text against it would splice mismatched halves.
+        self.invalidate_live_display();
+    }
+
+    pub(crate) fn clear_notation(&mut self) {
+        self.state.notation_fixed = None;
+        self.invalidate_live_snapshot();
         self.invalidate_live_display();
     }
 
@@ -1145,6 +1153,38 @@ pub(crate) fn apply_presenter_candidate_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_keys_pass_and_cancel_rejection_preserves_the_actual_composition() {
+        let mut module = InputModule::default();
+        for event in [KeyEvent::Enter, KeyEvent::Escape] {
+            assert!(!module.handle(InputEvent::Key(event)).eaten);
+        }
+        assert!(module.explicit_snapshot(1, 1, None).is_none());
+        module.handle(key('a'));
+        assert!(module.explicit_snapshot(1, 1, None).is_some());
+        let cancel = module.handle(InputEvent::Key(KeyEvent::Escape)).immediate.unwrap();
+        module.complete(&cancel, false);
+        let enter = module.handle(InputEvent::Key(KeyEvent::Enter));
+        assert!(matches!(enter.immediate, Some(ImmediateOperation::Commit { ref text, .. }) if text == "あ"));
+        module.complete(&cancel, true);
+        assert!(!module.handle(InputEvent::Key(KeyEvent::Enter)).eaten);
+        assert!(module.canonical_reading().is_empty());
+    }
+
+    #[test]
+    fn llm_admission_uses_the_production_module_state() {
+        let mut module = InputModule::default();
+        assert!(!module.can_start_llm());
+        module.handle(key('a'));
+        assert!(module.can_start_llm());
+        module.set_awaiting_llm(true);
+        assert!(!module.can_start_llm());
+        module.set_awaiting_llm(false);
+        assert!(module.can_start_llm());
+        module.reset();
+        assert!(!module.can_start_llm());
+    }
 
     #[test]
     fn folded_literal_keeps_original_keys_in_the_journal() {

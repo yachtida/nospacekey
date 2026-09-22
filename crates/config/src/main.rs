@@ -11,7 +11,6 @@ mod download;
 mod keymap_catalog;
 mod logic;
 mod operation_state;
-mod prediction_download;
 mod settings_service;
 mod update;
 
@@ -250,9 +249,6 @@ fn main() {
             download::zenzai_model_status,
             download::download_zenzai_model,
             download::cancel_zenzai_download,
-            prediction_download::prediction_model_status,
-            prediction_download::download_prediction_model,
-            prediction_download::cancel_prediction_model_download,
             update::check_for_update,
             update::download_and_install_update,
             update::cancel_update_download,

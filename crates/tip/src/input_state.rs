@@ -1,4 +1,4 @@
-//! COM非依存の入力状態機械。ここをTDDする。
+//! InputModule が所有する入力素材の状態。キー操作の判断と完了処理は InputModule に集約する。
 /// 入力フェーズ。Composing=通常ライブ / AwaitingLlm=LLM変換中（入力ロック）。
 #[derive(Clone, Default, Debug, PartialEq)]
 pub enum Phase {
@@ -29,14 +29,6 @@ pub struct InputState {
 #[derive(Debug, PartialEq)]
 pub enum Action {
     StartOrUpdatePreedit(String), // preeditに表示すべき文字列
-    #[allow(dead_code)] // テスト専用: prod は OnKeyDown 内に同等処理をインライン化（テストモデル）
-    RequestConvert, // 候補要求（Space）
-    #[allow(dead_code)] // テスト専用: prod は OnKeyDown 内に同等処理をインライン化（テストモデル）
-    Commit, // 確定（Enter）
-    #[cfg(test)]
-    Cancel,       // 取消（Esc）の参照モデル
-    #[allow(dead_code)] // テスト専用: prod は start_llm_convert を直接呼ぶ（テストモデル）
-    RequestLlmConvert, // 外部LLM変換要求（Tab）
     Pass,                         // IMEは関与しない
 }
 
@@ -62,31 +54,6 @@ impl InputState {
     /// 破れないようにする。
     pub fn latin_mode(&self) -> bool {
         self.composing && self.latin_from.is_some()
-    }
-    #[allow(dead_code)] // テスト専用: prod の Space 処理は OnKeyDown にインライン化（テストモデル）
-    pub fn on_space(&self) -> Action {
-        if self.composing {
-            Action::RequestConvert
-        } else {
-            Action::Pass
-        }
-    }
-    #[allow(dead_code)] // テスト専用: prod の Enter 処理は OnKeyDown にインライン化（テストモデル）
-    pub fn on_enter(&self) -> Action {
-        if self.composing {
-            Action::Commit
-        } else {
-            Action::Pass
-        }
-    }
-    #[cfg(test)]
-    pub fn on_escape(&mut self) -> Action {
-        if self.composing {
-            self.reset();
-            Action::Cancel
-        } else {
-            Action::Pass
-        }
     }
     pub fn on_backspace(&mut self) -> Action {
         if self.composing {
@@ -144,15 +111,6 @@ impl InputState {
     pub fn bump_live_seq(&mut self) -> u64 {
         self.live_seq += 1;
         self.live_seq
-    }
-    /// Tab: composition 中かつ Composing フェーズのときだけ LLM 変換を要求する。
-    #[allow(dead_code)] // テスト専用: prod は VK_TAB→start_llm_convert を直接呼ぶ（テストモデル）
-    pub fn on_tab(&self) -> Action {
-        if self.composing && self.phase == Phase::Composing {
-            Action::RequestLlmConvert
-        } else {
-            Action::Pass
-        }
     }
     /// LLM 変換要求ごとに seq を1つ進める（世代ガード用・TIP 採番）。
     pub fn bump_llm_seq(&mut self) -> u64 {
@@ -589,26 +547,6 @@ pub fn classify_reconvert_selection(s: &str) -> ReconvertKind {
 mod tests {
     use super::*;
     #[test]
-    fn typing_builds_preedit_and_space_requests_convert() {
-        let mut s = InputState::default();
-        assert_eq!(s.on_char('n'), Action::StartOrUpdatePreedit("n".into()));
-        assert_eq!(s.on_char('i'), Action::StartOrUpdatePreedit("ni".into()));
-        assert_eq!(s.on_space(), Action::RequestConvert);
-    }
-    #[test]
-    fn space_without_composition_passes() {
-        let s = InputState::default();
-        assert_eq!(s.on_space(), Action::Pass);
-    }
-    #[test]
-    fn escape_resets() {
-        let mut s = InputState::default();
-        s.on_char('a');
-        assert_eq!(s.on_escape(), Action::Cancel);
-        assert_eq!(s.raw, "");
-        assert!(!s.composing);
-    }
-    #[test]
     fn backspace_shrinks_then_passes() {
         let mut s = InputState::default();
         s.on_char('a');
@@ -640,16 +578,6 @@ mod tests {
         latin.resume_composing_after_cancel_reject();
         assert!(latin.latin_from.is_none()); // resume は composing だけ戻し、モードは復活させない
         assert!(!latin.latin_mode());
-    }
-    #[test]
-    fn resume_after_cancel_reject_keeps_escape_cancel() {
-        // 巻き戻し中間状態では Esc(on_escape)が Cancel を返す — Esc 再押下の cancel
-        // 再試行経路が生きていることの状態機械レベルの固定。
-        let mut s = InputState::default();
-        s.on_char('あ');
-        let _ = s.on_backspace();
-        s.resume_composing_after_cancel_reject();
-        assert_eq!(s.on_escape(), Action::Cancel);
     }
     #[test]
     fn commit_falls_back_to_reading_on_engine_error() {
@@ -695,25 +623,7 @@ mod tests {
         assert_eq!(latin_run_span("a.b"), 1); // 句読点は依然境界
         assert_eq!(latin_run_span("abc "), 0); // 末尾空白は依然 0
     }
-    #[test]
-    fn tab_requests_llm_only_when_composing_and_idle_phase() {
-        let mut s = InputState::default();
-        assert_eq!(s.on_tab(), Action::Pass); // 非 composition
-        s.on_char('a');
-        assert_eq!(s.on_tab(), Action::RequestLlmConvert);
-        s.set_awaiting_llm(true);
-        assert_eq!(s.on_tab(), Action::Pass); // 待機中は再要求しない
-    }
 
-    // on_space=>RequestConvert は上でテスト済み。その対の on_enter=>Commit を補い、
-    // 入力状態機械の Space/Enter 対称性を保つ（これで on_enter/Commit も cfg(test) で被覆）。
-    #[test]
-    fn enter_commits_only_when_composing() {
-        let mut s = InputState::default();
-        assert_eq!(s.on_enter(), Action::Pass); // 非 composition は素通し
-        s.on_char('a');
-        assert_eq!(s.on_enter(), Action::Commit); // composition 中は確定
-    }
 
     #[test]
     fn llm_seq_is_monotonic_and_awaiting_toggles() {

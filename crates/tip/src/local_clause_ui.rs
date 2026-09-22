@@ -32,7 +32,7 @@ impl TextService_Impl {
         let outcome = draft.delete_display_tail();
         match outcome {
             LocalEditOutcome::Unchanged => return true,
-            LocalEditOutcome::Exhausted => { self.queue_local_clause_commit(context, false); return true; }
+            LocalEditOutcome::Exhausted => { self.queue_local_clause_commit(context); return true; }
             LocalEditOutcome::Empty => {
                 if !self.do_cancel(context) { return false; }
                 self.state.borrow_mut().reset();
@@ -41,7 +41,7 @@ impl TextService_Impl {
             }
             LocalEditOutcome::ReadingChanged => {
                 let revision = self.state.borrow_mut().retain_clause_reading_prefix(&draft.reading);
-                let Some(revision) = revision else { self.queue_local_clause_commit(context, false); return true; };
+                let Some(revision) = revision else { self.queue_local_clause_commit(context); return true; };
                 draft.identity.revision = revision;
                 *self.last_reading.borrow_mut() = draft.reading.clone();
                 // The stateful engine still owns the old suffix. Force the next
@@ -51,7 +51,7 @@ impl TextService_Impl {
             _ => {}
         }
         self.disarm_debounce();
-        self.state.borrow_mut().notation_fixed = None;
+        self.state.borrow_mut().clear_notation();
         *self.local_clauses.borrow_mut() = Some(draft);
         self.render_local_edit(context);
         true
@@ -62,13 +62,13 @@ impl TextService_Impl {
         let outcome = self.local_clauses.borrow_mut().as_mut().map(|model| model.escape());
         match outcome {
             Some(LocalEditOutcome::Editing) => {
-                self.state.borrow_mut().notation_fixed = None;
+                self.state.borrow_mut().clear_notation();
                 self.state.borrow_mut().invalidate_live_snapshot();
                 self.candidate_ui.borrow_mut().hide();
                 // Keep the Editing model until its all-reading display is applied.
                 self.render_local_edit(context);
             }
-            Some(LocalEditOutcome::Exhausted) => self.queue_local_clause_commit(context, false),
+            Some(LocalEditOutcome::Exhausted) => self.queue_local_clause_commit(context),
             _ => { self.render_local_edit(context); }
         }
     }
@@ -188,8 +188,7 @@ impl TextService_Impl {
                 .borrow_mut()
                 .show(&values, selected_candidate, anchor, theme);
             if !loading {
-                let list = if self.prediction_enabled.get() { String::new() }
-                    else { format!(" list={}", values.join("|")) };
+                let list = format!(" list={}", values.join("|"));
                 crate::text_service::tip_log(&format!("ev=candidates_shown n={} sel={selected_candidate}{list}", values.len()));
                 crate::text_service::tip_log(&format!("ev=clause_presented window=ready sel={selected_candidate}"));
             }
@@ -204,7 +203,7 @@ impl TextService_Impl {
         let now = Instant::now();
         let request_id = self.background_input.next_clause_request_id();
         if request_id.is_none() || self.local_clauses.borrow().as_ref().is_some_and(|model| model.revision == u64::MAX) {
-            self.queue_local_clause_commit(context, false);
+            self.queue_local_clause_commit(context);
             return;
         }
         let request = {
@@ -265,6 +264,10 @@ impl TextService_Impl {
         let mut changed = false;
         let mut boundary_applied = false;
         while let Some(reply) = self.clause_worker.try_reply() {
+            if matches!(reply.response, Response::InputPredictionsResult { .. }) {
+                self.accept_input_predictions(reply);
+                continue;
+            }
             let identity = reply.learning_identity.filter(|identity| {
                 !self.receipt_outbox.borrow().as_ref().is_some_and(|outbox| outbox.rejects_identity(identity))
             });
@@ -378,19 +381,14 @@ impl TextService_Impl {
         text.is_some_and(|text| self.commit_and_reset(context, &text, "clause", None))
     }
 
-    pub(crate) fn queue_local_clause_commit(&self, context: &ITfContext, suppress_prediction: bool) {
+    pub(crate) fn queue_local_clause_commit(&self, context: &ITfContext) {
         use crate::conversion_queue::{ConversionAction, QueueAdmission};
         if self.replaying_conversion_queue.get() && self.conversion_queue.borrow_mut().commit_exhausted_action() {
             return;
         }
         if !self.bind_conversion_queue_context(context) { return; }
         let admitted = {
-            let mut queue = self.conversion_queue.borrow_mut();
-            let admitted = queue.push(ConversionAction::Commit);
-            if admitted == QueueAdmission::Accepted && suppress_prediction {
-                queue.suppress_commit_prediction = true;
-            }
-            admitted
+            self.conversion_queue.borrow_mut().push(ConversionAction::Commit)
         };
         if admitted != QueueAdmission::Accepted {
             self.show_conversion_queue_notice(context, "入力を受け付けられません。Enterで再試行、Escで取消");

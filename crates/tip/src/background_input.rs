@@ -1837,9 +1837,7 @@ mod tests {
             llm_timeout_ms: 1,
             zenzai_enabled: false,
             zenzai_weight: String::new(),
-            inline_prediction_enabled: false,
             learning_enabled: false,
-            typo_learn_enabled: false,
             zenzai_inference_limit: None,
         }
     }

@@ -15,15 +15,18 @@ func encodeResponse(_ response: Response) -> Data {
 /// リクエスト1件（connId, フレーム body）を処理して応答フレーム body を返すハンドラを構築する。
 /// runEngineHost から分離した唯一の理由はテスト可能化（パイプ無しで request/response を検証する）。
 /// serviceLock で ConversionService への全アクセスを直列化する規律は従来どおり。
-func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
-                       predictionService: PredictionService = PredictionService()) -> @Sendable (Int, Data) -> (reply: Data, exitAfterReply: Bool) {
+func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Sendable (Int, Data) -> (reply: Data, exitAfterReply: Bool) {
     return { connId, body in
-        let req: Request
+        let receivedAt = GetTickCount64()
+        let envelope: RequestEnvelope
         do {
-            req = try Framing.decode(Request.self, from: body)
+            envelope = try Framing.decode(RequestEnvelope.self, from: body)
         } catch {
             return (encodeResponse(.error("\(error)")), false)
         }
+
+        let req = envelope.request
+        let deadline = envelope.admissionDeadline(receivedAt: receivedAt)
 
         // Runtime status reads a short sanitized snapshot instead of waiting for converterLock.
         // The snapshot excludes model/input data and is updated independently of converterLock.
@@ -79,18 +82,6 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
             return (encodeResponse(response), false)
         }
 
-        // 予測はモデル待ちの間も通常変換の serviceLock を保持しない。所有権だけ短く確認する。
-        if case .predict(let session, let seq, let tokenIDs) = req {
-            serviceLock.lock()
-            let owns = service.connectionOwns(session: Int(session), connection: connId)
-            serviceLock.unlock()
-            guard owns else { return (encodeResponse(.error("no session")), false) }
-            guard (2...480).contains(tokenIDs.count), tokenIDs.first == 1,
-                  tokenIDs.allSatisfy({ $0 < 99_584 }) else {
-                return (encodeResponse(.predictionUnavailable(seq: seq, state: "invalid_prompt")), false)
-            }
-            return (encodeResponse(predictionService.predict(seq: seq, tokenIDs: tokenIDs)), false)
-        }
 
         // Clear may wait for already accepted persistence, so it cannot hold the global request
         // lock. Admission is single-flight to keep the fixed pipe worker pool available.
@@ -104,8 +95,10 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
         }
 
         // All operations below can change the visible conversion context.
-        predictionService.cancel()
-        serviceLock.lock(); defer { serviceLock.unlock() }
+        guard RequestDeadline.acquire(serviceLock, before: deadline) else {
+            return (encodeResponse(.error("request expired before execution")), false)
+        }
+        defer { serviceLock.unlock() }
         let response: Response
         var exitAfterReply = false
             // セッション所有権（UU-2）: session を伴う op は、その session を作成した接続からのみ
@@ -125,9 +118,6 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                 // Routed before serviceLock is acquired above. This arm is unreachable but
                 // keeps the exhaustive dispatch table explicit when protocol cases change.
                 response = .error("runtime status routing error")
-            case .predict:
-                // 上のロック外レーンで必ず処理済み。網羅性のためだけの防御分岐。
-                response = .error("prediction routing error")
             case .ping: response = .error("ping routing error")
             // 接続id を渡してセッションの所有者を記録する（切断時に cleanupConnection で掃除するため）。
             case .startSession:
@@ -135,10 +125,12 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                     Int64(service.startSession(connection: connId)),
                     proto: ProtocolVersion.current,
                     boot: BuildInfo.version, engineEpoch: service.engineEpoch, learningGeneration: service.currentLearningGeneration)
+            case .inputPredictions(let request):
+                response = .inputPredictionsResult(service.inputPredictions(request, admissionDeadline: deadline))
             case .clauseCandidates(let request):
-                response = .clauseCandidatesResult(service.clauseCandidates(request))
+                response = .clauseCandidatesResult(service.clauseCandidates(request, admissionDeadline: deadline))
             case .convertClauses(let request):
-                response = .convertClausesResult(service.convertClauses(request))
+                response = .convertClausesResult(service.convertClauses(request, admissionDeadline: deadline))
             case .commitReceipt(let receipt):
                 response = .commitReceiptAck(service.commitReceipt(receipt))
             case .insert(let s, let t, let style):
@@ -147,8 +139,6 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                 response = service.backspace(session: Int(s)).map(Response.reading) ?? .error("no session")
             case .convert(let s, let ctx):
                 response = service.convert(session: Int(s), leftContext: ctx).map(Response.candidates) ?? .error("no session")
-            case .typoConvert(let s, let ctx):
-                response = service.typoConvert(session: Int(s), leftContext: ctx).map(Response.candidates) ?? .error("no session")
             case .reconvert(let s, let surf, let ctx):
                 response = service.reconvert(session: Int(s), surface: surf, leftContext: ctx).map(Response.candidates) ?? .error("no session")
             case .commit(let s, let idx):
@@ -170,9 +160,11 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                     composition: composition, revision: revision,
                     configurationGeneration: configurationGeneration,
                     connectionGeneration: connectionGeneration, conversionRevision: conversionRevision, requestID: requestID)
-                let result = service.snapshot(
+                guard let result = service.snapshot(
                     segments, explicit: explicit, leftContext: context, enhancementKey: key,
-                    snapshotConnection: connId, liveSearchWidth: liveSearchWidth)
+                    snapshotConnection: connId, liveSearchWidth: liveSearchWidth, admissionDeadline: deadline) else {
+                    return (encodeResponse(.error("request expired before conversion")), false)
+                }
                 response = .snapshotResult(
                     composition: composition, revision: revision,
                     configurationGeneration: configurationGeneration,
@@ -205,11 +197,6 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                 case .failure(let e): response = .error(e.message)
                 }
             case .reloadConfig(let p):
-                if let enabled = p.inline_prediction_enabled {
-                    var predictionEnvironment = ProcessInfo.processInfo.environment
-                    predictionEnvironment["NOSPACEKEY_INLINE_PREDICTION"] = enabled ? "1" : "0"
-                    predictionService.reload(config: .resolve(environment: predictionEnvironment))
-                }
                 // UU-5: TIP が push した最新設定を、LLMConfig.resolve / ZenzaiConfig.resolve が読む
                 // env キーの「上書き集合」へ写す（reload が実プロセス env に重ねる — #2）。
                 var overrides: [String: String] = [:]
@@ -249,9 +236,6 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                 }
                 if let le = p.learning_enabled {
                     overrides["NOSPACEKEY_LEARNING"] = le ? "1" : "0"
-                }
-                if let tl = p.typo_learn_enabled {
-                    overrides["NOSPACEKEY_TYPO_LEARN"] = tl ? "1" : "0"
                 }
                 if let il = p.zenzai_inference_limit {
                     overrides["NOSPACEKEY_ZENZAI_INFERENCE_LIMIT"] = String(il)
@@ -303,13 +287,11 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
                 // ここで exit しないのは、応答を書き終える前にプロセスを殺すと TIP が broken pipe に
                 // 落ちる（degrade 経路）ため。実際の exit(0) は writeAll 成功後に exitHook が
                 // serviceLock を取り直して（進行中の別接続要求を drain して）から行う。
-                predictionService.shutdown()
                 service.prepareForShutdown()
                 exitAfterReply = true
                 response = .ok
             case .prepareMaintenance:
                 if service.beginMaintenanceShutdownIfIdle() {
-                    predictionService.shutdown()
                     service.prepareForShutdown()
                     exitAfterReply = true
                     response = .ok
@@ -324,7 +306,7 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock,
 /// Config の ClearLearning と、別 logon session の Engine 起動を直列化する短期 gate。
 /// CreateMutex(initialOwner=true) は既存 object を開いた場合 ownership を与えないため、
 /// ERROR_ALREADY_EXISTS を直後に採取してから bounded wait する。
-private final class LearningLifecycleGate {
+final class LearningLifecycleGate {
     private var handle: HANDLE?
     private var owned = false
 
@@ -413,6 +395,10 @@ private func createLearningPresence(name: String) -> HANDLE? {
 /// ConversionService を名前付きパイプに配線して常駐する。main.swift から呼ぶ唯一の公開関数。
 /// oneShot=true なら1接続を捌いて切断したら終了する（TIP のプロセス毎一意エンジン向け）。
 public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, oneShot: Bool = false) {
+    guard allowEngineImageQueries() else {
+        engineLog("ev=engine_start_blocked reason=process_identity_acl_unavailable\n")
+        return
+    }
     // 不互換な接続先で presence を占有すると、正しい TIP の起動も妨げるため lease 取得前に拒否する。
     // 新形式は通信世代で共有する。製品版を含む旧形式は旧 TIP の完全一致契約を維持する。
     if let reason = enginePipeNameRejectionReason(pipeName) {
@@ -498,9 +484,7 @@ public func runEngineHost(pipeName: String = #"\\.\pipe\nospacekey-engine"#, one
     service.startWarmUp()
 
     let serviceLock = NSLock()
-    let predictionService = PredictionService.configured(environment: environment)
-    let handle = makeEngineHandler(service: service, serviceLock: serviceLock,
-                                   predictionService: predictionService)
+    let handle = makeEngineHandler(service: service, serviceLock: serviceLock)
 
     // NOTE: `handle` 内で参照される `service` は @Sendable クロージャ内でキャプチャされる。
     // ConversionService はスレッドセーフではないが、serviceLock で排他制御されているため安全。

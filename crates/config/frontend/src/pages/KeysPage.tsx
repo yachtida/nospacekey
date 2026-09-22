@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { command, errorMessage } from "../bridge/tauri";
 import type { FieldError, KeymapCatalogEntry } from "../bridge/types";
 import { EditorDialog, StatusMessage } from "../components/SettingsPrimitives";
@@ -16,6 +16,7 @@ function prettyChord(chord: string) {
 }
 
 function recordedChord(event: KeyboardEvent): string | undefined {
+  if (event.metaKey || event.isComposing) return undefined;
   if (["Control", "Shift", "Alt", "Meta"].includes(event.key)) return undefined;
   if (!ALLOWED_CODES.test(event.code)) return undefined;
   const parts: string[] = [];
@@ -27,7 +28,7 @@ function recordedChord(event: KeyboardEvent): string | undefined {
 }
 
 export function KeysPage() {
-  const { save, errors } = useSettings();
+  const { snapshot, save, errors } = useSettings();
   const [entries, setEntries] = useState<KeymapCatalogEntry[]>([]);
   const [filter, setFilter] = useState("");
   const [context, setContext] = useState("all");
@@ -37,12 +38,59 @@ export function KeysPage() {
   const [localErrors, setLocalErrors] = useState<FieldError[]>([]);
   const [loadError, setLoadError] = useState<string>();
 
+  const [validating, setValidating] = useState(false);
+  const validationGeneration = useRef(0);
+  const catalogGeneration = useRef(0);
+
   const refresh = useCallback(() => {
+    const generation = ++catalogGeneration.current;
     void command<KeymapCatalogEntry[]>("keymap_catalog")
-      .then((value) => { setEntries(value); setLoadError(undefined); })
-      .catch((error) => setLoadError(errorMessage(error)));
+      .then((value) => {
+        if (generation !== catalogGeneration.current) return;
+        setEntries(value);
+        setLoadError(undefined);
+      })
+      .catch((error) => {
+        if (generation === catalogGeneration.current) setLoadError(errorMessage(error));
+      });
+    return () => { catalogGeneration.current++; };
   }, []);
-  useEffect(refresh, [refresh]);
+  useEffect(refresh, [refresh, snapshot?.revision]);
+  useEffect(() => () => { validationGeneration.current++; }, []);
+
+  const closeEditor = useCallback(() => {
+    validationGeneration.current++;
+    setValidating(false);
+    setRecording(false);
+    setEditing(undefined);
+  }, []);
+  const startRecording = () => {
+    validationGeneration.current++;
+    setValidating(false);
+    setLocalErrors([]);
+    setRecording(true);
+  };
+  const validate = useCallback(async (next: string | null, commit = false) => {
+    if (!editing) return;
+    const generation = ++validationGeneration.current;
+    setBinding(next);
+    setRecording(false);
+    setValidating(true);
+    setLocalErrors([]);
+    try {
+      const validation = await command<FieldError[]>("validate_key_binding", { function: editing.function, binding: next });
+      if (generation !== validationGeneration.current) return;
+      setLocalErrors(validation);
+      if (commit && !validation.length) {
+        save({ field: "key_binding", value: { function: editing.function, binding: next } });
+        closeEditor();
+      }
+    } catch (error) {
+      if (generation === validationGeneration.current) setLocalErrors([{ field: "_io", message: errorMessage(error) }]);
+    } finally {
+      if (generation === validationGeneration.current) setValidating(false);
+    }
+  }, [editing, save, closeEditor]);
 
   useEffect(() => {
     if (!recording || !editing) return;
@@ -55,15 +103,12 @@ export function KeysPage() {
       }
       const chord = recordedChord(event);
       if (!chord) return;
-      setBinding(chord);
       setRecording(false);
-      void command<FieldError[]>("validate_key_binding", { function: editing.function, binding: chord })
-        .then(setLocalErrors)
-        .catch((error) => setLocalErrors([{ field: "key_binding", message: errorMessage(error) }]));
+      void validate(chord);
     };
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, [recording, editing]);
+  }, [recording, editing, validate]);
 
   const shown = useMemo(() => entries.filter((entry) => {
     const text = `${entry.label} ${entry.context} ${entry.effectiveChords.join(" ")}`.toLowerCase();
@@ -73,27 +118,12 @@ export function KeysPage() {
   }), [entries, filter, context]);
 
   const open = (entry: KeymapCatalogEntry) => {
+    validationGeneration.current++;
+    setValidating(false);
+    setRecording(false);
     setEditing(entry);
     setBinding(entry.state === "default" ? null : entry.state === "disabled" ? "none" : entry.effectiveChords[0] ?? null);
     setLocalErrors([]);
-  };
-  const validate = async (next: string | null) => {
-    if (!editing) return;
-    setBinding(next);
-    try {
-      setLocalErrors(await command<FieldError[]>("validate_key_binding", { function: editing.function, binding: next }));
-    } catch (error) {
-      setLocalErrors([{ field: "key_binding", message: errorMessage(error) }]);
-    }
-  };
-  const commit = async () => {
-    if (!editing) return;
-    const validation = await command<FieldError[]>("validate_key_binding", { function: editing.function, binding });
-    setLocalErrors(validation);
-    if (validation.length) return;
-    save({ field: "key_binding", value: { function: editing.function, binding } });
-    setEditing(undefined);
-    window.setTimeout(refresh, 500);
   };
   const originalBinding = editing
     ? editing.state === "default" ? null : editing.state === "disabled" ? "none" : editing.effectiveChords[0] ?? null
@@ -118,14 +148,14 @@ export function KeysPage() {
       <section className="settings-group"><h2>固定操作</h2><div className="fixed-key-grid"><div><kbd>Space</kbd><span>変換・空白入力</span></div><div><kbd>↑ ↓</kbd><span>候補の移動</span></div><div><kbd>Shift＋↑ ↓</kbd><span>候補ページ移動</span></div><div><kbd>Esc</kbd><span>候補や予測を閉じる</span></div></div></section>
       {errors.filter((error) => error.field.startsWith("keymap.")).map((error) => <StatusMessage key={`${error.field}-${error.message}`} tone="error">{error.message}</StatusMessage>)}
 
-      <EditorDialog open={Boolean(editing)} title={editing?.label ?? "キー操作"} dirty={Boolean(editing) && binding !== originalBinding} onClose={() => { setRecording(false); setEditing(undefined); }}>
+      <EditorDialog open={Boolean(editing)} title={editing?.label ?? "キー操作"} dirty={Boolean(editing) && binding !== originalBinding} onClose={closeEditor}>
         {editing && <>
           <div className="key-editor-summary"><div><span>現在</span><strong>{editing.effectiveChords.map(prettyChord).join(" / ") || "割り当てなし"}</strong></div><div><span>既定</span><strong>{editing.defaultChords.map(prettyChord).join(" / ")}</strong></div></div>
-          <fieldset className="key-state-options"><legend>割り当て</legend><label><input type="radio" checked={binding === null} onChange={() => void validate(null)} /> 既定を使う</label><label><input type="radio" checked={binding === "none"} onChange={() => void validate("none")} /> 無効にする</label><label><input type="radio" checked={binding !== null && binding !== "none"} onChange={() => setRecording(true)} /> 別のキー</label></fieldset>
-          <button type="button" className={recording ? "recording" : ""} onClick={() => setRecording(true)}>{recording ? "キーを入力してください…（Escで停止）" : binding && binding !== "none" ? prettyChord(binding) : "キーを入力"}</button>
+          <fieldset className="key-state-options"><legend>割り当て</legend><label><input type="radio" checked={binding === null} onChange={() => void validate(null)} /> 既定を使う</label><label><input type="radio" checked={binding === "none"} onChange={() => void validate("none")} /> 無効にする</label><label><input type="radio" checked={binding !== null && binding !== "none"} onChange={startRecording} /> 別のキー</label></fieldset>
+          <button type="button" className={recording ? "recording" : ""} onClick={startRecording}>{recording ? "キーを入力してください…（Escで停止）" : binding && binding !== "none" ? prettyChord(binding) : "キーを入力"}</button>
           <button type="button" className="quiet" onClick={() => void validate("HankakuZenkaku")}>半角/全角を選択</button>
           {localErrors.map((error) => <StatusMessage key={`${error.field}-${error.message}`} tone="error">{error.message}</StatusMessage>)}
-          <div className="dialog-actions"><button type="button" onClick={() => setEditing(undefined)}>キャンセル</button><button type="button" className="primary" disabled={Boolean(localErrors.length) || recording} onClick={() => void commit()}>保存</button></div>
+          <div className="dialog-actions"><button type="button" onClick={closeEditor}>キャンセル</button><button type="button" className="primary" disabled={localErrors.some((error) => error.field !== "_io") || recording || validating} onClick={() => void validate(binding, true)}>{validating ? "確認中…" : "保存"}</button></div>
         </>}
       </EditorDialog>
     </div>

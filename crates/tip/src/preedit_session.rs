@@ -67,22 +67,23 @@ pub struct StartOrUpdatePreedit {
 
 impl ITfEditSession_Impl for StartOrUpdatePreedit_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        let composition = self.composition.borrow().clone();
-        if !self
-            .request
-            .state
-            .begin(self.apply.is_current(&self.request, &composition))
-        {
-            self.request.state.complete(E_FAIL.0);
+        let result = crate::panic_guard::com("StartOrUpdatePreedit_Impl.DoEditSession", || {
+            let composition = self.composition.borrow().clone();
+            if !self
+                .request
+                .state
+                .begin(self.apply.is_current(&self.request, &composition))
+            {
+                return Err(E_FAIL.into());
+            }
+            self.apply_preedit(ec)
+        });
+        self.request.state.complete(result.as_ref().err().map_or(0, |error| error.code().0));
+        let notified = crate::panic_guard::com("StartOrUpdatePreedit.on_complete", || {
             (self.on_complete)(&self.request);
-            return Err(E_FAIL.into());
-        }
-        let result = self.apply_preedit(ec);
-        self.request
-            .state
-            .complete(result.as_ref().err().map_or(0, |error| error.code().0));
-        (self.on_complete)(&self.request);
-        result
+            Ok(())
+        });
+        result.and(notified)
     }
 }
 

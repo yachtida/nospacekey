@@ -230,10 +230,78 @@ mod windows_impl {
             let _ = LocalFree(Some(HLOCAL(text.0.cast())));
             let _ = LocalFree(Some(HLOCAL(descriptor.0)));
         }
-        if actual? != expected {
+        if !task_artifact_acl_matches(&actual?, expected) {
             return Err("task transaction artifact ACL mismatch".into());
         }
         Ok(())
+    }
+
+    fn task_artifact_acl_matches(actual: &str, expected: &str) -> bool {
+        let Some(actual) = task_acl_signature(actual) else { return false; };
+        let stored = if expected.contains("OICI") {
+            "O:BAG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;FR;;;BU)(A;OICIIO;GR;;;BU)"
+        } else {
+            "O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"
+        };
+        [expected, stored].iter().any(|sddl| task_acl_signature(sddl).as_ref() == Some(&actual))
+    }
+
+    // Match the installer's exact owner/group and ACE multiset. Only ACE order and
+    // automatic-inheritance metadata may differ; rights/flags/extra ACEs may not.
+    #[derive(PartialEq, Eq)]
+    struct TaskAclSignature {
+        owner: Vec<u8>,
+        group: Vec<u8>,
+        aces: Vec<Vec<u8>>,
+    }
+
+    fn task_acl_signature(sddl: &str) -> Option<TaskAclSignature> {
+        use windows::core::{BOOL, HSTRING};
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows::Win32::Security::*;
+
+        unsafe {
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &HSTRING::from(sddl), SDDL_REVISION_1, &mut descriptor, None,
+            ).ok()?;
+            let result = (|| {
+                let mut control = 0;
+                let mut revision = 0;
+                GetSecurityDescriptorControl(descriptor, &mut control, &mut revision).ok()?;
+                let required = SE_DACL_PRESENT.0 | SE_DACL_PROTECTED.0;
+                if control & required != required { return None; }
+                let mut owner = PSID::default();
+                let mut group = PSID::default();
+                let mut defaulted = BOOL::default();
+                GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted).ok()?;
+                GetSecurityDescriptorGroup(descriptor, &mut group, &mut defaulted).ok()?;
+                if owner.0.is_null() || group.0.is_null() { return None; }
+                let owner = std::slice::from_raw_parts(owner.0.cast::<u8>(), GetLengthSid(owner) as usize).to_vec();
+                let group = std::slice::from_raw_parts(group.0.cast::<u8>(), GetLengthSid(group) as usize).to_vec();
+                let mut present = BOOL::default();
+                let mut acl = std::ptr::null_mut();
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted).ok()?;
+                if !present.as_bool() || acl.is_null() { return None; }
+                let mut aces = Vec::new();
+                for index in 0..(*acl).AceCount {
+                    let mut ace = std::ptr::null_mut();
+                    GetAce(acl, u32::from(index), &mut ace).ok()?;
+                    let header = &*ace.cast::<ACE_HEADER>();
+                    // ACCESS_ALLOWED_ACE only; deny/object/callback rules are not part
+                    // of the narrowly accepted installer contract.
+                    if header.AceType != 0 { return None; }
+                    aces.push(std::slice::from_raw_parts(ace.cast::<u8>(), header.AceSize as usize).to_vec());
+                }
+                aces.sort();
+                Some(TaskAclSignature { owner, group, aces })
+            })();
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+            result
+        }
     }
 
     impl VersionLease {
@@ -387,6 +455,33 @@ mod windows_impl {
     mod tests {
         use super::*;
         use windows::core::HSTRING;
+
+        #[test]
+        fn task_artifact_acl_contract() {
+            for line in include_str!("../../../fixtures/task-artifact-acls.tsv").lines() {
+                if line.starts_with('#') || line.is_empty() { continue; }
+                let fields: Vec<_> = line.split('\t').collect();
+                let expected = if fields[1] == "gate" {
+                    "O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)"
+                } else {
+                    "O:BAG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;BU)"
+                };
+                assert_eq!(task_artifact_acl_matches(fields[3], expected), fields[2] == "accept", "{}", fields[0]);
+            }
+        }
+
+        #[test]
+        #[ignore = "requires an installed nospacekey; reads ACLs without changing files or tasks"]
+        fn installed_task_artifact_acls_are_accepted() {
+            use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
+            let root = std::path::PathBuf::from(std::env::var_os("ProgramFiles").unwrap()).join("nospacekey");
+            let gate = std::fs::File::open(root.join(".nospacekey-task-transaction")).unwrap();
+            validate_task_artifact_acl(&gate, "O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)").unwrap();
+            let directory = std::fs::OpenOptions::new().read(true)
+                .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+                .open(root.join(".nospacekey-uninstall")).unwrap();
+            validate_task_artifact_acl(&directory, "O:BAG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;BU)").unwrap();
+        }
 
         #[test]
         fn task_transaction_gate_rejects_pending_uninstall_and_tamper() {

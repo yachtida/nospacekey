@@ -60,12 +60,12 @@ impl TextService_Impl {
         let mut input = self.state.borrow().clone();
         if !input.adopt_conversion_reading(&model.reading) { return BOOL(0); }
         match model.begin_reading_edit(index) {
-            LocalEditOutcome::Exhausted => { self.queue_local_clause_commit(&context, false); return BOOL(1); }
+            LocalEditOutcome::Exhausted => { self.queue_local_clause_commit(&context); return BOOL(1); }
             LocalEditOutcome::Changed => {}
             _ => return BOOL(0),
         }
         input.set_reading_cursor(cursor);
-        input.notation_fixed = None;
+        input.clear_notation();
         input.invalidate_live_snapshot();
         *self.state.borrow_mut() = input;
         self.clear_conversion_queue();

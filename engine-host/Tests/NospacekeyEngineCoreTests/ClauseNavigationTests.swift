@@ -154,19 +154,6 @@ final class ClauseNavigationTests: XCTestCase {
         XCTAssertNil(svc.moveClause(session: sid, offset: 0, baseIndex: -1))
     }
 
-    func testMoveClauseRejectsRepairedSeed() throws {
-        // Tab（修正変換）の修復候補を選んだ状態の ←/→ は文節モードに入らず settle 劣化する
-        // （修復候補は literal 読みを被覆しない — 乗り換えると Tab で直したタイポが復活する）。
-        let svc = classicService()
-        let sid = svc.startSession()
-        _ = svc.insert(session: sid, text: "shitekudassai")
-        let cands = try XCTUnwrap(svc.typoConvert(session: sid))
-        let repairedIdx = try XCTUnwrap(cands.firstIndex(of: "してください"),
-                                        "前提: 修復仮説が出るはず（ConversionServiceTypoTests と同素材）")
-        XCTAssertEqual(svc.typoRepairedIndices[sid]?.contains(repairedIdx), true,
-                       "前提: 修復ブロック由来の index であるはず")
-        XCTAssertNil(svc.moveClause(session: sid, offset: 1, baseIndex: repairedIdx))
-    }
 
     func testMoveClauseRejectsSingleClauseSeed() {
         // 真の1文節は移動先が無い（辞書境界の再導出でも 1 文節にしかならず settle 劣化）。

@@ -21,9 +21,6 @@ pub struct KeymapCatalogEntry {
 fn feature_state(function: settings::keymap::KeymapFunc, settings: &settings::Settings) -> bool {
     use settings::keymap::KeymapFunc::*;
     match function {
-        Ephemeral => settings.ephemeral.enabled,
-        Feedback => settings.feedback.enabled,
-        TypoCorrect => settings.typo_correct.enabled,
         LlmConvert => settings::llm_effective_enabled(settings),
         _ => true,
     }
@@ -46,7 +43,7 @@ pub fn catalog() -> Vec<KeymapCatalogEntry> {
             *function != settings::keymap::KeymapFunc::LlmConvert || !settings::LLM_CONVERT_FROZEN
         })
         .map(|function| {
-            let defaults = settings::keymap::default_chords(function, &current.ephemeral.trigger)
+            let defaults = settings::keymap::default_chords(function, "f8")
                 .iter()
                 .map(settings::keymap::format_chord)
                 .collect::<Vec<_>>();
@@ -68,15 +65,6 @@ pub fn catalog() -> Vec<KeymapCatalogEntry> {
                 effective_chords,
                 enabled,
                 disabled_reason: (!enabled).then(|| match function {
-                    settings::keymap::KeymapFunc::Ephemeral => {
-                        "入力・変換で一時かな入力を有効にすると使えます。".into()
-                    }
-                    settings::keymap::KeymapFunc::Feedback => {
-                        "診断・詳細で誤変換記録を有効にすると使えます。".into()
-                    }
-                    settings::keymap::KeymapFunc::TypoCorrect => {
-                        "入力・変換で修正変換を有効にすると使えます。".into()
-                    }
                     _ => "現在この機能は利用できません。".into(),
                 }),
                 alt_allowed: function.alt_allowed(),
@@ -101,10 +89,8 @@ pub fn validate(function: String, binding: Option<String>) -> Vec<FieldError> {
     let slot = match function.as_str() {
         "mode_toggle" => &mut current.keymap.mode_toggle,
         "reconvert" => &mut current.keymap.reconvert,
-        "feedback" => &mut current.keymap.feedback,
         "ephemeral" => &mut current.keymap.ephemeral,
         "commit_undo" => &mut current.keymap.commit_undo,
-        "typo_correct" => &mut current.keymap.typo_correct,
         "to_hiragana" => &mut current.keymap.to_hiragana,
         "to_katakana" => &mut current.keymap.to_katakana,
         "to_hankaku_kana" => &mut current.keymap.to_hankaku_kana,

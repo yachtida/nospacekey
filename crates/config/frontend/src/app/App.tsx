@@ -18,19 +18,20 @@ const PAGES: Array<{ id: PageId; label: string; short: string }> = [
   { id: "keys", label: "キー操作", short: "キー" },
   { id: "display", label: "候補・読みの表示", short: "表示" },
   { id: "dictionary", label: "辞書・学習", short: "辞書" },
-  { id: "engine", label: "変換・予測エンジン", short: "エンジン" },
+  { id: "engine", label: "変換エンジン", short: "エンジン" },
   { id: "updates", label: "更新", short: "更新" },
   { id: "diagnostics", label: "診断・詳細", short: "診断" },
 ];
 
 type SearchEntry = { page: PageId; target: string; title: string; description: string; terms: string };
 const SEARCH: SearchEntry[] = [
+  { page: "engine", target: "setting-conversion-latency", title: "変換速度の詳細", description: "処理時間と時間切れの統計", terms: "遅い 応答 タイムアウト 計測" },
   { page: "input", target: "setting-default-direct", title: "開始時モード", description: "ひらがな／半角英数", terms: "初期 アプリ" },
+  { page: "input", target: "setting-input-prediction", title: "入力中の予測候補", description: "読みから候補を表示しTabで選択", terms: "予測 補完 Tab" },
   { page: "input", target: "setting-live-conversion", title: "ライブ変換", description: "入力中に自動で変換", terms: "自動" },
   { page: "input", target: "setting-live-search-width", title: "ライブ変換の探索幅", description: "速度優先（1）・精度優先（10）", terms: "候補 探索範囲 N_best スペース" },
-  { page: "input", target: "setting-ephemeral", title: "一時かな入力", description: "確定後に半角英数へ戻る", terms: "vim ターミナル f8" },
+  { page: "keys", target: "key-ephemeral", title: "一時かなモード開始", description: "開始キーの割当・無効。日本語を確定すると半角英数へ戻る", terms: "vim ターミナル f8 一時かな入力" },
   { page: "input", target: "setting-symbol-width", title: "記号", description: "全角にする記号を選ぶ", terms: "半角 全角 句読点" },
-  { page: "input", target: "setting-typo-correct", title: "修正変換", description: "誤入力した読みの候補", terms: "誤字 tab" },
   { page: "keys", target: "key-mode_toggle", title: "キー操作", description: "操作ごとのショートカット", terms: "ショートカット キーバインド 半角" },
   { page: "display", target: "setting-appearance-theme", title: "候補の明暗", description: "OS／ライト／ダーク", terms: "テーマ" },
   { page: "display", target: "setting-appearance-palette", title: "配色", description: "ライトとダークの編集", terms: "色 カスタム" },
@@ -40,7 +41,19 @@ const SEARCH: SearchEntry[] = [
   { page: "engine", target: "setting-zenzai-enabled", title: "変換エンジン", description: "標準／GPU変換", terms: "遅い zenzai gpu" },
   { page: "engine", target: "setting-zenzai-limit", title: "推論上限", description: "Zenzaiの詳細調整", terms: "速度 統計 遅い" },
   { page: "updates", target: "setting-automatic-update", title: "自動更新確認", description: "Windowsタスクによる確認", terms: "アップデート" },
-  { page: "diagnostics", target: "setting-feedback", title: "誤変換記録", description: "読みと確定文字列をローカル保存", terms: "ログ 診断" },
+  { page: "input", target: "setting-shift-latin", title: "Shift＋英字", description: "英語入力の継続・大文字の確定", terms: "英数 ラテン" },
+  { page: "input", target: "setting-number-width", title: "数字の幅", description: "数字の全角・半角", terms: "123 １２３" },
+  { page: "input", target: "setting-punctuation-width", title: "句読点", description: "、。と,.の切替", terms: "カンマ ピリオド" },
+  { page: "display", target: "setting-appearance-font", title: "候補のフォント・サイズ", description: "書体と文字の大きさ", terms: "ポイント 拡大" },
+  { page: "display", target: "setting-appearance-backdrop", title: "背景効果", description: "不透明・アクリル", terms: "透明 透過" },
+  { page: "display", target: "setting-appearance-corner", title: "候補ウィンドウの角", description: "角丸・四角", terms: "形状" },
+  { page: "display", target: "setting-reading-accumulate", title: "読みを保持", description: "自動確定をまたいで読みを残す", terms: "蓄積" },
+  { page: "display", target: "setting-reading-max", title: "読みの最大文字数", description: "読みモニタに表示する文字数", terms: "長さ" },
+  { page: "engine", target: "setting-zenzai-path", title: "モデルのパス", description: "任意GGUFファイルを使う", terms: "重み 保存先" },
+  { page: "engine", target: "setting-zenzai-model", title: "モデルの取得・修復", description: "ダウンロードと有効化", terms: "破損 再取得" },
+  { page: "updates", target: "setting-app-version", title: "バージョン・更新確認", description: "現在の版と利用可能な更新", terms: "アップデート ビルド" },
+  { page: "updates", target: "setting-include-beta", title: "ベータ版を含める", description: "更新確認の対象", terms: "beta 試用版" },
+  { page: "diagnostics", target: "setting-clear-learning", title: "学習履歴を消去", description: "変換・訂正学習の削除", terms: "リセット 個人データ" },
   { page: "diagnostics", target: "setting-scoped-reset", title: "範囲別リセット", description: "入力・キー・表示を初期化", terms: "既定 初期化" },
 ];
 
@@ -61,9 +74,9 @@ export function clampWindowPosition(saved: PixelPoint, windowSize: { width: numb
 }
 
 function SaveIndicator({ hasDraft, onDraftClick }: { hasDraft: boolean; onDraftClick: () => void }) {
-  const { saveState, errors, retry } = useSettings();
-  const text = hasDraft ? "未保存の入力があります" : saveState === "loading" ? "読込中" : saveState === "saving" ? "保存中" : saveState === "checking" ? "保存を確認中" : saveState === "blocked" ? "保存できない項目があります" : "保存済み";
-  return <div className={`save-indicator ${saveState}`} aria-live="polite"><span className="save-dot" />{hasDraft ? <button type="button" className="quiet" onClick={onDraftClick}>{text}</button> : text}{saveState === "blocked" && <button type="button" className="quiet" onClick={retry}>再試行</button>}{errors.length > 0 && <span className="error-count">{errors.length}件</span>}</div>;
+  const { saveState, errors, conflict, retry } = useSettings();
+  const text = hasDraft ? "未保存の入力があります" : saveState === "loading" ? "読込中" : saveState === "saving" ? "保存中" : saveState === "checking" ? "保存を確認中" : conflict ? "競合する設定を確認してください" : saveState === "blocked" ? "保存できない項目があります" : "保存済み";
+  return <div className={`save-indicator ${saveState}`} aria-live="polite"><span className="save-dot" />{hasDraft ? <button type="button" className="quiet" onClick={onDraftClick}>{text}</button> : text}{saveState === "blocked" && !conflict && <button type="button" className="quiet" onClick={retry}>再試行</button>}{errors.length > 0 && <span className="error-count">{errors.length}件</span>}</div>;
 }
 
 export function App() {
@@ -179,7 +192,7 @@ export function App() {
       if (operations.length) {
         if (!window.confirm("モデル処理を中止して終了しますか？ 配置中は安全に完了するまで待ちます。")) return;
         await Promise.all(operations.filter((operation) => operation.cancelable).map((operation) => command(
-          operation.modelKind === "zenzai" ? "cancel_zenzai_download" : "cancel_prediction_model_download",
+          "cancel_zenzai_download",
           { attemptId: operation.operationId },
         ).catch(() => false)));
         const deadline = Date.now() + 10_000;
@@ -246,7 +259,7 @@ export function App() {
           {conflict && <section className="operation-panel" role="alert"><div><span className="eyebrow">保存競合</span><h2>同じ設定が別の処理で変更されました</h2>{conflict.fields.map((item) => <div key={item.field}><p><code>{item.field}</code>: 保存値 <strong>{JSON.stringify(item.saved)}</strong> ／ 編集値 <strong>{JSON.stringify(item.edited)}</strong></p><div className="operation-actions"><button type="button" onClick={() => resolveConflict(item.field, false)}>保存値を使う</button><button type="button" className="primary" onClick={() => resolveConflict(item.field, true)}>編集した値を保存</button></div></div>)}</div></section>}
           {!conflict && effects.length > 0 && <StatusMessage tone="success">{effects[effects.length - 1].message}</StatusMessage>}
           {!values ? <div className="loading-view"><span className="spinner" />設定を読み込んでいます…</div> : <>
-            {visited.has("input") && <div data-page="input" hidden={page !== "input"}><InputPage navigate={navigate} /></div>}
+            {visited.has("input") && <div data-page="input" hidden={page !== "input"}><InputPage /></div>}
             {visited.has("keys") && <div data-page="keys" hidden={page !== "keys"}><KeysPage /></div>}
             {visited.has("display") && <div data-page="display" hidden={page !== "display"}><DisplayPage /></div>}
             {visited.has("dictionary") && <div data-page="dictionary" hidden={page !== "dictionary"}><DictionaryPage /></div>}

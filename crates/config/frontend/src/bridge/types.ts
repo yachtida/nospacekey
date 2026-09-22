@@ -34,11 +34,10 @@ export type PublicSettings = {
   weightPath: string;
   zenzaiInferenceLimit: number;
   liveEnabled: boolean;
+  inputPredictionEnabled: boolean;
   liveSearchWidth: number;
-  inlinePredictionEnabled: boolean;
   defaultDirect: boolean;
   learningEnabled: boolean;
-  feedbackEnabled: boolean;
   numberFullWidth: boolean;
   punctuationFullWidth: boolean;
   symbolFullWidth: boolean;
@@ -46,10 +45,6 @@ export type PublicSettings = {
   readingMonitorEnabled: boolean;
   readingMonitorAccumulate: boolean;
   readingMonitorMaxChars: number;
-  ephemeralEnabled: boolean;
-  ephemeralTrigger: string;
-  typoCorrectEnabled: boolean;
-  typoCorrectLearn: boolean;
   shiftLatinMode: "compose" | "commit";
   userDictionaryEnabled: boolean;
   updateIncludeBeta: boolean;
@@ -61,6 +56,7 @@ export type PublicSettings = {
 
 export type SettingsSnapshot = {
   revision: string;
+  sequence: number;
   values: PublicSettings;
   access: "writable" | "read_only";
   loadState: string;
@@ -70,8 +66,8 @@ export type SettingsSnapshot = {
 export type FieldError = { field: string; message: string };
 
 export type SettingChange =
-  | { field: "default_direct" | "live_enabled" | "ephemeral_enabled" | "number_full_width" | "punctuation_full_width" | "symbol_full_width" | "typo_correct_enabled" | "typo_correct_learn" | "reading_monitor_enabled" | "reading_monitor_accumulate" | "user_dictionary_enabled" | "learning_enabled" | "zenzai_enabled" | "inline_prediction_enabled" | "update_include_beta" | "feedback_enabled"; value: boolean }
-  | { field: "ephemeral_legacy_trigger" | "appearance_font_family" | "weight_path"; value: string }
+  | { field: "default_direct" | "live_enabled" | "input_prediction_enabled" | "number_full_width" | "punctuation_full_width" | "symbol_full_width" | "reading_monitor_enabled" | "reading_monitor_accumulate" | "user_dictionary_enabled" | "learning_enabled" | "zenzai_enabled" | "update_include_beta"; value: boolean }
+  | { field: "appearance_font_family" | "weight_path"; value: string }
   | { field: "shift_latin_mode"; value: PublicSettings["shiftLatinMode"] }
   | { field: "symbol_full_width_chars"; value: string[] }
   | { field: "key_binding"; value: { function: string; binding: string | null } }
@@ -143,20 +139,28 @@ export type AppInfo = { version: string; build_hash: string; settings_path: stri
 export type ModelStatus = { installed: boolean; valid: boolean; path: string; source: string };
 export type ModelOperationStatus = {
   operationId: number;
-  modelKind: "zenzai" | "prediction";
+  modelKind: "zenzai";
   phase: "downloading" | "verifying" | "placement_waiting" | "placing" | "activating" | "cancelling" | "succeeded" | "failed" | "cancelled";
   progress: number | null;
   cancelable: boolean;
   activationIntent: boolean;
   result: string | null;
 };
+export type ZenzaiLatencyTier = {
+  count: number;
+  p50_ms: number;
+  p95_ms: number;
+  max_ms: number;
+  timeout_count: number;
+};
+
 export type ZenzaiRuntimeStatus = {
   state: string;
   backend?: string;
   device?: string;
   reason?: string;
-  latency_live?: unknown;
-  latency_convert?: unknown;
+  latency_live?: ZenzaiLatencyTier;
+  latency_convert?: ZenzaiLatencyTier;
 };
 
 export type UpdateCheckResult =

@@ -15,10 +15,10 @@ use std::sync::OnceLock;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC,
-    GetDeviceCaps, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, SetBkMode,
-    SetTextColor, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, LOGPIXELSX,
-    PAINTSTRUCT, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FrameRect, GetDC,
+    GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, SetBkMode,
+    SetTextColor, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+    TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, ShowWindow, SW_HIDE,
@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::candidate_window::CaretAnchor;
-use crate::popup::{self, effective_dpi, font_size_px, scale, Backend, PopupState};
+use crate::popup::{self, font_size_px, scale, Backend, PopupState};
 use crate::text_service::tip_log;
 
 const CLASS_NAME: PCWSTR = w!("NospacekeyReadingMonitor");
@@ -133,6 +133,7 @@ pub(crate) fn monitor_window_size(
 
 /// HWND ごとの描画状態（GWLP_USERDATA に格納）。
 struct MonitorState {
+    layout_dpi: i32,
     /// 現在の読み（ひらがな）。打鍵ごとに更新される。
     text: String,
     theme: crate::theme::Theme,
@@ -158,7 +159,7 @@ unsafe fn monitor_state<'a>(hwnd: HWND) -> Option<&'a mut MonitorState> {
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
-            paint(hwnd);
+            popup::paint_guarded::<MonitorState>(hwnd, "ReadingMonitor.WM_PAINT", || paint(hwnd));
             LRESULT(0)
         }
         WM_TIMER => unsafe {
@@ -209,19 +210,18 @@ fn paint(hwnd: HWND) {
 
 fn paint_gdi(hwnd: HWND) {
     unsafe {
-        let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
+        let paint_session = popup::PaintSession::begin(hwnd);
+        let hdc = paint_session.hdc();
         if hdc.is_invalid() {
             return;
         }
         let state = match monitor_state(hwnd) {
             Some(s) => s,
             None => {
-                let _ = EndPaint(hwnd, &ps);
                 return;
             }
         };
-        let dpi = effective_dpi(GetDeviceCaps(Some(hdc), LOGPIXELSX));
+        let dpi = state.layout_dpi;
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
         let colors = state.theme.colors;
@@ -260,8 +260,6 @@ fn paint_gdi(hwnd: HWND) {
         let bb = CreateSolidBrush(COLORREF(colors.border.colorref()));
         let _ = FrameRect(hdc, &rc, bb);
         let _ = DeleteObject(bb.into());
-
-        let _ = EndPaint(hwnd, &ps);
     }
 }
 
@@ -276,17 +274,15 @@ unsafe fn paint_d2d(hwnd: HWND) {
         DWRITE_TEXT_ALIGNMENT_TRAILING,
     };
 
-    let mut ps = PAINTSTRUCT::default();
-    let hdc = BeginPaint(hwnd, &mut ps);
+    let paint_session = popup::PaintSession::begin(hwnd);
+    let _hdc = paint_session.hdc();
     let Some(state) = monitor_state(hwnd) else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     if state.backend.renderer.is_none() {
-        let _ = EndPaint(hwnd, &ps);
         return;
     }
-    let dpi = effective_dpi(GetDeviceCaps(Some(hdc), LOGPIXELSX));
+    let dpi = state.layout_dpi;
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
 
@@ -305,7 +301,6 @@ unsafe fn paint_d2d(hwnd: HWND) {
         (DWRITE_TEXT_ALIGNMENT_LEADING, true)
     };
     let Some(fmt) = state.backend.text_format(&family, font_px, align, trim) else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     // 以降 state への書き込みは end_draw 後にしか無いので、テーマは不変借用で読む。
@@ -313,11 +308,9 @@ unsafe fn paint_d2d(hwnd: HWND) {
 
     // TIP パスでは expect/unwrap を使わず else で対の EndPaint を打って return する。
     let Some(renderer) = state.backend.renderer.as_ref() else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     let Ok(ctx) = renderer.begin_draw() else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     ctx.SetDpi(96.0, 96.0);
@@ -380,7 +373,6 @@ unsafe fn paint_d2d(hwnd: HWND) {
     if lost {
         state.backend.renderer_dead = true;
     }
-    let _ = EndPaint(hwnd, &ps);
 }
 
 /// GDI パス用のテキスト幅実測（物理px）。フォントが作れない/測れないときは None（呼び出し側は
@@ -474,6 +466,7 @@ impl ReadingMonitor {
             popup::install_state(
                 hwnd,
                 Box::new(MonitorState {
+                    layout_dpi: 96,
                     text: String::new(),
                     theme,
                     backend: Backend::new(renderer),
@@ -556,6 +549,7 @@ impl ReadingMonitor {
             let Some(state) = monitor_state(self.hwnd) else {
                 return;
             };
+            state.layout_dpi = dpi;
             let font_px_f = font_size_px(state.theme.font_point_tenths, dpi);
             let font_px = font_px_f.ceil() as i32;
             // テキスト幅は描画と同一エンジンで実測（D2D=DWrite / GDI=GetTextExtentPoint32W）。
@@ -697,6 +691,33 @@ impl Drop for ReadingMonitor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paint_panic_stays_inside_window_callback() {
+        crate::popup::assert_paint_panic_is_contained(Some(super::wnd_proc));
+    }
+
+    #[test]
+    fn paint_uses_the_layout_dpi() {
+        use super::*;
+        unsafe {
+            popup::register_class(&CLASS_ATOM, CLASS_NAME, Some(wnd_proc)).unwrap();
+            let hwnd = popup::create_popup(CLASS_NAME, Default::default(), 50, 50).unwrap();
+            popup::install_state(hwnd, Box::new(MonitorState {
+                layout_dpi: 96,
+                text: String::new(), theme: Default::default(), backend: Backend::new(None),
+                overflow: false, last_size: (0, 0),
+            }));
+            let mut monitor = ReadingMonitor { hwnd };
+            for dpi in [192, 96, 288] {
+                popup::TEST_ANCHOR_DPI.set(Some(dpi));
+                let anchor = CaretAnchor { x: 100, y: 100, caret_top: Some(80) };
+                monitor.show_or_update("にほんご", Some(anchor), 34, Default::default());
+                popup::TEST_ANCHOR_DPI.set(None);
+                paint_gdi(hwnd);
+                assert_eq!(monitor_state(hwnd).unwrap().backend.cached_font_dpi(), Some(dpi));
+            }
+        }
+    }
     use super::*;
 
     #[test]

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { command, errorMessage } from "../bridge/tauri";
-import type { PageId, SymbolCatalogEntry } from "../bridge/types";
+import type { SymbolCatalogEntry } from "../bridge/types";
 import {
   EditorDialog,
   InlineError,
@@ -12,7 +12,7 @@ import {
 } from "../components/SettingsPrimitives";
 import { useSettings } from "../settings/SettingsStore";
 
-export function InputPage({ navigate }: { navigate: (page: PageId, target?: string) => void }) {
+export function InputPage() {
   const { values, save, errors } = useSettings();
   const [symbolsOpen, setSymbolsOpen] = useState(false);
   const [catalog, setCatalog] = useState<SymbolCatalogEntry[]>([]);
@@ -27,16 +27,11 @@ export function InputPage({ navigate }: { navigate: (page: PageId, target?: stri
   }, [symbolsOpen]);
 
   if (!values) return null;
-  const effectiveEphemeral = values.keymap.ephemeral;
-  const trigger = effectiveEphemeral === "none"
-    ? "無効"
-    : effectiveEphemeral ?? values.ephemeralTrigger.toUpperCase();
-
   return (
     <div className="page-stack">
       <header className="page-heading">
         <h1>入力・変換</h1>
-        <p>普段の入力方法と、文字の幅や一時的なかな入力を設定します。</p>
+        <p>普段の入力方法と、文字の幅を設定します。</p>
       </header>
 
       <SettingsGroup title="入力の始まり方">
@@ -61,6 +56,11 @@ export function InputPage({ navigate }: { navigate: (page: PageId, target?: stri
         >
           <Switch checked={values.liveEnabled} onChange={(value) => save({ field: "live_enabled", value })} label="ライブ変換" />
         </SettingRow>
+        <SettingRow id="input-prediction" title="入力中の予測候補"
+          description="読みの先を補う候補を表示します。Tabで選択、Enterまたはクリックで確定。Escで閉じ、次に読みを変えると再表示します。"
+          effect="入力先を開き直した後">
+          <Switch checked={values.inputPredictionEnabled} onChange={(value) => save({ field: "input_prediction_enabled", value })} label="入力中の予測候補" />
+        </SettingRow>
         <SettingRow
           id="live-search-width"
           title="ライブ変換の探索幅"
@@ -74,17 +74,6 @@ export function InputPage({ navigate }: { navigate: (page: PageId, target?: stri
             onChange={(value) => save({ field: "live_search_width", value: Number(value) })}
           />
           <InlineError errors={errors} field="live_search_width" />
-        </SettingRow>
-        <SettingRow
-          id="ephemeral"
-          title="一時かな入力"
-          description={<>開始キー（現在: <kbd>{trigger}</kbd>）で日本語入力を始め、確定すると半角英数へ戻ります。</>}
-          effect="入力先を開き直した後"
-        >
-          <div className="control-stack">
-            <Switch checked={values.ephemeralEnabled} onChange={(value) => save({ field: "ephemeral_enabled", value })} label="一時かな入力" />
-            <button type="button" className="quiet" onClick={() => navigate("keys", "key-ephemeral")}>キーを変更</button>
-          </div>
         </SettingRow>
         <SettingRow
           id="shift-latin"
@@ -126,12 +115,6 @@ export function InputPage({ navigate }: { navigate: (page: PageId, target?: stri
         </SettingRow>
       </SettingsGroup>
 
-      <SettingsGroup title="詳細">
-        <SettingRow id="typo-correct" title="修正変換を使う" description="Tabで誤入力した読みの修復候補を表示します。" effect="入力先を開き直した後">
-          <Switch checked={values.typoCorrectEnabled} onChange={(value) => save({ field: "typo_correct_enabled", value })} label="修正変換" />
-          <InlineError errors={errors} field="typo_correct_enabled" />
-        </SettingRow>
-      </SettingsGroup>
 
       <EditorDialog open={symbolsOpen} title="全角にする記号" dirty={JSON.stringify(symbolDraft) !== JSON.stringify(values.symbolFullWidthChars)} onClose={() => setSymbolsOpen(false)}>
         <p className="dialog-description">選択内容は「保存」するまで設定にもIMEにも送られません。</p>

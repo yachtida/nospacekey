@@ -9,7 +9,7 @@ use windows::Win32::Foundation::HMODULE;
 
 // 永続IDの唯一の真実源は `ids`。tip と testbench が同一値を参照する。
 pub use ids::{
-    CLSID_NOSPACEKEY, GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_PREDICTION,
+    CLSID_NOSPACEKEY, GUID_DISPLAY_ATTRIBUTE,
     GUID_DISPLAY_ATTRIBUTE_TARGET, GUID_DISPLAY_ATTRIBUTE_CONVERTED, LANGID_JA, PROFILE_NOSPACEKEY,
 };
 
@@ -31,14 +31,6 @@ pub const GUID_PRESERVEDKEY_RECONVERT_US: GUID =
 /// (resolve_action の bare_special 経路)が受ける(spec §3)。
 pub const GUID_PRESERVEDKEY_MODE_TOGGLE_HZ: GUID =
     GUID::from_u128(0x3f8b6a92_1d47_4c05_8e2a_7b9c0d4e5f16);
-/// 品質ループ③: 誤変換フィードバック記録（Ctrl+変換 0x1C, JIS）の preserved key 識別 GUID。
-/// 既存4登録と衝突しない新 GUID。一度確定したら変更しない。
-pub const GUID_PRESERVEDKEY_FEEDBACK: GUID =
-    GUID::from_u128(0x5b8ce2d1_7f3a_4d68_9a41_c1d20f6e3b57);
-/// 品質ループ③: 誤変換フィードバック記録（Ctrl+/ 0xBF, US）の preserved key 識別 GUID。
-pub const GUID_PRESERVEDKEY_FEEDBACK_US: GUID =
-    GUID::from_u128(0x9e4f1c3b_2a6d_4e90_b7c8_51aa0d2f8e64);
-
 /// SP6a: 候補リスト UIElement の識別 GUID（ITfUIElement::GetGUID が返す純粋な識別子。登録不要）。
 /// 一度確定したら変更しないこと（SP5 preserved-key GUID と同じ規律）。
 pub const GUID_UIELEMENT_CANDIDATELIST: GUID =

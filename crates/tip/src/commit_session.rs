@@ -83,23 +83,22 @@ pub struct CommitText {
 
 impl ITfEditSession_Impl for CommitText_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        // A host can retain or reenter this COM object. One request may write
-        // its body at most once, even if the host invokes it again.
+        // Reentry must not complete the first invocation's still-pending report.
         if self.executed.replace(true) {
             return Ok(());
         }
-        let composition = self.composition.borrow().clone();
-        if !self
-            .request
-            .state
-            .begin(self.before_deadline() && self.apply.is_current(&self.request, &composition))
-        {
-            return Err(E_FAIL.into());
-        }
-        let result = self.commit_body(ec);
-        self.request
-            .state
-            .complete(result.as_ref().err().map_or(0, |e| e.code().0));
+        let result = crate::panic_guard::com("CommitText_Impl.DoEditSession", || {
+            let composition = self.composition.borrow().clone();
+            if !self
+                .request
+                .state
+                .begin(self.before_deadline() && self.apply.is_current(&self.request, &composition))
+            {
+                return Err(E_FAIL.into());
+            }
+            self.commit_body(ec)
+        });
+        self.request.state.complete(result.as_ref().err().map_or(0, |e| e.code().0));
         result
     }
 }
@@ -347,29 +346,31 @@ pub struct EndCompositionOnly {
 
 impl ITfEditSession_Impl for EndCompositionOnly_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        if !self.active.get()
-            || self.executed.replace(true)
-            || self.epoch.get() != self.expected_epoch
-        {
-            return Err(E_FAIL.into());
-        }
-        let result = self.repair_and_close(ec);
-        if self.epoch.get() == self.expected_epoch {
-            if let Some(report) = &self.report {
-                let closed = self.end_status.get() == CompositionEndStatus::Closed;
-                if self.cancel_selection || self.end_status.get() == CompositionEndStatus::Terminal
-                {
-                    report.begin(false);
-                }
-                report.complete(
-                    result
-                        .as_ref()
-                        .err()
-                        .map_or(if closed { 0 } else { E_FAIL.0 }, |error| error.code().0),
-                );
+        crate::panic_guard::com("EndCompositionOnly_Impl.DoEditSession", || {
+            if !self.active.get()
+                || self.executed.replace(true)
+                || self.epoch.get() != self.expected_epoch
+            {
+                return Err(E_FAIL.into());
             }
-        }
-        result
+            let result = self.repair_and_close(ec);
+            if self.epoch.get() == self.expected_epoch {
+                if let Some(report) = &self.report {
+                    let closed = self.end_status.get() == CompositionEndStatus::Closed;
+                    if self.cancel_selection || self.end_status.get() == CompositionEndStatus::Terminal
+                    {
+                        report.begin(false);
+                    }
+                    report.complete(
+                        result
+                            .as_ref()
+                            .err()
+                            .map_or(if closed { 0 } else { E_FAIL.0 }, |error| error.code().0),
+                    );
+                }
+            }
+            result
+        })
     }
 }
 

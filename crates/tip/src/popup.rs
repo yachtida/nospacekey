@@ -22,9 +22,9 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, GetDC, GetDeviceCaps, GetMonitorInfoW, InvalidateRect,
-    MonitorFromPoint, MonitorFromWindow, ReleaseDC, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HFONT, LOGPIXELSX, MONITORINFO,
+    CreateFontW, DeleteObject, GetMonitorInfoW, InvalidateRect,
+    MonitorFromPoint, MonitorFromWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HFONT, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, OUT_TT_PRECIS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -40,6 +40,77 @@ use crate::render::SurfaceRenderer;
 use crate::text_service::tip_log;
 use crate::theme::tokens;
 
+pub(crate) struct PaintSession {
+    hwnd: HWND,
+    ps: windows::Win32::Graphics::Gdi::PAINTSTRUCT,
+}
+
+pub(crate) fn paint_guarded<S: PopupState>(hwnd: HWND, site: &str, paint: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(paint)) {
+        std::mem::forget(payload);
+        unsafe {
+            if let Some(state) = state_mut::<S>(hwnd) {
+                let backend = state.backend_mut();
+                backend.renderer_dead = backend.renderer.is_some();
+            }
+        }
+        tip_log(&format!("ev=panic site={site}"));
+    }
+}
+
+impl PaintSession {
+    pub(crate) unsafe fn begin(hwnd: HWND) -> Self {
+        let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+        windows::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps);
+        Self { hwnd, ps }
+    }
+
+    pub(crate) fn hdc(&self) -> windows::Win32::Graphics::Gdi::HDC {
+        #[cfg(test)]
+        if TEST_PAINT_PANIC.replace(false) { panic!("injected paint panic"); }
+        self.ps.hdc
+    }
+}
+
+impl Drop for PaintSession {
+    fn drop(&mut self) {
+        unsafe { let _ = windows::Win32::Graphics::Gdi::EndPaint(self.hwnd, &self.ps); }
+        #[cfg(test)]
+        TEST_PAINT_ENDED.set(TEST_PAINT_ENDED.get() + 1);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PAINT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_PAINT_ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn assert_paint_panic_is_contained(proc: WNDPROC) {
+    let thread = std::thread::current();
+    let name = thread.name().unwrap();
+    if std::env::var_os("NOSPACEKEY_PAINT_PANIC_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("NOSPACEKEY_PAINT_PANIC_CHILD", "1").output().unwrap();
+        assert!(output.status.success(), "paint callback aborted: {:?}", output.status);
+        return;
+    }
+    unsafe {
+        let class = w!("NospacekeyPanicPaintTest");
+        static TEST_CLASS: OnceLock<u16> = OnceLock::new();
+        register_class(&TEST_CLASS, class, proc).unwrap();
+        let hwnd = create_popup(class, Default::default(), 50, 50).unwrap();
+        TEST_PAINT_PANIC.set(true);
+        TEST_PAINT_ENDED.set(0);
+        proc.unwrap()(hwnd, windows::Win32::UI::WindowsAndMessaging::WM_PAINT, Default::default(), Default::default());
+        assert!(!TEST_PAINT_PANIC.get());
+        assert_eq!(TEST_PAINT_ENDED.get(), 1, "EndPaint must run on unwind");
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
 // ============================================================================
 // 純粋ヘルパ（GDI 非依存・単体テスト可能）。
 // ============================================================================
@@ -50,7 +121,7 @@ pub(crate) fn scale(v: i32, dpi: i32) -> i32 {
     (v * dpi + 48) / 96
 }
 
-/// `GetDeviceCaps` の結果を妥当な DPI に丸める。<=0 は 96 にフォールバックし、
+/// 取得した DPI を妥当な範囲に丸める。<=0 は 96 にフォールバックし、
 /// 異常な大値も [96,480] にクランプして暴走を防ぐ。
 pub(crate) fn effective_dpi(raw: i32) -> i32 {
     if raw <= 0 {
@@ -150,15 +221,7 @@ pub(crate) unsafe fn create_font(family_z: &[u16], point_tenths: i32, dpi: i32) 
 /// 注意: これは窓の**現位置**（前回 SetWindowPos 位置・初回生成は (0,0)=主モニタ）の DPI を
 /// 返す。移動を伴う表示のサイズ計算には `dpi_for_anchor` を使うこと（UIバグ2）。
 pub(crate) fn window_dpi(hwnd: HWND) -> i32 {
-    unsafe {
-        let hdc = GetDC(Some(hwnd));
-        if hdc.is_invalid() {
-            return 96;
-        }
-        let dpi = effective_dpi(GetDeviceCaps(Some(hdc), LOGPIXELSX));
-        let _ = ReleaseDC(Some(hwnd), hdc);
-        dpi
-    }
+    effective_dpi(unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) } as i32)
 }
 
 /// 点 (x, y) が属すモニタの実効 DPI。ポップアップのサイズ計算は「これから移動する先」
@@ -169,6 +232,8 @@ pub(crate) fn window_dpi(hwnd: HWND) -> i32 {
 /// `MonitorFromPoint + GetDpiForMonitor(MDT_EFFECTIVE_DPI)`。DPI 非対応プロセスでは
 /// GetDpiForMonitor は仮想化された値を返す（= window_dpi と同値になり無害）。
 pub(crate) fn dpi_for_anchor(x: i32, y: i32) -> i32 {
+    #[cfg(test)]
+    if let Some(dpi) = TEST_ANCHOR_DPI.get() { return dpi; }
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     unsafe {
         let hmon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
@@ -180,6 +245,11 @@ pub(crate) fn dpi_for_anchor(x: i32, y: i32) -> i32 {
             96
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_ANCHOR_DPI: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
 /// 点 (x, y) が属すモニタの作業領域(RECT)。モニタ情報が取れなければ None。
@@ -462,6 +532,10 @@ fn next_fade_timer_id() -> usize {
 }
 
 impl Backend {
+    #[cfg(test)]
+    pub(crate) fn cached_font_dpi(&self) -> Option<i32> {
+        self.font.as_ref().map(|(_, dpi, _, _)| *dpi)
+    }
     pub fn new(renderer: Option<SurfaceRenderer>) -> Self {
         Self {
             renderer,

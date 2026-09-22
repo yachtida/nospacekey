@@ -8,6 +8,7 @@ import WinSDK
 /// need to spawn a native process.
 public final class NativeGPUWorkerTransport: GPUWorkerTransport, @unchecked Sendable {
 #if os(Windows)
+    private static let processCreationLock = NSLock()
     private let lock = NSLock()
     private var process: HANDLE?
     private var job: HANDLE?
@@ -298,7 +299,7 @@ public final class NativeGPUWorkerTransport: GPUWorkerTransport, @unchecked Send
         var processInfo = PROCESS_INFORMATION()
         let directory = executableURL.deletingLastPathComponent().path
         let flags = DWORD(CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT)
-        engineInheritableHandleProcessCreationLock.lock()
+        Self.processCreationLock.lock()
         let created = executableURL.path.withCString(encodedAs: UTF16.self) { executable in
             directory.withCString(encodedAs: UTF16.self) { workingDirectory in
                 commandBuffer.withUnsafeMutableBufferPointer { commandLine in
@@ -307,7 +308,7 @@ public final class NativeGPUWorkerTransport: GPUWorkerTransport, @unchecked Send
                 }
             }
         }
-        engineInheritableHandleProcessCreationLock.unlock()
+        Self.processCreationLock.unlock()
         guard created else { return false }
         CloseHandle(processInfo.hThread)
         guard let job = CreateJobObjectW(nil, nil) else {

@@ -557,6 +557,25 @@ impl TsfHost {
                 eprintln!("DIAG start: ChangeCurrentLanguage hr=S_OK");
             }
             let profiles: ITfInputProcessorProfileMgr = ipp.cast()?;
+            // Fresh registration reaches msctf asynchronously in Sandbox.
+            // Wait for catalogue visibility; an actual activation error below
+            // is still returned immediately rather than retried or hidden.
+            let profile_deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let entries = profiles.EnumProfiles(LANGID_JA)?;
+                let mut entry = [TF_INPUTPROCESSORPROFILE::default()];
+                let mut fetched = 0;
+                let mut registered = false;
+                while entries.Next(&mut entry, &mut fetched).is_ok() && fetched != 0 {
+                    if entry[0].clsid == CLSID_NOSPACEKEY && entry[0].guidProfile == PROFILE_NOSPACEKEY {
+                        registered = true;
+                        break;
+                    }
+                }
+                if registered || std::time::Instant::now() >= profile_deadline { break; }
+                pump();
+                std::thread::sleep(Duration::from_millis(25));
+            }
             let activate_result = profiles.ActivateProfile(
                 TF_PROFILETYPE_INPUTPROCESSOR,
                 LANGID_JA,
@@ -737,7 +756,7 @@ impl TsfHost {
     /// `vk` を Shift 押下状態で注入する（外部LLM変換 Shift+Tab 用。item12）。
     ///
     /// TIP 側の Tab 分岐（key_event_sink.rs `VK_TAB`）は `shift_down()`（`GetKeyState(VK_SHIFT)`）
-    /// で Tab（修正変換）/Shift+Tab（外部LLM変換）を振り分ける実装なので、`feed_key_with_ctrl`
+    /// で Tab／Shift+Tab を区別する実装なので、`feed_key_with_ctrl`
     /// と同じ `SetKeyboardState` 方式で VK_SHIFT(0x10) の下位ビットを立ててから注入する。
     /// 設計ロック 未確認(a)（feed_key_with_ctrl と同一の注記）: SetKeyboardState が GetKeyState に
     /// 反映されない環境では偽 FAIL しうる（その場合 keybd_event 代替 — 実機/VM 受入で確認する）。
@@ -953,6 +972,23 @@ impl TsfHost {
             pump();
         }
         Ok(())
+    }
+
+    pub(crate) fn push_and_pop_empty_context(&self) -> windows::core::Result<bool> {
+        unsafe {
+            let hwnd = ensure_foreground_window()?;
+            let (store, _) = HarnessTextStore::create(hwnd);
+            let mut context = None;
+            let mut cookie = 0;
+            self.doc_mgr.CreateContext(self.tid, 0, &store, &mut context, &mut cookie)?;
+            let context = context.ok_or_else(|| Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED))?;
+            self.doc_mgr.Push(&context)?;
+            pump();
+            let hidden = self.candidate_strings().is_empty();
+            self.doc_mgr.Pop(0)?;
+            pump();
+            Ok(hidden && self.candidate_strings().is_empty())
+        }
     }
 
     pub(crate) fn langbar_toggle_mode(&self) -> windows::core::Result<()> {

@@ -3,6 +3,36 @@ import WinSDK
 @testable import NospacekeyEngineCore
 
 final class NamedPipeSecurityTests: XCTestCase {
+    func testImageQueryAccessIsLimitedAndIdempotent() {
+        XCTAssertTrue(allowEngineImageQueries())
+        XCTAssertTrue(allowEngineImageQueries())
+        var descriptor: PSECURITY_DESCRIPTOR? = nil
+        var dacl: PACL? = nil
+        XCTAssertEqual(GetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT,
+            DWORD(DACL_SECURITY_INFORMATION), nil, nil, &dacl, nil, &descriptor), DWORD(ERROR_SUCCESS))
+        guard let descriptor, let dacl else { return XCTFail("missing process DACL") }
+        defer { LocalFree(descriptor) }
+        var found: Set<String> = []
+        for index in 0..<DWORD(dacl.pointee.AceCount) {
+            var raw: LPVOID? = nil
+            XCTAssertNotEqual(GetAce(dacl, index, &raw), false)
+            guard let raw else { continue }
+            let ace = raw.assumingMemoryBound(to: ACCESS_ALLOWED_ACE.self)
+            if ace.pointee.Header.AceType != BYTE(ACCESS_ALLOWED_ACE_TYPE) { continue }
+            let sid = raw.advanced(by: MemoryLayout<ACCESS_ALLOWED_ACE>.offset(of: \.SidStart)!)
+            var text: LPWSTR? = nil
+            XCTAssertNotEqual(ConvertSidToStringSidW(sid, &text), false)
+            guard let text else { continue }
+            let string = String(decodingCString: text, as: UTF16.self)
+            LocalFree(text)
+            if ["S-1-15-2-1", "S-1-15-2-2"].contains(string) {
+                XCTAssertEqual(ace.pointee.Mask, DWORD(PROCESS_QUERY_LIMITED_INFORMATION))
+                XCTAssertTrue(found.insert(string).inserted, "duplicate query ACE")
+            }
+        }
+        XCTAssertEqual(found, ["S-1-15-2-1", "S-1-15-2-2"])
+    }
+
     func testPipeSddlUsesProcessLogonSidAndRetainsRestrictedAccess() {
         let logonSid = "S-1-5-5-123-456"
         let sddl = pipeSddl(logonSid: logonSid)

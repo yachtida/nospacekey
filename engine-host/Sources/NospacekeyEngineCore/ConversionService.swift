@@ -38,7 +38,8 @@ func learningPathMetadata(for url: URL) throws -> LearningPathMetadata? {
         attributes = try FileManager.default.attributesOfItem(atPath: url.path)
     } catch {
         let nsError = error as NSError
-        if (nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError) ||
+        if (nsError.domain == NSCocoaErrorDomain &&
+            (nsError.code == NSFileNoSuchFileError || nsError.code == NSFileReadNoSuchFileError)) ||
             (nsError.domain == NSPOSIXErrorDomain && nsError.code == 2) {
             return nil
         }
@@ -134,6 +135,7 @@ public final class ConversionService: @unchecked Sendable {
         let originalSurface: String
         let modelTop: String?
         var sentenceAction: SentenceAction? = nil
+        var predictionReading: String? = nil
     }
     private var clauseTokens: [String: ClauseTokenMaterial] = [:]
     private var nextClauseToken: UInt64 = 0
@@ -247,6 +249,8 @@ public final class ConversionService: @unchecked Sendable {
     private let converter = KanaKanjiConverter.withDefaultDictionary()
     private var learningConverter = KanaKanjiConverter.withDefaultDictionary()
     private let recentLearning = RecentLearningOverlay()
+    // Never imports or reads legacy learning memory. Its only dynamic entries are user dictionaries.
+    private let inputPredictionConverter = KanaKanjiConverter.withDefaultDictionary()
     private let learningStateLock = NSLock()
     // Serializes actual vendor writes with settings generation changes. Reload
     // uses try(), preserving its existing busy/retry contract during disk I/O.
@@ -274,10 +278,8 @@ public final class ConversionService: @unchecked Sendable {
     private let learningClearStartedForTesting: (@Sendable () -> Void)?
 
     /// 1セッションの全状態（合成テキスト・候補キャッシュ・ライブ変換履歴・所有接続）。
-    /// 並列 Dictionary 6本（sessions/cachedCandidates/cachedTarget/typoRepairedIndices/
-    /// liveState/sessionConnection）に分けない理由: その構造では各メソッドが必要な部分集合を
-    /// 手で同期することになり、更新漏れがそのまま stale バグになる（実例: typoRepairedIndices の
-    /// 手動 nil 忘れ — 旧レビューCritical）。アクセスは従来どおり呼び出し元 serviceLock で直列化。
+    /// 状態を複数の Dictionary に分けると更新漏れで古い候補が残るため、一緒に管理する。
+    /// アクセスは呼び出し元 serviceLock で直列化する。
     struct SessionRecord {
         var composing: ComposingText
         /// 直近の convert 系が返した候補の [Candidate]（commit が index で引く）。
@@ -285,7 +287,7 @@ public final class ConversionService: @unchecked Sendable {
         var cachedCandidates: [Candidate]? = nil
         /// キャッシュ時点の convertTarget（読みが変わったら stale としてキャッシュを使わない）。
         var cachedTarget: String? = nil
-        /// キャッシュ時点の「モデル1位」表層（昇格・修復ブロック挿入で並びが動く**前**の素の
+        /// キャッシュ時点の「モデル1位」表層（昇格で並びが動く**前**の素の
         /// 先頭候補）。訂正記録の除外基準 — 判定を表示リスト添字（index != 0）だけにしないのは、
         /// 昇格発火時は表示 index 0 が昇格候補で「0=モデル正解」の前提が破れ、モデル正解の
         /// 選択が訂正記録され既存訂正を上書き破壊するため（文節スコープの modelTopTexts と
@@ -293,17 +295,10 @@ public final class ConversionService: @unchecked Sendable {
         var cachedModelTop: String? = nil
         /// キャッシュ時点で訂正昇格が実際に起きたか(promoted() 非nil)。un-learn の発火条件 —
         /// cachedModelTop の文字列一致だけでは「昇格が model top を押し下げた窓での選択」と
-        /// 「昇格の無い窓(typoConvert の修復ブロック先頭等)で literal 1位を普通に選んだ」が
+        /// 「昇格の無い窓でモデル1位を普通に選んだ」が
         /// 区別できず、後者で訂正を誤削除する(第3R敵対レビュー N-1)。記録除外(!= modelTop)は
         /// fail-safe なので流用可だが、削除は fail-destructive なので昇格の実発火を要求する。
         var cachedPromoted: Bool = false
-        /// typoConvert が cachedCandidates に積んだ「修復候補ブロック」由来の index 集合。
-        /// commit がこの集合に含まれる index を確定するときだけ、全消費＋誤読み合成ペア学習の
-        /// 特別経路へ分岐する。
-        /// 不変条件: 非nil なのは、直近の typoConvert が積んだ修復ブロックが cachedCandidates に
-        /// 載っている間だけ（cacheCandidates が候補と同時に設定/クリアするため、書き込み箇所ごとの
-        /// 手動 nil は不要になった）。
-        var typoRepairedIndices: Set<Int>? = nil
         /// ライブ変換履歴（自動確定用 — iOS LiveConversionManager の移植）。
         var liveState: LiveConversionState? = nil
         /// 文節ナビゲーション状態（MoveClause で開始）。読みの変更・確定・新しい変換で必ず破棄する
@@ -319,19 +314,15 @@ public final class ConversionService: @unchecked Sendable {
             cachedTarget = nil
             cachedModelTop = nil
             cachedPromoted = false
-            typoRepairedIndices = nil
             clauseState = nil
         }
 
-        /// 変換結果を候補キャッシュへ載せる（invalidateCandidateCache と対）。repairedIndices は
-        /// 修復ブロックを積む typoConvert だけが渡す — 省略時 nil が、convert/liveConvert に古い
-        /// 修復 index が残る余地（旧レビューCritical）を構造的に塞ぐ。
-        mutating func cacheCandidates(_ candidates: [Candidate], target: String, repairedIndices: Set<Int>? = nil, modelTop: String? = nil, promoted: Bool = false) {
+        /// Cache candidates and their correction-learning baseline together.
+        mutating func cacheCandidates(_ candidates: [Candidate], target: String, modelTop: String? = nil, promoted: Bool = false) {
             cachedCandidates = candidates
             cachedTarget = target
             cachedModelTop = modelTop
             cachedPromoted = promoted
-            typoRepairedIndices = repairedIndices
             clauseState = nil   // 新しい変換 = 文節ナビゲーションは仕切り直し
         }
     }
@@ -380,13 +371,6 @@ public final class ConversionService: @unchecked Sendable {
     /// 読み書きは EngineHost の serviceLock 下に限定する。
     private var maintenanceShutdownPending = false
 
-    /// テスト専用の観測窓（読み取りのみ）。実体は SessionRecord.typoRepairedIndices。
-    /// private でなく internal にしているのはテスト専用（不変条件を「stale index が commit を
-    /// 誤分類する」という間接観測に頼ると、部分被覆候補が低 index に来ない実辞書データに
-    /// 依存し再現性が無い＝直接検査する）。
-    var typoRepairedIndices: [Int: Set<Int>] {
-        sessions.compactMapValues { $0.typoRepairedIndices }
-    }
     /// 共有 converter を現在「合成中」として使っているセッション。別セッションが converter を
     /// 使う直前にリセットし、completedData/previousInputData 等の文脈が別セッションへ漏れるのを防ぐ
     /// （同一セッション継続ならリセットしない＝部分確定の左文脈を保つ。Zenzai 実稼働中は audit H2
@@ -476,11 +460,6 @@ public final class ConversionService: @unchecked Sendable {
     /// 容量を 8 にしないのは、別接続の変換が挟まると追い出し→棄却で訂正が無言で失われるため。
     /// 読み書きとも converterLock 下。
     private var recordability: [(reading: String, surfaces: [String: Bool], modelTops: [String])] = []
-    /// 修正変換(TypoConvert)の誤読み学習トグル。ADR-0002: 誤読み(実在しない読み)を学習辞書へ
-    /// 恒久追加する副作用があるため、学習本体(learning.enabled)と独立に切れる必要がある。
-    /// `LearningSettings.swift` は変更しない方針のため、ここで env から直接解決する（読み書きとも
-    /// `converterLock` 下＝learning と同じ規律）。
-    private var typoLearn: Bool
     /// 自動確定の速さ（iOS の「自動確定の速さ」設定の移植）。読み(liveConvert)/書き(reload) とも
     /// `converterLock` 下（config と同じ規律）。
     private var autoCommit: AutoCommitStrength
@@ -524,7 +503,7 @@ public final class ConversionService: @unchecked Sendable {
     }
     /// Zenzai 推論の「重い」判定閾値（ms）。1回の推論がこれを超えたら zenzaiTooSlow=true。
     /// **TIP 側 IPC タイムアウトより前に自発的に古典へ落ちる安全裕度**として設定する。
-    /// convert/reconvert/typoConvert/moveClause は TIP 側 IPC_TIMEOUT_CONVERT(1200ms) に晒される
+    /// convert/reconvert/moveClause は TIP 側 IPC_TIMEOUT_CONVERT(1200ms) に晒される
     /// ため 800ms（400ms の裕度）。liveConvert は IPC_TIMEOUT_LIVE(400ms) に晒されるため
     /// 300ms（100ms の裕度）— 400ms に届く前にSwift側でフォールバックを決めないと、TIP 側が
     /// タイムアウトして Swift の liveConvert が呼ばれなくなり checkZenzaiTooSlowLocked が発火しない。
@@ -538,7 +517,7 @@ public final class ConversionService: @unchecked Sendable {
     /// zenzaiTooSlow 監視の初回スキップカウンタ。初回 cold spike（KVキャッシュがまだ温まっていない
     /// 一時的な遅延）で本来速いPCが誤って古典へ落ちるのを防ぐため、warmUp 完了後の最初の数回の
     /// Zenzai推論をスキップしてから監視を開始する。**実際に Zenzai 推論として実行されたもののみ**が
-    /// 消費する（合計回数ベース — op別でなく呼出順非依存。convert/liveConvert/typoConvert(literal)/
+    /// 消費する（合計回数ベース — op別でなく呼出順非依存。convert/liveConvert/
     /// reconvert/文節候補のいずれかの実推論から）。古典変換・ウォームアップ待ち・forceClassic・
     /// invalid/nonexistent weight の silent fallback・空入力・マージ/昇格/キャッシュ/自動確定の時間は
     /// 消費しない — 誤消費は Zenzai が一度も走らないまま skip を尽くし、最初の実推論が cold spike
@@ -586,6 +565,7 @@ public final class ConversionService: @unchecked Sendable {
         let env = ProcessInfo.processInfo.environment
         let cfg = ZenzaiConfig.resolve(exeDir: exeDir, environment: env)
         let learning = LearningSettings.resolve(environment: env)
+        if productionMain { _ = LearningMigration.prepare(environment: env, learning: learning) }
         if env["NOSPACEKEY_LEARNING"] == "1" && !learning.enabled {
             engineLog("ev=learning_degraded reason=dir_unavailable\n")  // 黙って壊れない（spec §1）
         }
@@ -593,7 +573,6 @@ public final class ConversionService: @unchecked Sendable {
                   llmClient: LLMClient(config: LLMConfig.resolve(environment: env)),
                   autoCommit: AutoCommitStrength.resolve(environment: env),
                   autoCommitMaxReading: AutoCommitLengthBackstop.resolve(environment: env),
-                  typoLearn: env["NOSPACEKEY_TYPO_LEARN"] != "0",
                   environment: env,
                   processRole: productionMain ? .mainClassicOnly : .legacy,
                   gpuWorkerSupervisor: productionMain
@@ -617,7 +596,6 @@ public final class ConversionService: @unchecked Sendable {
                             llmClient: LLMClient = LLMClient(config: LLMConfig.resolve(environment: [:])),
                             autoCommit: AutoCommitStrength = .weak,
                             autoCommitMaxReading: Int = 25,
-                            typoLearn: Bool = true,
                             environment: [String: String] = [:],
                             runtimeClient: ZenzaiRuntimeClient = NativeZenzaiRuntimeClient(),
                             processRole: ProcessRole = .legacy,
@@ -627,7 +605,7 @@ public final class ConversionService: @unchecked Sendable {
                             dictionaryRetryDelay: DispatchTimeInterval = .milliseconds(100)) {
         self.init(config: config, learning: learning, llmClient: llmClient,
                   autoCommit: autoCommit, autoCommitMaxReading: autoCommitMaxReading,
-                  typoLearn: typoLearn, environment: environment,
+                  environment: environment,
                   runtimeClient: runtimeClient,
                   fileSystem: .live,
                   processRole: processRole,
@@ -643,7 +621,6 @@ public final class ConversionService: @unchecked Sendable {
          llmClient: LLMClient = LLMClient(config: LLMConfig.resolve(environment: [:])),
          autoCommit: AutoCommitStrength = .weak,
          autoCommitMaxReading: Int = 25,
-         typoLearn: Bool = true,
          environment: [String: String] = [:],
          runtimeClient: ZenzaiRuntimeClient = NativeZenzaiRuntimeClient(),
          fileSystem: LearningFileSystem,
@@ -675,7 +652,6 @@ public final class ConversionService: @unchecked Sendable {
         self.learningPersistenceForTesting = learningPersistenceForTesting
         self.learningClearStartedForTesting = learningClearStartedForTesting
         self.dictionaryRetryDelay = dictionaryRetryDelay
-        self.typoLearn = typoLearn
         self.environment = environment
         self.desiredDictEnabled = UserDictionary.enabled(environment: environment)
         self.fileSystem = fileSystem
@@ -983,6 +959,8 @@ public final class ConversionService: @unchecked Sendable {
         converterLock.lock()
         defer { converterLock.unlock() }
         converter.importDynamicUserDictionary(dicdata)
+        inputPredictionConverter.importDynamicUserDictionary(dicdata)
+        inputPredictionConverter.stopComposition()
     }
 
     /// ReloadDictionary IPC の受け口: desired 状態を更新し、リロードを直列キューへ積んで**即返る**。
@@ -1068,6 +1046,8 @@ public final class ConversionService: @unchecked Sendable {
         converterLock.lock()
         defer { converterLock.unlock() }
         converter.importDynamicUserDictionary(dicdata)
+        inputPredictionConverter.importDynamicUserDictionary(dicdata)
+        inputPredictionConverter.stopComposition()
         // classic 経路は previousInputData 一致時に増分ラティスを使い辞書を索き直さないため、
         // 落とさないとリロード後の同一読み再変換に新語が出ない。Zenzai 実稼働中
         // （!tooSlow — isZenzaiOperationalLocked）は classic キャッシュを使わないので、
@@ -1173,6 +1153,9 @@ public final class ConversionService: @unchecked Sendable {
             let learningChanged = self.learning.enabled != newLearning.enabled || self.learningDirectory != newLearningDirectory
             if learningChanged && !learningPersistenceLock.try() { return false }
             defer { if learningChanged { learningPersistenceLock.unlock() } }
+            if learningChanged && newLearning.enabled && processRole == .mainClassicOnly {
+                _ = LearningMigration.prepare(environment: env, learning: newLearning)
+            }
             // Spec2: OFF へ切り替わる前に保留分を保存（.nothing では新規更新が止まり save も skip される
             // ＝保留分が「凍結」され、後で ON に戻すと古い保留分が書かれうる。先に保存して空にしておく。
             // 注: ライブラリの updateConfig(.nothing) は一時トライをクリアしない — LearningMemory.swift:645-650）。
@@ -1229,7 +1212,6 @@ public final class ConversionService: @unchecked Sendable {
             self.llmClient = LLMClient(config: newLLM)
             self.autoCommit = AutoCommitStrength.resolve(environment: env)
             self.autoCommitMaxReading = AutoCommitLengthBackstop.resolve(environment: env)
-            self.typoLearn = env["NOSPACEKEY_TYPO_LEARN"] != "0"
             // A model/runtime change starts a new native generation. Ordinary settings
             // reloads preserve a failure latch so a broken backend is not retried in a loop.
             if modelConfigurationChanged {
@@ -1282,7 +1264,7 @@ public final class ConversionService: @unchecked Sendable {
                     Thread.detachNewThread { [weak self] in self?.startWarmUp(explicitRetry: true) }
                 }
             }
-            engineLog("ev=reload_config zenzai=\(newZenzai.weightURL != nil) inference_limit=\(newZenzai.inferenceLimit) llm=\(newLLM.enabled) learning=\(newLearning.enabled) auto_commit=\(self.autoCommit.rawValue) auto_commit_max_reading=\(self.autoCommitMaxReading) typo_learn=\(self.typoLearn)\n")
+            engineLog("ev=reload_config zenzai=\(newZenzai.weightURL != nil) inference_limit=\(newZenzai.inferenceLimit) llm=\(newLLM.enabled) learning=\(newLearning.enabled) auto_commit=\(self.autoCommit.rawValue) auto_commit_max_reading=\(self.autoCommitMaxReading)\n")
             return true
         } else {
             // warm-up/変換中。config は現状維持（skip 安全 — 内部状態は壊れない）。
@@ -1697,9 +1679,6 @@ public final class ConversionService: @unchecked Sendable {
         }
         // commit(session:index:) が同じ並びの Candidate を index で引けるようキャッシュする。
         // 返す text 配列は mainResults と 1:1（同順）なので TIP 側 index がそのまま使える。
-        // レビューCritical だった「typoConvert 後に読みが変わらないまま convert()/liveConvert() が
-        // 呼ばれる経路で前回の修復 index が stale 残留」は、cacheCandidates が repairedIndices を
-        // 候補と同時に置き換える（省略時 nil）ことで消えている。
         rec.cacheCandidates(mainResults, target: rec.composing.convertTarget,
                             modelTop: rawResults.first?.text, promoted: promotedList != nil)
         sessions[session] = rec
@@ -1711,88 +1690,6 @@ public final class ConversionService: @unchecked Sendable {
         return results
     }
 
-    /// 修正変換(TypoConvert): ローマ字入力の「同一英字ちょうど2連打」を1文字へ縮約した仮説を
-    /// 列挙し、各仮説の古典変換候補を先頭に、通常(literal)変換候補を後続に連結した候補リストを返す。
-    /// 修復パターンが無ければ convert(session:leftContext:) と同じ（上位互換・キャッシュ意味論ごと委譲）。
-    /// 戻り値が nil なのは **未知セッションのときだけ**（既知セッションは空でも非nil）。
-    public func typoConvert(session: Int, leftContext: String? = nil) -> [String]? {
-        guard var rec = sessions[session] else { return nil }
-        // ローマ字列は input の .character piece を連結して得る。.character 以外の piece
-        // （direct 入力/reconvert 由来等）が混ざっていたら仮説なし扱い（roman2kana 前提が崩れるため）。
-        var roman = ""
-        var hasNonCharacterPiece = false
-        for element in rec.composing.input {
-            if case .character(let ch) = element.piece {
-                roman.append(ch)
-            } else {
-                hasNonCharacterPiece = true
-            }
-        }
-        let hyps = hasNonCharacterPiece ? [] : TypoRepair.hypotheses(roman: roman)
-        guard !hyps.isEmpty else {
-            // 前回 typoConvert の修復 index が残っていてもここで手動 nil はしない:
-            // 委譲先 convert の cacheCandidates（repairedIndices 省略=nil）が候補ごと必ず上書きする。
-            return convert(session: session, leftContext: leftContext)
-        }
-
-        converterLock.lock()
-        defer { converterLock.unlock() }
-        bindConverter(to: session)
-        let t0 = DispatchTime.now()
-
-        // literal（そのまま）変換を convert() と同じ options で先に実行する。仮説変換（使い捨て
-        // ComposingText）は converter の増分キャッシュを汚す（reconvert と同じ許容済みパターン）ため、
-        // 汚染の影響を literal 側に及ぼさないよう順序を固定する。
-        // 監視は literal の Zenzai .on 推論のみ: 仮説変換は forceClassic（古典）、マージ/重複除去は
-        // 後段処理なので、どちらも時間を数えず skip も消費させない。全区間を数える旧実装は
-        // 仮説数と辞書引きの遅さ次第で Zenzai 未実行のまま閾値を超え得た（High）。
-        let (literalOptions, literalRequestedZenzai) = makeOptionsWithZenzaiUsage(leftSideContext: leftContext)
-        let literalClassicOptions = makeOptions(leftSideContext: leftContext, forceClassic: true)
-        let literalT0 = DispatchTime.now()
-        let literalResults = requestCandidatesWithRuntimeFallbackLocked(
-            rec.composing, options: literalOptions, requestedZenzai: literalRequestedZenzai,
-            classicOptions: literalClassicOptions, leftContext: leftContext).mainResults
-        // 実稼働判定は literal の requestCandidates 直後に確定（convert と同じ規律 — 後続の
-        // forceClassic 仮説変換が converter を触る前に zenzStatus を読む）。
-        let literalUsedZenzai = zenzaiInferenceUsedLocked(requestedZenzai: literalRequestedZenzai,
-                                                          input: rec.composing.convertTarget)
-        let literalInferMs = Double(DispatchTime.now().uptimeNanoseconds &- literalT0.uptimeNanoseconds) / 1_000_000
-
-        var repaired: [Candidate] = []
-        for hyp in hyps {
-            var hypComposing = ComposingText()
-            hypComposing.insertAtCursorPosition(hyp, inputStyle: .roman2kana)
-            let hypResults = requestCandidatesLocked(hypComposing, options: makeOptions(nBest: 3, forceClassic: true)).mainResults
-            let covering = hypResults.filter { cand in
-                cand.data.reduce(0) { $0 + $1.ruby.count } == hypComposing.convertTarget.count
-            }
-            repaired.append(contentsOf: covering.prefix(3))
-        }
-        if repaired.count > 9 { repaired = Array(repaired.prefix(9)) }
-
-        // マージ: 修復ブロック→literal の順で連結し、text で重複除去(先勝ち)。
-        var seen = Set<String>()
-        var merged: [Candidate] = []
-        var repairedIndices = Set<Int>()
-        for cand in repaired {
-            guard seen.insert(cand.text).inserted else { continue }
-            repairedIndices.insert(merged.count)
-            merged.append(cand)
-        }
-        for cand in literalResults {
-            guard seen.insert(cand.text).inserted else { continue }
-            merged.append(cand)
-        }
-
-        rec.cacheCandidates(merged, target: rec.composing.convertTarget, repairedIndices: repairedIndices,
-                            modelTop: literalResults.first?.text)
-        sessions[session] = rec
-        let results = merged.map { $0.text }
-        let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000
-        checkZenzaiTooSlowLocked(ms: literalInferMs, thresholdMs: zenzaiSlowThresholdMs, usedZenzai: literalUsedZenzai)
-        engineLog("ev=infer kind=typo_convert ms=\(String(format: "%.1f", ms)) n=\(results.count) hyps=\(hyps.count) target_chars=\(rec.composing.convertTarget.count)\n")
-        return results
-    }
 
     /// 選択かな表層を「読み」として与え変換候補を返す（SP5 step-6）。
     /// surface は .direct で挿入する（roman2kana は使わない）。カタカナはひらがな読みへ正規化する。
@@ -1983,7 +1880,7 @@ public final class ConversionService: @unchecked Sendable {
         }))
     }
 
-    /// 候補が読み全体を被覆するか(typoConvert/liveConvert の被覆判定と同式)。
+    /// 候補が読み全体を被覆するか(liveConvert の被覆判定と同式)。
     private static func covers(_ cand: Candidate, targetCount: Int) -> Bool {
         cand.data.reduce(0) { $0 + $1.ruby.count } == targetCount
     }
@@ -2114,7 +2011,7 @@ public final class ConversionService: @unchecked Sendable {
         }
     }
 
-    // ---- テスト専用の観測窓(既存 typoRepairedIndices と同じ流儀。
+    // ---- テスト専用の観測窓（内部キャッシュを変更せず観測する。
     // 間接観測は辞書データ依存・学習効果との混同で再現性が無いため) ----
 
     /// テスト専用: 記録可否マップを迂回して直接 record する(昇格側の単体検証用)。
@@ -2203,7 +2100,6 @@ public final class ConversionService: @unchecked Sendable {
         // convert 後に読みが変わっていたら（insert/backspace）古い index は使わない。
         if let t = rec.cachedTarget, t != rec.composing.convertTarget { return nil }
         let candidate = cands[index]
-        let isRepaired = rec.typoRepairedIndices?.contains(index) == true
         converterLock.lock()
         defer { converterLock.unlock() }
         bindConverter(to: session)                                  // 別セッションの文脈をこの確定に混ぜない
@@ -2215,39 +2111,6 @@ public final class ConversionService: @unchecked Sendable {
             updateLearningDataLocked(candidate, session: session)   // Spec2: RAM 学習（ディスクは endSession で）
         }
 
-        if isRepaired {
-            // 修正変換(TypoConvert)の修復候補を確定: 読み全体を消費する（残り読みという概念が無い —
-            // 仮説は composingCount が literal の input 列と対応しないため prefixComplete は使えない）。
-            //
-            // 誤読み学習(ADR-0002): (誤読み全体, 修復表記) の合成ペアを学習器へ渡す。次回、通常の
-            // convert() でも誤読みのまま修復候補が浮上するようにするための唯一の経路。
-            // 予測変換(requireJapanesePrediction)は OFF 固定が前提: 学習辞書に入るこの「実在しない
-            // 読み」が他の入力へ漏れる唯一の経路は前方一致の先読みで、予測 OFF の間だけ閉じている。
-            // isLearningTarget ガード: 修復ブロックにもテンプレート候補が載り得る(vendor は
-            // forceClassic 経路にも parseTemplate を適用する)。素通しすると「誤読み→展開済み
-            // 日付」の合成ペアが恒久学習される(第3R敵対レビュー N-2 — commit() 注記の同型)。
-            if learning.enabled && typoLearn && candidate.isLearningTarget {
-                let synthetic = Candidate(
-                    text: candidate.text,
-                    value: candidate.value,
-                    composingCount: .inputCount(rec.composing.input.count),
-                    lastMid: candidate.lastMid,
-                    data: [DicdataElement(
-                        word: candidate.text,
-                        ruby: Self.toKatakana(rec.composing.convertTarget),
-                        lcid: candidate.data.first?.lcid ?? CIDData.一般名詞.cid,
-                        rcid: candidate.data.last?.rcid ?? CIDData.一般名詞.cid,
-                        mid: candidate.lastMid,
-                        value: candidate.value)])
-                updateLearningDataLocked(synthetic, session: session)
-                engineLog("ev=typo_learn ruby_chars=\(rec.composing.convertTarget.count) word_chars=\(candidate.text.count)\n")
-            }
-            rec.composing = ComposingText()                         // 読み全体を消費（次の入力はまっさらから）
-            rec.invalidateCandidateCache()
-            rec.liveState = nil
-            sessions[session] = rec
-            return (candidate.text, "")
-        }
 
         let wholeReading = rec.composing.convertTarget              // prefixComplete が破壊する前に採取
         let modelTop = rec.cachedModelTop                           // invalidateCandidateCache が消す前に採取
@@ -2273,8 +2136,8 @@ public final class ConversionService: @unchecked Sendable {
         // 昇格が押し下げたモデル1位の明示選択は「昇格の拒否」= un-learn。記録除外だけに
         // 留めると、誤登録した訂正の除去手段が ClearLearning(学習ごと全消し)しか無くなる
         // (第2R敵対レビュー②)。削除は再訂正でいつでも回復できる。
-        // promotedWindow を要求するのは、text == modelTop だけでは昇格の無い窓(typoConvert は
-        // 修復ブロックが先頭で literal 1位が index>0)での普通の選択と区別できず、訂正を
+        // promotedWindow を要求するのは、text == modelTop だけでは昇格の無い窓での
+        // 普通の選択と区別できず、訂正を
         // 誤削除するため(第3R敵対レビュー N-1 — 削除は fail-destructive なので記録除外の
         // 基準線をそのまま流用できない)。isLearningTarget はテンプレート1位の受容(日付が
         // 欲しかっただけ)を昇格拒否と読まないための保守側。
@@ -2443,10 +2306,6 @@ public final class ConversionService: @unchecked Sendable {
                 engineLog("ev=clause_seed_reject reason=stale_target cached_chars=\(rec.cachedTarget?.count ?? 0) now_chars=\(rec.composing.convertTarget.count)\n"); return nil }
             guard baseIndex >= 0, baseIndex < cands.count else {
                 engineLog("ev=clause_seed_reject reason=index_range base=\(baseIndex) n=\(cands.count)\n"); return nil }
-            // 修復候補は縮約仮説の読みを覆う＝literal の読みとは別物。covers は文字数比較なので
-            // 同数になる仮説が将来増えると素通りする — index 集合で明示的に弾く。
-            guard rec.typoRepairedIndices?.contains(baseIndex) != true else {
-                engineLog("ev=clause_seed_reject reason=typo_repaired base=\(baseIndex)\n"); return nil }
             let targetCount = rec.composing.convertTarget.count
             guard Self.covers(cands[baseIndex], targetCount: targetCount) else {
                 engineLog("ev=clause_seed_reject reason=not_covering base=\(baseIndex) target=\(targetCount)\n"); return nil }
@@ -2748,19 +2607,28 @@ public final class ConversionService: @unchecked Sendable {
         } ?? valid.first
     }
 
+    typealias SnapshotResult = (text: String, reading: String, candidates: [String]?, candidateRemaining: [String]?, baseline: UInt64,
+                                 autoCommit: SnapshotAutoCommitProposal?, clauseData: SnapshotClauseData)
+
     func snapshot(_ segments: [SnapshotSegment], explicit: Bool, leftContext: String? = nil,
                   enhancementKey: SnapshotEnhancementKey? = nil, snapshotConnection: Int = 0,
-                  liveSearchWidth: Int = 1)
-        -> (text: String, reading: String, candidates: [String]?, candidateRemaining: [String]?, baseline: UInt64,
-            autoCommit: SnapshotAutoCommitProposal?, clauseData: SnapshotClauseData)
-    {
+                  liveSearchWidth: Int = 1) -> SnapshotResult {
+        // Direct callers have no transport deadline; IPC uses the admission overload.
+        snapshot(segments, explicit: explicit, leftContext: leftContext, enhancementKey: enhancementKey,
+                 snapshotConnection: snapshotConnection, liveSearchWidth: liveSearchWidth, admissionDeadline: nil)!
+    }
+
+    func snapshot(_ segments: [SnapshotSegment], explicit: Bool, leftContext: String? = nil,
+                  enhancementKey: SnapshotEnhancementKey? = nil, snapshotConnection: Int = 0,
+                  liveSearchWidth: Int = 1, admissionDeadline: RequestDeadline?) -> SnapshotResult? {
         let composing = Self.makeSnapshotComposing(segments)
-        converterLock.lock()
+        guard RequestDeadline.acquire(converterLock, before: admissionDeadline) else { return nil }
         defer { converterLock.unlock() }
         stopCompositionLocked()
         let nBest = explicit || liveSearchWidth == 10 ? 10 : 1
         let options = makeOptions(nBest: nBest, leftSideContext: leftContext, forceClassic: true)
         var classic = requestCandidatesLocked(composing, options: options)
+        guard admissionDeadline?.expired != true else { return nil }
         if let snapshotCandidatesForTesting { classic.mainResults = snapshotCandidatesForTesting }
         let reading = composing.convertTarget
         let ranked = recentLearning.rank(
@@ -2822,6 +2690,48 @@ public final class ConversionService: @unchecked Sendable {
             candidate: selected, key: enhancementKey)
         clauseBaselines[baseline]?.clauses = data.clauses
         return (data.clauses.map(\.surface).joined(), reading, candidates, remaining, baseline, nil, data)
+    }
+
+    /// Completes the current reading without consuming it or producing an auto-commit proposal.
+    func inputPredictions(_ request: ClauseCandidatesRequest, admissionDeadline: RequestDeadline? = nil) -> InputPredictionsResult {
+        func empty() -> InputPredictionsResult { .init(key: request.key, candidates: []) }
+        let reading = ClauseCoordinates.normalize(request.reading)
+        guard !reading.isEmpty, reading.unicodeScalars.count <= 64,
+              request.reading_start == 0, request.reading_end == UInt32(reading.unicodeScalars.count),
+              request.preceding_surfaces.isEmpty,
+              reading.unicodeScalars.allSatisfy({ (0x3041...0x3096).contains($0.value) || $0.value == 0x30FC }),
+              (try? request.validate()) != nil else { return empty() }
+        guard RequestDeadline.acquire(converterLock, before: admissionDeadline) else { return empty() }
+        defer { converterLock.unlock() }
+        var input = ComposingText()
+        input.insertAtCursorPosition(reading, inputStyle: .direct)
+        var options = makeOptions(nBest: 30, forceClassic: true, noLearning: true)
+        options.requireJapanesePrediction = true
+        options.needTypoCorrection = false
+        inputPredictionConverter.stopComposition()
+        let dictionary = inputPredictionConverter.requestCandidates(input, options: options).mainResults
+        guard admissionDeadline?.expired != true else { return empty() }
+        let learned = learning.enabled ? recentLearning.predictions(reading: reading) : []
+        var seen = Set<String>()
+        let candidates = (learned + dictionary).filter { candidate in
+            let fullReading = ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined())
+            return !candidate.text.isEmpty && candidate.text != reading
+                && fullReading.hasPrefix(reading) && seen.insert(candidate.text).inserted
+        }.prefix(9)
+        let now = clauseClock()
+        clauseTokens = clauseTokens.filter { now - $0.value.issuedAt < 60 }
+        var result: [ClauseCandidate] = []
+        for candidate in candidates {
+            guard clauseTokens.count < 4096 else { break }
+            let token = newClauseTokenLocked()
+            clauseTokens[token] = ClauseTokenMaterial(candidate: candidate,
+                readingStart: 0, readingEnd: request.reading_end,
+                generation: currentLearningGeneration, issuedAt: now,
+                originalSurface: candidate.text, modelTop: nil, predictionReading: reading)
+            result.append(ClauseCandidate(surface: candidate.text, token: token,
+                reading_start: 0, reading_end: request.reading_end))
+        }
+        return InputPredictionsResult(key: request.key, candidates: result)
     }
 
     func snapshotClausesForTesting(reading: String, candidate: Candidate?) -> SnapshotClauseData {
@@ -2986,7 +2896,7 @@ public final class ConversionService: @unchecked Sendable {
                 guard material.readingStart == interval.reading_start,
                       material.readingEnd == interval.reading_end,
                       sameWireText(material.candidate.text, interval.surface),
-                      sameWireText(ClauseCoordinates.normalize(material.candidate.data.map(\.ruby).joined()), reading) else {
+                      sameWireText(material.predictionReading ?? ClauseCoordinates.normalize(material.candidate.data.map(\.ruby).joined()), reading) else {
                     return .rejected(.invalidToken)
                 }
                 materials.append(material)
@@ -3037,8 +2947,8 @@ public final class ConversionService: @unchecked Sendable {
         }
     }
 
-    func clauseCandidates(_ request: ClauseCandidatesRequest) -> ClauseCandidatesResult {
-        converterLock.lock()
+    func clauseCandidates(_ request: ClauseCandidatesRequest, admissionDeadline: RequestDeadline? = nil) -> ClauseCandidatesResult {
+        guard RequestDeadline.acquire(converterLock, before: admissionDeadline) else { return ClauseCandidatesResult(key: request.key, outcome: .unavailable(.expired)) }
         defer { converterLock.unlock() }
         let now = ProcessInfo.processInfo.systemUptime
         func unavailable(_ reason: ClauseUnavailableReason) -> ClauseCandidatesResult {
@@ -3070,15 +2980,15 @@ public final class ConversionService: @unchecked Sendable {
                     ? Self.sentenceAction(candidate, index: index, modelTop: native.modelTop, promoted: native.promoted) : nil)
         }
         let response: ClauseCandidatesResult
-        if ProcessInfo.processInfo.systemUptime - now >= 1.2 { response = unavailable(.expired) }
+        if admissionDeadline?.expired == true || ProcessInfo.processInfo.systemUptime - now >= 1.2 { response = unavailable(.expired) }
         else if candidates.isEmpty { response = unavailable(native.candidates.isEmpty ? .noCandidates : .busy) }
         else { response = ClauseCandidatesResult(key: request.key, outcome: .ready(candidates)) }
         clauseCandidateReplies[request.key] = (request, response, now)
         return response
     }
 
-    func convertClauses(_ request: ConvertClausesRequest) -> ConvertClausesResult {
-        converterLock.lock()
+    func convertClauses(_ request: ConvertClausesRequest, admissionDeadline: RequestDeadline? = nil) -> ConvertClausesResult {
+        guard RequestDeadline.acquire(converterLock, before: admissionDeadline) else { return ConvertClausesResult(key: request.key, outcome: .unavailable(.expired)) }
         defer { converterLock.unlock() }
         let now = ProcessInfo.processInfo.systemUptime
         func unavailable(_ reason: ClauseUnavailableReason) -> ConvertClausesResult {
@@ -3108,10 +3018,10 @@ public final class ConversionService: @unchecked Sendable {
                 candidate_token: retained?.token)
             clauses.append(clause)
             context += clause.surface
-            if ProcessInfo.processInfo.systemUptime - now >= 1.2 { break }
+            if admissionDeadline?.expired == true || ProcessInfo.processInfo.systemUptime - now >= 1.2 { break }
         }
         let response: ConvertClausesResult
-        if ProcessInfo.processInfo.systemUptime - now >= 1.2 { response = unavailable(.expired) }
+        if admissionDeadline?.expired == true || ProcessInfo.processInfo.systemUptime - now >= 1.2 { response = unavailable(.expired) }
         else if (try? request.validateResult(clauses)) == nil { response = unavailable(.invalidRequest) }
         else { response = ConvertClausesResult(key: request.key, outcome: .ready(clauses)) }
         clauseConversionReplies[request.key] = (request, response, now)
@@ -3730,7 +3640,7 @@ public final class ConversionService: @unchecked Sendable {
 
     /// 現 vendor 0.11.x が生成する名前だけを許可する。memory* の prefix だけでは
     /// `memory.backup` 等の foreign file を消すため、shard 以外は exact に限定する。
-    private static func isLearningArtifactName(_ name: String) -> Bool {
+    static func isLearningArtifactName(_ name: String) -> Bool {
         switch name {
         case ".pause", "corrections.json", "learningMemory.txt",
              "memory.louds", "memory.louds.2", "memory.loudschars2", "memory.loudschars2.2",
@@ -4003,8 +3913,7 @@ public final class ConversionService: @unchecked Sendable {
         )
     }
 
-    /// `forceClassic`: 修正変換(TypoConvert)の仮説変換専用。使い捨て ComposingText を Zenzai に
-    /// 通すと非決定的な上に高コストなので、修復仮説は常に古典（辞書）変換に固定する。
+    /// `forceClassic`: Deterministic dictionary conversion for snapshots and boundary reconstruction.
     /// `noLearning`: 文節境界の再導出専用。学習メモリの全文1エントリが 1 位を取り返すと
     /// 再導出まで単一要素に戻ってしまうため、そのリクエストだけ学習を外す。
     /// 実体は makeOptionsWithZenzaiUsage — フラグが不要な呼び出し側（forceClassic 仮説・辞書境界の

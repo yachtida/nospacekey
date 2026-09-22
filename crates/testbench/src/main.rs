@@ -9,6 +9,8 @@ mod receipt_relay;
 mod apply_faults;
 #[path = "../../tip/src/commit_session.rs"]
 mod commit_session;
+#[path = "../../tip/src/panic_guard.rs"]
+mod panic_guard;
 #[path = "../../tip/src/edit_range.rs"]
 mod edit_range;
 #[allow(dead_code)]
@@ -29,8 +31,8 @@ mod text_service {
     pub(crate) fn tip_log(message: &str) { crate::text_store::hlog(message); }
 }
 mod driver;
+mod input_prediction_acceptance;
 mod log_parse;
-mod manual_inline_apps;
 mod report;
 mod scenarios;
 mod text_store;
@@ -100,16 +102,14 @@ fn main() {
         "--item24" => run_item24_mode(),
         "--item29" => run_item29_mode(),
         "--item31" => run_item31_mode(),
-        "--item32" => run_item32_mode(),
         "--async-stress" => run_async_stress_mode(),
         "--async-burst" => run_async_burst_mode(),
         "--live-anchor" => run_live_anchor_mode(),
         "--live-clause-display" => live_clause_display::run(),
         "--pair-hold" => run_pair_hold_mode(args.get(2), args.get(3), args.get(4), args.get(5)),
         "--engine-absence" => run_engine_absence_mode(args.get(2), args.get(3), args.get(4)),
-        "--manual-inline-apps" => manual_inline_apps::run(),
-        "--manual-inline-host-apps" => manual_inline_apps::run_host(),
         "--keymap-smoke" => run_keymap_smoke(),
+        "--input-predictions" => input_prediction_acceptance::run(),
         "--diag" => tsf_host::diag(),
         other => {
             eprintln!("unknown mode: {other}");
@@ -1694,84 +1694,6 @@ fn run_item31_mode() -> i32 {
     }
 }
 
-/// item32: opt-in inline prediction acceptance test. It uses an isolated settings profile so the
-/// real user setting remains untouched. The evaluated model/runtime paths are supplied by env.
-fn run_item32_mode() -> i32 {
-    driver::kill_engine_processes();
-    struct EngineCleanup;
-    impl Drop for EngineCleanup {
-        fn drop(&mut self) {
-            driver::kill_engine_processes();
-        }
-    }
-    let _engine_cleanup = EngineCleanup;
-    if std::env::var_os("NOSPACEKEY_PREDICTION_MODEL_DIR").is_none() {
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            let installed = std::path::PathBuf::from(local)
-                .join("Nospacekey")
-                .join("models")
-                .join("inline-prediction");
-            if installed.join("VERIFIED").is_file() {
-                std::env::set_var("NOSPACEKEY_PREDICTION_MODEL_DIR", installed);
-            }
-        }
-    }
-    let Some(model_dir) = std::env::var_os("NOSPACEKEY_PREDICTION_MODEL_DIR") else {
-        eprintln!("item32 requires an installed model or NOSPACEKEY_PREDICTION_MODEL_DIR");
-        return 2;
-    };
-    let model_dir = std::path::PathBuf::from(model_dir);
-    if !model_dir.join("VERIFIED").is_file() || !model_dir.join("tokenizer.json").is_file() {
-        eprintln!(
-            "item32 prediction artifact pair is incomplete: {}",
-            model_dir.display()
-        );
-        return 2;
-    }
-    let scratch = match tempfile::Builder::new()
-        .prefix("nospacekey-item32-")
-        .tempdir()
-    {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("item32 scratch dir fail: {e:?}");
-            return 2;
-        }
-    };
-    std::env::set_var("LOCALAPPDATA", scratch.path());
-    let mut settings = settings::Settings::default();
-    settings.inline_prediction.enabled = true;
-    if let Err(e) = settings::save(&settings) {
-        eprintln!("item32 settings fixture fail: {e:?}");
-        return 2;
-    }
-    let _com = match tsf_host::ComSta::init() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("item32 ComSta::init fail: {e:?}");
-            return 2;
-        }
-    };
-    match tsf_host::TsfHost::start() {
-        Ok(host) => {
-            let result = driver::run_item32(&host);
-            println!(
-                "item32 : {} ({})",
-                if result.passed { "PASS" } else { "FAIL" },
-                result.detail
-            );
-            if result.passed {
-                0
-            } else {
-                1
-            }
-        }
-        Err(e) => {
-            eprintln!("item32 start fail: {e:?}");
-            2
-        }
-    }
-}
 
 /// keymap リマップのヘッドレススモーク。settings は Activate 時 1 回読みなので、
 /// TIP ロード前に専用 LOCALAPPDATA へ書き換え済み settings.json を書いてから活性化する

@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { command, errorMessage, onEvent } from "../bridge/tauri";
-import type { ModelOperationStatus, ModelStatus, ZenzaiRuntimeStatus } from "../bridge/types";
-import { CommitField, InlineError, SegmentedChoice, SettingRow, SettingsGroup, StatusMessage, Switch } from "../components/SettingsPrimitives";
+import type { ModelOperationStatus, ModelStatus, SettingsSnapshot, ZenzaiLatencyTier, ZenzaiRuntimeStatus } from "../bridge/types";
+import { CommitField, InlineError, SegmentedChoice, SettingRow, SettingsGroup, StatusMessage } from "../components/SettingsPrimitives";
 import { useSettings } from "../settings/SettingsStore";
 
-type PredictionStatus = { state: "ready" | "missing" | "invalid" | "unavailable"; path: string };
 type Progress = { attempt_id: number; received: number; total?: number; percent?: number; file?: string };
 
 function runtimeLabel(status?: ZenzaiRuntimeStatus) {
@@ -19,7 +18,7 @@ function runtimeLabel(status?: ZenzaiRuntimeStatus) {
 }
 
 function operationLabel(operation: ModelOperationStatus) {
-  const model = operation.modelKind === "zenzai" ? "Zenzai" : "インライン予測";
+  const model = "Zenzai";
   switch (operation.phase) {
     case "downloading": return `${model}: ダウンロード中`;
     case "verifying": return `${model}: 検証中`;
@@ -31,85 +30,111 @@ function operationLabel(operation: ModelOperationStatus) {
   }
 }
 
+function LatencyDetails({ runtime }: { runtime?: ZenzaiRuntimeStatus }) {
+  const tiers: Array<[string, ZenzaiLatencyTier | undefined]> = [
+    ["ライブ変換", runtime?.latency_live], ["スペース変換", runtime?.latency_convert],
+  ];
+  const milliseconds = (value: number) => Math.round(value) + " ms";
+  return <details className="details-panel" id="setting-conversion-latency" tabIndex={-1}><summary>変換速度の詳細</summary><div className="details-body latency-details">
+    <p className="setting-description">GPUでの候補評価に成功した直近100回までの処理時間です。入力内容は含みません。95%の時間は、成功した処理の約95%が終わるまでの目安です。</p>
+    <div className="latency-table-wrap"><table className="latency-table">
+      <thead><tr><th>処理</th><th>成功数</th><th>中央値</th><th>95%の時間</th><th>最大</th><th>時間切れ</th></tr></thead>
+      <tbody>{tiers.map(([label, stats]) => <tr key={label}><td>{label}</td>
+        {stats ? <><td>{stats.count}回</td><td>{stats.count ? milliseconds(stats.p50_ms) : "—"}</td><td>{stats.count ? milliseconds(stats.p95_ms) : "—"}</td><td>{stats.count ? milliseconds(stats.max_ms) : "—"}</td><td>{stats.timeout_count}回</td></> : <td colSpan={5}>まだ計測結果がありません</td>}
+      </tr>)}</tbody>
+    </table></div>
+    <p className="setting-description">時間切れは計測開始からの累計です。時間切れが続く場合は、詳細調整の推論上限を下げるか、標準変換をお試しください。「状態を再確認」で更新します。</p>
+  </div></details>;
+}
+
 export function EnginePage() {
-  const { values, save, errors } = useSettings();
+  const { values, save, errors, acceptSnapshot } = useSettings();
   const [model, setModel] = useState<ModelStatus>();
-  const [prediction, setPrediction] = useState<PredictionStatus>();
   const [runtime, setRuntime] = useState<ZenzaiRuntimeStatus>();
   const [failure, setFailure] = useState("");
   const [message, setMessage] = useState("");
   const [zenzaiBusy, setZenzaiBusy] = useState(false);
-  const [predictionBusy, setPredictionBusy] = useState(false);
   const [zenzaiProgress, setZenzaiProgress] = useState(0);
-  const [predictionProgress, setPredictionProgress] = useState(0);
   const [operations, setOperations] = useState<ModelOperationStatus[]>([]);
   const [runtimeCheckedAt, setRuntimeCheckedAt] = useState<Date>();
   const generation = useRef(0);
+  const minimumGeneration = useRef(0);
+  const downloadPending = useRef(false);
   const zenzaiAttempt = useRef<number | undefined>(undefined);
-  const predictionAttempt = useRef<number | undefined>(undefined);
 
   const refresh = useCallback(async () => {
     const currentGeneration = ++generation.current;
     const results = await Promise.allSettled([
       command<ModelStatus>("zenzai_model_status"),
-      command<PredictionStatus>("prediction_model_status"),
       command<ZenzaiRuntimeStatus>("zenzai_runtime_status"),
       command<ModelOperationStatus[]>("model_operation_status"),
     ]);
-    if (generation.current !== currentGeneration) return;
+    if (currentGeneration < minimumGeneration.current) return;
+    minimumGeneration.current = currentGeneration;
     if (results[0].status === "fulfilled") setModel(results[0].value);
-    if (results[1].status === "fulfilled") setPrediction(results[1].value);
-    if (results[2].status === "fulfilled") {
-      setRuntime(results[2].value);
+    if (results[1].status === "fulfilled") {
+      setRuntime(results[1].value);
       setRuntimeCheckedAt(new Date());
     }
-    if (results[3].status === "fulfilled") {
-      setOperations(results[3].value);
-      for (const operation of results[3].value) {
-        const active = !["succeeded", "failed", "cancelled"].includes(operation.phase);
-        if (operation.modelKind === "zenzai") {
-          setZenzaiBusy(active);
-          if (active) zenzaiAttempt.current = operation.operationId;
-          if (operation.progress !== null) setZenzaiProgress(operation.progress);
-        } else {
-          setPredictionBusy(active);
-          if (active) predictionAttempt.current = operation.operationId;
-          if (operation.progress !== null) setPredictionProgress(operation.progress);
-        }
+    if (results[2].status === "fulfilled") {
+      setOperations(results[2].value);
+      const operation = results[2].value.find((item) => item.modelKind === "zenzai");
+      const active = operation && !["succeeded", "failed", "cancelled"].includes(operation.phase);
+      setZenzaiBusy(downloadPending.current || Boolean(active));
+      if (operation && (!downloadPending.current || operation.operationId === zenzaiAttempt.current)) {
+        if (active) zenzaiAttempt.current = operation.operationId;
+        if (operation.progress !== null) setZenzaiProgress(operation.progress);
       }
     }
     const rejected = results.find((result) => result.status === "rejected");
     setFailure(rejected?.status === "rejected" ? errorMessage(rejected.reason) : "");
   }, []);
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => { void refresh(); return () => { minimumGeneration.current = ++generation.current; }; }, [refresh]);
   useEffect(() => {
-    if (!zenzaiBusy && !predictionBusy) return;
-    const timer = window.setInterval(() => { void refresh(); }, 500);
-    return () => window.clearInterval(timer);
-  }, [predictionBusy, refresh, zenzaiBusy]);
+    if (!zenzaiBusy) return;
+    let disposed = false;
+    let timer: number;
+    const poll = async () => {
+      await refresh();
+      if (!disposed) timer = window.setTimeout(() => void poll(), 500);
+    };
+    timer = window.setTimeout(() => void poll(), 500);
+    return () => { disposed = true; window.clearTimeout(timer); };
+  }, [zenzaiBusy, refresh]);
   useEffect(() => {
-    const unlisteners: Array<() => void> = [];
-    void onEvent<Progress>("zenzai-download-progress", (progress) => { if (progress.attempt_id === zenzaiAttempt.current) setZenzaiProgress(progress.percent ?? 0); }).then((fn) => unlisteners.push(fn));
-    void onEvent<Progress>("prediction-download-progress", (progress) => { if (progress.attempt_id === predictionAttempt.current) setPredictionProgress(progress.percent ?? 0); }).then((fn) => unlisteners.push(fn));
-    return () => unlisteners.forEach((fn) => fn());
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void onEvent<Progress>("zenzai-download-progress", (progress) => {
+      if (!disposed && progress.attempt_id === zenzaiAttempt.current) setZenzaiProgress(progress.percent ?? 0);
+    }).then((fn) => { if (disposed) fn(); else unlisten = fn; })
+      .catch((error) => { if (!disposed) setFailure(errorMessage(error)); });
+    return () => { disposed = true; unlisten?.(); };
   }, []);
 
   if (!values) return null;
   const downloadZenzai = async (activate: boolean) => {
+    if (downloadPending.current) return;
+    downloadPending.current = true;
+    minimumGeneration.current = ++generation.current;
     setZenzaiBusy(true); setFailure(""); setMessage(""); setZenzaiProgress(0);
     const attemptId = Date.now();
     zenzaiAttempt.current = attemptId;
-    try { setMessage(await command<string>("download_zenzai_model", { activate, attemptId })); await refresh(); }
-    catch (error) { setFailure(errorMessage(error)); }
-    finally { zenzaiAttempt.current = undefined; setZenzaiBusy(false); }
+    try {
+      setMessage(await command<string>("download_zenzai_model", { activate, attemptId }));
+      if (activate) acceptSnapshot(await command<SettingsSnapshot>("settings_snapshot"));
+      await refresh();
+    } catch (error) { setFailure(errorMessage(error)); }
+    finally {
+      downloadPending.current = false;
+      minimumGeneration.current = ++generation.current;
+      zenzaiAttempt.current = undefined;
+      setZenzaiBusy(false);
+    }
   };
-  const downloadPrediction = async (activate: boolean) => {
-    setPredictionBusy(true); setFailure(""); setMessage(""); setPredictionProgress(0);
-    const attemptId = Date.now();
-    predictionAttempt.current = attemptId;
-    try { setMessage(await command<string>("download_prediction_model", { activate, attemptId })); await refresh(); }
+  const cancelDownload = async () => {
+    if (zenzaiAttempt.current === undefined) return;
+    try { await command("cancel_zenzai_download", { attemptId: zenzaiAttempt.current }); }
     catch (error) { setFailure(errorMessage(error)); }
-    finally { predictionAttempt.current = undefined; setPredictionBusy(false); }
   };
   const retryGpu = async () => {
     setFailure("");
@@ -118,7 +143,7 @@ export function EnginePage() {
   };
   return (
     <div className="page-stack">
-      <header className="page-heading"><h1>変換・予測エンジン</h1><p>希望する方式、モデルの準備状況、実際に確認できた動作を分けて表示します。</p></header>
+      <header className="page-heading"><h1>変換エンジン</h1><p>希望する方式、モデルの準備状況、実際に確認できた動作を分けて表示します。</p></header>
       {failure && <StatusMessage tone="error">{failure}</StatusMessage>}
       {message && <StatusMessage tone="success">{message}</StatusMessage>}
       {operations.some((operation) => !["succeeded", "failed", "cancelled"].includes(operation.phase)) && <StatusMessage tone="warning">モデル処理: {operations.filter((operation) => !["succeeded", "failed", "cancelled"].includes(operation.phase)).map(operationLabel).join(" / ")}</StatusMessage>}
@@ -128,9 +153,10 @@ export function EnginePage() {
         </SettingRow>
       </SettingsGroup>
       <section className="operation-panel"><div><span className="eyebrow">現在の動作</span><h2>{runtimeLabel(runtime)}</h2><p>{runtime && runtimeCheckedAt ? `この画面で確認した結果です（${runtimeCheckedAt.toLocaleTimeString()}）。` : "保存値から動作を推定していません。"}</p></div><div className="operation-actions"><button type="button" onClick={() => void refresh()}>状態を再確認</button><button type="button" onClick={() => void retryGpu()}>GPUを再試行</button></div></section>
+      <LatencyDetails runtime={runtime} />
       <SettingsGroup title="Zenzaiモデル">
         <SettingRow id="zenzai-model" title={model?.installed ? model.valid ? "モデル導入済み" : "モデルが破損または不完全です" : "モデル未導入"} description={model?.installed ? `${model.path}（${model.source || "自動検出"}）` : "zenz-v3.1-small（約70MB、CC-BY-SA-4.0）をHuggingFaceから取得します。"}>
-          <div className="control-stack">{model?.installed ? <button type="button" disabled={zenzaiBusy} onClick={() => void downloadZenzai(false)}>再取得・修復</button> : <><button type="button" disabled={zenzaiBusy} onClick={() => void downloadZenzai(false)}>ダウンロードのみ</button><button type="button" className="primary" disabled={zenzaiBusy} onClick={() => void downloadZenzai(true)}>ダウンロードして有効にする</button></>}{zenzaiBusy && <button type="button" onClick={() => void command("cancel_zenzai_download", { attemptId: zenzaiAttempt.current })}>取消</button>}</div>
+          <div className="control-stack">{model?.installed ? <button type="button" disabled={zenzaiBusy} onClick={() => void downloadZenzai(false)}>再取得・修復</button> : <><button type="button" disabled={zenzaiBusy} onClick={() => void downloadZenzai(false)}>ダウンロードのみ</button><button type="button" className="primary" disabled={zenzaiBusy} onClick={() => void downloadZenzai(true)}>ダウンロードして有効にする</button></>}{zenzaiBusy && <button type="button" onClick={() => void cancelDownload()}>取消</button>}</div>
           {zenzaiBusy && <progress value={zenzaiProgress} max={100} aria-label="Zenzaiモデルの取得進捗" />}
         </SettingRow>
       </SettingsGroup>
@@ -138,8 +164,6 @@ export function EnginePage() {
         <SettingRow id="zenzai-path" title="任意GGUFパス" description="空欄では管理領域または同梱モデルを自動検出します。絶対パスだけを保存できます。" effect="次回のエンジン接続から"><CommitField value={values.weightPath} label="GGUFパス" placeholder="C:\\…\\model.gguf" onCommit={(value) => save({ field: "weight_path", value })} /><InlineError errors={errors} field="weight_path" /></SettingRow>
         <SettingRow id="zenzai-limit" title="推論上限" description="1〜10。値が大きいほど推論回数が増えます。" effect="次回のエンジン接続から"><CommitField type="number" min={1} max={10} step={1} value={values.zenzaiInferenceLimit} label="推論上限" onCommit={(value) => save({ field: "zenzai_inference_limit", value: Number(value) })} /><InlineError errors={errors} field="zenzai_inference_limit" /></SettingRow>
       </div></details>
-      <section className="operation-panel"><div><span className="eyebrow">アルファ版</span><h2>インライン予測</h2><p>明示確定後に文の続きを薄く表示します。Zenzaiとは独立した専用モデルを使い、入力を外部送信しません。</p><p className="model-state">モデル: {prediction?.state === "ready" ? "準備済み" : prediction?.state === "invalid" ? "破損または不完全" : prediction?.state === "unavailable" ? "保存先を確認できません" : "未導入"}</p></div><div className="operation-actions"><Switch checked={values.inlinePredictionEnabled} onChange={(value) => save({ field: "inline_prediction_enabled", value })} label="インライン予測" />{prediction?.state === "ready" ? <button type="button" disabled={predictionBusy} onClick={() => void downloadPrediction(false)}>再取得・修復</button> : <><button type="button" disabled={predictionBusy} onClick={() => void downloadPrediction(false)}>ダウンロードのみ（約171MB）</button><button type="button" disabled={predictionBusy} onClick={() => void downloadPrediction(true)}>ダウンロードして有効にする</button></>}{predictionBusy && <button type="button" onClick={() => void command("cancel_prediction_model_download", { attemptId: predictionAttempt.current })}>取消</button>}{predictionBusy && <progress value={predictionProgress} max={100} aria-label="予測モデルの取得進捗" />}</div></section>
-      <InlineError errors={errors} field="inline_prediction_enabled" />
     </div>
   );
 }

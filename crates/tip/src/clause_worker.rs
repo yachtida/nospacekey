@@ -34,6 +34,7 @@ pub(crate) struct ClauseWorker {
 
 fn failure(request: &Request, key: ClauseRequestKey, reason: ClauseUnavailableReason) -> Response {
     match request {
+        Request::InputPredictions(_) => Response::InputPredictionsResult { key, candidates: vec![] },
         Request::ConvertClauses(_) => Response::ConvertClausesResult {
             key,
             status: ConvertClausesStatus::Unavailable { reason },
@@ -120,7 +121,7 @@ impl ClauseWorker {
 
     pub fn submit(&self, request: Request, deadline: Instant) -> bool {
         let key = match &request {
-            Request::ClauseCandidates(r) => r.key,
+            Request::InputPredictions(r) | Request::ClauseCandidates(r) => r.key,
             Request::ConvertClauses(r) => r.key,
             _ => return false,
         };

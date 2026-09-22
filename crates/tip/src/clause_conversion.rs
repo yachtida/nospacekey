@@ -184,6 +184,16 @@ impl ClauseConversion {
         })
     }
 
+    pub fn from_predictions(identity: SnapshotIdentity, reading: String, candidates: Vec<ClauseCandidate>, index: usize) -> Option<Self> {
+        let mut model = Self::from_reading(identity, reading)?;
+        let clause = model.clauses.first()?;
+        model.cache.insert(clause.id, CachedCandidates { start: clause.start, end: clause.end,
+            preceding: vec![], candidates: candidates.clone() });
+        model.window = CandidateWindow::Ready { clause: clause.id, candidates, selected: 0 };
+        model.mode = OperationMode::Converting;
+        model.select_candidate(index).then_some(model)
+    }
+
     pub fn reset_notation_cycle(&mut self) { self.notation_cycle = None; }
 
     /// Freeze the applied live clauses on the first Space. A locally typed

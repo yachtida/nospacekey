@@ -27,7 +27,8 @@ use windows::Win32::UI::TextServices::{
 
 // この DLL の RT_GROUP_ICON ID は 1 始まりだが、TSF の uIconIndex はファイル内の 0 始まり位置。
 // 0 始まり位置の解釈は MS ドキュメントに明記がなく、Win10/11 入力インジケーターの実測と
-// register.rs の抽出テスト(profile_icon_index_is_bound_to_the_last_icon_group)で固定している。
+// register.rs の抽出テストで固定している。登録なしの DLL 差し替えと互換にするため、
+// プロファイルアイコンの位置 6（リソース ID 7）は将来も動かさない。
 const PROFILE_ICON_INDEX: u32 = (crate::langbar_icon::RES_PROFILE_N - 1) as u32;
 
 /// GUID をレジストリ正規形 `{8-4-4-4-12}`（大文字）にして返す。
@@ -408,21 +409,22 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn profile_icon_index_is_bound_to_the_last_icon_group() {
-        // 位置 = ID - 1 の不変条件の網: 末尾の1つ先の位置は解決不可(=最終位置は N-1)、
-        // 負数インデックス(リソースID参照)で ID N が存在する。リソースの**追加・欠落**は
-        // 検出する。同一個数のまま ID と .ico の対応を入れ替えても位置には別のアイコンが
-        // 入るだけで全て緑のまま(内容同一性は検査しない)。register_for_target が定数を
-        // 使うこと自体もこのテストの守備範囲外。
+    fn profile_icon_index_stays_backward_compatible() {
+        // dev-deploy -Only tip は再登録せず DLL だけを差し替える。従来の
+        // uIconIndex=6 が引き続き profile-n.ico を指す契約を数値と抽出の両方で固定する。
+        assert_eq!(PROFILE_ICON_INDEX, 6);
         assert!(module_icon_extractable(PROFILE_ICON_INDEX as i32));
-        assert!(
-            !module_icon_extractable(crate::langbar_icon::RES_PROFILE_N as i32),
-            "one past the last icon must not resolve"
-        );
         assert!(
             module_icon_extractable(-(crate::langbar_icon::RES_PROFILE_N as i32)),
             "resource ID must exist; negative index resolves by resource ID"
         );
+        // Zenzai 用リソースを後ろへ追加しても、新しい末尾位置まで解決できる。
+        assert!(module_icon_extractable(
+            (crate::langbar_icon::RES_MODE_EPHEMERAL_ZENZAI_DARK - 1) as i32
+        ));
+        assert!(!module_icon_extractable(
+            crate::langbar_icon::RES_MODE_EPHEMERAL_ZENZAI_DARK as i32
+        ));
     }
 
     #[test]

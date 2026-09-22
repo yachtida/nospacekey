@@ -12,7 +12,6 @@ ipc = { path = "../ipc" }
 ids = { path = "../ids" }
 settings = { path = "../settings" }
 nospacekey-lifetime = { path = "../lifetime" }
-tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
 # P5 display deletion is fixed to UAX #29 / Unicode 15.1.
 unicode-segmentation = "=1.11.0"
 semver = "1"

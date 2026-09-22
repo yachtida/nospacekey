@@ -16,8 +16,5 @@ pub const GUID_DISPLAY_ATTRIBUTE_TARGET: GUID =
 /// 非選択の変換済み文節の表示属性GUID。
 pub const GUID_DISPLAY_ATTRIBUTE_CONVERTED: GUID =
     GUID::from_u128(0x47615d96_e659_4259_a83e_04371873ea20);
-/// インライン予測ゴースト（灰色文字＋点線下線）の表示属性GUID。
-pub const GUID_DISPLAY_ATTRIBUTE_PREDICTION: GUID =
-    GUID::from_u128(0x6d8ce4c7_2e21_4b7a_9a5c_f08f446fe96a);
 /// 日本語（ja-JP）の LANGID。
 pub const LANGID_JA: u16 = 0x0411;

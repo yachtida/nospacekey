@@ -104,7 +104,6 @@ fn probe_preedit_attributes(host: &TsfHost) -> Vec<String> {
                 if guid == ids::GUID_DISPLAY_ATTRIBUTE_TARGET { "target".into() }
                 else if guid == ids::GUID_DISPLAY_ATTRIBUTE_CONVERTED { "converted".into() }
                 else if guid == ids::GUID_DISPLAY_ATTRIBUTE { "input".into() }
-                else if guid == ids::GUID_DISPLAY_ATTRIBUTE_PREDICTION { "prediction".into() }
                 else { format!("guid({guid:?})") }
             }
         })

@@ -37,6 +37,7 @@ mod globals;
 #[allow(dead_code)]
 pub(crate) mod input_module;
 mod input_state;
+mod input_prediction;
 // Task 4 wires the model-free state/worker to the runtime IPC.
 mod key_event_sink;
 mod keymap;
@@ -46,11 +47,9 @@ mod llm_worker;
 pub mod local_kana_composer;
 mod mode_hud;
 mod popup;
+mod panic_guard;
 mod power;
 #[allow(dead_code)]
-mod prediction_state;
-#[allow(dead_code)]
-mod prediction_worker;
 mod reading_monitor;
 mod register;
 mod render;

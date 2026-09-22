@@ -106,12 +106,6 @@ impl LiveSettings {
     }
 }
 
-/// 完全ローカルのインライン予測。モデル取得前に勝手に有効化しない opt-in 機能。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct InlinePredictionSettings {
-    pub enabled: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearningSettings {
     pub enabled: bool,
@@ -120,14 +114,6 @@ impl Default for LearningSettings {
     fn default() -> Self {
         Self { enabled: true }
     }
-}
-
-/// 品質ループ③: 誤変換ワンキー記録（Ctrl+変換 → feedback.jsonl）。**既定 OFF＝opt-in**
-/// （NOSPACEKEY_LOG の診断ログとは独立の opt-in — 既定状態で新規に書かれるものはゼロ）。
-/// `enabled: false` が既定なので Default は derive（clippy::derivable_impls）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FeedbackSettings {
-    pub enabled: bool,
 }
 
 /// かな入力モードで数字を既定で全角確定するか。既定 true（全角）。いつでも設定で切替可能。
@@ -192,38 +178,6 @@ impl SymbolSettings {
     /// 判定ロジックを Activate に書かない。
     pub fn symbol_overlay(&self) -> bool {
         self.full_width && !self.effective_chars().is_empty()
-    }
-}
-
-/// 一時的なかなモード（トリガキーで一時的にかな入力へ入り、確定で自動的に半角英数へ戻る）。
-/// ターミナル/vim 向けに「日本語モードの抜け忘れ」を防ぐ。既定 ON・トリガは F8。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EphemeralSettings {
-    pub enabled: bool,
-    pub trigger: String,
-}
-impl Default for EphemeralSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            trigger: "f8".into(),
-        }
-    }
-}
-
-/// 修正変換(Tab): 読みのタイポ修復候補を提示する。`learn` は修復候補確定時の
-/// 誤読み学習(合成ペア — engine env NOSPACEKEY_TYPO_LEARN)。両方とも既定 ON。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TypoCorrectSettings {
-    pub enabled: bool,
-    pub learn: bool,
-}
-impl Default for TypoCorrectSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            learn: true,
-        }
     }
 }
 
@@ -322,9 +276,9 @@ pub struct Settings {
     pub zenzai: ZenzaiSettings,
     #[serde(default)]
     pub live_conversion: LiveSettings,
-    /// 明示確定後のローカル続き予測。欠落する旧 settings.json は OFF。
-    #[serde(default)]
-    pub inline_prediction: InlinePredictionSettings,
+    /// 入力中の辞書予測候補。旧設定からの移行も既定ON。
+    #[serde(default = "default_true")]
+    pub input_prediction_enabled: bool,
     /// Spec2: かな漢字変換の学習（確定候補を以後の順位に反映）。既定 ON。
     /// engine env `NOSPACEKEY_LEARNING`（"1"/"0"）へ resolve_env_map が常に注入する。
     #[serde(default)]
@@ -338,10 +292,6 @@ pub struct Settings {
     /// A 段: 外観（配色/フォント/角丸/バックドロップ）。欠落は既定 Appearance。
     #[serde(default)]
     pub appearance: Appearance,
-    /// 品質ループ③: 誤変換ワンキー記録（feedback.jsonl）。既定 false=opt-in。
-    /// フィールド欠落の旧 settings.json は false でロード（後方互換）。
-    #[serde(default)]
-    pub feedback: FeedbackSettings,
     /// かな入力モードの数字既定幅（true=全角）。欠落の旧 settings.json は true でロード。
     #[serde(default)]
     pub number: NumberSettings,
@@ -351,14 +301,6 @@ pub struct Settings {
     /// かな入力モードの記号既定幅（false=半角 ASCII）。欠落の旧 settings.json は false でロード。
     #[serde(default)]
     pub symbol: SymbolSettings,
-    /// 一時的なかなモード（トリガキーで一時的にかな入力へ、確定で自動的に半角英数へ戻る）。
-    /// 欠落の旧 settings.json は既定（enabled=true, trigger="f8"）でロード。
-    #[serde(default)]
-    pub ephemeral: EphemeralSettings,
-    /// 修正変換(Tab): 読みのタイポ修復候補。欠落の旧 settings.json は既定
-    /// （enabled=true, learn=true）でロード。
-    #[serde(default)]
-    pub typo_correct: TypoCorrectSettings,
     /// Shift+英字の挙動（"compose"=英語未確定モード / "commit"=大文字直接確定）。
     /// 欠落の旧 settings.json は "compose" でロード。TIP ローカル設定（engine env 非注入）。
     #[serde(default)]
@@ -384,16 +326,13 @@ impl Default for Settings {
             llm: Default::default(),
             zenzai: Default::default(),
             live_conversion: Default::default(),
-            inline_prediction: Default::default(),
+            input_prediction_enabled: true,
             learning: Default::default(),
             default_direct: false,
             appearance: Default::default(),
-            feedback: Default::default(),
             number: Default::default(),
             punctuation: Default::default(),
             symbol: Default::default(),
-            ephemeral: EphemeralSettings::default(),
-            typo_correct: Default::default(),
             shift_latin: Default::default(),
             reading_monitor: Default::default(),
             keymap: Default::default(),
@@ -587,11 +526,35 @@ pub fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
     Some((r, g, b))
 }
 
+// Legacy switches are consumed at the JSON boundary; runtime and saved settings
+// have only keymap.ephemeral. Remove the legacy object on save so a later key
+// assignment cannot be disabled again on the next load.
+fn parse_current_settings(text: &str) -> serde_json::Result<Settings> {
+    let mut value: serde_json::Value = serde_json::from_str(text)?;
+    if let Some(legacy) = value.as_object_mut().and_then(|v| v.remove("ephemeral")) {
+        let enabled = legacy.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let trigger = legacy.get("trigger").and_then(|v| v.as_str()).unwrap_or("f8");
+        if let Some(object) = value.as_object_mut() {
+            let keymap = object.entry("keymap").or_insert_with(|| serde_json::json!({}));
+            if let Some(keymap) = keymap.as_object_mut() {
+                if !enabled {
+                    keymap.insert("ephemeral".into(), serde_json::json!("none"));
+                } else if keymap.get("ephemeral").is_none_or(|v| v.is_null()) {
+                    if matches!(trigger, "f9" | "f10") {
+                        keymap.insert("ephemeral".into(), serde_json::json!(trigger.to_uppercase()));
+                    }
+                }
+            }
+        }
+    }
+    serde_json::from_value(value)
+}
+
 impl Settings {
     pub fn from_json_str(s: &str) -> Settings {
         // 巡4 J6: migrate と対の第2パース経路でも normalize_loaded を通す（lib の migrate
         // doc が「load_reporting / from_json_str の両経路」と契約する正規化 choke point）。
-        serde_json::from_str(s)
+        parse_current_settings(s)
             .map(|s| normalize_loaded(migrate(s)))
             .unwrap_or_default()
     }
@@ -851,10 +814,44 @@ pub fn load_reporting() -> (Settings, LoadOutcome) {
 /// Consumers that must preserve the settings path (for example, the background
 /// update checker) must use this API instead of [`load_reporting`].
 pub fn load_reporting_read_only() -> (Settings, LoadOutcome) {
+    let snapshot = load_snapshot_read_only();
+    (snapshot.settings, snapshot.outcome)
+}
+
+/// Values and source bytes from one read, so revision checks cannot describe a
+/// different file from the values presented to the caller. Never serialize the
+/// source bytes: they also contain settings that are private to the backend.
+pub struct SettingsRead {
+    pub settings: Settings,
+    pub outcome: LoadOutcome,
+    pub contents: Option<Vec<u8>>,
+}
+
+pub fn load_snapshot_read_only() -> SettingsRead {
     let Some(path) = settings_path() else {
-        return (Settings::default(), LoadOutcome::NoPath);
+        return SettingsRead {
+            settings: Settings::default(), outcome: LoadOutcome::NoPath, contents: None,
+        };
     };
-    load_reporting_from_with(&path, |path| std::fs::read_to_string(path))
+    load_snapshot_from_with(&path, |path| std::fs::read(path))
+}
+
+fn load_snapshot_from_with(
+    path: &Path,
+    read: impl FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+) -> SettingsRead {
+    match read(path) {
+        Ok(contents) => {
+            let (settings, outcome) = match std::str::from_utf8(&contents) {
+                Ok(text) => parse_settings_text(text),
+                Err(_) => (Settings::default(), LoadOutcome::IoError),
+            };
+            SettingsRead { settings, outcome, contents: Some(contents) }
+        }
+        Err(error) => SettingsRead {
+            settings: Settings::default(), outcome: classify_read_error(error.kind()), contents: None,
+        },
+    }
 }
 
 /// Read-modify-save 用の loader。読み取り失敗や quarantine 失敗を既定値へ畳まず、
@@ -994,7 +991,7 @@ fn parse_settings_text(text: &str) -> (Settings, LoadOutcome) {
             LoadOutcome::UnsupportedVersion,
         );
     }
-    match serde_json::from_str::<Settings>(text) {
+    match parse_current_settings(text) {
         Ok(s) => (normalize_loaded(migrate(s)), LoadOutcome::Loaded),
         Err(_) => (Settings::default(), LoadOutcome::Corrupt),
     }
@@ -1061,6 +1058,16 @@ fn merged_settings_json(existing: Option<&str>, settings: &Settings) -> std::io:
             }
         }
     };
+    if let Some(object) = destination.as_object_mut() {
+        object.remove("ephemeral");
+        object.remove("typo_correct");
+        object.remove("inline_prediction");
+        object.remove("feedback");
+        if let Some(keymap) = object.get_mut("keymap").and_then(|v| v.as_object_mut()) {
+            keymap.remove("typo_correct");
+            keymap.remove("feedback");
+        }
+    }
     let known = serde_json::to_value(settings).map_err(std::io::Error::other)?;
     merge_known_fields(&mut destination, known);
     serde_json::to_string_pretty(&destination).map_err(std::io::Error::other)
@@ -1238,24 +1245,8 @@ pub fn resolve_env_map(
         },
     );
     put(
-        "NOSPACEKEY_TYPO_LEARN",
-        if s.typo_correct.learn {
-            "1".into()
-        } else {
-            "0".into()
-        },
-    );
-    put(
         "NOSPACEKEY_USER_DICT_ENABLED",
         if s.user_dictionary.enabled {
-            "1".into()
-        } else {
-            "0".into()
-        },
-    );
-    put(
-        "NOSPACEKEY_INLINE_PREDICTION",
-        if s.inline_prediction.enabled {
             "1".into()
         } else {
             "0".into()
@@ -1267,6 +1258,46 @@ pub fn resolve_env_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_values_and_contents_come_from_the_same_read() {
+        let mut file = Settings::default();
+        file.default_direct = true;
+        let original = file.to_json().into_bytes();
+        let read = load_snapshot_from_with(Path::new("unused"), |_| {
+            let returned = original.clone();
+            // A writer replaces the file after this read, before the caller hashes it.
+            file.default_direct = false;
+            Ok(returned)
+        });
+        assert!(!file.default_direct);
+        assert!(read.settings.default_direct);
+        assert_eq!(read.outcome, LoadOutcome::Loaded);
+        assert_eq!(read.contents.as_deref(), Some(original.as_slice()));
+    }
+
+    #[test]
+    fn snapshot_retains_unreadable_and_corrupt_outcomes_without_writing() {
+        let denied = load_snapshot_from_with(Path::new("unused"), |_| {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        });
+        assert_eq!(denied.outcome, LoadOutcome::PermissionDenied);
+        assert!(denied.contents.is_none());
+        let corrupt = load_snapshot_from_with(Path::new("unused"), |_| Ok(b"broken".to_vec()));
+        assert_eq!(corrupt.outcome, LoadOutcome::Corrupt);
+        assert_eq!(corrupt.contents.as_deref(), Some(b"broken".as_slice()));
+    }
+
+    #[test]
+    fn removed_typo_settings_do_not_disable_normal_learning_or_restore_a_key() {
+        let old = r#"{"version":2,"typo_correct":{"enabled":true,"learn":true},"keymap":{"typo_correct":"Ctrl+KeyJ"},"learning":{"enabled":true}}"#;
+        let settings = Settings::from_json_str(old);
+        assert!(settings.learning.enabled);
+        let saved = merged_settings_json(Some(old), &settings).unwrap();
+        assert!(!saved.contains("typo_correct"));
+        assert!(!resolve_env_map(&settings, None, |_| None).iter()
+            .any(|(key, _)| key == "NOSPACEKEY_TYPO_LEARN"));
+    }
 
     #[test]
     fn latest_corrupt_backup_ignores_unrelated_and_non_regular_entries() {
@@ -2119,19 +2150,6 @@ mod tests {
     }
 
     #[test]
-    fn feedback_settings_default_disabled_and_roundtrips() {
-        // opt-in: 既定 false。フィールド欠落の旧 settings.json でも false でロード（後方互換）。
-        assert!(!Settings::default().feedback.enabled);
-        let s: Settings = serde_json::from_str(r#"{"version":1}"#).unwrap();
-        assert!(!s.feedback.enabled);
-        // ON がラウンドトリップする。
-        let mut s = Settings::default();
-        s.feedback.enabled = true;
-        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
-        assert!(back.feedback.enabled);
-    }
-
-    #[test]
     fn learning_defaults_to_enabled_and_resolves_env() {
         // 既定 ON（settings.json 欠落フィールドは true でロード — 後方互換）。
         let s = Settings::default();
@@ -2333,46 +2351,28 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_defaults_and_old_json_compat() {
-        assert!(Settings::default().ephemeral.enabled);
-        assert_eq!(Settings::default().ephemeral.trigger, "f8");
-        // ephemeral フィールドを欠く旧 JSON も既定で埋まる（#[serde(default)]）。
-        // version は #[serde(default)] が無い必須フィールドなので他の後方互換テストと
-        // 同じく明示する（欠くと version 必須で from_str 自体が失敗する）。
-        let old = r#"{"version":1,"number":{"full_width":true}}"#;
-        let s: Settings = serde_json::from_str(old).unwrap();
-        assert!(s.ephemeral.enabled);
-        assert_eq!(s.ephemeral.trigger, "f8");
+    fn ephemeral_migration_preserves_effective_binding_and_can_be_reassigned() {
+        for (legacy, key, expected) in [
+            (r#"{"enabled":false,"trigger":"f8"}"#, "null", Some("none")),
+            (r#"{"enabled":false,"trigger":"f9"}"#, r#""F10""#, Some("none")),
+            (r#"{"enabled":true,"trigger":"f8"}"#, "null", None),
+            (r#"{"enabled":true,"trigger":"f9"}"#, "null", Some("F9")),
+            (r#"{"enabled":true,"trigger":"f10"}"#, r#""Ctrl+KeyJ""#, Some("Ctrl+KeyJ")),
+            (r#"{"enabled":true,"trigger":"f9"}"#, r#""none""#, Some("none")),
+        ] {
+            let old = format!(r#"{{"version":2,"ephemeral":{legacy},"keymap":{{"ephemeral":{key}}}}}"#);
+            let (mut settings, outcome) = parse_settings_text(&old);
+            assert_eq!(outcome, LoadOutcome::Loaded);
+            assert_eq!(settings.keymap.ephemeral.as_deref(), expected);
+            settings.keymap.ephemeral = Some("F10".into());
+            let saved = merged_settings_json(Some(&old), &settings).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&saved).unwrap();
+            assert!(json.get("ephemeral").is_none());
+            assert_eq!(Settings::from_json_str(&saved).keymap.ephemeral.as_deref(), Some("F10"));
+        }
+        assert_eq!(Settings::from_json_str(r#"{"version":2}"#).keymap.ephemeral, None);
     }
 
-    #[test]
-    fn typo_correct_defaults_to_enabled_and_resolves_env() {
-        // 既定 ON（settings.json 欠落フィールドは true/true でロード — 後方互換）。
-        let s = Settings::default();
-        assert!(s.typo_correct.enabled);
-        assert!(s.typo_correct.learn);
-        let js = r#"{"version":1}"#; // typo_correct フィールド無しの旧 settings.json
-        let loaded = Settings::from_json_str(js);
-        assert!(loaded.typo_correct.enabled);
-        assert!(loaded.typo_correct.learn);
-
-        // resolve_env_map: 常に NOSPACEKEY_TYPO_LEARN を注入（NOSPACEKEY_LEARNING と同じ「常時 put」）。
-        let env = resolve_env_map(&s, None, |_| None);
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "NOSPACEKEY_TYPO_LEARN" && v == "1"));
-        let mut off = s.clone();
-        off.typo_correct.learn = false;
-        let env = resolve_env_map(&off, None, |_| None);
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "NOSPACEKEY_TYPO_LEARN" && v == "0"));
-        // D6: ユーザーが env で明示 override していれば注入しない。
-        let env = resolve_env_map(&s, None, |k| {
-            (k == "NOSPACEKEY_TYPO_LEARN").then(|| "0".into())
-        });
-        assert!(!env.iter().any(|(k, _)| k == "NOSPACEKEY_TYPO_LEARN"));
-    }
 
     #[test]
     fn appearance_roundtrips_through_json() {
@@ -2534,19 +2534,26 @@ mod tests {
     }
 
     #[test]
-    fn inline_prediction_defaults_off_and_roundtrips() {
-        let old = Settings::from_json_str(r#"{"version":2}"#);
-        assert!(!old.inline_prediction.enabled);
-        let mut enabled = Settings::default();
-        enabled.inline_prediction.enabled = true;
-        assert!(
-            Settings::from_json_str(&enabled.to_json())
-                .inline_prediction
-                .enabled
-        );
-        let env = resolve_env_map(&enabled, None, |_| None);
-        assert!(env
-            .iter()
-            .any(|(key, value)| { key == "NOSPACEKEY_INLINE_PREDICTION" && value == "1" }));
+    fn reading_prediction_default_and_override_ignore_removed_inline_setting() {
+        for enabled in [false, true] {
+            let old = format!(r#"{{"version":2,"inline_prediction":{{"enabled":{enabled}}}}}"#);
+            assert!(Settings::from_json_str(&old).input_prediction_enabled);
+        }
+        let settings = Settings::from_json_str(r#"{"version":2,"input_prediction_enabled":false,"inline_prediction":{"enabled":true}}"#);
+        assert!(!settings.input_prediction_enabled);
+        assert!(!settings.to_json().contains("inline_prediction"));
+        assert!(!Settings::from_json_str(&settings.to_json()).input_prediction_enabled);
     }
+
+    #[test]
+    fn removed_feedback_settings_are_ignored_and_removed_on_save() {
+        let old = r#"{"version":2,"feedback":{"enabled":true},"keymap":{"feedback":"Ctrl+Slash","to_katakana":"Ctrl+Slash"}}"#;
+        let settings = Settings::from_json_str(old);
+        assert_eq!(settings.keymap.to_katakana.as_deref(), Some("Ctrl+Slash"));
+        assert!(!settings.to_json().contains("feedback"));
+        let saved = merged_settings_json(Some(old), &settings).unwrap();
+        assert!(!saved.contains("feedback"));
+        assert!(keymap::find_conflicts(&settings.keymap, "f8", false).is_empty());
+    }
+
 }

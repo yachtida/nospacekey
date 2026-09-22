@@ -38,11 +38,7 @@ to be placed on the GPU; input, tokenization, candidate generation, and other
 lightweight control work may remain on the CPU. A missing or unusable backend,
 GPU, driver, model, context, or warm-up is a classic-conversion condition; the
 product never falls back to CPU Zenzai. Built from the azooKey/llama.cpp fork,
-tag `b4846`. The optional
-`prediction-runtime` also bundles `llama-server.exe`, `llama-server-impl.dll`,
-`llama-common.dll`, `mtmd.dll`, and the same ggml runtime family, built from
-upstream llama.cpp revision `c060ca974c773c7c3d17fd1b66dc9d312bc292c0` for
-local inline prediction.
+tag `b4846`.
 
 `ggml-vulkan.dll` is part of the MIT-licensed ggml/llama.cpp runtime and is a
 required signed file in the Zenzai distribution. `vulkan-1.dll` is not bundled:
@@ -77,29 +73,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
-
----
-
-## LLM-jp-3-150m
-
-**What it is:** The optional local language model and tokenizer used for inline
-prediction. The app downloads the pinned upstream tokenizer and the project's
-pinned Q8_0 conversion only after an explicit user action; the model is not
-part of the source tree or base installer.
-
-**Source:** `llm-jp/llm-jp-3-150m`, revision
-`b112feef602fff752e4dac4c30af6a2c2fa41c7a`
-
-**Modifications:** The project's redistributed model artifact,
-`llm-jp-3-150m-q8_0-c060ca9.gguf`, was converted to GGUF and quantized to Q8_0
-from that upstream checkpoint using llama.cpp revision
-`c060ca974c773c7c3d17fd1b66dc9d312bc292c0`.
-No fine-tuning or additional training was performed. The tokenizer is
-downloaded unchanged from the pinned upstream revision.
-
-**License:** Apache License, Version 2.0 (full text below)
-
-**Copyright:** LLM-jp contributors
 
 ---
 
@@ -460,7 +433,6 @@ notice in the subsections immediately after this table.
 | `time` | 0.3.53 | MIT OR Apache-2.0 | Jacob Pratt; Time contributors |
 | `time-core` | 0.1.9 | MIT OR Apache-2.0 | Jacob Pratt; Time contributors |
 | `tinystr` | 0.8.3 | Unicode-3.0 | The ICU4X Project Developers |
-| `tokenizers` | 0.23.1 | Apache-2.0 | Anthony Moi; Nicolas Patry |
 | `tokio` | 1.52.3 | MIT | Tokio Contributors |
 | `tokio-native-tls` | 0.3.1 | MIT | Tokio Contributors |
 | `tokio-util` | 0.7.18 | MIT | Tokio Contributors |

@@ -25,6 +25,7 @@ type QueueItem = {
   operationId: string;
   changes: SettingChange[];
   baseValues?: PublicSettings;
+  baseRevision?: string;
   conflictRetries?: number;
 };
 
@@ -54,14 +55,11 @@ export function applyLocalChange(values: PublicSettings, change: SettingChange):
     case "default_direct":
       next.defaultDirect = Boolean(change.value);
       break;
+    case "input_prediction_enabled":
+      next.inputPredictionEnabled = Boolean(change.value);
+      break;
     case "live_enabled":
       next.liveEnabled = Boolean(change.value);
-      break;
-    case "ephemeral_enabled":
-      next.ephemeralEnabled = Boolean(change.value);
-      break;
-    case "ephemeral_legacy_trigger":
-      next.ephemeralTrigger = String(change.value);
       break;
     case "shift_latin_mode":
       next.shiftLatinMode = change.value as PublicSettings["shiftLatinMode"];
@@ -77,12 +75,6 @@ export function applyLocalChange(values: PublicSettings, change: SettingChange):
       break;
     case "symbol_full_width_chars":
       next.symbolFullWidthChars = clone(change.value as string[]);
-      break;
-    case "typo_correct_enabled":
-      next.typoCorrectEnabled = Boolean(change.value);
-      break;
-    case "typo_correct_learn":
-      next.typoCorrectLearn = Boolean(change.value);
       break;
     case "key_binding": {
       const value = change.value as { function: string; binding: string | null };
@@ -140,14 +132,8 @@ export function applyLocalChange(values: PublicSettings, change: SettingChange):
     case "live_search_width":
       next.liveSearchWidth = Number(change.value);
       break;
-    case "inline_prediction_enabled":
-      next.inlinePredictionEnabled = Boolean(change.value);
-      break;
     case "update_include_beta":
       next.updateIncludeBeta = Boolean(change.value);
-      break;
-    case "feedback_enabled":
-      next.feedbackEnabled = Boolean(change.value);
       break;
   }
   return next;
@@ -164,16 +150,13 @@ function replay(snapshot: SettingsSnapshot, active: QueueItem | undefined, queue
 function changeValue(values: PublicSettings, change: SettingChange): unknown {
   switch (change.field) {
     case "default_direct": return values.defaultDirect;
+    case "input_prediction_enabled": return values.inputPredictionEnabled;
     case "live_enabled": return values.liveEnabled;
-    case "ephemeral_enabled": return values.ephemeralEnabled;
-    case "ephemeral_legacy_trigger": return values.ephemeralTrigger;
     case "shift_latin_mode": return values.shiftLatinMode;
     case "number_full_width": return values.numberFullWidth;
     case "punctuation_full_width": return values.punctuationFullWidth;
     case "symbol_full_width": return values.symbolFullWidth;
     case "symbol_full_width_chars": return values.symbolFullWidthChars;
-    case "typo_correct_enabled": return values.typoCorrectEnabled;
-    case "typo_correct_learn": return values.typoCorrectLearn;
     case "key_binding": return values.keymap[change.value.function];
     case "appearance_theme": return values.appearance.theme;
     case "appearance_font_family": return values.appearance.font_family;
@@ -190,9 +173,7 @@ function changeValue(values: PublicSettings, change: SettingChange): unknown {
     case "weight_path": return values.weightPath;
     case "zenzai_inference_limit": return values.zenzaiInferenceLimit;
     case "live_search_width": return values.liveSearchWidth;
-    case "inline_prediction_enabled": return values.inlinePredictionEnabled;
     case "update_include_beta": return values.updateIncludeBeta;
-    case "feedback_enabled": return values.feedbackEnabled;
   }
 }
 
@@ -225,25 +206,43 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   const discardedConflictTargets = useRef<Set<string>>(new Set());
   const paused = useRef(false);
 
-  const updateSnapshot = useCallback((next: SettingsSnapshot) => {
+  const updateSnapshot = useCallback((incoming: SettingsSnapshot) => {
+    const current = snapshotRef.current;
+    const next = current && current.sequence > incoming.sequence ? current : incoming;
     snapshotRef.current = next;
     setSnapshot(next);
-    setValues(replay(next, active.current, queue.current));
+    const pendingConflict = conflictItem.current;
+    const pending = pendingConflict ? {
+      ...pendingConflict,
+      changes: pendingConflict.changes.filter(
+        (change) => !discardedConflictTargets.current.has(changeTarget(change)),
+      ),
+    } : active.current;
+    setValues(replay(next, pending, queue.current));
+    if (pendingConflict) {
+      setConflict((current) => current && ({
+        fields: current.fields.map((field) => {
+          const change = pendingConflict.changes.find((item) => changeTarget(item) === field.field);
+          return change ? { ...field, saved: changeValue(next.values, change) } : field;
+        }),
+      }));
+    }
+    return next;
   }, []);
 
   const refresh = useCallback(async () => {
     setLoadError(undefined);
     try {
       const next = await command<SettingsSnapshot>("settings_snapshot");
-      snapshotRef.current = next;
-      setSnapshot(next);
-      setValues(replay(next, active.current, queue.current));
-      setSaveState(active.current || queue.current.length ? "saving" : "saved");
+      updateSnapshot(next);
+      setSaveState(paused.current ? "blocked" : active.current || queue.current.length ? "saving" : "saved");
+      return true;
     } catch (error) {
       setLoadError(errorMessage(error));
       setSaveState("blocked");
+      return false;
     }
-  }, []);
+  }, [updateSnapshot]);
 
   const drainRef = useRef<() => Promise<void>>(async () => undefined);
   drainRef.current = async () => {
@@ -254,6 +253,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       return;
     }
     item.baseValues ??= clone(snapshotRef.current.values);
+    item.baseRevision ??= snapshotRef.current.revision;
     active.current = item;
     setSaveState("saving");
     setErrors([]);
@@ -262,7 +262,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       result = await command<SettingsPatchResult>("settings_patch", {
         request: {
           operationId: item.operationId,
-          baseRevision: snapshotRef.current.revision,
+          baseRevision: item.baseRevision,
           changes: item.changes,
         },
       });
@@ -290,34 +290,38 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     active.current = undefined;
     if (result.kind === "saved") {
       setEffects(result.effects);
-      snapshotRef.current = result.snapshot;
-      setSnapshot(result.snapshot);
-      setValues(replay(result.snapshot, undefined, queue.current));
+      updateSnapshot(result.snapshot);
       void drainRef.current();
       return;
     }
     if (result.kind === "conflict") {
-      snapshotRef.current = result.snapshot;
-      setSnapshot(result.snapshot);
-      const changedFields = conflictingChanges(item.baseValues!, result.snapshot.values, item.changes);
-      if (!changedFields.length && (item.conflictRetries ?? 0) < 1) {
+      const latest = updateSnapshot(result.snapshot);
+      const changedFields = conflictingChanges(item.baseValues!, latest.values, item.changes);
+      if (!changedFields.length) {
         queue.current.unshift({
           ...item,
           operationId: crypto.randomUUID(),
-          baseValues: clone(result.snapshot.values),
+          baseValues: clone(latest.values),
+          baseRevision: latest.revision,
           conflictRetries: (item.conflictRetries ?? 0) + 1,
         });
-        setValues(replay(result.snapshot, undefined, queue.current));
-        void drainRef.current();
+        setValues(replay(latest, undefined, queue.current));
+        if ((item.conflictRetries ?? 0) < 1) {
+          void drainRef.current();
+        } else {
+          paused.current = true;
+          setErrors([{ field: "_conflict", message: "別の処理による設定変更が続いています。編集内容は保持しています。少し待ってから再試行してください。" }]);
+          setSaveState("blocked");
+        }
         return;
       }
       conflictItem.current = item;
       discardedConflictTargets.current.clear();
       paused.current = true;
-      setValues(replay(result.snapshot, item, queue.current));
+      setValues(replay(latest, item, queue.current));
       setConflict({ fields: changedFields.map((change) => ({
         field: changeTarget(change),
-        saved: changeValue(result.snapshot.values, change),
+        saved: changeValue(latest.values, change),
         edited: change.value,
       })) });
       setErrors([
@@ -329,16 +333,19 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       setSaveState("blocked");
       return;
     }
+    if (result.errors.some((error) => error.field === "_io")) {
+      // Rejected operations are cached by Rust; an explicit retry needs a new ID.
+      queue.current.unshift({ ...item, operationId: crypto.randomUUID() });
+      paused.current = true;
+    }
     if (result.snapshot) {
-      snapshotRef.current = result.snapshot;
-      setSnapshot(result.snapshot);
-      setValues(replay(result.snapshot, undefined, queue.current));
+      updateSnapshot(result.snapshot);
     } else if (snapshotRef.current) {
       setValues(replay(snapshotRef.current, undefined, queue.current));
     }
     setErrors(result.errors);
-    setSaveState(queue.current.length ? "saving" : "blocked");
-    if (queue.current.length) void drainRef.current();
+    setSaveState(!paused.current && queue.current.length ? "saving" : "blocked");
+    if (!paused.current && queue.current.length) void drainRef.current();
   };
 
   const save = useCallback((change: SettingChange | SettingChange[]) => {
@@ -347,16 +354,21 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     setValues((current) =>
       current ? changes.reduce(applyLocalChange, current) : current,
     );
-    setSaveState("saving");
+    setSaveState(paused.current ? "blocked" : "saving");
     void drainRef.current();
   }, []);
 
-  const retry = useCallback(() => {
+  const retry = useCallback(async () => {
+    if (conflictItem.current) return;
+    if (!snapshotRef.current || loadError) {
+      setSaveState("loading");
+      if (!await refresh()) return;
+    }
     paused.current = false;
     setErrors([]);
     setSaveState("saving");
     void drainRef.current();
-  }, []);
+  }, [loadError, refresh]);
 
   const resolveConflict = useCallback((field: string, keepEdited: boolean) => {
     const item = conflictItem.current;
@@ -390,11 +402,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     void drainRef.current();
   }, [conflict]);
 
-  const acceptSnapshot = useCallback((next: SettingsSnapshot) => {
-    snapshotRef.current = next;
-    setSnapshot(next);
-    setValues(replay(next, active.current, queue.current));
-  }, []);
+  const acceptSnapshot = updateSnapshot;
 
   useEffect(() => {
     void refresh();

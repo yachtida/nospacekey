@@ -50,10 +50,8 @@ const NOTATIONS: [(KeymapFunc, Notation); 5] = [
 pub struct Keymap {
     pub mode_toggle: Binding,
     pub reconvert: Binding,
-    pub feedback: Binding,
     ephemeral: Option<KeyChord>,
     commit_undo: Option<KeyChord>,
-    typo: Option<KeyChord>,
     llm: Option<KeyChord>,
     notations: [Option<KeyChord>; 5], // NOTATIONS と同順
     notation_rotate: Option<KeyChord>,
@@ -83,7 +81,7 @@ impl Keymap {
     pub fn from_settings(s: &settings::Settings) -> Self {
         use KeymapFunc::*;
         let km = &s.keymap;
-        let legacy = s.ephemeral.trigger.as_str();
+        let legacy = "f8";
         let mut notations = [None; 5];
         for (i, (f, _)) in NOTATIONS.iter().enumerate() {
             notations[i] = sink_chord(km.get(*f), *f, legacy);
@@ -91,10 +89,8 @@ impl Keymap {
         Keymap {
             mode_toggle: resolve_binding(&km.mode_toggle),
             reconvert: resolve_binding(&km.reconvert),
-            feedback: resolve_binding(&km.feedback),
             ephemeral: sink_chord(&km.ephemeral, Ephemeral, legacy),
             commit_undo: sink_chord(&km.commit_undo, CommitUndo, legacy),
-            typo: sink_chord(&km.typo_correct, TypoCorrect, legacy),
             llm: sink_chord(&km.llm_convert, LlmConvert, legacy),
             notations,
             notation_rotate: sink_chord(&km.notation_rotate, NotationRotate, legacy),
@@ -124,7 +120,6 @@ pub enum KeyAction {
     ModeToggle,
     Ephemeral,
     CommitUndo,
-    Typo,
     Llm,
     Notation(Notation),
     NotationRotate,
@@ -139,8 +134,6 @@ pub struct ActionInput {
     pub showing: bool,
     pub direct: bool,
     pub undo_armed: bool,
-    pub ephemeral_enabled: bool,
-    pub typo_enabled: bool,
     pub llm_enabled: bool,
 }
 
@@ -176,14 +169,11 @@ pub fn resolve_action(km: &Keymap, i: &ActionInput) -> KeyAction {
         return KeyAction::CommitUndo;
     }
     // Ephemeral: direct+idle。
-    if i.ephemeral_enabled && i.direct && idle && hit(km.ephemeral) {
+    if i.direct && idle && hit(km.ephemeral) {
         return KeyAction::Ephemeral;
     }
     // Composing 系(native composing)。
     if i.composing && !i.direct {
-        if i.typo_enabled && hit(km.typo) {
-            return KeyAction::Typo;
-        }
         if i.llm_enabled && hit(km.llm) {
             return KeyAction::Llm;
         }
@@ -246,9 +236,9 @@ pub struct PreservedReg {
     pub desc: &'static str,
 }
 
-pub fn build_preserved_regs(km: &Keymap, feedback_enabled: bool) -> Vec<PreservedReg> {
+pub fn build_preserved_regs(km: &Keymap) -> Vec<PreservedReg> {
     use crate::globals::{
-        GUID_PRESERVEDKEY_FEEDBACK, GUID_PRESERVEDKEY_FEEDBACK_US, GUID_PRESERVEDKEY_MODE_TOGGLE,
+        GUID_PRESERVEDKEY_MODE_TOGGLE,
         GUID_PRESERVEDKEY_MODE_TOGGLE_HZ, GUID_PRESERVEDKEY_MODE_TOGGLE_US,
         GUID_PRESERVEDKEY_RECONVERT, GUID_PRESERVEDKEY_RECONVERT_US,
     };
@@ -312,31 +302,6 @@ pub fn build_preserved_regs(km: &Keymap, feedback_enabled: bool) -> Vec<Preserve
             desc: "nospacekey reconvert",
         }),
         Binding::Disabled => {}
-    }
-    if feedback_enabled {
-        match km.feedback {
-            Binding::Default => {
-                out.push(PreservedReg {
-                    guid: GUID_PRESERVEDKEY_FEEDBACK,
-                    vk: 0x1C,
-                    modifiers: TF_MOD_CONTROL,
-                    desc: "nospacekey feedback",
-                });
-                out.push(PreservedReg {
-                    guid: GUID_PRESERVEDKEY_FEEDBACK_US,
-                    vk: 0xBF,
-                    modifiers: TF_MOD_CONTROL,
-                    desc: "nospacekey feedback (US)",
-                });
-            }
-            Binding::Chord(c) => out.push(PreservedReg {
-                guid: GUID_PRESERVEDKEY_FEEDBACK,
-                vk: c.vk,
-                modifiers: mods(c),
-                desc: "nospacekey feedback",
-            }),
-            Binding::Disabled => {}
-        }
     }
     out
 }
@@ -406,7 +371,7 @@ mod tests {
                     ..ainput(0x09)
                 }
             ),
-            KeyAction::Typo
+            KeyAction::None
         );
         assert_eq!(
             resolve_action(
@@ -425,7 +390,6 @@ mod tests {
                 &km,
                 &ActionInput {
                     composing: true,
-                    typo_enabled: false,
                     ..ainput(0x09)
                 }
             ),
@@ -492,8 +456,7 @@ mod tests {
     #[test]
     fn disabled_and_legacy_trigger_resolve() {
         let mut s = settings::Settings::default();
-        s.keymap.typo_correct = Some("none".into());
-        s.ephemeral.trigger = "f9".into(); // 旧設定のフォールバック(keymap.ephemeral は None)
+        s.keymap.ephemeral = Some("F9".into()); // Migrated legacy trigger.
         let km = Keymap::from_settings(&s);
         assert_eq!(
             resolve_action(
@@ -553,8 +516,6 @@ mod tests {
             showing: false,
             direct: false,
             undo_armed: false,
-            ephemeral_enabled: true,
-            typo_enabled: true,
             llm_enabled: true,
         }
     }
@@ -848,9 +809,9 @@ mod tests {
     #[test]
     fn preserved_regs_reflect_bindings() {
         use windows::Win32::UI::TextServices::{TF_MOD_ALT, TF_MOD_CONTROL};
-        // 既定: JIS/US/半角全角 の 3 登録(toggle)+ JIS/US(reconvert)+ feedback は enabled 時のみ。
+        // 既定: JIS/US/半角全角 の 3 登録(toggle)+ JIS/US(reconvert)。
         let km = Keymap::default();
-        let regs = build_preserved_regs(&km, false);
+        let regs = build_preserved_regs(&km);
         assert_eq!(regs.len(), 5);
         assert!(regs.iter().any(|r| r.vk == 0x1D && r.modifiers == 0));
         assert!(regs
@@ -860,18 +821,27 @@ mod tests {
             regs.iter().any(|r| r.vk == 0xF3 && r.modifiers == 0),
             "半角/全角の第3登録"
         );
-        let regs = build_preserved_regs(&km, true);
-        assert_eq!(regs.len(), 7);
-        assert!(regs
-            .iter()
-            .any(|r| r.vk == 0x1C && r.modifiers == TF_MOD_CONTROL));
         // 明示バインド: 単一登録(JIS/US 区別は既定専用の概念)。無効: 登録なし。
         let mut s = settings::Settings::default();
         s.keymap.mode_toggle = Some("Ctrl+KeyJ".into());
         s.keymap.reconvert = Some("none".into());
         let km = Keymap::from_settings(&s);
-        let regs = build_preserved_regs(&km, false);
+        let regs = build_preserved_regs(&km);
         assert_eq!(regs.len(), 1);
         assert_eq!((regs[0].vk, regs[0].modifiers), (0x4A, TF_MOD_CONTROL));
     }
+    #[test]
+    fn removed_feedback_bindings_never_register_or_claim_keys() {
+        let settings = settings::Settings::from_json_str(r#"{"version":2,"feedback":{"enabled":true},"keymap":{"feedback":"Ctrl+KeyJ"}}"#);
+        let keymap = Keymap::from_settings(&settings);
+        let regs = build_preserved_regs(&keymap);
+        for vk in [0x1C, 0xBF, 0x4A] {
+            assert!(!regs.iter().any(|r| r.vk == vk && r.modifiers == windows::Win32::UI::TextServices::TF_MOD_CONTROL));
+            for composing in [false, true] {
+                assert_eq!(resolve_action(&keymap, &ActionInput {vk, ctrl: true, shift: false, alt: false,
+                    composing, showing: false, direct: false, undo_armed: false, llm_enabled: false}), KeyAction::None);
+            }
+        }
+    }
+
 }

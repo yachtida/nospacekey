@@ -67,6 +67,7 @@ final class RecentLearningOverlay: @unchecked Sendable {
     private let capacity: Int
     private let lock = NSLock()
     private var entries: [Identity] = []
+    private var candidates: [Identity: Candidate] = [:]
 
     init(capacity: Int = 128) { self.capacity = max(1, capacity) }
 
@@ -75,7 +76,8 @@ final class RecentLearningOverlay: @unchecked Sendable {
         lock.lock()
         entries.removeAll { $0 == identity }
         entries.insert(identity, at: 0)
-        if entries.count > capacity { entries.removeLast(entries.count - capacity) }
+        candidates[identity] = candidate
+        while entries.count > capacity { candidates[entries.removeLast()] = nil }
         lock.unlock()
     }
 
@@ -113,9 +115,18 @@ final class RecentLearningOverlay: @unchecked Sendable {
         return ((main, firstClause), evaluations)
     }
 
+    /// Only material learned by this process, after legacy typo learning was removed.
+    func predictions(reading: String) -> [Candidate] {
+        guard let prefix = CorrectionStore.normalizedKey(reading) else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.filter { $0.ruby.hasPrefix(prefix) }.compactMap { candidates[$0] }
+    }
+
     func clear() {
         lock.lock()
         entries.removeAll(keepingCapacity: true)
+        candidates.removeAll(keepingCapacity: true)
         lock.unlock()
     }
 

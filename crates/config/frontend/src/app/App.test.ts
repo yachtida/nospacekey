@@ -4,13 +4,18 @@ it.each([
   ["小窓", "読みモニタ"],
   ["探索範囲", "ライブ変換の探索幅"],
   ["精度優先", "ライブ変換の探索幅"],
-  ["vim", "一時かな入力"],
+  ["vim", "一時かなモード開始"],
   ["半角", "開始時モード"],
   ["ショートカット", "キー操作"],
 ])("finds plan-defined synonym %s", (query, title) => {
   const normalized = normalizeSearch(query);
   const found = SEARCH.filter((entry) => normalizeSearch(`${entry.title} ${entry.description} ${entry.terms}`).includes(normalized));
   expect(found.some((entry) => entry.title === title)).toBe(true);
+});
+
+it("routes temporary kana help to its key setting", () => {
+  expect(SEARCH.find((item) => item.title === "一時かなモード開始"))
+    .toMatchObject({ page: "keys", target: "key-ephemeral" });
 });
 
 it("restores a saved window position inside an available work area", () => {

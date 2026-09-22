@@ -50,9 +50,9 @@ use crate::theme::tokens;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC,
+    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FrameRect, GetDC,
     GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HFONT, PAINTSTRUCT,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HFONT,
     TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -84,6 +84,9 @@ pub trait CandidateUI {
         anchor: CaretAnchor,
         theme: crate::theme::Theme,
     );
+    fn show_preview(&mut self, candidates: &[String], anchor: CaretAnchor, theme: crate::theme::Theme) {
+        self.show(candidates, 0, anchor, theme);
+    }
     fn hide(&mut self);
     fn selected(&self) -> usize;
     fn move_selection(&mut self, delta: i32);
@@ -250,6 +253,10 @@ fn clamp_selection(selected: usize, len: usize) -> usize {
 }
 
 /// 番号ガターのラベル（1 始まり）。インライン format! からラベル生成を分離。
+fn preview_index(preview: bool, i: usize) -> String {
+    if preview { if i == 0 { "Tab".into() } else { String::new() } } else { format_index(i) }
+}
+
 fn format_index(i: usize) -> String {
     (i + 1).to_string()
 }
@@ -315,6 +322,7 @@ struct WindowState {
     /// 外枠・描画・ヒットテストが共有する、配置先モニタ基準の DPI。
     /// ホストの thread DPI context は WndProc 呼出時に変わり得るため、HDC から再取得しない。
     layout_dpi: i32,
+    preview: bool,
 }
 
 impl PopupState for WindowState {
@@ -392,7 +400,7 @@ unsafe fn on_click(hwnd: HWND, y: i32) {
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
-            paint(hwnd);
+            popup::paint_guarded::<WindowState>(hwnd, "CandidateWindow.WM_PAINT", || paint(hwnd));
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -464,8 +472,8 @@ fn paint(hwnd: HWND) {
 /// 色はハードコード const ではなく `state.theme.colors.*` から取る（GDI パスも theme 準拠）。
 fn paint_gdi(hwnd: HWND) {
     unsafe {
-        let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
+        let paint_session = popup::PaintSession::begin(hwnd);
+        let hdc = paint_session.hdc();
         if hdc.is_invalid() {
             return;
         }
@@ -473,7 +481,6 @@ fn paint_gdi(hwnd: HWND) {
         let state = match window_state(hwnd) {
             Some(s) => s,
             None => {
-                let _ = EndPaint(hwnd, &ps);
                 return;
             }
         };
@@ -514,7 +521,7 @@ fn paint_gdi(hwnd: HWND) {
         for (row_idx, abs_i) in (start..end).enumerate() {
             let cand = &state.candidates[abs_i];
             let (row, number, text) = column_rects(row_idx, rc.right, dpi);
-            let is_sel = abs_i == selected;
+            let is_sel = !state.preview && abs_i == selected;
 
             if is_sel {
                 // 唯一の選択手がかり: アクセント青のベタ塗り。
@@ -522,7 +529,7 @@ fn paint_gdi(hwnd: HWND) {
             }
 
             // 番号（ガター内で右寄せ、ページ内相対の 1 始まり＝数字キーと一致）。
-            let mut num: Vec<u16> = format_index(abs_i - start).encode_utf16().collect();
+            let mut num: Vec<u16> = preview_index(state.preview, abs_i - start).encode_utf16().collect();
             let mut num_rect = number;
             let idx_color = if is_sel {
                 colors.sel_index
@@ -563,8 +570,6 @@ fn paint_gdi(hwnd: HWND) {
         if let Some(old) = old_obj {
             let _ = SelectObject(hdc, old);
         }
-
-        let _ = EndPaint(hwnd, &ps);
     }
 }
 
@@ -582,15 +587,13 @@ unsafe fn paint_d2d(hwnd: HWND) {
 
     // update region の validate（無限 WM_PAINT 防止）。
     // BeginPaint 済みなので、以降のどの early-out でも EndPaint は必須（全経路で対にする）。
-    let mut ps = PAINTSTRUCT::default();
-    let _hdc = BeginPaint(hwnd, &mut ps);
+    let paint_session = popup::PaintSession::begin(hwnd);
+    let _hdc = paint_session.hdc();
     let Some(state) = window_state(hwnd) else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     // renderer が無ければ paint() が GDI へ振り分けるはずだが、防御的に対にして return。
     if state.backend.renderer.is_none() {
-        let _ = EndPaint(hwnd, &ps);
         return;
     }
     let dpi = state.layout_dpi;
@@ -614,7 +617,6 @@ unsafe fn paint_d2d(hwnd: HWND) {
             .backend
             .text_format(&family, font_px, DWRITE_TEXT_ALIGNMENT_TRAILING, true),
     ) else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     // 以降 state への書き込みは end_draw 後にしか無いので、テーマは不変借用で読む。
@@ -623,13 +625,11 @@ unsafe fn paint_d2d(hwnd: HWND) {
     // renderer は上で Some を確認済みだが、TIP パスでは expect/unwrap を使わず else で
     // 対の EndPaint を打って return する（防御的・panic 皆無）。
     let Some(renderer) = state.backend.renderer.as_ref() else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     // begin_draw に成功したら、この関数のどの経路でも end_draw を必ず呼ぶ
     // （begin_draw without end_draw は D2D context を begun 状態に残す）。
     let Ok(ctx) = renderer.begin_draw() else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     ctx.SetDpi(96.0, 96.0); // px==DIP 扱い（レイアウト helper は物理 px を返す）
@@ -668,7 +668,7 @@ unsafe fn paint_d2d(hwnd: HWND) {
 
     for (row_idx, abs_i) in (start..end).enumerate() {
         let (row, number, text) = column_rects(row_idx, rc.right, dpi);
-        let is_sel = abs_i == selected;
+        let is_sel = !state.preview && abs_i == selected;
         if is_sel {
             if let Some(b) = sel_brush.as_ref() {
                 // Apple 風: 選択ハイライトは --radius-sm 相当の角丸ピルで塗る。
@@ -680,7 +680,7 @@ unsafe fn paint_d2d(hwnd: HWND) {
                 ctx.FillRoundedRectangle(&rr, b);
             }
         }
-        let num_utf16: Vec<u16> = format_index(abs_i - start).encode_utf16().collect();
+        let num_utf16: Vec<u16> = preview_index(state.preview, abs_i - start).encode_utf16().collect();
         let body_utf16: Vec<u16> = state.candidates[abs_i].encode_utf16().collect();
         let nb = if is_sel {
             sel_index_brush.as_ref()
@@ -755,7 +755,6 @@ unsafe fn paint_d2d(hwnd: HWND) {
     if lost {
         state.backend.renderer_dead = true;
     }
-    let _ = EndPaint(hwnd, &ps);
 }
 
 /// 自前描画の候補ウィンドウ。`hwnd` は遅延生成（初回 `show` まで null）。
@@ -849,7 +848,7 @@ impl CandidateWindow {
                     shared: self.shared.clone(),
                     selection_dirty: self.selection_dirty.clone(),
                     backend: Backend::new(renderer),
-                    layout_dpi: 96,
+                    layout_dpi: 96, preview: false,
                 }),
             );
         }
@@ -979,6 +978,12 @@ impl CandidateWindow {
     /// cand_state で新しい絶対位置を計算してからこれを呼ぶ。相対 delta の二重適用をやめる
     /// ことで、マウスクリック（WndProc 側で表示状態を直接更新する）と経路が競合しても
     /// 表示と真実源が乖離しない。
+    pub fn set_preview(&mut self, preview: bool) {
+        unsafe {
+            if let Some(state) = window_state(self.hwnd) { state.preview = preview; }
+            let _ = InvalidateRect(Some(self.hwnd), None, true);
+        }
+    }
     pub fn set_selection(&mut self, index: usize) {
         if self.candidates.is_empty() {
             return;
@@ -1080,6 +1085,7 @@ impl CandidateUI for CandidateWindow {
         }
         // WM_PAINT 用に HWND ごとの描画状態（候補・選択・テーマ）を更新する。
         self.sync_state();
+        self.set_preview(false);
         // 先に content-fit のサイズ・位置へ合わせてから可視化する。順序を逆にすると
         // 初期サイズ（ensure_hwnd の仮値）や前回サイズで一瞬表示されてからジャンプする
         // ちらつきが出る。SW_SHOWNOACTIVATE で WM_PAINT が走るのは確定後なので、
@@ -1173,6 +1179,11 @@ impl CandidateUI for CandidateWindow {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paint_panic_stays_inside_window_callback() {
+        crate::popup::assert_paint_panic_is_contained(Some(super::wnd_proc));
+    }
+
     use super::*;
 
     #[test]
@@ -1359,7 +1370,7 @@ mod tests {
             shared: None,
             selection_dirty: None,
             backend: Backend::new(None),
-            layout_dpi: 96,
+            layout_dpi: 96, preview: false,
         };
 
         assert_eq!(state.layout_dpi, 96);

@@ -215,6 +215,11 @@ impl CandidateUI for CandidatePresenter {
             }
         }
     }
+    fn show_preview(&mut self, candidates: &[String], anchor: crate::candidate_window::CaretAnchor, theme: crate::theme::Theme) {
+        self.show(candidates, 0, anchor, theme);
+        self.window.set_preview(true);
+    }
+
     fn hide(&mut self) {
         self.window.hide();
         self.end();

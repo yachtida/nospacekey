@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import WinSDK
 @testable import NospacekeyEngineCore
 
 /// 背景スレッドが書いた応答をテスト本体へ渡す箱（Swift 6 の Sendable 検査のため —
@@ -14,6 +15,69 @@ private final class ReplyBox: @unchecked Sendable {
 }
 
 final class EngineHostHandlerTests: XCTestCase {
+    private func snapshotRequest(deadline: UInt64? = nil) throws -> Data {
+        var wire: [String: Any] = ["method": "LiveSnapshot", "params": [
+            "composition": 1, "revision": 1, "configuration_generation": 1,
+            "connection_generation": 1, "conversion_revision": 0, "request_id": 1,
+            "segments": [["text": "a"]], "explicit": false,
+        ]]
+        if let deadline { wire["deadline_tick_ms"] = deadline }
+        return try JSONSerialization.data(withJSONObject: wire)
+    }
+
+    func testExpiredSnapshotDoesNotWaitForServiceLockOrRunConversion() throws {
+        let serviceLock = NSLock()
+        let service = makeService()
+        let handler = makeEngineHandler(service: service, serviceLock: serviceLock)
+        serviceLock.lock()
+        defer { serviceLock.unlock() }
+        let request = try snapshotRequest(deadline: GetTickCount64() + 60)
+        let reply = ReplyBox()
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            reply.data = handler(1, request).reply
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(resultTag((reply.data ?? Data(), false)), "Error")
+        XCTAssertEqual(service.zenzaiVendorInvocationCountForTesting, 0)
+    }
+
+    func testSnapshotDeadlineAlsoBoundsConverterLockWait() throws {
+        let service = makeService()
+        let serviceLock = NSLock()
+        let handler = makeEngineHandler(service: service, serviceLock: serviceLock)
+        let release = service.beginConverterLockHoldForTesting()
+        defer { release() }
+        let request = try snapshotRequest(deadline: GetTickCount64() + 60)
+        let reply = ReplyBox()
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            reply.data = handler(1, request).reply
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(resultTag((reply.data ?? Data(), false)), "Error")
+        // Timed-out work must release the global lock for another client.
+        let available = serviceLock.try()
+        XCTAssertTrue(available)
+        if available { serviceLock.unlock() }
+    }
+
+    func testDeadlineIsOptionalCappedAndIgnoredForMutatingRequests() throws {
+        let old = try JSONDecoder().decode(RequestEnvelope.self, from: snapshotRequest())
+        XCTAssertEqual(old.admissionDeadline(receivedAt: 100)?.tickMilliseconds, 500)
+        let distant = try JSONDecoder().decode(RequestEnvelope.self, from: snapshotRequest(deadline: UInt64.max))
+        XCTAssertEqual(distant.admissionDeadline(receivedAt: 100)?.tickMilliseconds, 500)
+        let expired = try JSONDecoder().decode(RequestEnvelope.self, from: snapshotRequest(deadline: 0))
+        XCTAssertTrue(expired.admissionDeadline(receivedAt: GetTickCount64())!.expired)
+        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
+        let started = handler(7, Data(#"{"method":"StartSession","deadline_tick_ms":0}"#.utf8))
+        let session = try XCTUnwrap(sessionId(started))
+        let ended = handler(7, Data(#"{"method":"EndSession","params":{"session":\#(session)},"deadline_tick_ms":0}"#.utf8))
+        XCTAssertEqual(resultTag(ended), "Ok")
+    }
+
     func testEndSessionAcknowledgesBeforeDeferredConverterCleanupCompletes() throws {
         let service = ConversionService(config: ZenzaiConfig(weightURL: nil, inferenceLimit: 1))
         let session = service.startSession(connection: 17)
@@ -116,7 +180,7 @@ final class EngineHostHandlerTests: XCTestCase {
         let obj = try JSONSerialization.jsonObject(
             with: handler(1, Data(#"{"method":"StartSession"}"#.utf8)).reply) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
-        XCTAssertEqual(obj["proto"] as? Int, 10)
+        XCTAssertEqual(obj["proto"] as? Int, 11)
         XCTAssertEqual(obj["boot"] as? String, BuildInfo.version)
     }
 
@@ -158,88 +222,9 @@ final class EngineHostHandlerTests: XCTestCase {
         XCTAssertEqual(resultTag(handler(1, Data("not json".utf8))), "Error")
     }
 
-    func testPredictionUsesOwnedSessionAndPreservesSequence() throws {
-        let predictor = PredictionService(availability: .ready) { _, _ in "会議です" }
-        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
-                                        predictionService: predictor)
-        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
-            return XCTFail("no session")
-        }
-        let body = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":42,"token_ids":[1,50014,28998,65484,29282]}}"#.utf8)
-        let obj = try JSONSerialization.jsonObject(with: handler(10, body).reply) as! [String: Any]
-        XCTAssertEqual(obj["result"] as? String, "Prediction")
-        XCTAssertEqual(obj["seq"] as? Int, 42)
-        XCTAssertEqual(obj["text"] as? String, "会議です")
-    }
 
-    func testPredictionRejectsAnotherConnectionsSession() {
-        let predictor = PredictionService(availability: .ready) { _, _ in "漏れてはいけない" }
-        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
-                                        predictionService: predictor)
-        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
-            return XCTFail("no session")
-        }
-        let body = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":1,"token_ids":[1,2]}}"#.utf8)
-        XCTAssertEqual(resultTag(handler(11, body)), "Error")
-    }
 
-    func testReloadConfigDisablesPredictionImmediately() throws {
-        let predictor = PredictionService(availability: .ready) { _, _ in "表示しない" }
-        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
-                                        predictionService: predictor)
-        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
-            return XCTFail("no session")
-        }
-        let reload = Data(#"{"method":"ReloadConfig","params":{"llm_enabled":false,"llm_api_key":"","llm_endpoint":"","llm_model":"","llm_prompt":"","llm_timeout_ms":15000,"zenzai_enabled":false,"zenzai_weight":"","inline_prediction_enabled":false}}"#.utf8)
-        XCTAssertEqual(resultTag(handler(10, reload)), "Ok")
-        let predict = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":7,"token_ids":[1,2]}}"#.utf8)
-        let object = try JSONSerialization.jsonObject(with: handler(10, predict).reply) as! [String: Any]
-        XCTAssertEqual(object["result"] as? String, "PredictionUnavailable")
-        XCTAssertEqual(object["state"] as? String, "disabled")
-    }
 
-    func testNormalOperationCancelsInFlightPredictionButPingDoesNot() throws {
-        let started = DispatchSemaphore(value: 0)
-        let release = DispatchSemaphore(value: 0)
-        let predictor = PredictionService(availability: .ready) { _, _ in
-            started.signal()
-            _ = release.wait(timeout: .now() + 2)
-            return "候補です"
-        }
-        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock(),
-                                        predictionService: predictor)
-        guard let sid = sessionId(handler(10, Data(#"{"method":"StartSession"}"#.utf8))) else {
-            return XCTFail("no session")
-        }
-        let predict = Data(#"{"method":"Predict","params":{"session":\#(sid),"seq":8,"token_ids":[1,2]}}"#.utf8)
-
-        let pingReply = ReplyBox()
-        let pingDone = DispatchSemaphore(value: 0)
-        Thread.detachNewThread {
-            pingReply.data = handler(10, predict).reply
-            pingDone.signal()
-        }
-        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
-        XCTAssertEqual(resultTag(handler(10, Data(#"{"method":"Ping"}"#.utf8))), "Pong")
-        release.signal()
-        XCTAssertEqual(pingDone.wait(timeout: .now() + 2), .success)
-        XCTAssertEqual(resultTag((pingReply.data ?? Data(), false)), "Prediction")
-
-        let operationReply = ReplyBox()
-        let operationDone = DispatchSemaphore(value: 0)
-        Thread.detachNewThread {
-            operationReply.data = handler(10, predict).reply
-            operationDone.signal()
-        }
-        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
-        let insert = Data(#"{"method":"Insert","params":{"session":\#(sid),"text":"a"}}"#.utf8)
-        XCTAssertEqual(resultTag(handler(10, insert)), "Reading")
-        release.signal()
-        XCTAssertEqual(operationDone.wait(timeout: .now() + 2), .success)
-        let object = try JSONSerialization.jsonObject(with: operationReply.data ?? Data()) as! [String: Any]
-        XCTAssertEqual(object["result"] as? String, "PredictionUnavailable")
-        XCTAssertEqual(object["state"] as? String, "stale")
-    }
 
     // UU-5: ReloadConfig は session を伴わずに Ok を返す（decode→dispatch→反映のスモーク）。
     func testReloadConfigDispatchesToOk() {
@@ -424,23 +409,7 @@ final class EngineHostHandlerTests: XCTestCase {
     // 互換: zenzai_inference_limit 無しの旧 TIP からの ReloadConfig も従来どおり Ok
     // （既存 testReloadConfigDispatchesToOk がそのまま担保 — フィールドを UInt32? にする理由）。
 
-    // 修正変換(Tab): TypoConvert は decode→dispatch→Candidates のスモーク（Insert 後）。
-    func testTypoConvertDispatchesToCandidates() throws {
-        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
-        guard let sid = sessionId(handler(1, Data(#"{"method":"StartSession"}"#.utf8))) else {
-            return XCTFail("StartSession が session id を返さない")
-        }
-        _ = handler(1, Data(#"{"method":"Insert","params":{"session":\#(sid),"text":"nihongo"}}"#.utf8))
-        let body = Data(#"{"method":"TypoConvert","params":{"session":\#(sid)}}"#.utf8)
-        XCTAssertEqual(resultTag(handler(1, body)), "Candidates")
-    }
 
-    // 未知セッションへの TypoConvert は Error("no session") へ正規化される。
-    func testTypoConvertUnknownSessionYieldsError() {
-        let handler = makeEngineHandler(service: makeService(), serviceLock: NSLock())
-        let body = Data(#"{"method":"TypoConvert","params":{"session":99999}}"#.utf8)
-        XCTAssertEqual(resultTag(handler(1, body)), "Error")
-    }
 
     // カスタム辞書: ReloadDictionary ハンドラは converterLock を待たない（spec §4.1 の眼目）。
     // 別スレッドがロックを保持している間でも desired 更新+enqueue だけで即 Ok を返す。

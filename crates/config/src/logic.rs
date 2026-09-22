@@ -37,13 +37,10 @@ pub struct SettingsDto {
     /// Zenzai 推論上限（1〜10、既定1）。範囲外は validate が弾く（timeout_ms と同パターン）。
     pub zenzai_inference_limit: u32,
     pub live_enabled: bool,
+    pub input_prediction_enabled: bool,
     pub live_search_width: u32,
-    /// ローカルインライン予測（既定 OFF）。
-    pub inline_prediction_enabled: bool,
     pub default_direct: bool,
     pub learning_enabled: bool,
-    /// 品質ループ③: 誤変換フィードバック記録（feedback.jsonl）。既定 false=opt-in。
-    pub feedback_enabled: bool,
     /// かな入力モードで数字を既定で全角確定するか（既定 true）。
     pub number_full_width: bool,
     /// かな入力モードで句読点を既定で全角確定するか（既定 true）。
@@ -58,17 +55,6 @@ pub struct SettingsDto {
     pub reading_monitor_accumulate: bool,
     /// 読みモニタ: 窓の表示上限（全角文字数換算、既定 34。apply 時に 10..=100 へクランプ）。
     pub reading_monitor_max_chars: u32,
-    /// 一時的なかなモードを有効にするか（既定 true）。
-    pub ephemeral_enabled: bool,
-    /// 一時的なかなモードの旧トリガキー設定（"f8"|"f9"|"f10"、既定 "f8"）。
-    /// UI には露出しない読み取り専用の移行フィールド: トリガキーの変更は keymap.ephemeral に
-    /// 一本化した（キー設定ページ）。この値は keymap.ephemeral 不在時の既定の解決
-    /// （TIP の default_chords / キー設定ページの既定表示）にだけ使われ、素通しで保存される。
-    pub ephemeral_trigger: String,
-    /// 修正変換そのものの有効状態。旧 UI では未露出だったが、差分保存 UI では独立項目。
-    pub typo_correct_enabled: bool,
-    /// 修正変換の誤読み学習。通常の変換学習とは独立して保持する。
-    pub typo_correct_learn: bool,
     /// Shift+英字の挙動（"compose"=英語未確定モード / "commit"=大文字直接確定、既定 "compose"）。
     pub shift_latin_mode: String,
     /// カスタム辞書(ユーザー辞書)を有効にするか(既定 true)。
@@ -100,11 +86,10 @@ pub fn to_dto(s: &settings::Settings) -> SettingsDto {
         weight_path: s.zenzai.weight_path.clone(),
         zenzai_inference_limit: s.zenzai.inference_limit,
         live_enabled: s.live_conversion.enabled,
+        input_prediction_enabled: s.input_prediction_enabled,
         live_search_width: s.live_conversion.search_width,
-        inline_prediction_enabled: s.inline_prediction.enabled,
         default_direct: s.default_direct,
         learning_enabled: s.learning.enabled,
-        feedback_enabled: s.feedback.enabled,
         number_full_width: s.number.full_width,
         punctuation_full_width: s.punctuation.full_width,
         symbol_full_width: s.symbol.full_width,
@@ -117,10 +102,7 @@ pub fn to_dto(s: &settings::Settings) -> SettingsDto {
         reading_monitor_enabled: s.reading_monitor.enabled,
         reading_monitor_accumulate: s.reading_monitor.accumulate,
         reading_monitor_max_chars: s.reading_monitor.max_chars,
-        ephemeral_enabled: s.ephemeral.enabled,
-        ephemeral_trigger: s.ephemeral.trigger.clone(),
-        typo_correct_enabled: s.typo_correct.enabled,
-        typo_correct_learn: s.typo_correct.learn,
+
         shift_latin_mode: s.shift_latin.mode.clone(),
         user_dictionary_enabled: s.user_dictionary.enabled,
         update_include_beta: s.update.include_beta,
@@ -217,12 +199,6 @@ pub fn validate(dto: &SettingsDto) -> Vec<FieldError> {
             message: format!("不正な角丸値です: {:?}", a.corner),
         });
     }
-    if !["f8", "f9", "f10"].contains(&dto.ephemeral_trigger.as_str()) {
-        errs.push(FieldError {
-            field: "ephemeral_trigger".into(),
-            message: format!("不正なトリガキーです: {:?}", dto.ephemeral_trigger),
-        });
-    }
     if !["compose", "commit"].contains(&dto.shift_latin_mode.as_str()) {
         errs.push(FieldError {
             field: "shift_latin_mode".into(),
@@ -271,10 +247,7 @@ pub fn validate(dto: &SettingsDto) -> Vec<FieldError> {
     }
     for c in settings::keymap::find_conflicts(
         &dto.keymap,
-        &dto.ephemeral_trigger,
-        dto.ephemeral_enabled,
-        dto.feedback_enabled,
-        dto.typo_correct_enabled,
+        "f8",
         settings::llm_effective(dto.llm_enabled), // 凍結中は llm_convert を衝突判定から外す
     ) {
         errs.push(FieldError {
@@ -331,11 +304,10 @@ pub fn apply_dto(
     s.zenzai.weight_path = dto.weight_path;
     s.zenzai.inference_limit = dto.zenzai_inference_limit; // validate 済み（範囲内）
     s.live_conversion.enabled = dto.live_enabled;
+    s.input_prediction_enabled = dto.input_prediction_enabled;
     s.live_conversion.search_width = dto.live_search_width;
-    s.inline_prediction.enabled = dto.inline_prediction_enabled;
     s.default_direct = dto.default_direct;
     s.learning.enabled = dto.learning_enabled;
-    s.feedback.enabled = dto.feedback_enabled;
     s.number.full_width = dto.number_full_width;
     s.punctuation.full_width = dto.punctuation_full_width;
     s.symbol.full_width = dto.symbol_full_width;
@@ -345,10 +317,7 @@ pub fn apply_dto(
     // 範囲外はエラーでなくクランプ(spec 決定)。正規化点は settings::effective_max_chars。
     s.reading_monitor.max_chars = dto.reading_monitor_max_chars;
     s.reading_monitor.max_chars = s.reading_monitor.effective_max_chars();
-    s.ephemeral.enabled = dto.ephemeral_enabled;
-    s.ephemeral.trigger = dto.ephemeral_trigger; // validate 済み（未知値は上で Err 済み）
-    s.typo_correct.enabled = dto.typo_correct_enabled;
-    s.typo_correct.learn = dto.typo_correct_learn;
+
     s.shift_latin.mode = dto.shift_latin_mode; // validate 済み（同上）
     s.user_dictionary.enabled = dto.user_dictionary_enabled;
     s.update.include_beta = dto.update_include_beta;
@@ -440,6 +409,7 @@ pub enum DictCmdError {
     Invalid { field: String },
     Unreadable,
     QuarantineFailed,
+    InvalidEncoding,
     Io { message: String },
 }
 
@@ -631,6 +601,10 @@ pub fn dict_import_logic(
     // エンコーディング判別+パースは mutex の外(spec §5.3 — ダイアログ同様、重い処理で
     // 辞書タブ全体を無期限に無反応にしない)。
     let parsed = settings::user_dictionary::parse_tsv(bytes);
+    // A valid reading can hide a damaged word; never persist a lossy decode.
+    if parsed.had_replacement {
+        return Err(DictCmdError::InvalidEncoding);
+    }
     let _guard = lock.0.lock().unwrap();
     let mut loaded = load_locked(path)?;
     let report = settings::user_dictionary::merge_imported(
@@ -1058,53 +1032,6 @@ mod tests {
     }
 
     #[test]
-    fn feedback_enabled_roundtrips_between_dto_and_settings() {
-        // Settings → DTO（既定 OFF=opt-in が DTO に写る）
-        let mut s = settings::Settings::default();
-        assert!(!to_dto(&s).feedback_enabled, "既定 OFF が DTO に写る");
-        s.feedback.enabled = true;
-        assert!(to_dto(&s).feedback_enabled);
-        // DTO → Settings（learning トグルと同じパターン）
-        let mut dto = to_dto(&settings::Settings::default());
-        dto.feedback_enabled = true;
-        let applied = apply_dto(dto, &settings::Settings::default(), |v| Some(v.to_string()))
-            .expect("妥当な DTO は適用できる");
-        assert!(applied.feedback.enabled, "DTO の ON が Settings に写る");
-    }
-
-    #[test]
-    fn inline_prediction_defaults_off_and_roundtrips_between_dto_and_settings() {
-        let defaults = settings::Settings::default();
-        assert!(!to_dto(&defaults).inline_prediction_enabled);
-        let mut dto = to_dto(&defaults);
-        dto.inline_prediction_enabled = true;
-        let applied = apply_dto(dto, &defaults, |value| Some(value.to_string())).unwrap();
-        assert!(applied.inline_prediction.enabled);
-    }
-
-    #[test]
-    fn ephemeral_settings_roundtrip_and_validate() {
-        let mut s = settings::Settings::default();
-        s.ephemeral.enabled = false;
-        s.ephemeral.trigger = "f9".into();
-        let dto = to_dto(&s);
-        assert!(!dto.ephemeral_enabled);
-        assert_eq!(dto.ephemeral_trigger, "f9");
-        let back = apply_dto(dto.clone(), &settings::Settings::default(), |v| {
-            Some(v.to_string())
-        })
-        .expect("妥当な DTO は適用できる");
-        assert_eq!(back.ephemeral.trigger, "f9");
-        // 未知 trigger は validate が拒否する（apply_dto も Err で拒否する）。
-        let mut bad = dto.clone();
-        bad.ephemeral_trigger = "ctrl_z".into();
-        assert!(validate(&bad)
-            .iter()
-            .any(|e| e.field == "ephemeral_trigger"));
-        assert!(apply_dto(bad, &settings::Settings::default(), |v| Some(v.to_string())).is_err());
-    }
-
-    #[test]
     fn dto_roundtrips_user_dictionary_enabled() {
         let mut s = settings::Settings::default();
         s.user_dictionary.enabled = false;
@@ -1130,13 +1057,13 @@ mod tests {
     fn keymap_roundtrips_between_dto_and_settings() {
         let mut s = settings::Settings::default();
         s.keymap.commit_undo = Some("Ctrl+KeyZ".into());
-        s.keymap.typo_correct = Some("none".into());
+        s.keymap.to_katakana = Some("none".into());
         let dto = to_dto(&s);
         assert_eq!(dto.keymap.commit_undo.as_deref(), Some("Ctrl+KeyZ"));
         let back = apply_dto(dto, &settings::Settings::default(), |v| Some(v.to_string()))
             .expect("妥当な DTO は適用できる");
         assert_eq!(back.keymap.commit_undo.as_deref(), Some("Ctrl+KeyZ"));
-        assert_eq!(back.keymap.typo_correct.as_deref(), Some("none"));
+        assert_eq!(back.keymap.to_katakana.as_deref(), Some("none"));
         assert_eq!(back.keymap.mode_toggle, None);
     }
 
@@ -1168,13 +1095,10 @@ mod tests {
             .iter()
             .any(|e| e.field == "keymap.to_hiragana" && e.message.contains("カタカナ")));
         assert!(errs.iter().any(|e| e.field == "keymap.to_katakana"));
-        // feature off の機能の既定キーは空き地(feedback off で Ctrl+Slash は妥当)。
+        // 撤去済みの記録キーは他の機能へ割り当てられる。
         let mut dto = base_dto();
-        dto.feedback_enabled = false;
-        dto.keymap.typo_correct = Some("Ctrl+Slash".into());
+        dto.keymap.to_katakana = Some("Ctrl+Slash".into());
         assert!(validate(&dto).is_empty());
-        dto.feedback_enabled = true;
-        assert!(!validate(&dto).is_empty());
     }
 
     #[test]
@@ -1183,7 +1107,7 @@ mod tests {
         // 既定 Shift+Tab を他機能へ割当可能(spec 2026-07-21-llm-freeze-design.md)。
         let mut dto = base_dto();
         dto.llm_enabled = true;
-        dto.keymap.typo_correct = Some("Shift+Tab".into());
+        dto.keymap.to_katakana = Some("Shift+Tab".into());
         assert!(validate(&dto).is_empty());
     }
 
@@ -1198,6 +1122,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nsk-cfg-dict-{}-{case}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("d.json")
+    }
+
+    #[test]
+    fn dictionary_import_rejects_lossy_words_before_loading_or_saving() {
+        let path = temp_dict_path("invalid-encoding");
+        std::fs::write(&path, b"original bytes must survive").unwrap();
+        let mut bytes = "あっぷる\tApple".as_bytes().to_vec();
+        bytes.extend_from_slice(&[0xff, b'\n']);
+        let result = dict_import_logic(
+            &DictLock(std::sync::Mutex::new(())),
+            &path,
+            &|| panic!("rejected import must not reload the engine"),
+            &bytes,
+        );
+        assert!(matches!(result, Err(DictCmdError::InvalidEncoding)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original bytes must survive");
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

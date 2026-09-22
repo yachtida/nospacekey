@@ -116,7 +116,7 @@ struct RawCase {
 #[test]
 fn production_protocol_decodes_every_shared_fixture_without_numeric_rounding() {
     use ipc::protocol::{Request, Response, PROTO_VERSION};
-    assert_eq!(PROTO_VERSION, 10);
+    assert_eq!(PROTO_VERSION, 11);
     let data: RawFixtures = serde_json::from_str(include_str!(
         "../../../docs/design/clause-navigation-p2/wire-fixtures.json"
     ))

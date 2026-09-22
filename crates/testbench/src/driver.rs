@@ -3,7 +3,6 @@
 use crate::scenarios::{typed, Vk};
 use crate::tsf_host::TsfHost;
 use ipc::client::{stable_pipe_name, EngineClient};
-use ipc::protocol::{Request, Response};
 use std::time::{Duration, Instant};
 
 /// 1 シナリオの観測結果。
@@ -165,7 +164,7 @@ pub fn run_item8(host: &TsfHost, threshold_ms: u128) -> Item8Result {
         Ok(pid) => pid,
         Err(error) => return Item8Result { passed: false, detail: format!("connected engine PID: {error}") },
     };
-    if let Err(error) = kill_pid(engine_pid) {
+    if let Err(error) = kill_pid(engine_pid, true) {
         return Item8Result { passed: false, detail: format!("engine termination not verified: {error}") };
     }
     drop(connected);
@@ -805,7 +804,9 @@ pub fn run_item24(host: &TsfHost) -> Item24Result {
     // 接続して env 不発＝非決定になるため、先に kill して自前 spawn を強制する
     // (item8 が engine kill を行うのと同じ作法。常駐 engine はユーザーの次打鍵で自動
     // respawn する — A7 で受入済みの自己修復)。
-    kill_engine_processes();
+    if !kill_engine_processes() {
+        return Item24Result { passed: false, detail: "engine pre-kill failed".into() };
+    }
     let _ = host.normalize_native_mode();
     host.warm_up();
     host.store.reset();
@@ -1033,197 +1034,29 @@ pub fn run_item31(host: &TsfHost) -> Item31Result {
     Item31Result { passed, detail }
 }
 
-pub struct Item32Result {
-    pub passed: bool,
-    pub detail: String,
-}
 
-fn wait_for_prediction_preedit(host: &TsfHost) -> String {
-    for _ in 0..30 {
-        host.settle_debounce();
-        let preedit = host.store.preedit();
-        if !preedit.is_empty() {
-            return preedit;
-        }
-    }
-    String::new()
-}
 
-fn commit_prediction_context(host: &TsfHost, romanized: &str) -> bool {
-    let before = host.store.committed().chars().count();
-    for _ in 0..4 {
-        for key in typed(romanized) {
-            let _ = host.feed_key(key.0);
-        }
-        host.settle_debounce();
-        let _ = host.feed_key(0x20); // Space: explicit candidate selection
-        let _ = host.feed_key(0x0D); // Enter: explicit full commit
-        if host
-            .store
-            .committed()
-            .chars()
-            .count()
-            .saturating_sub(before)
-            >= 8
-        {
-            return true;
-        }
-    }
-    false
-}
 
-fn wait_for_prediction_runtime_ready() -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let pipe = stable_pipe_name();
-    let mut client = loop {
-        match EngineClient::connect_to(&pipe, Duration::from_millis(500)) {
-            Ok(client) => break client,
-            Err(error) if Instant::now() < deadline => {
-                let _ = error;
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => return Err(format!("engine connect failed: {:?}", error.kind())),
-        }
-    };
-    let session = match client.request(&Request::StartSession) {
-        Ok(Response::Session { session, .. }) => session,
-        Ok(_) => return Err("engine returned an unexpected StartSession response".into()),
-        Err(error) => return Err(format!("StartSession failed: {:?}", error.kind())),
-    };
-    let token_ids = vec![
-        1, 46_275, 30_751, 55_574, 31_120, 29_314, 30_857, 78_564, 78_466, 66_700, 99_248,
-    ];
-    let result = loop {
-        let request = Request::Predict {
-            session,
-            seq: 1,
-            token_ids: token_ids.clone(),
-        };
-        match client.request(&request) {
-            Ok(Response::Prediction { .. }) => break Ok(()),
-            Ok(Response::PredictionUnavailable { state, .. }) if state == "loading" => {
-                if Instant::now() >= deadline {
-                    break Err("prediction runtime readiness timed out".into());
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Ok(Response::PredictionUnavailable { state, .. }) => {
-                break Err(format!("prediction runtime unavailable: {state}"));
-            }
-            Ok(_) => break Err("prediction runtime returned an unexpected response".into()),
-            Err(error) => {
-                break Err(format!(
-                    "prediction readiness request failed: {:?}",
-                    error.kind()
-                ))
-            }
-        }
-    };
-    let _ = client.request(&Request::EndSession { session });
-    result
-}
 
-/// item32: real TSF composition path for inline prediction: show, accept, dismiss and focus-stale.
-/// This explicit mode needs the pinned model/runtime and opt-in setting, so it is not part of the
-/// model-free default scenario suite.
-pub fn run_item32(host: &TsfHost) -> Item32Result {
-    let pid = std::process::id();
-    let _ = host.normalize_native_mode();
-    host.warm_up();
-    if let Err(error) = wait_for_prediction_runtime_ready() {
-        return Item32Result {
-            passed: false,
-            detail: error,
-        };
-    }
-    host.store.reset();
-    let base = read_events(pid).len();
 
-    let first_context_ready = commit_prediction_context(host, "kyouhaasakaraame");
-    let committed_before = host.store.committed();
-    let first_ghost = wait_for_prediction_preedit(host);
-    let accepted_eaten = host.feed_key(0x27); // Right
-    let committed_after = host.store.committed();
-
-    let second_ghost = wait_for_prediction_preedit(host); // accept re-arms prediction
-    let dismissed_eaten = host.feed_key(0x1B); // Esc
-    host.settle_debounce();
-    let empty_after_dismiss = host.store.preedit().is_empty();
-
-    // A pending/re-armed result must not survive a document focus transition.
-    let focus_ok = host.lose_and_regain_focus().is_ok();
-    for _ in 0..10 {
-        host.settle_debounce();
-    }
-    let empty_after_focus = host.store.preedit().is_empty();
-
-    // Force the prediction-only TSF edit session to be rejected after a valid explicit commit.
-    // The field must stay empty and ordinary IME input must remain usable after the lock clears.
-    let rejection_context_ready = commit_prediction_context(host, "ashitamokaigi");
-    host.store.force_lock_rejection(true);
-    for _ in 0..10 {
-        host.settle_debounce();
-    }
-    host.store.force_lock_rejection(false);
-    let empty_after_error = host.store.preedit().is_empty();
-    let input_after_error = host.feed_key(0x41); // A: prediction failure must not disable IME input.
-    let normal_input_after_error = input_after_error && !host.store.preedit().is_empty();
-    let _ = host.feed_key(0x1B);
-    let events: Vec<Ev> = read_events(pid).into_iter().skip(base).collect();
-    let log =
-        std::path::Path::new(&std::env::var("TEMP").unwrap_or_default()).join("nospacekey-tip.log");
-    let pid_tag = format!("[pid {pid}]");
-    let log_text = std::fs::read_to_string(log).unwrap_or_default();
-    let accepted_logged = log_text
-        .lines()
-        .any(|line| line.contains(&pid_tag) && line.contains("ev=prediction_accept"));
-    let dismissed_logged = log_text
-        .lines()
-        .any(|line| line.contains(&pid_tag) && line.contains("ev=prediction_dismiss"));
-
-    let passed = first_context_ready
-        && rejection_context_ready
-        && !committed_before.is_empty()
-        && !first_ghost.is_empty()
-        && accepted_eaten
-        && committed_after.chars().count() > committed_before.chars().count()
-        && !second_ghost.is_empty()
-        && dismissed_eaten
-        && empty_after_dismiss
-        && focus_ok
-        && empty_after_focus
-        && empty_after_error
-        && normal_input_after_error
-        && accepted_logged
-        && dismissed_logged
-        && events
-            .iter()
-            .any(|event| matches!(event, Ev::Commit { source, .. } if source == "candidate"));
-    let detail = format!(
-        "first_context_ready={first_context_ready} rejection_context_ready={rejection_context_ready} \
-         committed_before_len={} first_ghost_len={} accepted_eaten={accepted_eaten} \
-         committed_after_len={} second_ghost_len={} dismissed_eaten={dismissed_eaten} \
-         empty_after_dismiss={empty_after_dismiss} focus_ok={focus_ok} \
-         empty_after_focus={empty_after_focus} empty_after_error={empty_after_error} \
-         normal_input_after_error={normal_input_after_error} \
-         accept_log={accepted_logged} dismiss_log={dismissed_logged}",
-        committed_before.chars().count(), first_ghost.chars().count(),
-        committed_after.chars().count(), second_ghost.chars().count(),
-    );
-    Item32Result { passed, detail }
-}
-
-fn kill_pid(pid: u32) -> Result<(), String> {
-    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+fn kill_pid(pid: u32, require_alive: bool) -> Result<(), String> {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW,
         TerminateProcess, WaitForSingleObject, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
     // Keep the same process object through validation and termination; PID reuse
     // must not turn a stale spawn log into a successful fault injection.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) }
-        .map_err(|error| format!("OpenProcess({pid}): {error}"))?;
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) } {
+        Ok(handle) => handle,
+        Err(error) if !require_alive && error.code() == ERROR_INVALID_PARAMETER.to_hresult() => return Ok(()),
+        Err(error) => return Err(format!("OpenProcess({pid}): {error}")),
+    };
     let result = (|| {
-        if unsafe { WaitForSingleObject(handle, 0) } != WAIT_TIMEOUT {
+        let state = unsafe { WaitForSingleObject(handle, 0) };
+        if !require_alive && state == WAIT_OBJECT_0 {
+            return Ok(());
+        }
+        if state != WAIT_TIMEOUT {
             return Err(format!("pid {pid} is not alive"));
         }
         let mut path = vec![0u16; 32768];
@@ -1236,7 +1069,14 @@ fn kill_pid(pid: u32) -> Result<(), String> {
             name.to_string_lossy().eq_ignore_ascii_case("NospacekeyEngineHost.exe")) {
             return Err(format!("pid {pid} is not EngineHost"));
         }
-        unsafe { TerminateProcess(handle, 1) }.map_err(|error| format!("TerminateProcess: {error}"))?;
+        if let Err(error) = unsafe { TerminateProcess(handle, 1) } {
+            // A losing engine bootstrap can exit after the liveness probe.
+            // Only accept the failure when this same process object has exited.
+            if !require_alive && unsafe { WaitForSingleObject(handle, 1000) } == WAIT_OBJECT_0 {
+                return Ok(());
+            }
+            return Err(format!("TerminateProcess: {error}"));
+        }
         if unsafe { WaitForSingleObject(handle, 1000) } != WAIT_OBJECT_0 {
             return Err(format!("pid {pid} termination did not complete"));
         }
@@ -1246,15 +1086,39 @@ fn kill_pid(pid: u32) -> Result<(), String> {
     result
 }
 
-/// 常駐 engine（NospacekeyEngineHost.exe）を全て kill する。失敗（不在等）は無視。
+/// 常駐 engine（NospacekeyEngineHost.exe）を停止し、失敗を呼び出し元へ返す。
 /// item24 の env 継承を確実にするための pre-kill（詳細は run_item24 冒頭コメント）。
 /// keymap-smoke（main.rs）も同じ作法で使うため pub(crate)。
-pub(crate) fn kill_engine_processes() {
-    use std::os::windows::process::CommandExt;
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/IM", "NospacekeyEngineHost.exe"])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .status();
+pub(crate) fn kill_engine_processes() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    // taskkill can wait indefinitely inside Sandbox. The existing kill_pid
+    // validates the opened process image and bounds its termination wait.
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return false;
+        };
+        let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default() };
+        let mut found = Process32FirstW(snapshot, &mut entry).is_ok();
+        let mut success = found;
+        while found {
+            let length = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
+            if String::from_utf16_lossy(&entry.szExeFile[..length])
+                .eq_ignore_ascii_case("NospacekeyEngineHost.exe") {
+                if let Err(error) = kill_pid(entry.th32ProcessID, false) {
+                    eprintln!("engine pre-kill: {error}");
+                    success = false;
+                }
+            }
+            found = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+        success
+    }
 }
 
 /// item9: プロファイル解除前後で feed_key('a') の eaten を測る。

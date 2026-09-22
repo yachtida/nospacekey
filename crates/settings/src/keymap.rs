@@ -139,16 +139,14 @@ pub fn format_chord(c: &KeyChord) -> String {
     out
 }
 
-/// カスタマイズ対象のコマンド系 14 機能(spec §1、Convert 末尾＝優先順最下位)。宣言順が
+/// カスタマイズ対象のコマンド系機能(spec §1、Convert 末尾＝優先順最下位)。宣言順が
 /// 「手編集 JSON で同一文脈に重複バインドがあったときの決定的優先順」を兼ねる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeymapFunc {
     ModeToggle,
     Reconvert,
-    Feedback,
     Ephemeral,
     CommitUndo,
-    TypoCorrect,
     LlmConvert,
     ToHiragana,
     ToKatakana,
@@ -159,13 +157,11 @@ pub enum KeymapFunc {
     Convert,
 }
 
-pub const ALL_FUNCS: [KeymapFunc; 14] = [
+pub const ALL_FUNCS: [KeymapFunc; 12] = [
     KeymapFunc::ModeToggle,
     KeymapFunc::Reconvert,
-    KeymapFunc::Feedback,
     KeymapFunc::Ephemeral,
     KeymapFunc::CommitUndo,
-    KeymapFunc::TypoCorrect,
     KeymapFunc::LlmConvert,
     KeymapFunc::ToHiragana,
     KeymapFunc::ToKatakana,
@@ -188,7 +184,7 @@ impl KeymapFunc {
     pub fn group(self) -> FuncGroup {
         use KeymapFunc::*;
         match self {
-            ModeToggle | Reconvert | Feedback => FuncGroup::Global,
+            ModeToggle | Reconvert => FuncGroup::Global,
             Ephemeral | CommitUndo => FuncGroup::Idle,
             _ => FuncGroup::Composing,
         }
@@ -207,10 +203,8 @@ impl KeymapFunc {
         match self {
             ModeToggle => "mode_toggle",
             Reconvert => "reconvert",
-            Feedback => "feedback",
             Ephemeral => "ephemeral",
             CommitUndo => "commit_undo",
-            TypoCorrect => "typo_correct",
             LlmConvert => "llm_convert",
             ToHiragana => "to_hiragana",
             ToKatakana => "to_katakana",
@@ -226,10 +220,8 @@ impl KeymapFunc {
         match self {
             ModeToggle => "モードトグル(あ⇔A)",
             Reconvert => "再変換",
-            Feedback => "誤変換フィードバック記録",
             Ephemeral => "一時かなモード開始",
             CommitUndo => "確定取り消し",
-            TypoCorrect => "修正変換",
             LlmConvert => "外部LLM変換",
             ToHiragana => "表記変換: ひらがな",
             ToKatakana => "表記変換: カタカナ",
@@ -247,7 +239,7 @@ impl KeymapFunc {
         if self.is_preserved() && bare_special(chord.vk, chord.ctrl, chord.shift, chord.alt) {
             match self {
                 Reconvert => FuncGroup::Idle,
-                _ => FuncGroup::Global, // ModeToggle/Feedback は全文脈
+                _ => FuncGroup::Global, // ModeToggle は全文脈
             }
         } else {
             self.group()
@@ -307,22 +299,11 @@ pub fn default_chords(f: KeymapFunc, legacy_ephemeral_trigger: &str) -> Vec<KeyC
                 ..bare(0xBF)
             },
         ],
-        Feedback => vec![
-            KeyChord {
-                ctrl: true,
-                ..bare(0x1C)
-            },
-            KeyChord {
-                ctrl: true,
-                ..bare(0xBF)
-            },
-        ],
         Ephemeral => vec![legacy_ephemeral_chord(legacy_ephemeral_trigger)],
         CommitUndo => vec![KeyChord {
             ctrl: true,
             ..bare(0x08)
         }],
-        TypoCorrect => vec![bare(0x09)],
         LlmConvert => vec![KeyChord {
             shift: true,
             ..bare(0x09)
@@ -391,7 +372,7 @@ pub fn resolve_binding(v: &Option<String>) -> Binding {
 
 /// 機能→バインド設定値。各フィールドは None=既定 / Some("none")=無効 / Some(チョード)=明示。
 /// None も JSON に null として書く(skip しない): 設定アプリの dirty 判定(JSON 文字列比較)が
-/// null と欠落を区別できないため、常に全 14 キーを出して表現を一意にする。
+/// null と欠落を区別できないため、常に全キーを出して表現を一意にする。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KeymapSettings {
     #[serde(default)]
@@ -399,13 +380,9 @@ pub struct KeymapSettings {
     #[serde(default)]
     pub reconvert: Option<String>,
     #[serde(default)]
-    pub feedback: Option<String>,
-    #[serde(default)]
     pub ephemeral: Option<String>,
     #[serde(default)]
     pub commit_undo: Option<String>,
-    #[serde(default)]
-    pub typo_correct: Option<String>,
     #[serde(default)]
     pub llm_convert: Option<String>,
     #[serde(default)]
@@ -430,10 +407,8 @@ impl KeymapSettings {
         match f {
             ModeToggle => &self.mode_toggle,
             Reconvert => &self.reconvert,
-            Feedback => &self.feedback,
             Ephemeral => &self.ephemeral,
             CommitUndo => &self.commit_undo,
-            TypoCorrect => &self.typo_correct,
             LlmConvert => &self.llm_convert,
             ToHiragana => &self.to_hiragana,
             ToKatakana => &self.to_katakana,
@@ -449,9 +424,6 @@ impl KeymapSettings {
 pub fn find_conflicts(
     km: &KeymapSettings,
     legacy_ephemeral_trigger: &str,
-    ephemeral_enabled: bool,
-    feedback_enabled: bool,
-    typo_enabled: bool,
     llm_enabled: bool,
 ) -> Vec<Conflict> {
     let entries: Vec<(KeymapFunc, Option<String>)> =
@@ -459,9 +431,6 @@ pub fn find_conflicts(
     find_conflicts_in(
         &entries,
         legacy_ephemeral_trigger,
-        ephemeral_enabled,
-        feedback_enabled,
-        typo_enabled,
         llm_enabled,
     )
 }
@@ -473,23 +442,17 @@ pub struct Conflict {
     pub chord: KeyChord,
 }
 
-/// 実効チョードの重複を検出する。entries は (機能, 設定値) の全 14 件。
-/// feature off の機能(ephemeral/feedback/typo/llm)はチョードを持たない=衝突に参加しない。
+/// 実効チョードの重複を検出する。entries は (機能, 設定値) の全機能。
+/// feature off の機能(llm)はチョードを持たない=衝突に参加しない。
 pub fn find_conflicts_in(
     entries: &[(KeymapFunc, Option<String>)],
     legacy_ephemeral_trigger: &str,
-    ephemeral_enabled: bool,
-    feedback_enabled: bool,
-    typo_enabled: bool,
     llm_enabled: bool,
 ) -> Vec<Conflict> {
     use KeymapFunc::*;
     let mut chords: Vec<(KeymapFunc, KeyChord)> = Vec::new();
     for (f, v) in entries {
         let enabled = match f {
-            Ephemeral => ephemeral_enabled,
-            Feedback => feedback_enabled,
-            TypoCorrect => typo_enabled,
             LlmConvert => llm_enabled,
             _ => true,
         };
@@ -518,8 +481,7 @@ pub fn find_conflicts_in(
             // OnPreservedKey が全文脈で奪い Composing 側が沈黙するため免除しない。
             // 免除対象の Global 側は **ModeToggle に限る**: 「変換中は Composing 優先」の救済経路
             // (resolve_action の composing ブロック + OnPreservedKey 委譲)を持つのは ModeToggle
-            // だけ。Feedback も bare_special だと conflict_group=Global になるが救済経路が無く、
-            // 同キー共有は真の衝突(OnPreservedKey が composing でも先取り)なので免除しない。
+            // だけ。
             let global_composing_exempt = bare_special(ca.vk, ca.ctrl, ca.shift, ca.alt)
                 && match (ga, gb) {
                     (FuncGroup::Global, FuncGroup::Composing) => fa == ModeToggle,
@@ -650,7 +612,7 @@ mod tests {
     fn func_groups_match_spec() {
         use KeymapFunc::*;
         // spec §6: global(PreservedKey)/idle/composing の3グループ。
-        for f in [ModeToggle, Reconvert, Feedback] {
+        for f in [ModeToggle, Reconvert] {
             assert_eq!(f.group(), FuncGroup::Global);
             assert!(f.is_preserved());
             assert!(f.alt_allowed(), "PreservedKey 経路は Alt 可");
@@ -663,7 +625,7 @@ mod tests {
             );
         }
         for f in [
-            TypoCorrect,
+            ToKatakana,
             LlmConvert,
             ToHiragana,
             ToKatakana,
@@ -705,9 +667,9 @@ mod tests {
             }]
         );
         assert_eq!(
-            default_chords(TypoCorrect, "f8"),
+            default_chords(ToKatakana, "f8"),
             vec![KeyChord {
-                vk: 0x09,
+                vk: 0x76,
                 ctrl: false,
                 shift: false,
                 alt: false
@@ -771,23 +733,6 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            default_chords(Feedback, "f8"),
-            vec![
-                KeyChord {
-                    vk: 0x1C,
-                    ctrl: true,
-                    shift: false,
-                    alt: false
-                },
-                KeyChord {
-                    vk: 0xBF,
-                    ctrl: true,
-                    shift: false,
-                    alt: false
-                },
-            ]
-        );
     }
 
     #[test]
@@ -807,7 +752,7 @@ mod tests {
         assert!(validate_binding(CommitUndo, "Semicolon").is_err());
         assert!(validate_binding(CommitUndo, "Ctrl+Shift+KeyZ").is_ok());
         // Tab/Backspace は単独可(現行既定が単独 Tab / Ctrl+Back のため)。
-        assert!(validate_binding(TypoCorrect, "Tab").is_ok());
+        assert!(validate_binding(ToKatakana, "Tab").is_ok());
         assert!(validate_binding(CommitUndo, "Backspace").is_ok());
         // Space: 単独不可・修飾付きなら可。英字と違い Shift 単独修飾も可
         // (Shift+Space=IME トグルの定番。一時かな/モードトグルへの要望 — 2026-07-18)。
@@ -827,11 +772,11 @@ mod tests {
         let none: Option<String> = None;
         let all_default = || ALL_FUNCS.map(|f| (f, none.clone())).to_vec();
         // 既定同士は無衝突(F8 の idle/composing 二毛作は cross-group で許容 — spec §6)。
-        assert!(find_conflicts_in(&all_default(), "f8", true, false, true, true).is_empty());
+        assert!(find_conflicts_in(&all_default(), "f8", true).is_empty());
         // 同一グループ(composing)内の重複=衝突: to_hiragana を F7 にすると to_katakana(既定 F7) と衝突。
         let mut e = all_default();
         e.iter_mut().find(|(f, _)| *f == ToHiragana).unwrap().1 = Some("F7".into());
-        let c = find_conflicts_in(&e, "f8", true, false, true, true);
+        let c = find_conflicts_in(&e, "f8", true);
         assert_eq!(c.len(), 1);
         assert!(matches!(
             (c[0].a, c[0].b),
@@ -840,31 +785,22 @@ mod tests {
         // グループ跨ぎは許容: commit_undo(idle) を F7 にしても to_katakana(composing) と衝突しない。
         let mut e = all_default();
         e.iter_mut().find(|(f, _)| *f == CommitUndo).unwrap().1 = Some("F7".into());
-        assert!(find_conflicts_in(&e, "f8", true, false, true, true).is_empty());
+        assert!(find_conflicts_in(&e, "f8", true).is_empty());
         // Global は全グループと衝突: mode_toggle を F7 にすると to_katakana と衝突。
         let mut e = all_default();
         e.iter_mut().find(|(f, _)| *f == ModeToggle).unwrap().1 = Some("F7".into());
         assert_eq!(
-            find_conflicts_in(&e, "f8", true, false, true, true).len(),
+            find_conflicts_in(&e, "f8", true).len(),
             1
         );
         // 無効化した機能・feature off の機能はチョードを持たない=衝突しない。
         let mut e = all_default();
         e.iter_mut().find(|(f, _)| *f == ToKatakana).unwrap().1 = Some("none".into());
         e.iter_mut().find(|(f, _)| *f == ToHiragana).unwrap().1 = Some("F7".into());
-        assert!(find_conflicts_in(&e, "f8", true, false, true, true).is_empty());
-        // feedback は既定 Ctrl+Slash を持つが feedback_enabled=false なら不参加。
+        assert!(find_conflicts_in(&e, "f8", true).is_empty());
         let mut e = all_default();
-        e.iter_mut().find(|(f, _)| *f == TypoCorrect).unwrap().1 = Some("Ctrl+Slash".into());
-        assert!(
-            find_conflicts_in(&e, "f8", true, false, true, true).is_empty(),
-            "feedback off なら Ctrl+Slash は空いている"
-        );
-        assert_eq!(
-            find_conflicts_in(&e, "f8", true, true, true, true).len(),
-            1,
-            "feedback on なら Global 衝突"
-        );
+        e.iter_mut().find(|(f, _)| *f == ToKatakana).unwrap().1 = Some("Ctrl+Slash".into());
+        assert!(find_conflicts_in(&e, "f8", true).is_empty());
     }
 
     #[test]
@@ -882,14 +818,14 @@ mod tests {
             to_hiragana: Some("F7".into()),
             ..Default::default()
         };
-        assert_eq!(find_conflicts(&km, "f8", true, false, true, true).len(), 1);
+        assert_eq!(find_conflicts(&km, "f8", true).len(), 1);
     }
 
     #[test]
     fn convert_func_is_registered() {
         use KeymapFunc::Convert;
-        assert_eq!(ALL_FUNCS.len(), 14);
-        assert_eq!(ALL_FUNCS[13], Convert, "Convert は末尾(優先順が最も低い)");
+        assert_eq!(ALL_FUNCS.len(), 12);
+        assert_eq!(*ALL_FUNCS.last().unwrap(), Convert, "Convert は末尾(優先順が最も低い)");
         assert_eq!(Convert.group(), FuncGroup::Composing);
         assert_eq!(Convert.settings_field(), "convert");
         assert!(!Convert.is_preserved());
@@ -926,42 +862,29 @@ mod tests {
         let all_default = || ALL_FUNCS.map(|f| (f, none.clone())).to_vec();
         // 既定(14 機能全既定)は衝突 0 件: NotationRotate(bare 0x1D, Composing) ×
         // ModeToggle(bare 0x1D, Global) は bare_special 免除(spec §6.2)。
-        assert!(find_conflicts_in(&all_default(), "f8", true, true, true, true).is_empty());
+        assert!(find_conflicts_in(&all_default(), "f8", true).is_empty());
         // 免除は bare_special 限定: ModeToggle を受理系チョード F7 にすると
         // to_katakana(既定 F7) と衝突する(受理 preserved の全文脈シャドウ検出は維持)。
         let mut e = all_default();
         e.iter_mut().find(|(f, _)| *f == ModeToggle).unwrap().1 = Some("F7".into());
-        assert!(!find_conflicts_in(&e, "f8", true, true, true, true).is_empty());
+        assert!(!find_conflicts_in(&e, "f8", true).is_empty());
         // 免除は Global×Composing のみ。Composing 同士は衝突する:
         let mut e = all_default();
-        e.iter_mut().find(|(f, _)| *f == NotationRotate).unwrap().1 = Some("Tab".into());
-        let c = find_conflicts_in(&e, "f8", true, true, true, true);
+        e.iter_mut().find(|(f, _)| *f == NotationRotate).unwrap().1 = Some("F7".into());
+        let c = find_conflicts_in(&e, "f8", true);
         assert!(
             c.iter().any(|x| matches!(
                 (x.a, x.b),
-                (NotationRotate, TypoCorrect) | (TypoCorrect, NotationRotate)
+                (NotationRotate, ToKatakana) | (ToKatakana, NotationRotate)
             )),
-            "NotationRotate=Tab × TypoCorrect=Tab(ともに Composing)は衝突: {c:?}"
+            "NotationRotate=Tab × ToKatakana=Tab(ともに Composing)は衝突: {c:?}"
         );
         // Global(bare 0x1D) × Idle は免除しない: Ephemeral を NonConvert にすると衝突。
         let mut e = all_default();
         e.iter_mut().find(|(f, _)| *f == Ephemeral).unwrap().1 = Some("NonConvert".into());
         assert!(
-            !find_conflicts_in(&e, "f8", true, true, true, true).is_empty(),
+            !find_conflicts_in(&e, "f8", true).is_empty(),
             "ModeToggle(Global bare 0x1D) × Ephemeral(Idle 0x1D) は衝突のまま"
-        );
-        // 免除対象の Global は ModeToggle 限定。Feedback を bare NonConvert(0x1D)へ振ると
-        // NotationRotate(既定 0x1D, Composing)と同キーだが、Feedback には composing 救済経路が
-        // 無い(bare は OS 拒否/OnPreservedKey が composing でも先取り)ので衝突検出する。
-        let mut e = all_default();
-        e.iter_mut().find(|(f, _)| *f == Feedback).unwrap().1 = Some("NonConvert".into());
-        let c = find_conflicts_in(&e, "f8", true, true, true, true);
-        assert!(
-            c.iter().any(|x| matches!(
-                (x.a, x.b),
-                (Feedback, NotationRotate) | (NotationRotate, Feedback)
-            )),
-            "Feedback(bare 0x1D) × NotationRotate(bare 0x1D) は免除せず衝突: {c:?}"
         );
     }
 
@@ -996,12 +919,12 @@ mod tests {
     #[test]
     fn notation_rotate_func_is_registered() {
         use KeymapFunc::{Convert, NotationRotate};
-        assert_eq!(ALL_FUNCS.len(), 14);
+        assert_eq!(ALL_FUNCS.len(), 12);
         assert_eq!(
-            ALL_FUNCS[12], NotationRotate,
+            ALL_FUNCS[ALL_FUNCS.len() - 2], NotationRotate,
             "NotationRotate は Convert の直前"
         );
-        assert_eq!(ALL_FUNCS[13], Convert, "Convert は末尾(優先順が最も低い)");
+        assert_eq!(*ALL_FUNCS.last().unwrap(), Convert, "Convert は末尾(優先順が最も低い)");
         assert_eq!(NotationRotate.group(), FuncGroup::Composing);
         assert_eq!(NotationRotate.settings_field(), "notation_rotate");
         assert!(!NotationRotate.is_preserved());
@@ -1080,7 +1003,7 @@ mod tests {
     #[test]
     fn default_keymap_has_no_conflicts() {
         let km = KeymapSettings::default();
-        let c = find_conflicts(&km, "f8", true, true, true, true);
+        let c = find_conflicts(&km, "f8", true);
         assert!(c.is_empty(), "既定は衝突ゼロ: {c:?}");
     }
 
@@ -1089,25 +1012,25 @@ mod tests {
         use KeymapFunc::*;
         // clippy::field_reassign_with_default 回避のため struct update 構文で組み立てる。
         let km = KeymapSettings {
-            typo_correct: Some("Convert".into()),
+            to_katakana: Some("Convert".into()),
             ..Default::default()
-        }; // typo を bare 変換へ
-        let c = find_conflicts(&km, "f8", true, true, true, true);
+        }; // 表記操作を bare 変換へ
+        let c = find_conflicts(&km, "f8", true);
         assert!(
-            c.iter().any(|x| (x.a == Convert && x.b == TypoCorrect)
-                || (x.a == TypoCorrect && x.b == Convert)),
-            "Convert × Typo(同 0x1C, ともに Composing) は衝突: {c:?}"
+            c.iter().any(|x| (x.a == Convert && x.b == ToKatakana)
+                || (x.a == ToKatakana && x.b == Convert)),
+            "Convert × ToKatakana(同 0x1C, ともに Composing) は衝突: {c:?}"
         );
         assert!(
-            !c.iter().any(|x| (x.a == Reconvert && x.b == TypoCorrect)
-                || (x.a == TypoCorrect && x.b == Reconvert)),
-            "Reconvert-bare(Idle) × Typo(Composing) は文脈排他で衝突しない"
+            !c.iter().any(|x| (x.a == Reconvert && x.b == ToKatakana)
+                || (x.a == ToKatakana && x.b == Reconvert)),
+            "Reconvert-bare(Idle) × ToKatakana(Composing) は文脈排他で衝突しない"
         );
         let km2 = KeymapSettings {
             reconvert: Some("F7".into()),
             ..Default::default()
         }; // 受理 preserved(非 bare_special)
-        let c2 = find_conflicts(&km2, "f8", true, true, true, true);
+        let c2 = find_conflicts(&km2, "f8", true);
         assert!(
             c2.iter().any(|x| (x.a == Reconvert && x.b == ToKatakana)
                 || (x.a == ToKatakana && x.b == Reconvert)),

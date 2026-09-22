@@ -6,8 +6,8 @@ import XCTest
 /// 実体で決まる）を占有して新版 TIP の起動まで弾く事故を、起動入口の拒否で塞ぐ。
 final class EngineHostPipeNameTests: XCTestCase {
     func testCompatibleUpdatesUseTheSameProtocolEndpoint() {
-        // Search width is optional: the endpoint used by already loaded TIPs stays valid.
-        XCTAssertNil(enginePipeNameRejectionReason(#"\\.\pipe\nospacekey-engine.v10.s1"#))
+        // Removed request methods make the old generation incompatible.
+        XCTAssertEqual(enginePipeNameRejectionReason(#"\\.\pipe\nospacekey-engine.v10.s1"#), "pipe_name_protocol_mismatch")
         XCTAssertNil(enginePipeNameRejectionReason(
             #"\\.\pipe\nospacekey-engine.v"# + "\(ProtocolVersion.current).s1"))
         XCTAssertEqual(enginePipeNameRejectionReason(

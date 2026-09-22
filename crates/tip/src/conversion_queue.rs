@@ -82,7 +82,6 @@ pub(crate) struct ConversionQueue {
     pub unwritten_commit: Option<String>,
     // An implicit mode-settle is admitted only to an empty queue, so this
     // intent belongs to its first Commit and must survive failed/deferred attempts.
-    pub suppress_commit_prediction: bool,
 }
 impl ConversionQueue {
     /// Owner loss never grants permission to replay accepted input in another document.
@@ -201,7 +200,6 @@ impl ConversionQueue {
         if let Some(action) = self.actions.pop_front() {
             if matches!(action, ConversionAction::Commit) {
                 self.initial_reading = None;
-                self.suppress_commit_prediction = false;
             }
             self.units -= action.payload_units();
         }
@@ -383,27 +381,6 @@ mod tests {
             queue.complete_front();
         }
         assert!(queue.front().is_none());
-    }
-    #[test]
-    fn implicit_commit_keeps_prediction_intent_through_wait_and_retry_only() {
-        let mut queue = ConversionQueue::default();
-        queue.push(ConversionAction::Commit);
-        queue.suppress_commit_prediction = true;
-        queue.push(insert("a"));
-        queue.push(ConversionAction::Commit);
-        queue.begin(Instant::now(), None);
-        queue.fail_wait();
-        queue.commit_failed = true;
-        assert!(queue.suppress_commit_prediction);
-        queue.commit_failed = false;
-        queue.complete_front();
-        assert!(!queue.suppress_commit_prediction);
-        queue.complete_front();
-        assert_eq!(queue.front(), Some(&ConversionAction::Commit));
-        assert!(!queue.suppress_commit_prediction);
-        queue.suppress_commit_prediction = true;
-        queue.clear();
-        assert!(!queue.suppress_commit_prediction);
     }
     #[test]
     fn correction_supersedes_only_calculation_actions() {

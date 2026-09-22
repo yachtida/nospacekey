@@ -11,7 +11,6 @@ use std::sync::{LazyLock, Mutex};
 #[serde(rename_all = "snake_case")]
 pub enum ModelKind {
     Zenzai,
-    Prediction,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -154,10 +153,6 @@ pub fn request_cancel(kind: ModelKind, operation_id: u64) {
             operation.cancelable = false;
         }
     });
-}
-
-pub fn progress(kind: ModelKind, operation_id: u64, value: Option<u8>) {
-    with_record(kind, operation_id, |operation| operation.progress = value);
 }
 
 pub fn statuses() -> Vec<ModelOperationStatus> {

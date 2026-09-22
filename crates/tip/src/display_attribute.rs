@@ -1,9 +1,8 @@
 //! 表示属性プロバイダ（ITfDisplayAttributeProvider）。
 //!
-//! preedit / インライン予測へ付ける表示属性を 3 つ提供する:
+//! preeditへ付ける表示属性を 3 つ提供する:
 //!   - `GUID_DISPLAY_ATTRIBUTE`        : solid 下線（入力中の既定）
 //!   - `GUID_DISPLAY_ATTRIBUTE_TARGET` : 太下線（文節ナビゲーションの選択文節）
-//!   - `GUID_DISPLAY_ATTRIBUTE_PREDICTION` : 灰色文字＋点線下線（予測ゴースト）
 //!
 //! TSF はアプリ側で属性 GUID → スタイルの対応を引くため、
 //! プロバイダ・属性情報・列挙子の 3 役を実装する。
@@ -12,16 +11,15 @@ use std::cell::Cell;
 
 use windows::core::{implement, Result, BOOL, BSTR, GUID};
 use windows::Win32::Foundation::{E_INVALIDARG, S_FALSE};
-use windows::Win32::Graphics::Gdi::COLOR_GRAYTEXT;
 use windows::Win32::UI::TextServices::{
     IEnumTfDisplayAttributeInfo, IEnumTfDisplayAttributeInfo_Impl, ITfDisplayAttributeInfo,
     ITfDisplayAttributeInfo_Impl, ITfDisplayAttributeProvider_Impl, TF_ATTR_INPUT, TF_ATTR_CONVERTED,
-    TF_ATTR_TARGET_CONVERTED, TF_CT_SYSCOLOR, TF_DA_COLOR, TF_DA_COLOR_0, TF_DISPLAYATTRIBUTE,
-    TF_LS_DOT, TF_LS_SOLID,
+    TF_ATTR_TARGET_CONVERTED, TF_DA_COLOR, TF_DISPLAYATTRIBUTE,
+    TF_LS_SOLID,
 };
 
 use crate::globals::{
-    ComObjectGuard, GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_PREDICTION,
+    ComObjectGuard, GUID_DISPLAY_ATTRIBUTE,
     GUID_DISPLAY_ATTRIBUTE_TARGET, GUID_DISPLAY_ATTRIBUTE_CONVERTED,
 };
 
@@ -30,17 +28,8 @@ enum DisplayAttributeKind {
     Input,
     Target,
     Converted,
-    PredictionGhost,
 }
 
-fn ghost_color() -> TF_DA_COLOR {
-    TF_DA_COLOR {
-        r#type: TF_CT_SYSCOLOR,
-        Anonymous: TF_DA_COLOR_0 {
-            nIndex: COLOR_GRAYTEXT.0,
-        },
-    }
-}
 
 fn display_attribute(kind: DisplayAttributeKind) -> TF_DISPLAYATTRIBUTE {
     match kind {
@@ -57,14 +46,6 @@ fn display_attribute(kind: DisplayAttributeKind) -> TF_DISPLAYATTRIBUTE {
             } else {
                 TF_ATTR_INPUT
             },
-        },
-        DisplayAttributeKind::PredictionGhost => TF_DISPLAYATTRIBUTE {
-            crText: ghost_color(),
-            crBk: TF_DA_COLOR::default(),
-            lsStyle: TF_LS_DOT,
-            fBoldLine: BOOL(0),
-            crLine: ghost_color(),
-            bAttr: TF_ATTR_INPUT,
         },
     }
 }
@@ -93,12 +74,6 @@ impl UnderlineInfo {
         }
     }
 
-    pub fn new_prediction() -> Self {
-        Self {
-            kind: DisplayAttributeKind::PredictionGhost,
-            _guard: ComObjectGuard::new(),
-        }
-    }
     pub fn new_converted() -> Self {
         Self { kind: DisplayAttributeKind::Converted, _guard: ComObjectGuard::new() }
     }
@@ -110,7 +85,6 @@ impl ITfDisplayAttributeInfo_Impl for UnderlineInfo_Impl {
             DisplayAttributeKind::Input => GUID_DISPLAY_ATTRIBUTE,
             DisplayAttributeKind::Target => GUID_DISPLAY_ATTRIBUTE_TARGET,
             DisplayAttributeKind::Converted => GUID_DISPLAY_ATTRIBUTE_CONVERTED,
-            DisplayAttributeKind::PredictionGhost => GUID_DISPLAY_ATTRIBUTE_PREDICTION,
         })
     }
 
@@ -119,7 +93,6 @@ impl ITfDisplayAttributeInfo_Impl for UnderlineInfo_Impl {
             DisplayAttributeKind::Input => "nospacekey input",
             DisplayAttributeKind::Target => "nospacekey target clause",
             DisplayAttributeKind::Converted => "nospacekey converted clause",
-            DisplayAttributeKind::PredictionGhost => "nospacekey inline prediction",
         }))
     }
 
@@ -144,14 +117,13 @@ impl ITfDisplayAttributeInfo_Impl for UnderlineInfo_Impl {
 }
 
 /// 属性情報の総数（既定下線＋選択文節の太下線）。
-const ATTR_COUNT: u32 = 4;
+const ATTR_COUNT: u32 = 3;
 
 fn attr_at(index: u32) -> ITfDisplayAttributeInfo {
     match index {
         0 => UnderlineInfo::new().into(),
         1 => UnderlineInfo::new_target().into(),
-        3 => UnderlineInfo::new_converted().into(),
-        _ => UnderlineInfo::new_prediction().into(),
+        _ => UnderlineInfo::new_converted().into(),
     }
 }
 
@@ -244,8 +216,6 @@ impl ITfDisplayAttributeProvider_Impl for crate::text_service::TextService_Impl 
                 Ok(UnderlineInfo::new().into())
             } else if *guid == GUID_DISPLAY_ATTRIBUTE_TARGET {
                 Ok(UnderlineInfo::new_target().into())
-            } else if *guid == GUID_DISPLAY_ATTRIBUTE_PREDICTION {
-                Ok(UnderlineInfo::new_prediction().into())
             } else if *guid == GUID_DISPLAY_ATTRIBUTE_CONVERTED {
                 Ok(UnderlineInfo::new_converted().into())
             } else {
@@ -268,18 +238,5 @@ mod tests {
         assert_eq!(target.bAttr, TF_ATTR_TARGET_CONVERTED);
         assert!(target.fBoldLine.as_bool());
     }
-    use windows::Win32::Graphics::Gdi::COLOR_GRAYTEXT;
-    use windows::Win32::UI::TextServices::{TF_CT_SYSCOLOR, TF_LS_DOT};
 
-    #[test]
-    fn prediction_ghost_uses_gray_text_and_dotted_underline() {
-        let attribute = display_attribute(DisplayAttributeKind::PredictionGhost);
-        assert_eq!(attribute.crText.r#type, TF_CT_SYSCOLOR);
-        assert_eq!(
-            unsafe { attribute.crText.Anonymous.nIndex },
-            COLOR_GRAYTEXT.0
-        );
-        assert_eq!(attribute.lsStyle, TF_LS_DOT);
-        assert!(!attribute.fBoldLine.as_bool());
-    }
 }

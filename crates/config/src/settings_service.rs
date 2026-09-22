@@ -44,11 +44,10 @@ pub struct PublicSettings {
     pub weight_path: String,
     pub zenzai_inference_limit: u32,
     pub live_enabled: bool,
+    pub input_prediction_enabled: bool,
     pub live_search_width: u32,
-    pub inline_prediction_enabled: bool,
     pub default_direct: bool,
     pub learning_enabled: bool,
-    pub feedback_enabled: bool,
     pub number_full_width: bool,
     pub punctuation_full_width: bool,
     pub symbol_full_width: bool,
@@ -56,10 +55,7 @@ pub struct PublicSettings {
     pub reading_monitor_enabled: bool,
     pub reading_monitor_accumulate: bool,
     pub reading_monitor_max_chars: u32,
-    pub ephemeral_enabled: bool,
-    pub ephemeral_trigger: String,
-    pub typo_correct_enabled: bool,
-    pub typo_correct_learn: bool,
+
     pub shift_latin_mode: String,
     pub user_dictionary_enabled: bool,
     pub update_include_beta: bool,
@@ -77,11 +73,10 @@ impl From<&settings::Settings> for PublicSettings {
             weight_path: dto.weight_path,
             zenzai_inference_limit: dto.zenzai_inference_limit,
             live_enabled: dto.live_enabled,
+            input_prediction_enabled: dto.input_prediction_enabled,
             live_search_width: dto.live_search_width,
-            inline_prediction_enabled: dto.inline_prediction_enabled,
             default_direct: dto.default_direct,
             learning_enabled: dto.learning_enabled,
-            feedback_enabled: dto.feedback_enabled,
             number_full_width: dto.number_full_width,
             punctuation_full_width: dto.punctuation_full_width,
             symbol_full_width: dto.symbol_full_width,
@@ -89,10 +84,7 @@ impl From<&settings::Settings> for PublicSettings {
             reading_monitor_enabled: dto.reading_monitor_enabled,
             reading_monitor_accumulate: dto.reading_monitor_accumulate,
             reading_monitor_max_chars: dto.reading_monitor_max_chars,
-            ephemeral_enabled: dto.ephemeral_enabled,
-            ephemeral_trigger: dto.ephemeral_trigger,
-            typo_correct_enabled: dto.typo_correct_enabled,
-            typo_correct_learn: dto.typo_correct_learn,
+
             shift_latin_mode: dto.shift_latin_mode,
             user_dictionary_enabled: dto.user_dictionary_enabled,
             update_include_beta: dto.update_include_beta,
@@ -108,6 +100,7 @@ impl From<&settings::Settings> for PublicSettings {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsSnapshot {
     pub revision: String,
+    pub sequence: u64,
     pub values: PublicSettings,
     pub access: SettingsAccess,
     pub load_state: SettingsLoadState,
@@ -126,16 +119,14 @@ pub struct KeyBindingChange {
 pub enum SettingChange {
     DefaultDirect(bool),
     LiveEnabled(bool),
+    InputPredictionEnabled(bool),
     LiveSearchWidth(u32),
-    EphemeralEnabled(bool),
-    EphemeralLegacyTrigger(String),
+
     ShiftLatinMode(String),
     NumberFullWidth(bool),
     PunctuationFullWidth(bool),
     SymbolFullWidth(bool),
     SymbolFullWidthChars(Vec<String>),
-    TypoCorrectEnabled(bool),
-    TypoCorrectLearn(bool),
     KeyBinding(KeyBindingChange),
     AppearanceTheme(String),
     AppearanceFontFamily(String),
@@ -154,9 +145,7 @@ pub enum SettingChange {
     ZenzaiEnabled(bool),
     WeightPath(String),
     ZenzaiInferenceLimit(u32),
-    InlinePredictionEnabled(bool),
     UpdateIncludeBeta(bool),
-    FeedbackEnabled(bool),
 }
 
 impl SettingChange {
@@ -278,15 +267,29 @@ fn request_fingerprint(request: &SettingsPatchRequest) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
-fn current_revision() -> String {
-    let Some(path) = settings::settings_path() else {
-        return "unavailable:no_path".into();
-    };
-    match std::fs::read(path) {
-        Ok(bytes) => format!("sha256:{:x}", Sha256::digest(bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".into(),
-        Err(error) => format!("unavailable:{:?}", error.kind()).to_lowercase(),
+fn revision(read: &settings::SettingsRead) -> String {
+    match &read.contents {
+        Some(bytes) => format!("sha256:{:x}", Sha256::digest(bytes)),
+        None if matches!(read.outcome, settings::LoadOutcome::Missing | settings::LoadOutcome::Corrupt) => "missing".into(),
+        None => format!("unavailable:{:?}", read.outcome).to_lowercase(),
     }
+}
+
+// Every production snapshot is read and numbered under SettingsLock. The
+// sequence orders observations within this Config process, including cached
+// operation replies; the content hash still detects external file changes.
+static SNAPSHOT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn read_with_recovery() -> settings::SettingsRead {
+    let read = settings::load_snapshot_read_only();
+    if read.outcome != settings::LoadOutcome::Corrupt { return read; }
+    let (_, recovery) = settings::load_reporting();
+    let mut recovered = settings::load_snapshot_read_only();
+    if matches!(recovery, settings::LoadOutcome::Corrupt | settings::LoadOutcome::CorruptQuarantineFailed)
+        && matches!(recovered.outcome, settings::LoadOutcome::Missing | settings::LoadOutcome::Corrupt) {
+        recovered.outcome = recovery;
+    }
+    recovered
 }
 
 fn project_load_outcome(outcome: settings::LoadOutcome) -> (SettingsAccess, SettingsLoadState) {
@@ -316,14 +319,14 @@ fn project_load_outcome(outcome: settings::LoadOutcome) -> (SettingsAccess, Sett
     }
 }
 
-pub fn settings_snapshot() -> SettingsSnapshot {
-    let (settings, outcome) = settings::load_reporting();
-    with_pending_recovery_notice(snapshot_from(settings, outcome))
+pub fn settings_snapshot(lock: &logic::SettingsLock) -> Result<SettingsSnapshot, String> {
+    let _guard = lock.0.lock().map_err(|_| "設定ロックを取得できませんでした".to_string())?;
+    Ok(snapshot_from(read_with_recovery()))
 }
 
+// Caller holds SettingsLock, including while assigning the observation sequence.
 fn snapshot_read_only() -> SettingsSnapshot {
-    let (settings, outcome) = settings::load_reporting_read_only();
-    with_pending_recovery_notice(snapshot_from(settings, outcome))
+    snapshot_from(settings::load_snapshot_read_only())
 }
 
 fn with_pending_recovery_notice(mut snapshot: SettingsSnapshot) -> SettingsSnapshot {
@@ -344,7 +347,9 @@ fn with_pending_recovery_notice(mut snapshot: SettingsSnapshot) -> SettingsSnaps
     snapshot
 }
 
-fn snapshot_from(settings: settings::Settings, outcome: settings::LoadOutcome) -> SettingsSnapshot {
+fn snapshot_from(read: settings::SettingsRead) -> SettingsSnapshot {
+    let revision = revision(&read);
+    let settings::SettingsRead { settings, outcome, .. } = read;
     let (access, load_state) = project_load_outcome(outcome);
     let notices = match outcome {
         settings::LoadOutcome::Corrupt => Vec::new(),
@@ -364,13 +369,14 @@ fn snapshot_from(settings: settings::Settings, outcome: settings::LoadOutcome) -
         }],
         _ => Vec::new(),
     };
-    SettingsSnapshot {
-        revision: current_revision(),
+    with_pending_recovery_notice(SettingsSnapshot {
+        revision,
+        sequence: SNAPSHOT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         values: PublicSettings::from(&settings),
         access,
         load_state,
         notices,
-    }
+    })
 }
 
 fn keymap_slot<'a>(
@@ -380,10 +386,8 @@ fn keymap_slot<'a>(
     match function {
         "mode_toggle" => Some(&mut keymap.mode_toggle),
         "reconvert" => Some(&mut keymap.reconvert),
-        "feedback" => Some(&mut keymap.feedback),
         "ephemeral" => Some(&mut keymap.ephemeral),
         "commit_undo" => Some(&mut keymap.commit_undo),
-        "typo_correct" => Some(&mut keymap.typo_correct),
         "to_hiragana" => Some(&mut keymap.to_hiragana),
         "to_katakana" => Some(&mut keymap.to_katakana),
         "to_hankaku_kana" => Some(&mut keymap.to_hankaku_kana),
@@ -403,12 +407,9 @@ fn apply_changes(
     for change in changes {
         match change {
             SettingChange::DefaultDirect(value) => settings.default_direct = *value,
+            SettingChange::InputPredictionEnabled(value) => settings.input_prediction_enabled = *value,
             SettingChange::LiveEnabled(value) => settings.live_conversion.enabled = *value,
             SettingChange::LiveSearchWidth(value) => settings.live_conversion.search_width = *value,
-            SettingChange::EphemeralEnabled(value) => settings.ephemeral.enabled = *value,
-            SettingChange::EphemeralLegacyTrigger(value) => {
-                settings.ephemeral.trigger = value.clone()
-            }
             SettingChange::ShiftLatinMode(value) => settings.shift_latin.mode = value.clone(),
             SettingChange::NumberFullWidth(value) => settings.number.full_width = *value,
             SettingChange::PunctuationFullWidth(value) => settings.punctuation.full_width = *value,
@@ -425,8 +426,6 @@ fn apply_changes(
                     })
                     .collect();
             }
-            SettingChange::TypoCorrectEnabled(value) => settings.typo_correct.enabled = *value,
-            SettingChange::TypoCorrectLearn(value) => settings.typo_correct.learn = *value,
             SettingChange::KeyBinding(change) => {
                 if let Some(slot) = keymap_slot(&mut settings.keymap, &change.function) {
                     *slot = change.binding.clone();
@@ -466,11 +465,7 @@ fn apply_changes(
             SettingChange::ZenzaiEnabled(value) => settings.zenzai.enabled = *value,
             SettingChange::WeightPath(value) => settings.zenzai.weight_path = value.clone(),
             SettingChange::ZenzaiInferenceLimit(value) => settings.zenzai.inference_limit = *value,
-            SettingChange::InlinePredictionEnabled(value) => {
-                settings.inline_prediction.enabled = *value
-            }
             SettingChange::UpdateIncludeBeta(value) => settings.update.include_beta = *value,
-            SettingChange::FeedbackEnabled(value) => settings.feedback.enabled = *value,
         }
     }
     errors.extend(logic::validate(&logic::to_dto(&settings)));
@@ -487,9 +482,6 @@ pub fn settings_patch(
     lock: &logic::SettingsLock,
     request: SettingsPatchRequest,
 ) -> SettingsPatchResult {
-    if let Some(previous) = service.previous(&request) {
-        return previous;
-    }
     let _guard = match lock.0.lock() {
         Ok(guard) => guard,
         Err(_) => {
@@ -503,18 +495,21 @@ pub fn settings_patch(
             };
         }
     };
-    let current_revision = current_revision();
-    if current_revision != request.base_revision {
+    // The replay check shares the write lock so concurrent retries cannot both execute.
+    if let Some(previous) = service.previous(&request) { return previous; }
+    let read = read_with_recovery();
+    if revision(&read) != request.base_revision {
         let result = SettingsPatchResult::Conflict {
             operation_id: request.operation_id.clone(),
-            snapshot: snapshot_read_only(),
+            snapshot: snapshot_from(read),
         };
         service.remember(&request, result.clone());
         return result;
     }
-    let current = match settings::load_for_mutation() {
-        Ok(settings) => settings,
-        Err(outcome) => {
+    let current = match read.outcome {
+        settings::LoadOutcome::Loaded | settings::LoadOutcome::Missing
+        | settings::LoadOutcome::Empty | settings::LoadOutcome::Corrupt => read.settings,
+        outcome => {
             let result = SettingsPatchResult::Rejected {
                 operation_id: request.operation_id.clone(),
                 errors: vec![FieldError {
@@ -527,22 +522,6 @@ pub fn settings_patch(
             return result;
         }
     };
-    if request.changes.iter().any(|change| {
-        matches!(change, SettingChange::InlinePredictionEnabled(true))
-            && !current.inline_prediction.enabled
-            && !crate::prediction_download::local_model_is_ready()
-    }) {
-        let result = SettingsPatchResult::Rejected {
-            operation_id: request.operation_id.clone(),
-            errors: vec![FieldError {
-                field: "inline_prediction_enabled".into(),
-                message: "インライン予測を有効にするには、先にモデルを導入してください。".into(),
-            }],
-            snapshot: Some(snapshot_read_only()),
-        };
-        service.remember(&request, result.clone());
-        return result;
-    }
     let next = match apply_changes(current, &request.changes) {
         Ok(settings) => settings,
         Err(errors) => {
@@ -570,9 +549,6 @@ pub fn settings_patch(
     for change in &request.changes {
         match change {
             SettingChange::ZenzaiEnabled(_) => crate::download::invalidate_activation_intent(),
-            SettingChange::InlinePredictionEnabled(_) => {
-                crate::prediction_download::invalidate_activation_intent()
-            }
             _ => {}
         }
     }
@@ -628,6 +604,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_hashes_the_captured_bytes_and_numbers_each_observation() {
+        let mut settings = settings::Settings::default();
+        settings.default_direct = true;
+        let contents = settings.to_json().into_bytes();
+        let expected = format!("sha256:{:x}", Sha256::digest(&contents));
+        let first = snapshot_from(settings::SettingsRead {
+            settings, outcome: settings::LoadOutcome::Loaded, contents: Some(contents),
+        });
+        let second = snapshot_from(settings::SettingsRead {
+            settings: settings::Settings::default(), outcome: settings::LoadOutcome::Missing, contents: None,
+        });
+        assert_eq!(first.revision, expected);
+        assert!(first.values.default_direct);
+        assert!(second.sequence > first.sequence);
+        assert_eq!(second.revision, "missing");
+        let recovered = snapshot_from(settings::SettingsRead {
+            settings: settings::Settings::default(), outcome: settings::LoadOutcome::Corrupt, contents: None,
+        });
+        assert_eq!(recovered.revision, "missing", "successful quarantine leaves a missing file");
+    }
+
+    #[test]
     fn live_search_width_patch_roundtrips_and_rejects_other_widths() {
         for width in [10, 1] {
             let original = settings::Settings::default();
@@ -650,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_changes_only_named_fields_and_exposes_hidden_typo_settings() {
+    fn patch_changes_only_named_fields() {
         let mut original = settings::Settings::default();
         original.llm.api_key_dpapi = "secret-blob".into();
         original.appearance.theme = "dark".into();
@@ -658,27 +656,14 @@ mod tests {
             original.clone(),
             &[
                 SettingChange::NumberFullWidth(false),
-                SettingChange::TypoCorrectEnabled(false),
             ],
         )
         .unwrap();
         assert!(!changed.number.full_width);
-        assert!(!changed.typo_correct.enabled);
         assert_eq!(changed.appearance.theme, original.appearance.theme);
         assert_eq!(changed.llm.api_key_dpapi, "secret-blob");
         let public = PublicSettings::from(&changed);
-        assert!(!public.typo_correct_enabled);
-    }
-
-    #[test]
-    fn patch_revalidates_key_conflicts_after_feature_enablement() {
-        let mut original = settings::Settings::default();
-        original.feedback.enabled = false;
-        original.keymap.typo_correct = Some("Ctrl+Slash".into());
-        let errors = apply_changes(original, &[SettingChange::FeedbackEnabled(true)]).unwrap_err();
-        assert!(errors
-            .iter()
-            .any(|error| error.field.starts_with("keymap.")));
+        assert!(!public.number_full_width);
     }
 
     #[test]
@@ -743,10 +728,11 @@ mod tests {
 
         let result = SettingsPatchResult::Saved {
             operation_id: "op-ts".into(),
-            snapshot: snapshot_from(
-                settings::Settings::default(),
-                settings::LoadOutcome::Missing,
-            ),
+            snapshot: snapshot_from(settings::SettingsRead {
+                settings: settings::Settings::default(),
+                outcome: settings::LoadOutcome::Missing,
+                contents: None,
+            }),
             effects: Vec::new(),
         };
         let json = serde_json::to_value(result).unwrap();
@@ -754,4 +740,13 @@ mod tests {
         assert!(json["snapshot"]["values"]["defaultDirect"].is_boolean());
         assert!(json.get("operation_id").is_none());
     }
+    #[test]
+    fn prediction_patch_roundtrips_and_removed_feedback_api_is_rejected() {
+        let changed = apply_changes(settings::Settings::default(), &[SettingChange::InputPredictionEnabled(false)]).unwrap();
+        assert!(!PublicSettings::from(&changed).input_prediction_enabled);
+        assert!(!settings::Settings::from_json_str(&changed.to_json()).input_prediction_enabled);
+        assert!(serde_json::from_value::<SettingChange>(serde_json::json!({"field":"feedback_enabled","value":true})).is_err());
+        assert!(apply_changes(changed, &[SettingChange::KeyBinding(KeyBindingChange {function: "feedback".into(), binding: Some("Ctrl+Slash".into())})]).is_err());
+    }
+
 }

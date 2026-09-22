@@ -29,7 +29,8 @@ fn main() {
     // 自動設定する。文字列にブランド名リテラルを焼かないのは命名未決定のため
     // （改名時にここを触らずに済ませる — 表示名は installer 側の MyAppName 1 箇所に集約）。
     //
-    // アイコンリソース: タスクバー入力モード表示 (Pure Glyph 案) とプロファイル固定
+    // アイコンリソース: タスクバー入力モード表示 (Pure Glyph 案)、Zenzai GPU 稼働色、
+    // プロファイル固定
     // アイコン (Gapless N 案)。ID は langbar_icon.rs の RES_* 定数が参照し、プロファイル
     // 登録では対応するゼロ始まり位置へ変換するため**並びを変えると実行時整合が壊れる**。
     // PE のリソースディレクトリは文字列 ID エントリを数値 ID より先頭に置くため、
@@ -55,7 +56,15 @@ fn main() {
             ("4", "icons/mode-kana-dark.ico"),
             ("5", "icons/mode-ephemeral-light.ico"),
             ("6", "icons/mode-ephemeral-dark.ico"),
+            // 既存インストールの TSF uIconIndex=6 を壊さないよう、
+            // プロファイルアイコンは従来どおり 7 番目に固定する。
             ("7", "icons/profile-n.ico"),
+            ("8", "icons/mode-direct-zenzai-light.ico"),
+            ("9", "icons/mode-direct-zenzai-dark.ico"),
+            ("10", "icons/mode-kana-zenzai-light.ico"),
+            ("11", "icons/mode-kana-zenzai-dark.ico"),
+            ("12", "icons/mode-ephemeral-zenzai-light.ico"),
+            ("13", "icons/mode-ephemeral-zenzai-dark.ico"),
         ];
         for (id, path) in ICONS {
             res.set_icon_with_id(path, id);

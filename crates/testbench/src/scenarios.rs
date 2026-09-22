@@ -6,7 +6,6 @@ pub struct Vk(pub u32, pub &'static str);
 
 // VK 定数（key_event_sink.rs と同値）。
 pub const BACK: Vk = Vk(0x08, "Backspace");
-pub const TAB: Vk = Vk(0x09, "Tab");
 pub const ENTER: Vk = Vk(0x0D, "Enter");
 pub const ESC: Vk = Vk(0x1B, "Esc");
 pub const SPACE: Vk = Vk(0x20, "Space");
@@ -865,39 +864,6 @@ pub fn all() -> Vec<Scenario> {
                     return Err(format!(
                         "preedit={p:?} committed={c:?} に / が無い（打鍵が消えた）"
                     ));
-                }
-                Ok(())
-            },
-        },
-        // item41: 修正変換(Tab) — 打ち間違い読み(s 2連打)を Tab 一発で修復し確定する。
-        // "shitekudassai"(読み してくだっさい。literal 変換は「してく獺祭」等に崩壊する実測済みケース)
-        // → Tab で ev=typo_candidates_shown(修復ブロック先頭=してください)→ Enter で確定。
-        // 自己証明: typo_candidates_shown の list 先頭が してください であること(候補が出ずに
-        // Enter がライブ確定しただけの偽 PASS を防ぐ)+ committed==してください。
-        Scenario {
-            item: 41,
-            name: "tab typo-convert repairs double-s and commits",
-            keys: {
-                let mut k = typed("shitekudassai");
-                k.push(TAB);
-                k.push(ENTER);
-                k
-            },
-            expect: |c, _f, _p, evs, _l| {
-                let shown = evs.iter().find_map(|e| match e {
-                    Ev::TypoCandidatesShown { list, .. } => Some(list),
-                    _ => None,
-                });
-                let Some(list) = shown else {
-                    return Err(
-                        "ev=typo_candidates_shown 未受信(Tab が修正変換を起動していない)".into(),
-                    );
-                };
-                if list.first().map(String::as_str) != Some("してください") {
-                    return Err(format!("修復候補の先頭が してください でない: {list:?}"));
-                }
-                if c != "してください" {
-                    return Err(format!("committed={c:?} != してください"));
                 }
                 Ok(())
             },

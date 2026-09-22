@@ -316,8 +316,10 @@ fn load_settings_for_mutation() -> Result<settings::Settings, Vec<FieldError>> {
 
 /// 新 UI の初期読込。OS の自動更新タスク照合を待たず、まず保存済み設定を返す。
 #[tauri::command(async)]
-pub fn settings_snapshot() -> crate::settings_service::SettingsSnapshot {
-    crate::settings_service::settings_snapshot()
+pub fn settings_snapshot(
+    lock: tauri::State<'_, crate::logic::SettingsLock>,
+) -> Result<crate::settings_service::SettingsSnapshot, String> {
+    crate::settings_service::settings_snapshot(&lock)
 }
 
 /// 型付き差分を revision 付きで保存する。通常設定だけを扱い、ネットワークや
@@ -419,7 +421,8 @@ pub fn set_automatic_check(
         reconcile.clear_after_successful_apply();
     }
     Ok(AutomaticCheckChangeResult {
-        snapshot: crate::settings_service::settings_snapshot(),
+        snapshot: crate::settings_service::settings_snapshot(&lock)
+            .map_err(|message| vec![FieldError { field: "_io".into(), message }])?,
         warning,
     })
 }
@@ -1256,6 +1259,27 @@ fn open_existing_learning_directory(path: &Path) -> Result<Option<std::fs::File>
     Ok(Some(handle))
 }
 
+/// Uninstalled versions can still be migration sources. Include their presence locks and
+/// history in ClearLearning so the next upgrade cannot resurrect deleted words.
+fn add_stored_learning_builds(base: &Path, builds: &mut Vec<String>) -> Result<(), String> {
+    for entry in std::fs::read_dir(base)
+        .map_err(|error| format!("学習履歴の版一覧を確認できません: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("学習履歴の版を確認できません: {error}"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let build = name.strip_prefix(".learning-inheritance-").unwrap_or(name);
+        if build.as_bytes().first().is_some_and(u8::is_ascii_digit) && is_safe_build_name(build) {
+            builds.push(build.to_string());
+        }
+    }
+    builds.sort();
+    builds.dedup();
+    Ok(())
+}
+
 fn collect_existing_learning_roots_with<T>(
     base: &Path,
     builds: &[String],
@@ -1270,9 +1294,12 @@ fn collect_existing_learning_roots_with<T>(
         if !is_safe_build_name(build) {
             return Err("学習履歴の版名が安全な形式ではありません。".into());
         }
-        let path = base.join(build);
-        if let Some(handle) = open(&path)? {
-            roots.push((build.clone(), path, handle));
+        // An interrupted inheritance can contain the same private history as a live store.
+        for name in [build.clone(), format!(".learning-inheritance-{build}")] {
+            let path = base.join(&name);
+            if let Some(handle) = open(&path)? {
+                roots.push((name, path, handle));
+            }
         }
     }
     Ok((Some(base_handle), roots))
@@ -1487,6 +1514,9 @@ impl LearningClearLease {
         let exe = std::env::current_exe()
             .map_err(|error| format!("設定アプリの配置を確認できませんでした: {error}"))?;
         lease.builds = known_learning_builds(&exe)?;
+        if base_handle.is_some() {
+            add_stored_learning_builds(&base, &mut lease.builds)?;
+        }
         let (base_handle, roots) = collect_existing_learning_roots_with(
             &base,
             &lease.builds,
@@ -3201,6 +3231,33 @@ mod tests {
     }
 
     #[test]
+    fn learning_clear_includes_uninstalled_versions_and_interrupted_inheritance() {
+        let base = std::env::temp_dir().join(format!("nsk-clear-stored-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("1.0.0")).unwrap();
+        std::fs::create_dir_all(base.join(".learning-inheritance-2.0.0")).unwrap();
+        std::fs::create_dir_all(base.join("foreign")).unwrap();
+        let mut builds = vec![env!("CARGO_PKG_VERSION").to_string()];
+        super::add_stored_learning_builds(&base, &mut builds).unwrap();
+        assert!(builds.contains(&"1.0.0".to_string()));
+        assert!(builds.contains(&"2.0.0".to_string()));
+        assert!(!builds.contains(&"foreign".to_string()));
+        let (_, roots) =
+            collect_existing_learning_roots_with(&base, &builds, Some(()), |path| {
+                Ok(path.exists().then_some(()))
+            })
+            .unwrap();
+        let roots: Vec<_> = roots
+            .into_iter()
+            .map(|(build, path, ())| (build, path))
+            .collect();
+        let paths = super::selected_learning_root_paths(&base, true, &roots, true);
+        assert!(paths.contains(&base.join("1.0.0")));
+        assert!(paths.contains(&base.join(".learning-inheritance-2.0.0")));
+        assert!(!paths.contains(&base.join("foreign")));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn learning_root_plan_uses_the_validated_base_and_ignores_late_roots() {
         let base = std::path::PathBuf::from(r"C:\validated\memory");
         let builds = vec!["1.0.0".to_string(), "2.0.0".to_string()];
@@ -3212,7 +3269,15 @@ mod tests {
             })
             .unwrap();
         assert_eq!(base_handle, Some("held-base"));
-        assert_eq!(opened, vec![base.join("1.0.0"), base.join("2.0.0")]);
+        assert_eq!(
+            opened,
+            vec![
+                base.join("1.0.0"),
+                base.join(".learning-inheritance-1.0.0"),
+                base.join("2.0.0"),
+                base.join(".learning-inheritance-2.0.0"),
+            ]
+        );
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].1, base.join("1.0.0"));
 

@@ -4,9 +4,8 @@ import { InputPage } from "./InputPage";
 
 const state = vi.hoisted(() => ({
   values: {
-    liveEnabled: true,
+    liveEnabled: true, inputPredictionEnabled: true,
     liveSearchWidth: 1,
-    ephemeralTrigger: "f8",
     keymap: {},
     symbolFullWidthChars: [],
   } as unknown as PublicSettings,
@@ -16,13 +15,13 @@ const state = vi.hoisted(() => ({
 vi.mock("../settings/SettingsStore", () => ({ useSettings: () => state }));
 
 it("saves and displays both live search choices", () => {
-  const view = render(<InputPage navigate={() => {}} />);
+  const view = render(<InputPage />);
   expect(screen.getByRole("radio", { name: "速度優先（1）" })).toBeChecked();
   fireEvent.click(screen.getByRole("radio", { name: "精度優先（10）" }));
   expect(state.save).toHaveBeenLastCalledWith({ field: "live_search_width", value: 10 });
 
   state.values = { ...state.values, liveSearchWidth: 10 };
-  view.rerender(<InputPage navigate={() => {}} />);
+  view.rerender(<InputPage />);
   expect(screen.getByRole("radio", { name: "精度優先（10）" })).toBeChecked();
   fireEvent.click(screen.getByRole("radio", { name: "速度優先（1）" }));
   expect(state.save).toHaveBeenLastCalledWith({ field: "live_search_width", value: 1 });

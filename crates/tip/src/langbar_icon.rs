@@ -2,9 +2,10 @@
 //! B段までは Yu Gothic UI のテキスト描画（DrawTextW）で A/あ/あ˙ をラスタライズして
 //! いたが、2026-08 アイコン改稿で **Pure Glyph 案**（design/icons/ 採択素材）の
 //! 事前ラスタライズ ICO へ切り替えた。ICO は scripts/gen-ime-icons.ps1 が素材 PNG から
-//! 生成し、build.rs が DLL リソース（RT_GROUP_ICON ID 1..7）として埋め込む。
-//! 実行時はテーマとモードからリソースIDを選び `LoadImageW` で HICON を得るだけ —
-//! 染色（Light=#202020 / Dark=#F0F0F0）と一時かなの青点は ICO 生成時に焼き済み。
+//! 生成し、build.rs が DLL リソース（RT_GROUP_ICON ID 1..13）として埋め込む。
+//! 実行時はテーマ・モード・Zenzai GPU 稼働状態からリソースIDを選び `LoadImageW` で
+//! HICON を得るだけ — 通常染色（Light=#202020 / Dark=#F0F0F0）、GPU 稼働中の紫、
+//! 一時かなの青点は ICO 生成時に焼き済み。
 //!
 //! 旧テキスト描画の知見（なぜ事前ラスタライズか）: フォントのサイドベアリング差の
 //! 吸収にピクセル実測の中央寄せ（ink_centering_shift）が必要だったが、ICO 化で
@@ -19,12 +20,34 @@ pub(crate) const RES_MODE_KANA_DARK: usize = 4;
 pub(crate) const RES_MODE_EPHEMERAL_LIGHT: usize = 5;
 pub(crate) const RES_MODE_EPHEMERAL_DARK: usize = 6;
 /// プロファイル固定アイコン（Gapless N 案）。登録時はゼロ始まり位置へ変換して使う。
+/// 既存登録の `uIconIndex=6` との互換性のため 7 番目から動かさない。
 pub(crate) const RES_PROFILE_N: usize = 7;
+pub(crate) const RES_MODE_DIRECT_ZENZAI_LIGHT: usize = 8;
+pub(crate) const RES_MODE_DIRECT_ZENZAI_DARK: usize = 9;
+pub(crate) const RES_MODE_KANA_ZENZAI_LIGHT: usize = 10;
+pub(crate) const RES_MODE_KANA_ZENZAI_DARK: usize = 11;
+pub(crate) const RES_MODE_EPHEMERAL_ZENZAI_LIGHT: usize = 12;
+pub(crate) const RES_MODE_EPHEMERAL_ZENZAI_DARK: usize = 13;
 
 /// モードとテーマからタスクバー表示に使うリソースIDを選ぶ純関数。
 /// direct のときは ephemeral を無視する（`mode_label_ephemeral` と同じ規則 —
 /// direct 中は一時かな状態自体が存在しない）。
-pub(crate) fn mode_icon_res_id(is_direct: bool, ephemeral: bool, theme: IconTheme) -> usize {
+pub(crate) fn mode_icon_res_id(
+    is_direct: bool,
+    ephemeral: bool,
+    zenzai_gpu_active: bool,
+    theme: IconTheme,
+) -> usize {
+    if zenzai_gpu_active {
+        return match (is_direct, theme) {
+            (true, IconTheme::Light) => RES_MODE_DIRECT_ZENZAI_LIGHT,
+            (true, IconTheme::Dark) => RES_MODE_DIRECT_ZENZAI_DARK,
+            (false, IconTheme::Light) if !ephemeral => RES_MODE_KANA_ZENZAI_LIGHT,
+            (false, IconTheme::Light) => RES_MODE_EPHEMERAL_ZENZAI_LIGHT,
+            (false, IconTheme::Dark) if !ephemeral => RES_MODE_KANA_ZENZAI_DARK,
+            (false, IconTheme::Dark) => RES_MODE_EPHEMERAL_ZENZAI_DARK,
+        };
+    }
     match (is_direct, theme) {
         (true, IconTheme::Light) => RES_MODE_DIRECT_LIGHT,
         (true, IconTheme::Dark) => RES_MODE_DIRECT_DARK,
@@ -81,6 +104,7 @@ pub fn read_system_uses_light_theme() -> Option<u32> {
 pub(crate) unsafe fn render_mode_icon(
     is_direct: bool,
     ephemeral: bool,
+    zenzai_gpu_active: bool,
     dpi: i32,
 ) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
     use windows::core::PCWSTR;
@@ -91,7 +115,7 @@ pub(crate) unsafe fn render_mode_icon(
         return None;
     }
     let theme = icon_theme_from_registry_value(read_system_uses_light_theme());
-    let res = mode_icon_res_id(is_direct, ephemeral, theme);
+    let res = mode_icon_res_id(is_direct, ephemeral, zenzai_gpu_active, theme);
     // MAKEINTRESOURCE 相当: リソースID をそのままポインタ値へ入れて渡す
     // （RT_GROUP_ICON の数値ID 参照。文字列名との衝突は ID < 65536 で判別される）。
     let name = PCWSTR(res as *const u16);
@@ -133,8 +157,8 @@ mod tests {
 
     #[test]
     fn res_ids_are_distinct_and_match_build_order() {
-        // build.rs の ICONS 並び（direct/kana/ephemeral × light/dark、profile 末尾）と
-        // 番号がずれると実行時に別アイコンが出る。定数側の一意性だけでも機械検査する。
+        // build.rs の ICONS 並び（通常 6 種、互換性のため固定した profile、
+        // Zenzai 6 種）と番号がずれると実行時に別アイコンが出る。
         let ids = [
             RES_MODE_DIRECT_LIGHT,
             RES_MODE_DIRECT_DARK,
@@ -143,9 +167,15 @@ mod tests {
             RES_MODE_EPHEMERAL_LIGHT,
             RES_MODE_EPHEMERAL_DARK,
             RES_PROFILE_N,
+            RES_MODE_DIRECT_ZENZAI_LIGHT,
+            RES_MODE_DIRECT_ZENZAI_DARK,
+            RES_MODE_KANA_ZENZAI_LIGHT,
+            RES_MODE_KANA_ZENZAI_DARK,
+            RES_MODE_EPHEMERAL_ZENZAI_LIGHT,
+            RES_MODE_EPHEMERAL_ZENZAI_DARK,
         ];
         for (i, id) in ids.iter().enumerate() {
-            assert_eq!(*id, i + 1, "resource ids must stay 1..=7 in declared order");
+            assert_eq!(*id, i + 1, "resource ids must stay 1..=13 in declared order");
         }
     }
 
@@ -153,11 +183,11 @@ mod tests {
     fn mode_icon_res_id_selects_direct_by_theme() {
         // direct 中は ephemeral を無視（mode_label_ephemeral と同じ規則）。
         assert_eq!(
-            mode_icon_res_id(true, false, IconTheme::Light),
+            mode_icon_res_id(true, false, false, IconTheme::Light),
             RES_MODE_DIRECT_LIGHT
         );
         assert_eq!(
-            mode_icon_res_id(true, true, IconTheme::Dark),
+            mode_icon_res_id(true, true, false, IconTheme::Dark),
             RES_MODE_DIRECT_DARK
         );
     }
@@ -165,20 +195,36 @@ mod tests {
     #[test]
     fn mode_icon_res_id_selects_kana_and_ephemeral() {
         assert_eq!(
-            mode_icon_res_id(false, false, IconTheme::Light),
+            mode_icon_res_id(false, false, false, IconTheme::Light),
             RES_MODE_KANA_LIGHT
         );
         assert_eq!(
-            mode_icon_res_id(false, true, IconTheme::Light),
+            mode_icon_res_id(false, true, false, IconTheme::Light),
             RES_MODE_EPHEMERAL_LIGHT
         );
         assert_eq!(
-            mode_icon_res_id(false, false, IconTheme::Dark),
+            mode_icon_res_id(false, false, false, IconTheme::Dark),
             RES_MODE_KANA_DARK
         );
         assert_eq!(
-            mode_icon_res_id(false, true, IconTheme::Dark),
+            mode_icon_res_id(false, true, false, IconTheme::Dark),
             RES_MODE_EPHEMERAL_DARK
+        );
+    }
+
+    #[test]
+    fn mode_icon_res_id_selects_zenzai_variants() {
+        assert_eq!(
+            mode_icon_res_id(true, true, true, IconTheme::Light),
+            RES_MODE_DIRECT_ZENZAI_LIGHT
+        );
+        assert_eq!(
+            mode_icon_res_id(false, false, true, IconTheme::Dark),
+            RES_MODE_KANA_ZENZAI_DARK
+        );
+        assert_eq!(
+            mode_icon_res_id(false, true, true, IconTheme::Dark),
+            RES_MODE_EPHEMERAL_ZENZAI_DARK
         );
     }
 }

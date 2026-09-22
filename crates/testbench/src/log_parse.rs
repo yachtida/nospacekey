@@ -45,16 +45,6 @@ pub enum Ev {
         #[allow(dead_code)]
         seq: u64,
     }, // 診断用: 世代 seq を保持（現状未読）
-    /// 修正変換（Tab→trigger_typo_convert）が読みのタイポ修復候補を候補窓に出した。
-    /// n=候補数, sel=選択位置（常に 0 で開始）, list=候補列（先頭が修復第一候補）。
-    /// item41 は list のみ判定に使うため n/sel は診断用に保持（現状未読）。
-    TypoCandidatesShown {
-        #[allow(dead_code)]
-        n: usize,
-        #[allow(dead_code)]
-        sel: usize,
-        list: Vec<String>,
-    },
     /// 読みモニタの表示状態遷移（action = show|update|hide|destroy）。item42 が読む。
     ReadingMonitor {
         action: String,
@@ -248,16 +238,6 @@ fn parse_one(body: &str) -> Option<Ev> {
     if body.starts_with("ev=llm_applied") {
         let seq = kv(body, "seq").and_then(|s| s.parse().ok()).unwrap_or(0);
         return Some(Ev::LlmApplied { seq });
-    }
-    // ev=typo_candidates_shown は接頭辞 "ev=typo" が他分岐と衝突しないため単独判定でよい。
-    // list= の扱いは ev=candidates_shown と同一（'|' 区切り、次の既知境界で切る）。
-    if body.starts_with("ev=typo_candidates_shown") {
-        let n = kv(body, "n").and_then(|s| s.parse().ok()).unwrap_or(0);
-        let sel = kv(body, "sel").and_then(|s| s.parse().ok()).unwrap_or(0);
-        let list = list_value(body)
-            .map(|v| v.split('|').map(|s| s.trim().to_string()).collect())
-            .unwrap_or_default();
-        return Some(Ev::TypoCandidatesShown { n, sel, list });
     }
     if body.starts_with("ev=reading_monitor") {
         let action = kv(body, "action").unwrap_or("").to_string();
@@ -673,31 +653,6 @@ mod tests {
         assert!(matches!(&evs[1], Ev::EphemeralExit));
     }
 
-    #[test]
-    fn parses_typo_candidates_shown() {
-        // item41: ev=typo_candidates_shown を Ev::TypoCandidatesShown として取れること
-        // （修復候補の先頭がしてください、であることを述語で検証するための前提パース）。
-        let pid = std::process::id();
-        let lines = vec![
-            format!("[pid {pid}] ev=typo_candidates_shown n=3 sel=0 list=してください|して下さい|してく獺祭"),
-        ];
-        let evs = parse_lines(&lines, pid);
-        assert_eq!(evs.len(), 1, "evs={evs:?}");
-        match &evs[0] {
-            Ev::TypoCandidatesShown { n, list, .. } => {
-                assert_eq!(*n, 3);
-                assert_eq!(
-                    list,
-                    &vec![
-                        "してください".to_string(),
-                        "して下さい".to_string(),
-                        "してく獺祭".to_string()
-                    ]
-                );
-            }
-            _ => panic!("expected TypoCandidatesShown"),
-        }
-    }
 
     #[test]
     fn parses_notation_vk() {

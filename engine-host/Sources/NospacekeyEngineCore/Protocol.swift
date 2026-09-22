@@ -6,7 +6,7 @@ import Foundation
 /// 省略・無視しても従来動作を維持する optional 項目（例: live_search_width）は同じ世代にする。
 /// 詳細と変更時の検証基準: docs/adr/0006-ipc-protocol-generation-policy.md。
 enum ProtocolVersion {
-    static let current: UInt32 = 10
+    static let current: UInt32 = 11
 }
 
 struct AutoCommitProposal: Codable, Equatable {
@@ -28,6 +28,7 @@ struct SnapshotSegment: Codable, Equatable {
 enum Request: Decodable {
     case ping
     case startSession
+    case inputPredictions(ClauseCandidatesRequest)
     case clauseCandidates(ClauseCandidatesRequest)
     case convertClauses(ConvertClausesRequest)
     case commitReceipt(CommitReceipt)
@@ -37,8 +38,6 @@ enum Request: Decodable {
     case backspace(session: Int64)
     case convert(session: Int64, leftContext: String?)
     // 修正変換(Tab): ローマ字入力のタイポ修復仮説を先頭に立てた候補リストを返す。
-    // Rust 側 `Request::TypoConvert` と対（一字一句一致規約。wire 形は Convert と同型）。
-    case typoConvert(session: Int64, leftContext: String?)
     case commit(session: Int64, index: UInt32)
     case endSession(session: Int64)
     case reconvert(session: Int64, surface: String, leftContext: String?)
@@ -54,8 +53,6 @@ enum Request: Decodable {
                            configurationGeneration: UInt64, connectionGeneration: UInt64,
                            proposal: UInt64)
     case llmConvert(session: Int64, seq: UInt64, leftContext: String?)
-    // ローカルインライン予測。通常変換とは別の接続・セッションで扱う。
-    case predict(session: Int64, seq: UInt64, tokenIDs: [UInt32])
     // UU-5: 常駐エンジンへ最新設定を反映（session を伴わないプロセス全体設定）。
     case reloadConfig(ReloadConfigParams)
     // Spec2: 学習履歴の消去（session を伴わないプロセス全体操作）。
@@ -109,7 +106,6 @@ enum Request: Decodable {
         let configuration_generation: UInt64; let connection_generation: UInt64
         let proposal: UInt64
     }
-    private struct PredictParams: Decodable { let session: Int64; let seq: UInt64; let token_ids: [UInt32] }
     private struct CommitParams: Decodable { let session: Int64; let index: UInt32 }
     private struct RecordCorrectionParams: Decodable { let reading: String; let surface: String }
     /// カスタム辞書: Rust `Request::ReloadDictionary` のフィールドと一字一句一致させること。
@@ -130,12 +126,10 @@ enum Request: Decodable {
         let zenzai_enabled: Bool
         let zenzai_weight: String
         // 旧 TIP は送らない。nil は「現行 runtime 設定を維持」。
-        let inline_prediction_enabled: Bool?
         // Spec2: 学習トグル。旧 TIP は送らないので Optional（nil なら spawn 時 env のまま）。
         let learning_enabled: Bool?
         // 修正変換(Tab): 誤読み学習(ADR-0002)のトグル。旧 TIP は送らないので Optional
         // （learning_enabled と同じ互換規約）。
-        let typo_learn_enabled: Bool?
         // Zenzai 推論上限。旧 TIP・診断 env override（D6）時の新 TIP は送らないので Optional
         // （nil なら spawn 時 env のまま — learning_enabled と同じ互換規約）。
         let zenzai_inference_limit: UInt32?
@@ -146,6 +140,7 @@ enum Request: Decodable {
         switch try c.decode(String.self, forKey: .method) {
         case "Ping": self = .ping
         case "StartSession": self = .startSession
+        case "InputPredictions": self = .inputPredictions(try c.decode(ClauseCandidatesRequest.self, forKey: .params))
         case "ClauseCandidates": self = .clauseCandidates(try c.decode(ClauseCandidatesRequest.self, forKey: .params))
         case "ConvertClauses": self = .convertClauses(try c.decode(ConvertClausesRequest.self, forKey: .params))
         case "CommitReceipt": self = .commitReceipt(try c.decode(CommitReceipt.self, forKey: .params))
@@ -155,7 +150,6 @@ enum Request: Decodable {
         // Optional デコードで旧TIP（キー無し）互換を保つ。
         case "Convert": let p = try c.decode(ConvertParams.self, forKey: .params); self = .convert(session: p.session, leftContext: p.left_context)
         // 修正変換(Tab): wire 形は Convert と同型なので ConvertParams を共有する。
-        case "TypoConvert": let p = try c.decode(ConvertParams.self, forKey: .params); self = .typoConvert(session: p.session, leftContext: p.left_context)
         case "Reconvert": let p = try c.decode(ReconvertParams.self, forKey: .params); self = .reconvert(session: p.session, surface: p.surface, leftContext: p.left_context)
         case "Commit": let p = try c.decode(CommitParams.self, forKey: .params); self = .commit(session: p.session, index: p.index)
         case "LiveConvert": let p = try c.decode(LiveConvertParams.self, forKey: .params); self = .liveConvert(session: p.session, seq: p.seq, leftContext: p.left_context, autoCommit: p.auto_commit ?? false)
@@ -181,7 +175,6 @@ enum Request: Decodable {
                 configurationGeneration: p.configuration_generation,
                 connectionGeneration: p.connection_generation, proposal: p.proposal)
         case "LlmConvert": let p = try c.decode(LiveConvertParams.self, forKey: .params); self = .llmConvert(session: p.session, seq: p.seq, leftContext: p.left_context)
-        case "Predict": let p = try c.decode(PredictParams.self, forKey: .params); self = .predict(session: p.session, seq: p.seq, tokenIDs: p.token_ids)
         case "EndSession": let p = try c.decode(SessionParams.self, forKey: .params); self = .endSession(session: p.session)
         case "ReloadConfig": let p = try c.decode(ReloadConfigParams.self, forKey: .params); self = .reloadConfig(p)
         case "ClearLearning": self = .clearLearning
@@ -209,7 +202,13 @@ enum Request: Decodable {
     }
 }
 
+struct InputPredictionsResult: Codable {
+    let key: ClauseRequestKey
+    let candidates: [ClauseCandidate]
+}
+
 enum Response: Encodable {
+    case inputPredictionsResult(InputPredictionsResult)
     case pong
     case clauseCandidatesResult(ClauseCandidatesResult)
     case convertClausesResult(ConvertClausesResult)
@@ -232,8 +231,6 @@ enum Response: Encodable {
     case snapshotEnhancementPending(SnapshotResponseKey)
     case snapshotEnhancementUnavailable(SnapshotResponseKey)
     case llmResult(seq: UInt64, text: String)
-    case prediction(seq: UInt64, text: String)
-    case predictionUnavailable(seq: UInt64, state: String)
     case committed(text: String, reading: String)
     // 文節ナビゲーションのビュー。Rust 側 `Response::ClauseView` と対（一字一句一致規約）。
     case clauseView(segments: [String], selected: Int, candidates: [String], candidateIndex: Int)
@@ -256,6 +253,9 @@ enum Response: Encodable {
         var c = encoder.container(keyedBy: Keys.self)
         switch self {
         case .pong: try c.encode("Pong", forKey: .result)
+        case .inputPredictionsResult(let response):
+            try c.encode("InputPredictionsResult", forKey: .result)
+            try response.encode(to: encoder)
         case .clauseCandidatesResult(let response):
             try c.encode("ClauseCandidatesResult", forKey: .result)
             try response.encode(to: encoder)
@@ -319,14 +319,6 @@ enum Response: Encodable {
             try c.encode("LlmResult", forKey: .result)
             try c.encode(seq, forKey: .seq)
             try c.encode(text, forKey: .text)
-        case .prediction(let seq, let text):
-            try c.encode("Prediction", forKey: .result)
-            try c.encode(seq, forKey: .seq)
-            try c.encode(text, forKey: .text)
-        case .predictionUnavailable(let seq, let state):
-            try c.encode("PredictionUnavailable", forKey: .result)
-            try c.encode(seq, forKey: .seq)
-            try c.encode(state, forKey: .state)
         case .committed(let text, let reading):
             try c.encode("Committed", forKey: .result)
             try c.encode(text, forKey: .text)
@@ -359,7 +351,7 @@ extension Request {
     var sessionId: Int64? {
         switch self {
         case .ping, .startSession, .liveSnapshot, .pollSnapshotEnhancement, .autoCommitReceipt,
-             .clauseCandidates, .convertClauses, .commitReceipt,
+             .inputPredictions, .clauseCandidates, .convertClauses, .commitReceipt,
              .reloadConfig, .clearLearning, .shutdown, .prepareMaintenance, .queryZenzaiStatus,
              .retryZenzai, .recordCorrection,
              .reloadDictionary:
@@ -373,12 +365,10 @@ extension Request {
              .commit(let session, _),
              .liveConvert(let session, _, _, _),
              .llmConvert(let session, _, _),
-             .predict(let session, _, _),
              .moveClause(let session, _, _, _):
             return session
         case .backspace(let session),
              .convert(let session, _),
-             .typoConvert(let session, _),
              .endSession(let session),
              .selectClauseCandidate(let session, _),
              .commitClauses(let session):

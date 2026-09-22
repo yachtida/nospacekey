@@ -26,13 +26,15 @@ export function UpdatesPage() {
 
   useEffect(() => { void command<AppInfo>("get_app_info").then(setInfo).catch((error) => setFailure(errorMessage(error))); }, []);
   useEffect(() => {
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     void onEvent<UpdateProgress>("update-download-progress", (event) => {
-      if (event.attempt_id !== attempt.current) return;
+      if (disposed || event.attempt_id !== attempt.current) return;
       setPhase(event.phase);
       if (event.phase === "downloading") setProgress(event.percent ?? 0);
-    }).then((fn) => { unlisten = fn; });
-    return () => unlisten?.();
+    }).then((fn) => { if (disposed) fn(); else unlisten = fn; })
+      .catch((error) => { if (!disposed) setFailure(errorMessage(error)); });
+    return () => { disposed = true; unlisten?.(); };
   }, []);
   useEffect(() => {
     const updateDraftCount = () => setDraftCount(document.querySelectorAll("[data-commit-dirty='true'], dialog[open][data-dirty='true']").length);
@@ -45,6 +47,7 @@ export function UpdatesPage() {
     };
   }, []);
   if (!values) return null;
+  const resultStale = Boolean(result) && resultBeta !== values.updateIncludeBeta;
 
   const check = async () => {
     setChecking(true); setFailure(""); setWarning("");
@@ -68,7 +71,11 @@ export function UpdatesPage() {
     finally { setAutomaticBusy(false); }
   };
   const install = async () => {
-    if (!result || result.kind !== "Available") return;
+    if (!result || result.kind !== "Available" || checking || phase !== "idle") return;
+    if (resultStale) {
+      setWarning("確認条件が変わりました。もう一度更新を確認してください。");
+      return;
+    }
     if (saveState !== "saved") {
       setWarning("設定の保存が完了してから更新を開始してください。");
       return;
@@ -90,7 +97,7 @@ export function UpdatesPage() {
       });
       // App の終了ポリシーを通し、取得中に新たな未保存入力が生じても黙って破棄しない。
       await getCurrentWindow().close();
-    } catch (error) { setFailure(errorMessage(error)); setPhase("idle"); }
+    } catch (error) { attempt.current = undefined; setFailure(errorMessage(error)); setPhase("idle"); }
   };
   const cancel = async () => {
     if (!attempt.current) return;
@@ -105,15 +112,15 @@ export function UpdatesPage() {
     <div className="page-stack">
       <header className="page-heading"><h1>更新</h1><p>新しい版の確認とインストールを、明示的に操作します。</p></header>
       {failure && <StatusMessage tone="error">確認または処理に失敗しました: {failure}</StatusMessage>}
-      {warning && <StatusMessage tone="warning">{warning}</StatusMessage>}
+      {(resultStale || warning) && <StatusMessage tone="warning">{resultStale ? "確認条件が変わりました。もう一度更新を確認してください。" : warning}</StatusMessage>}
       <SettingsGroup title="現在のバージョン">
         <SettingRow id="app-version" title={`nospacekey ${info?.version ?? "…"}`} description={`ビルド ${info?.build_hash ?? "…"}`}><button type="button" disabled={checking || phase !== "idle"} onClick={() => void check()}>{checking ? "確認中…" : "更新を確認"}</button></SettingRow>
       </SettingsGroup>
-      <section className="operation-panel update-result" aria-live="polite"><div><span className="eyebrow">更新確認結果</span>{checking ? <h2>確認しています…</h2> : failure ? <><h2>確認できませんでした</h2><p>「最新」とは判定していません。ネットワークを確認して再試行してください。</p></> : result?.kind === "Available" ? <><h2>{result.latest} を利用できます</h2><p>現在 {result.current}。{resultBeta ? "ベータ版を含めて" : "安定版のみで"}確認しました。</p></> : result ? <><h2>最新です</h2><p>{result.current} を使用中です。</p></> : <><h2>まだ確認していません</h2><p>確認するまで外部通信は行いません。</p></>}{checkedAt && <p className="checked-at">確認時刻: {checkedAt.toLocaleString()}</p>}</div>{result?.kind === "Available" && <div className="operation-actions"><button type="button" className="primary" disabled={phase !== "idle" || saveState !== "saved" || draftCount > 0} title={saveState !== "saved" ? "設定の保存完了後に開始できます" : draftCount > 0 ? "未保存の入力を確定または破棄してください" : undefined} onClick={() => void install()}>ダウンロードしてインストール</button></div>}</section>
+      <section className="operation-panel update-result" aria-live="polite"><div><span className="eyebrow">更新確認結果</span>{checking ? <h2>確認しています…</h2> : failure ? <><h2>確認できませんでした</h2><p>「最新」とは判定していません。ネットワークを確認して再試行してください。</p></> : result?.kind === "Available" ? <><h2>{result.latest} を利用できます</h2><p>現在 {result.current}。{resultBeta ? "ベータ版を含めて" : "安定版のみで"}確認しました。</p></> : result ? <><h2>最新です</h2><p>{result.current} を使用中です。</p></> : <><h2>まだ確認していません</h2><p>確認するまで外部通信は行いません。</p></>}{checkedAt && <p className="checked-at">確認時刻: {checkedAt.toLocaleString()}</p>}</div>{result?.kind === "Available" && <div className="operation-actions"><button type="button" className="primary" disabled={checking || resultStale || phase !== "idle" || saveState !== "saved" || draftCount > 0} title={checking ? "更新を確認しています" : resultStale ? "現在の条件でもう一度更新を確認してください" : saveState !== "saved" ? "設定の保存完了後に開始できます" : draftCount > 0 ? "未保存の入力を確定または破棄してください" : undefined} onClick={() => void install()}>ダウンロードしてインストール</button></div>}</section>
       {phase !== "idle" && <section className="operation-panel"><div><h2>{phase === "downloading" ? "ダウンロード中" : "インストーラを起動しました"}</h2><p>{phase === "installing" ? "更新完了ではありません。インストーラ側の案内に従ってください。" : "検証と起動が終わるまで完了にはなりません。"}</p>{phase === "downloading" && <progress value={progress} max={100} aria-label="更新のダウンロード進捗" />}</div><div className="operation-actions"><button type="button" onClick={() => void cancel()}>{phase === "installing" ? "インストーラ側で操作" : "取消"}</button></div></section>}
       <SettingsGroup title="自動確認">
         <SettingRow id="automatic-update" title="自動的に更新を確認" description="Windowsのタスクを登録して確認します。ダウンロードやインストールは自動で始めません。" effect="OSタスクの登録・削除結果を確認後"><Switch checked={values.updateAutomaticCheck} disabled={automaticBusy} onChange={(value) => void setAutomatic(value)} label="自動更新確認" /></SettingRow>
-        <SettingRow id="include-beta" title="ベータ版を含める" description="変更後、以前の確認結果は別の条件で得た結果として扱われます。" effect="次回の更新確認から"><Switch checked={values.updateIncludeBeta} onChange={(value) => { save({ field: "update_include_beta", value }); if (result && value !== resultBeta) setWarning("確認条件が変わりました。もう一度更新を確認してください。"); }} label="ベータ版を含める" /></SettingRow>
+        <SettingRow id="include-beta" title="ベータ版を含める" description="変更後、以前の確認結果は別の条件で得た結果として扱われます。" effect="次回の更新確認から"><Switch checked={values.updateIncludeBeta} onChange={(value) => save({ field: "update_include_beta", value })} label="ベータ版を含める" /></SettingRow>
       </SettingsGroup>
       {result?.kind === "Available" && result.notes && <details className="details-panel"><summary>リリースノート</summary><pre className="release-notes">{result.notes}</pre></details>}
     </div>

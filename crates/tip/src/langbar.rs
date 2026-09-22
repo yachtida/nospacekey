@@ -62,6 +62,23 @@ pub fn mode_label_ephemeral(is_direct: bool, ephemeral: bool) -> &'static str {
     }
 }
 
+/// 旧来のテキスト言語バーではアイコン色だけで状態を伝えられないため、GPU 稼働中は
+/// `✦` を添える。Win11 のタスクバー入力インジケータは主に GetIcon を使う。
+pub fn mode_label_with_zenzai(
+    is_direct: bool,
+    ephemeral: bool,
+    zenzai_gpu_active: bool,
+) -> &'static str {
+    if !zenzai_gpu_active {
+        return mode_label_ephemeral(is_direct, ephemeral);
+    }
+    match (is_direct, ephemeral) {
+        (true, _) => "A✦",
+        (false, false) => "あ✦",
+        (false, true) => "あ˙✦",
+    }
+}
+
 /// 言語バーへ あ/A を出すモードインジケータ。`is_direct`/`sink` を TextService と共有する。
 #[implement(ITfLangBarItemButton, ITfSource)]
 pub struct ModeLangBarItem {
@@ -71,6 +88,8 @@ pub struct ModeLangBarItem {
     /// `langbar_is_direct` と並行して更新する。direct=true のときは無視される
     /// （`mode_label_ephemeral` 参照）。
     ephemeral: Rc<Cell<bool>>,
+    /// エンジンの sanitized runtime 状態が `gpu_active` のときだけ true。
+    zenzai_gpu_active: Rc<Cell<bool>>,
     /// システムが `ITfSource::AdviseSink` で渡してくる更新 sink。TextService が共有参照で
     /// 読み、モード切替時に `OnUpdate` を呼んで表示を再取得させる。
     sink: Rc<RefCell<Option<ITfLangBarItemSink>>>,
@@ -87,12 +106,14 @@ impl ModeLangBarItem {
     pub fn new(
         is_direct: Rc<Cell<bool>>,
         ephemeral: Rc<Cell<bool>>,
+        zenzai_gpu_active: Rc<Cell<bool>>,
         sink: Rc<RefCell<Option<ITfLangBarItemSink>>>,
         on_toggle: ModeToggleHandle,
     ) -> Self {
         Self {
             is_direct,
             ephemeral,
+            zenzai_gpu_active,
             sink,
             on_toggle,
             _guard: ComObjectGuard::new(),
@@ -263,16 +284,22 @@ impl ITfLangBarItemButton_Impl for ModeLangBarItem_Impl {
         // STA スレッド（TSF 呼び出し文脈）から呼ばれる。
         let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() } as i32;
         match unsafe {
-            crate::langbar_icon::render_mode_icon(self.is_direct.get(), self.ephemeral.get(), dpi)
+            crate::langbar_icon::render_mode_icon(
+                self.is_direct.get(),
+                self.ephemeral.get(),
+                self.zenzai_gpu_active.get(),
+                dpi,
+            )
         } {
             Some(hicon) => Ok(hicon),
             None => Err(E_NOTIMPL.into()), // 生成失敗時はシステム既定表示に劣化
         }
     }
     fn GetText(&self) -> Result<BSTR> {
-        Ok(BSTR::from(mode_label_ephemeral(
+        Ok(BSTR::from(mode_label_with_zenzai(
             self.is_direct.get(),
             self.ephemeral.get(),
+            self.zenzai_gpu_active.get(),
         )))
     }
 }
@@ -297,7 +324,7 @@ impl ITfSource_Impl for ModeLangBarItem_Impl {
 
 #[cfg(test)]
 mod tests {
-    use super::mode_label_ephemeral;
+    use super::{mode_label_ephemeral, mode_label_with_zenzai};
 
     #[test]
     fn mode_label_maps_direct_and_native() {
@@ -312,6 +339,14 @@ mod tests {
         assert_eq!(mode_label_ephemeral(false, true), "あ˙");
         // direct 中は ephemeral 状態自体が存在しない＝フラグは無視される。
         assert_eq!(mode_label_ephemeral(true, true), "A");
+    }
+
+    #[test]
+    fn active_zenzai_adds_text_langbar_marker() {
+        assert_eq!(mode_label_with_zenzai(true, false, true), "A✦");
+        assert_eq!(mode_label_with_zenzai(false, false, true), "あ✦");
+        assert_eq!(mode_label_with_zenzai(false, true, true), "あ˙✦");
+        assert_eq!(mode_label_with_zenzai(false, false, false), "あ");
     }
 }
 

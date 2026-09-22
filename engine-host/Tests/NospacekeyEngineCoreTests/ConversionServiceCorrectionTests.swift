@@ -106,23 +106,6 @@ final class ConversionServiceCorrectionTests: XCTestCase {
         XCTAssertNil(svc.correctionLookupForTesting(reading: "きょうははれです"))
     }
 
-    func testRepairedCommitIsNotRecorded() {
-        // 修正変換の修復確定(isRepaired)は記録しない(ADR-0002 キルスイッチ迂回の防止)。
-        // 入力は既存 ConversionServiceTypoTests が実証済みの "shitekudassai"
-        // (ss の2連打ちょうど → 修復仮説「してください」が決定的に出る)。
-        let s = svc.startSession()
-        _ = svc.insert(session: s, text: "shitekudassai")
-        let cands = svc.typoConvert(session: s)!
-        guard let repairedIdx = cands.firstIndex(of: "してください"),
-              svc.typoRepairedIndices[s]?.contains(repairedIdx) == true else {
-            return XCTFail("repair hypothesis missing: \(cands)")
-        }
-        _ = svc.commit(session: s, index: repairedIdx)
-        svc.endSession(session: s)
-        // 誤読み・修復読みのどちらのキーでも記録されていない
-        XCTAssertNil(svc.correctionLookupForTesting(reading: "してくだっさい"))
-        XCTAssertNil(svc.correctionLookupForTesting(reading: "してください"))
-    }
 
     func testDateTemplateCommitIsNotRecorded() throws {
         // spec エッジ表「日付テンプレート候補」: isLearningTarget=false の展開候補を訂正として

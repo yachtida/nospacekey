@@ -195,7 +195,7 @@ fn open_named_pipe(pipe_path: &str) -> io::Result<File> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, OPEN_EXISTING,
+        FILE_SHARE_WRITE, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     };
 
     let wide: Vec<u16> = pipe_path.encode_utf16().chain(std::iter::once(0)).collect();
@@ -206,7 +206,7 @@ fn open_named_pipe(pipe_path: &str) -> io::Result<File> {
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
             None,
         )
     }
@@ -287,11 +287,31 @@ impl EngineClient {
     /// 指定したパイプ名へ接続（最大 `timeout` までリトライ）。サーバ未起動なら待って失敗を返す。
     /// TIP はプロセス毎に一意のパイプ名で自分専用エンジンへ接続するためこちらを使う。
     pub fn connect_to(pipe_path: &str, timeout: Duration) -> io::Result<Self> {
+        Self::connect_to_inner(pipe_path, timeout, None)
+    }
+
+    /// Connect to an explicitly staged engine, authenticating before any request.
+    /// Normal product callers use connect_to, which derives the installed engine
+    /// beside the calling TIP/config module automatically.
+    #[cfg(windows)]
+    pub fn connect_to_engine_at(pipe_path: &str, timeout: Duration, expected_engine: &std::path::Path) -> io::Result<Self> {
+        Self::connect_to_inner(pipe_path, timeout, Some(expected_engine))
+    }
+
+    fn connect_to_inner(pipe_path: &str, timeout: Duration, expected_engine: Option<&std::path::Path>) -> io::Result<Self> {
+        #[cfg(not(windows))]
+        let _ = expected_engine;
         let deadline = Instant::now() + timeout;
         let mut interval = CONNECT_POLL_MIN;
         loop {
             match open_named_pipe(pipe_path) {
                 Ok(pipe) => {
+                    #[cfg(windows)]
+                    if let Some(expected) = expected_engine {
+                        crate::server_identity::verify_server_at(&pipe, expected)?;
+                    } else if crate::server_identity::is_engine_pipe(pipe_path) {
+                        crate::server_identity::verify_engine_server(&pipe)?;
+                    }
                     return Ok(Self {
                         pipe,
                         #[cfg(windows)]
@@ -757,18 +777,12 @@ mod win_io {
         req: &Request,
         deadline: Option<Instant>,
     ) -> io::Result<()> {
-        let body = serde_json::to_vec(req)?;
-        if body.len() > crate::framing::MAX_REQUEST_FRAME_LEN || u32::try_from(body.len()).is_err()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "request frame length {} exceeds maximum {}",
-                    body.len(),
-                    crate::framing::MAX_REQUEST_FRAME_LEN
-                ),
-            ));
-        }
+        let deadline_tick_ms = deadline.map(|end| {
+            let remaining = end.saturating_duration_since(Instant::now()).as_millis();
+            unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+                .saturating_add(remaining.min(u64::MAX as u128) as u64)
+        });
+        let body = crate::framing::serialize_request(req, deadline_tick_ms)?;
         let header = (body.len() as u32).to_le_bytes();
         write_all(file, &header, deadline)?;
         write_all(file, &body, deadline)
@@ -934,6 +948,37 @@ mod win_pipe_tests {
 
     fn create_server(name: &str) -> windows::Win32::Foundation::HANDLE {
         create_server_with_input(name, 4096)
+    }
+
+    #[test]
+    fn impostor_on_an_engine_pipe_is_rejected_before_any_request() {
+        use std::os::windows::io::FromRawHandle;
+        let name = super::pipe_name_for_session(u32::MAX - std::process::id());
+        let server = create_server(&name);
+        let _server = unsafe { std::fs::File::from_raw_handle(server.0) };
+        let result = EngineClient::connect_to(&name, Duration::from_millis(50));
+        assert!(result.is_err(), "a process that is not the engine must never receive input or API keys");
+        let mut available = 0;
+        let _ = unsafe { windows::Win32::System::Pipes::PeekNamedPipe(server, None, 0, None, Some(&mut available), None) };
+        assert_eq!(available, 0);
+    }
+
+    #[test]
+    fn server_image_verification_accepts_the_actual_process_and_rejects_another_executable() {
+        use std::os::windows::io::FromRawHandle;
+        let me = std::env::current_exe().unwrap();
+        for (index, expected) in [me.clone(), std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe")].iter().enumerate() {
+            let name = format!(r"\\.\pipe\nospacekey-image-test-{}-{index}", std::process::id());
+            let server = unsafe { std::fs::File::from_raw_handle(create_server(&name).0) };
+            let result = EngineClient::connect_to_engine_at(&name, Duration::ZERO, expected);
+            if index == 0 {
+                let client = result.unwrap();
+                assert_eq!(crate::server_identity::server_image_path(&client.pipe).unwrap().canonicalize().unwrap(), me.canonicalize().unwrap());
+            } else {
+                assert_eq!(result.err().unwrap().kind(), io::ErrorKind::PermissionDenied);
+            }
+            drop(server);
+        }
     }
 
     #[test]

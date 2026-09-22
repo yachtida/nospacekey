@@ -26,6 +26,28 @@ fn serialize_frame<T: serde::Serialize>(
     Ok(body)
 }
 
+/// Optional admission deadline in Windows boot-clock milliseconds. Only
+/// replaceable calculations may expire; commits and learning receipts must run.
+pub(crate) fn serialize_request(
+    request: &crate::protocol::Request,
+    deadline_tick_ms: Option<u64>,
+) -> io::Result<Vec<u8>> {
+    use crate::protocol::Request;
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        #[serde(flatten)]
+        request: &'a Request,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        deadline_tick_ms: Option<u64>,
+    }
+    let discardable = matches!(request, Request::LiveSnapshot { .. }
+        | Request::InputPredictions { .. } | Request::ClauseCandidates { .. }
+        | Request::ConvertClauses { .. });
+    serialize_frame(&Envelope {
+        request, deadline_tick_ms: deadline_tick_ms.filter(|_| discardable),
+    }, MAX_REQUEST_FRAME_LEN, io::ErrorKind::InvalidInput)
+}
+
 /// 4byte リトルエンディアン長 + UTF-8 JSON 本体 を書き込む。
 /// generic frame は response 上限（16 MiB）で検査する。
 pub fn write_frame<W: Write, T: serde::Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
@@ -78,6 +100,34 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn optional_deadline_preserves_request_shape_and_never_expires_commits() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "method": "LiveSnapshot", "params": {
+                "composition": 1, "revision": 1, "configuration_generation": 1,
+                "connection_generation": 1, "conversion_revision": 0, "request_id": 1,
+                "segments": [{"text": "a"}], "explicit": false
+            }
+        })).unwrap();
+        let plain = serde_json::to_value(&request).unwrap();
+        let encoded = serialize_request(&request, Some(1234)).unwrap();
+        let mut envelope: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(envelope.as_object_mut().unwrap().remove("deadline_tick_ms"), Some(1234.into()));
+        assert_eq!(envelope, plain);
+        // A reader with the previous Request shape ignores the optional envelope field.
+        let decoded: Request = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), plain);
+        let no_deadline: serde_json::Value = serde_json::from_slice(&serialize_request(&request, None).unwrap()).unwrap();
+        assert_eq!(no_deadline, plain);
+        for method in ["Commit", "EndSession"] {
+            let request: Request = serde_json::from_value(serde_json::json!({
+                "method": method, "params": {"session": 1, "index": 0}
+            })).unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&serialize_request(&request, Some(0)).unwrap()).unwrap();
+            assert!(wire.get("deadline_tick_ms").is_none());
         }
     }
 

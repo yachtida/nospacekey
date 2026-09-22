@@ -133,7 +133,6 @@ export function DictionaryPage() {
       </section>
       <SettingsGroup title="学習">
         <SettingRow id="learning" title="変換結果を学習する" description="OFFにしても、これまでの学習内容は削除されません。" effect="次回のエンジン接続から"><Switch checked={values.learningEnabled} onChange={(value) => save({ field: "learning_enabled", value })} label="変換学習" /></SettingRow>
-        <SettingRow id="typo-learning" title="修正変換の誤読みを学習する" description="修正候補を確定したとき、誤読みと正しい読みの組を端末内に記録します。" effect="次回のエンジン接続から" disabledReason={!values.typoCorrectEnabled ? "入力・変換で修正変換を有効にすると使われます。" : undefined}><Switch checked={values.typoCorrectLearn} onChange={(value) => save({ field: "typo_correct_learn", value })} label="修正変換の学習" /></SettingRow>
       </SettingsGroup>
       <EditorDialog open={Boolean(editing)} title={editing === "new" ? "単語を追加" : "単語を編集"} dirty={editorDirty} onClose={() => !busy && setEditing(undefined)}>
         <div className="form-grid"><label>読み<input value={ruby} onChange={(event) => setRuby(event.target.value)} autoFocus spellCheck={false} /></label><label>単語<input value={word} onChange={(event) => setWord(event.target.value)} spellCheck={false} /></label><label>品詞<select value={pos} onChange={(event) => setPos(event.target.value)}><option>名詞</option><option>人名</option><option>姓</option><option>名</option><option>固有名詞</option><option>組織</option><option>地名</option><option>数</option></select></label></div>

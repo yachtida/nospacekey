@@ -5,7 +5,6 @@ const settings = {
   liveSearchWidth: 1,
   zenzaiInferenceLimit: 3,
   defaultDirect: false,
-  typoCorrectEnabled: true,
   keymap: { ephemeral: null },
   appearance: { theme: "auto", palette_light: {}, palette_dark: {} },
 } as unknown as PublicSettings;
@@ -35,7 +34,7 @@ it("keeps key binding null distinct from disabled none", () => {
 });
 
 it("distinguishes an unrelated revision conflict from a same-field conflict", () => {
-  const unrelated = { ...settings, typoCorrectEnabled: false };
+  const unrelated = { ...settings, zenzaiInferenceLimit: 4 };
   const sameField = { ...settings, defaultDirect: true };
   const change = { field: "default_direct", value: true } as const;
   expect(conflictingChanges(settings, unrelated, [change])).toEqual([]);

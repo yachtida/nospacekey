@@ -34,22 +34,6 @@ final class ProtocolTests: XCTestCase {
         XCTAssertNil(leftContext2)
     }
 
-    // 修正変換(Tab): TypoConvert の left_context デコード（あり／なしの両方が成功すること）。
-    // wire 形は Convert と同型（ConvertParams を共有する実装）。
-    func testTypoConvertParamsDecodeLeftContext() throws {
-        let withCtx = #"{"method":"TypoConvert","params":{"session":7,"left_context":"私の"}}"#.data(using: .utf8)!
-        let reqWith = try JSONDecoder().decode(Request.self, from: withCtx)
-        guard case let .typoConvert(session, leftContext) = reqWith else { return XCTFail("not typoConvert: \(reqWith)") }
-        XCTAssertEqual(session, 7)
-        XCTAssertEqual(leftContext, "私の")
-
-        let withoutCtx = #"{"method":"TypoConvert","params":{"session":7}}"#.data(using: .utf8)!
-        let reqWithout = try JSONDecoder().decode(Request.self, from: withoutCtx)
-        guard case let .typoConvert(session2, leftContext2) = reqWithout else { return XCTFail("not typoConvert: \(reqWithout)") }
-        XCTAssertEqual(session2, 7)
-        XCTAssertNil(leftContext2)
-        XCTAssertEqual(reqWithout.sessionId, 7)
-    }
 
     func testEncodeLiveResult() throws {
         let res = Response.liveResult(seq: 42, text: "日本語", reading: "にほんご", committed: nil)
@@ -112,18 +96,8 @@ final class ProtocolTests: XCTestCase {
         // session を伴わない（所有権ガード対象外）。
         XCTAssertNil(req.sessionId)
         // 修正変換(Tab): typo_learn_enabled キー無し（旧TIP）は nil にデコードされる。
-        XCTAssertNil(p.typo_learn_enabled)
     }
 
-    // 修正変換(Tab): typo_learn_enabled キー有りは値どおりにデコードされる（新TIP → 新エンジン）。
-    func testDecodeReloadConfigWithTypoLearnEnabled() throws {
-        let json = #"""
-        {"method":"ReloadConfig","params":{"llm_enabled":false,"llm_api_key":"","llm_endpoint":"","llm_model":"","llm_prompt":"","llm_timeout_ms":15000,"zenzai_enabled":false,"zenzai_weight":"","typo_learn_enabled":false}}
-        """#.data(using: .utf8)!
-        let req = try JSONDecoder().decode(Request.self, from: json)
-        guard case let .reloadConfig(p) = req else { return XCTFail("not reloadConfig: \(req)") }
-        XCTAssertEqual(p.typo_learn_enabled, false)
-    }
 
     func testEncodeLlmResult() throws {
         let res = Response.llmResult(seq: 9, text: "この変換でおこなってください")
@@ -145,8 +119,6 @@ final class ProtocolTests: XCTestCase {
             .error("no session"),
             .liveResult(seq: 1, text: "", reading: "", committed: nil),
             .llmResult(seq: 2, text: ""),
-            .prediction(seq: 3, text: ""),
-            .predictionUnavailable(seq: 4, state: "loading"),
             .committed(text: "", reading: ""),              // 全消費（残り読み空）でもフレーム本体は非空
             .zenzaiStatus(state: "classic", backend: nil, device: nil, reason: nil,
                           liveLatency: nil, convertLatency: nil),
@@ -176,42 +148,17 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(try decode(#"{"method":"Insert","params":{"session":7,"text":"a"}}"#).sessionId, 7)
         XCTAssertEqual(try decode(#"{"method":"Backspace","params":{"session":7}}"#).sessionId, 7)
         XCTAssertEqual(try decode(#"{"method":"Convert","params":{"session":7}}"#).sessionId, 7)
-        XCTAssertEqual(try decode(#"{"method":"TypoConvert","params":{"session":7}}"#).sessionId, 7)
         XCTAssertEqual(try decode(#"{"method":"Reconvert","params":{"session":7,"surface":"にほんご"}}"#).sessionId, 7)
         XCTAssertEqual(try decode(#"{"method":"Commit","params":{"session":7,"index":0}}"#).sessionId, 7)
         XCTAssertEqual(try decode(#"{"method":"EndSession","params":{"session":7}}"#).sessionId, 7)
         XCTAssertEqual(try decode(#"{"method":"LiveConvert","params":{"session":7,"seq":1}}"#).sessionId, 7)
         XCTAssertEqual(try decode(#"{"method":"LlmConvert","params":{"session":7,"seq":1}}"#).sessionId, 7)
-        XCTAssertEqual(try decode(#"{"method":"Predict","params":{"session":7,"seq":2,"token_ids":[1,2]}}"#).sessionId, 7)
     }
 
-    func testDecodePredictionRequest() throws {
-        let json = #"{"method":"Predict","params":{"session":7,"seq":42,"token_ids":[1,50014,28998,65484,29282]}}"#
-        let req = try JSONDecoder().decode(Request.self, from: Data(json.utf8))
-        guard case .predict(let session, let seq, let tokenIDs) = req else {
-            return XCTFail("not predict: \(req)")
-        }
-        XCTAssertEqual(session, 7)
-        XCTAssertEqual(seq, 42)
-        XCTAssertEqual(tokenIDs, [1, 50_014, 28_998, 65_484, 29_282])
-    }
 
-    func testEncodePredictionResponses() throws {
-        let prediction = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(Response.prediction(seq: 42, text: "会議です"))) as! [String: Any]
-        XCTAssertEqual(prediction["result"] as? String, "Prediction")
-        XCTAssertEqual(prediction["seq"] as? Int, 42)
-        XCTAssertEqual(prediction["text"] as? String, "会議です")
-
-        let unavailable = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(Response.predictionUnavailable(seq: 43, state: "loading"))) as! [String: Any]
-        XCTAssertEqual(unavailable["result"] as? String, "PredictionUnavailable")
-        XCTAssertEqual(unavailable["seq"] as? Int, 43)
-        XCTAssertEqual(unavailable["state"] as? String, "loading")
-    }
 
     func testSnapshotAutoCommitBumpsProtocolGeneration() {
-        XCTAssertEqual(ProtocolVersion.current, 10)
+        XCTAssertEqual(ProtocolVersion.current, 11)
     }
 
     func testSnapshotAutoCommitProposalAndReceiptWireContract() throws {

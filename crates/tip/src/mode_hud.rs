@@ -13,9 +13,9 @@ use std::sync::OnceLock;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect,
-    GetDeviceCaps, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, HFONT, LOGPIXELSX, PAINTSTRUCT, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FrameRect,
+    SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, HFONT, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetClientRect, IsWindowVisible, KillTimer, ShowWindow, SW_HIDE,
@@ -23,14 +23,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::langbar::mode_label_ephemeral;
-use crate::popup::{self, effective_dpi, font_size_px, scale, Backend, PopupState};
+use crate::popup::{self, font_size_px, scale, Backend, PopupState};
 
 const CLASS_NAME: PCWSTR = w!("NospacekeyModeHud");
 
 /// HUD カードの一辺（dp、96DPI 基準）。あ/A 1 文字＋余白に十分な正方形。
-const HUD_SIDE: i32 = 48;
-/// HUD フォントのポイントサイズ（10 倍値、24.0pt=240）。候補窓の 10.5pt より大きい。
-const HUD_FONT_POINT_TENTHS: i32 = 240;
+const HUD_SIDE: i32 = 32;
+/// 学習失敗通知は従来の高さを維持する。
+const NOTICE_HEIGHT: i32 = 48;
+/// HUD フォントのポイントサイズ（10 倍値、14.0pt=140）。候補窓の 10.5pt より大きい。
+const HUD_FONT_POINT_TENTHS: i32 = 140;
 /// 自動消去までの時間（ms）。
 const HUD_DURATION_MS: u32 = 1200;
 /// 自前ヘアライン枠の太さ（px、非スケール）。
@@ -46,6 +48,7 @@ pub(crate) fn hud_window_size(dpi: i32) -> (i32, i32) {
 
 /// HWND ごとの描画状態（GWLP_USERDATA に格納）。表示文字・テーマ・描画バックエンドを持つ。
 struct HudState {
+    layout_dpi: i32,
     font_point_tenths: i32,
     /// 現在の表示文字（"あ" or "A"。mode_label の &'static を持つので確保不要）。
     label: &'static str,
@@ -62,7 +65,7 @@ impl PopupState for HudState {
 }
 
 impl HudState {
-    /// HUD は候補窓のフォントサイズではなく大きな固定サイズ（24pt=240）を使う。
+    /// HUD は候補窓のフォントサイズではなく固定サイズ（14pt=140）を使う。
     /// ファミリは候補窓と同じく theme から（GDI パスにも settings のフォントが効く）。
     unsafe fn font_for_dpi(&mut self, dpi: i32) -> Option<HFONT> {
         let family = popup::family_utf16z(&self.theme.font_family);
@@ -113,7 +116,7 @@ unsafe fn begin_dismiss(hwnd: HWND) {
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
-            paint(hwnd);
+            popup::paint_guarded::<HudState>(hwnd, "ModeHud.WM_PAINT", || paint(hwnd));
             LRESULT(0)
         }
         WM_TIMER => unsafe {
@@ -174,19 +177,18 @@ fn paint(hwnd: HWND) {
 /// WM_PAINT の GDI 本体。色は theme.colors.* から取る（ハードコード const は使わない）。
 fn paint_gdi(hwnd: HWND) {
     unsafe {
-        let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
+        let paint_session = popup::PaintSession::begin(hwnd);
+        let hdc = paint_session.hdc();
         if hdc.is_invalid() {
             return;
         }
         let state = match hud_state(hwnd) {
             Some(s) => s,
             None => {
-                let _ = EndPaint(hwnd, &ps);
                 return;
             }
         };
-        let dpi = effective_dpi(GetDeviceCaps(Some(hdc), LOGPIXELSX));
+        let dpi = state.layout_dpi;
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
         let colors = state.theme.colors;
@@ -217,8 +219,6 @@ fn paint_gdi(hwnd: HWND) {
         let bb = CreateSolidBrush(COLORREF(colors.border.colorref()));
         let _ = FrameRect(hdc, &rc, bb);
         let _ = DeleteObject(bb.into());
-
-        let _ = EndPaint(hwnd, &ps);
     }
 }
 
@@ -231,22 +231,20 @@ unsafe fn paint_d2d(hwnd: HWND) {
         DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_ALIGNMENT_CENTER,
     };
 
-    let mut ps = PAINTSTRUCT::default();
-    let hdc = BeginPaint(hwnd, &mut ps);
+    let paint_session = popup::PaintSession::begin(hwnd);
+    let _hdc = paint_session.hdc();
     let Some(state) = hud_state(hwnd) else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     if state.backend.renderer.is_none() {
-        let _ = EndPaint(hwnd, &ps);
         return;
     }
-    let dpi = effective_dpi(GetDeviceCaps(Some(hdc), LOGPIXELSX));
+    let dpi = state.layout_dpi;
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
 
     // テキストフォーマットは Backend 経由（DWrite factory は遅延生成キャッシュ）。
-    // HUD は候補窓のフォントサイズではなく、大きな固定サイズ（24pt=240）を使う。
+    // HUD は候補窓のフォントサイズではなく、固定サイズ（14pt=140）を使う。
     let family: Vec<u16> = state
         .theme
         .font_family
@@ -258,7 +256,6 @@ unsafe fn paint_d2d(hwnd: HWND) {
         .backend
         .text_format(&family, font_px, DWRITE_TEXT_ALIGNMENT_CENTER, true)
     else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     // 以降 state への書き込みは end_draw 後にしか無いので、テーマは不変借用で読む。
@@ -266,11 +263,9 @@ unsafe fn paint_d2d(hwnd: HWND) {
 
     // TIP パスでは expect/unwrap を使わず else で対の EndPaint を打って return する。
     let Some(renderer) = state.backend.renderer.as_ref() else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     let Ok(ctx) = renderer.begin_draw() else {
-        let _ = EndPaint(hwnd, &ps);
         return;
     };
     ctx.SetDpi(96.0, 96.0);
@@ -328,7 +323,6 @@ unsafe fn paint_d2d(hwnd: HWND) {
     if lost {
         state.backend.renderer_dead = true;
     }
-    let _ = EndPaint(hwnd, &ps);
 }
 
 /// 自前描画のモード HUD。`hwnd` は遅延生成（初回 `flash` まで null）。
@@ -394,6 +388,7 @@ impl ModeHud {
             popup::install_state(
                 hwnd,
                 Box::new(HudState {
+                    layout_dpi: 96,
                     font_point_tenths: HUD_FONT_POINT_TENTHS,
                     label: mode_label_ephemeral(false, false),
                     theme,
@@ -456,7 +451,10 @@ impl ModeHud {
         // DPI は表示先アンカー(x, y)のモニタから先に確定する（候補窓と同じ理由 — 窓の
         // 現位置 DPI では混合DPIのモニタ越え初回フレームで窓とグリフの縮尺が食い違う、UIバグ2）。
         let dpi = popup::dpi_for_anchor(x, y);
-        let (w, h) = if notice { (2 * BORDER + scale(400, dpi), 2 * BORDER + scale(HUD_SIDE, dpi)) }
+        unsafe {
+            if let Some(state) = hud_state(self.hwnd) { state.layout_dpi = dpi; }
+        }
+        let (w, h) = if notice { (2 * BORDER + scale(400, dpi), 2 * BORDER + scale(NOTICE_HEIGHT, dpi)) }
             else { hud_window_size(dpi) };
         let (fx, fy) = popup::place_on_monitor(x, y, w, h);
         unsafe {
@@ -465,7 +463,7 @@ impl ModeHud {
             // ResizeBuffers は同寸なら安価・冪等なので無条件で呼んで問題ない。以前はここに
             // size_changed ガードを置いていたが、その比較対象が SetWindowPos "後" の
             // GetClientRect（＝既に新サイズ）と (w,h) だったため常に偽になり、初回 flash で
-            // リサイズが一度も走らず backbuffer が生成時サイズ（hud_window_size(96)=50x50）に
+            // リサイズが一度も走らず backbuffer が生成時サイズ（hud_window_size(96)=34x34）に
             // 据え置かれた。結果 150% DPI で 74x74 の窓に対し 50x50 バックバッファへ 74 空間で
             // レイアウト＋DXGI_SCALING_STRETCH され、グリフが拡大・クリップされていた。
             // 候補窓 relayout_and_repaint と同じく無条件 resize にしてこの真因を潰す。
@@ -504,13 +502,39 @@ impl Drop for ModeHud {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paint_panic_stays_inside_window_callback() {
+        crate::popup::assert_paint_panic_is_contained(Some(super::wnd_proc));
+    }
+
     use super::hud_window_size;
 
     #[test]
+    fn paint_uses_the_layout_dpi() {
+        use super::*;
+        unsafe {
+            popup::register_class(&CLASS_ATOM, CLASS_NAME, Some(wnd_proc)).unwrap();
+            let hwnd = popup::create_popup(CLASS_NAME, Default::default(), 50, 50).unwrap();
+            popup::install_state(hwnd, Box::new(HudState {
+                layout_dpi: 96,
+                font_point_tenths: HUD_FONT_POINT_TENTHS,
+                label: "A", theme: Default::default(), backend: Backend::new(None),
+            }));
+            let mut hud = ModeHud { hwnd };
+            for dpi in [192, 96, 288] {
+                popup::TEST_ANCHOR_DPI.set(Some(dpi));
+                hud.flash(false, false, 100, 100, Default::default());
+                popup::TEST_ANCHOR_DPI.set(None);
+                paint_gdi(hwnd);
+                assert_eq!(hud_state(hwnd).unwrap().backend.cached_font_dpi(), Some(dpi));
+            }
+        }
+    }
+
+    #[test]
     fn hud_window_size_is_square_and_dpi_scaled() {
-        // HUD_SIDE=48, BORDER=1。96DPI: 2*1 + scale(48,96)=2+48 = 50（正方形）。
-        assert_eq!(hud_window_size(96), (50, 50));
-        // 192DPI: 2 + scale(48,192)=2 + (48*192+48)/96 = 2 + 9264/96 = 2+96 = 98。
-        assert_eq!(hud_window_size(192), (98, 98));
+        assert_eq!(hud_window_size(96), (34, 34));
+        assert_eq!(hud_window_size(144), (50, 50));
+        assert_eq!(hud_window_size(192), (66, 66));
     }
 }

@@ -118,6 +118,13 @@ code { font-family: ui-monospace, "Cascadia Mono", monospace; }
 .details-panel { overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
 .details-panel summary { min-height: 44px; padding: 11px 16px; cursor: pointer; font-weight: 600; }
 .details-body { border-top: 1px solid var(--border); }
+.latency-details { padding: 0 16px 12px; }
+.latency-table-wrap { overflow-x: auto; }
+.latency-table { width: 100%; border-collapse: collapse; white-space: nowrap; }
+.latency-table th, .latency-table td { padding: 10px 8px; border-bottom: 1px solid var(--border); text-align: right; }
+.latency-table th { color: var(--muted); font-size: 12px; }
+.latency-table th:first-child, .latency-table td:first-child { text-align: left; }
+
 
 .filter-bar { display: flex; gap: 8px; margin-bottom: 12px; }
 .filter-bar label:first-child { flex: 1; }
