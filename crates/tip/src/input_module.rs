@@ -1330,6 +1330,40 @@ mod tests {
     }
 
     #[test]
+    fn issue9_backspace_reopens_cursor_frozen_romaji_and_reseeds_kana_pending() {
+        // Issue #9: カーソル移動で凍結した未確定ローマ字（こんn）へ削除で戻った後の打鍵は
+        // n+i=ni で再結合する。再結合は engine reseed が pending を Kana style で送ることに
+        // 依存するため、セグメント様式も固定する。
+        let mut module = InputModule::default();
+        for ch in "konnn".chars() {
+            module.handle(key(ch));
+        }
+        assert_eq!(module.canonical_reading(), "こんn");
+        module.handle(InputEvent::Key(KeyEvent::MoveReading(-1)));
+        module.handle(InputEvent::Key(KeyEvent::ReadingEnd));
+        module.handle(key('i'));
+        assert_eq!(module.canonical_reading(), "こんnい", "凍結中の打鍵は結合しない");
+        let deletion = module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "こんn");
+        // reopen した pending "n" は末尾 Kana ランへマージされた 1 セグメントとして
+        // engine へ再送される（Direct 凍結のままなら Kana ランに溶け込まない）。
+        match deletion.background {
+            Some(BackgroundIntent::Reseed { segments, .. }) => assert_eq!(
+                segments,
+                vec![InputSegment { text: "こんn".into(), style: TextStyle::Kana }],
+                "reopen した n は Kana style として engine へ再送される"
+            ),
+            other => panic!("expected reseed after backspace, got {other:?}"),
+        }
+        module.handle(key('i'));
+        assert_eq!(module.canonical_reading(), "こんに");
+        assert_eq!(
+            replayed_reading(&module.canonical_segments()),
+            module.canonical_reading()
+        );
+    }
+
+    #[test]
     fn automatic_romaji_origin_survives_partial_commit_and_stale_snapshots() {
         let mut module = InputModule::default();
         for ch in "adhy".chars() {

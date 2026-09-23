@@ -220,7 +220,7 @@ impl KeymapFunc {
         match self {
             ModeToggle => "モードトグル(あ⇔A)",
             Reconvert => "再変換",
-            Ephemeral => "一時かなモード開始",
+            Ephemeral => "一時かな・一時英数モード",
             CommitUndo => "確定取り消し",
             LlmConvert => "外部LLM変換",
             ToHiragana => "表記変換: ひらがな",

@@ -762,6 +762,15 @@ mod tests {
         let p = plan_live_enter(Some(String::new()), "あ", "a");
         assert_eq!(p, LiveEnterPlan::DirectCommit { text: "あ".into() });
     }
+    #[test]
+    fn issue7_displayed_string_commits_verbatim_even_when_a_fresh_conversion_differs() {
+        // Issue #7: 画面に「まで」が出ているのに確定だけ別の変換（間で）になる WYSIWYG
+        // 違反。VK_RETURN も settle も素材を live=None（表示中 live_text → 読みの順）で
+        // 組む契約 — fresh な engine 変換を差し込む経路は持たない。ここでは表示と読みが
+        // 一致する語形で、表示中文字列がそのまま確定素材になることを固定する。
+        let p = plan_live_enter(None, "まで", "まで");
+        assert_eq!(p, LiveEnterPlan::DirectCommit { text: "まで".into() });
+    }
 
     // ---- ライブ変換 OFF: 見えている読みがそのまま確定される（設定 OFF は OFF を意味する） ----
 

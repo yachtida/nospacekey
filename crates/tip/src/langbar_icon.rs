@@ -30,8 +30,9 @@ pub(crate) const RES_MODE_EPHEMERAL_ZENZAI_LIGHT: usize = 12;
 pub(crate) const RES_MODE_EPHEMERAL_ZENZAI_DARK: usize = 13;
 
 /// モードとテーマからタスクバー表示に使うリソースIDを選ぶ純関数。
-/// direct のときは ephemeral を無視する（`mode_label_ephemeral` と同じ規則 —
-/// direct 中は一時かな状態自体が存在しない）。
+/// direct のときは ephemeral を無視する（`mode_label_ephemeral` とは意図的な差 —
+/// 一時英数(Issue #8)用の青点 ICO は存在しないため、タスクバーは通常 A を使う。
+/// 一時モードであることは HUD/テキスト言語バーの「A˙」が担う）。
 pub(crate) fn mode_icon_res_id(
     is_direct: bool,
     ephemeral: bool,

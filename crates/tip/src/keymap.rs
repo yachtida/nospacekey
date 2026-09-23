@@ -26,10 +26,14 @@ pub fn normalize_vk(vk: u32) -> u32 {
 /// NotationRotate の遷移(spec §4.1)。現在表記から「次」を導出する。
 /// Why not 独立カウンタ: F6-F10 との併用で表示と巡回位置がズレる。表示中の表記
 /// (notation_fixed)を唯一の状態にすれば、どの経路で表記が変わっても次の一手が表示と整合する。
-pub fn next_notation(current: Option<Notation>) -> Notation {
+/// `display_converted` は None 起点専用: 自動変換などで表示が読み(ひらがな)と異なる
+/// 変換結果のとき true。この場合 1 打目でひらがな(読み)へ戻してから巡回に入る
+/// (Issue #6: 今日 → きょう → キョウ)。読みのままの表示は従来どおりカタカナから入る。
+pub fn next_notation(current: Option<Notation>, display_converted: bool) -> Notation {
     match current {
         Some(Notation::Katakana) => Notation::HankakuKana,
         Some(Notation::HankakuKana) => Notation::Hiragana,
+        None if display_converted => Notation::Hiragana,
         // None(ライブ変換=ひらがな起点) / Hiragana / 英数系 → カタカナで巡回に入る。
         _ => Notation::Katakana,
     }
@@ -119,6 +123,9 @@ pub enum KeyAction {
     Reconvert,
     ModeToggle,
     Ephemeral,
+    /// 一時英数モード開始（Issue #8）。Ephemeral の対: native+idle で同一 chord が
+    /// 「半角英数への一時切替」を意味する。入力モードによって同じキーの役割が反転する。
+    EphemeralDirect,
     CommitUndo,
     Llm,
     Notation(Notation),
@@ -171,6 +178,11 @@ pub fn resolve_action(km: &Keymap, i: &ActionInput) -> KeyAction {
     // Ephemeral: direct+idle。
     if i.direct && idle && hit(km.ephemeral) {
         return KeyAction::Ephemeral;
+    }
+    // Ephemeral の対（Issue #8）: native+idle では同一 chord が一時英数モード開始を
+    // 意味する。既定 F8 は native+idle で他機能に割当が無いため衝突しない。
+    if !i.direct && idle && hit(km.ephemeral) {
+        return KeyAction::EphemeralDirect;
     }
     // Composing 系(native composing)。
     if i.composing && !i.direct {
@@ -532,19 +544,39 @@ mod tests {
     fn next_notation_cycles_kana_three_states() {
         use Notation::*;
         assert_eq!(
-            next_notation(None),
+            next_notation(None, false),
             Katakana,
             "新規合成はひらがな起点 → 次はカタカナ"
         );
-        assert_eq!(next_notation(Some(Hiragana)), Katakana);
-        assert_eq!(next_notation(Some(Katakana)), HankakuKana);
-        assert_eq!(next_notation(Some(HankakuKana)), Hiragana);
+        assert_eq!(next_notation(Some(Hiragana), false), Katakana);
+        assert_eq!(next_notation(Some(Hiragana), true), Katakana);
+        assert_eq!(next_notation(Some(Katakana), false), HankakuKana);
+        assert_eq!(next_notation(Some(Katakana), true), HankakuKana);
+        assert_eq!(next_notation(Some(HankakuKana), false), Hiragana);
+        assert_eq!(next_notation(Some(HankakuKana), true), Hiragana);
         assert_eq!(
-            next_notation(Some(ZenkakuEisu)),
+            next_notation(Some(ZenkakuEisu), false),
             Katakana,
             "英数からはカタカナで巡回に入る"
         );
-        assert_eq!(next_notation(Some(HankakuEisu)), Katakana);
+        assert_eq!(next_notation(Some(HankakuEisu), true), Katakana);
+    }
+
+    #[test]
+    fn issue6_rotating_a_converted_display_returns_to_hiragana_first() {
+        use Notation::*;
+        // 自動変換で「今日」が表示されている状態の無変換連打:
+        // きょう(読みへ戻す) → キョウ → ｷｮｳ → きょう の巡回になる。
+        assert_eq!(
+            next_notation(None, true),
+            Hiragana,
+            "変換済み表示の 1 打目は読み(ひらがな)へ戻す (Issue #6)"
+        );
+        assert_eq!(next_notation(Some(Hiragana), false), Katakana);
+        assert_eq!(next_notation(Some(Katakana), false), HankakuKana);
+        assert_eq!(next_notation(Some(HankakuKana), false), Hiragana);
+        // 読みのままの表示(ライブ変換 OFF・変換結果が読みと同一)はカタカナ起点のまま。
+        assert_eq!(next_notation(None, false), Katakana);
     }
 
     #[test]
@@ -744,6 +776,30 @@ mod tests {
         ] {
             assert_ne!(resolve_action(&km, &st), KeyAction::Ephemeral);
         }
+        // 対の一時英数: 同一 chord(F8) が native+idle でのみ発火（Issue #8 —
+        // 入力モードで同じキーの役割が反転する）。composing 中は表記変換が優先。
+        assert_eq!(resolve_action(&km, &ainput(0x77)), KeyAction::EphemeralDirect);
+        assert_eq!(
+            resolve_action(
+                &km,
+                &ActionInput {
+                    composing: true,
+                    ..ainput(0x77)
+                }
+            ),
+            KeyAction::Notation(Notation::HankakuKana)
+        );
+        assert_eq!(
+            resolve_action(
+                &km,
+                &ActionInput {
+                    direct: true,
+                    ..ainput(0x77)
+                }
+            ),
+            KeyAction::Ephemeral,
+            "direct 側は引き続き一時かな"
+        );
         // CommitUndo は idle ゲート無し(旧 KeyHots.undo と同じ)。
         assert_eq!(
             resolve_action(

@@ -4,7 +4,8 @@ it.each([
   ["小窓", "読みモニタ"],
   ["探索範囲", "ライブ変換の探索幅"],
   ["精度優先", "ライブ変換の探索幅"],
-  ["vim", "一時かなモード開始"],
+  ["vim", "一時かな・一時英数モード"],
+  ["一時英数", "一時かな・一時英数モード"],
   ["半角", "開始時モード"],
   ["ショートカット", "キー操作"],
 ])("finds plan-defined synonym %s", (query, title) => {
@@ -13,8 +14,8 @@ it.each([
   expect(found.some((entry) => entry.title === title)).toBe(true);
 });
 
-it("routes temporary kana help to its key setting", () => {
-  expect(SEARCH.find((item) => item.title === "一時かなモード開始"))
+it("routes temporary input-mode help to its key setting", () => {
+  expect(SEARCH.find((item) => item.title === "一時かな・一時英数モード"))
     .toMatchObject({ page: "keys", target: "key-ephemeral" });
 });
 

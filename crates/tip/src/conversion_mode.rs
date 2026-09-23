@@ -104,6 +104,19 @@ pub fn toggle_before_mode(owned: bool, langbar_is_direct: bool, live: u32) -> u3
     }
 }
 
+/// 明示トグル（`toggle_conversion_mode`）の SetValue 失敗後、実値から ephemeral marker
+/// （ephemeral_kana / ephemeral_direct）の残置を決める。実値が既に目的側へ到達していれば
+/// 外部変更で目的達成済み＝marker 解消。まだなら復帰要求を保持し、次の冪等な exit 呼出しで
+/// 再試行する（`exit_ephemeral_to_direct` / `exit_ephemeral_to_native` の失敗経路と同じ方針）。
+/// 失敗前に marker を落とすと、実値 direct のまま marker だけ消えて一時英数が残留する。
+pub fn retain_ephemeral_markers_on_failed_toggle(
+    kana_marker: bool,
+    direct_marker: bool,
+    live_direct: bool,
+) -> (bool, bool) {
+    (kana_marker && !live_direct, direct_marker && live_direct)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +202,34 @@ mod tests {
             CONVMODE_NATIVE
         );
         assert_eq!(toggled(toggle_before_mode(false, true, CONVMODE_NATIVE)), 0);
+    }
+
+    #[test]
+    fn failed_toggle_keeps_ephemeral_marker_only_while_live_value_still_on_the_old_side() {
+        // 一時英数からのトグル失敗: live が direct のままなら native 復帰要求を保持（再試行）。
+        assert_eq!(
+            retain_ephemeral_markers_on_failed_toggle(false, true, true),
+            (false, true)
+        );
+        // live が既に native なら外部変更で目的達成済み＝marker だけ解消。
+        assert_eq!(
+            retain_ephemeral_markers_on_failed_toggle(false, true, false),
+            (false, false)
+        );
+        // 一時かな: live が native のままなら direct 復帰要求を保持。既に direct なら解消。
+        assert_eq!(
+            retain_ephemeral_markers_on_failed_toggle(true, false, false),
+            (true, false)
+        );
+        assert_eq!(
+            retain_ephemeral_markers_on_failed_toggle(true, false, true),
+            (false, false)
+        );
+        // marker 無しは何も保持しない。
+        assert_eq!(
+            retain_ephemeral_markers_on_failed_toggle(false, false, true),
+            (false, false)
+        );
     }
 
     #[test]

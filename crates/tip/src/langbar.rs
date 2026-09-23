@@ -49,16 +49,15 @@ pub(crate) const MENU_ID_TOGGLE_MODE: u32 = 2;
 /// 両側の宣言を一致させる。
 pub(crate) type ModeToggleHandle = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
-/// conversion-mode と ephemeral かなフラグから言語バー/HUD/トレイに出すモードラベルを返す純関数。
-/// direct(半角英数)=「A」, 永続かな=「あ」, ephemeral かな（F8 等の一時トリガ中）=「あ˙」。
-/// ephemeral は direct のときは無視する（direct 中は ephemeral 状態自体が存在しない）。
+/// conversion-mode と ephemeral フラグから言語バー/HUD/トレイに出すモードラベルを返す純関数。
+/// direct(半角英数)=「A」, 永続かな=「あ」, ephemeral かな（F8 等の一時トリガ中）=「あ˙」,
+/// ephemeral 英数（Issue #8: かなモードからの一時ダイレクト中）=「A˙」。
 pub fn mode_label_ephemeral(is_direct: bool, ephemeral: bool) -> &'static str {
-    if is_direct {
-        "A"
-    } else if ephemeral {
-        "あ˙"
-    } else {
-        "あ"
+    match (is_direct, ephemeral) {
+        (true, true) => "A˙",
+        (true, false) => "A",
+        (false, true) => "あ˙",
+        (false, false) => "あ",
     }
 }
 
@@ -73,7 +72,8 @@ pub fn mode_label_with_zenzai(
         return mode_label_ephemeral(is_direct, ephemeral);
     }
     match (is_direct, ephemeral) {
-        (true, _) => "A✦",
+        (true, true) => "A˙✦",
+        (true, false) => "A✦",
         (false, false) => "あ✦",
         (false, true) => "あ˙✦",
     }
@@ -84,9 +84,9 @@ pub fn mode_label_with_zenzai(
 pub struct ModeLangBarItem {
     /// 現在モード（true=半角英数=A / false=ひらがな=あ）。TextService がトグル時に更新する。
     is_direct: Rc<Cell<bool>>,
-    /// ephemeral かなモード中（F8 等の一時トリガ中）かどうか。TextService が
-    /// `langbar_is_direct` と並行して更新する。direct=true のときは無視される
-    /// （`mode_label_ephemeral` 参照）。
+    /// ephemeral モード中（一時かな/一時英数のトリガ中）かどうか。TextService が
+    /// `langbar_is_direct` と並行して更新する。テキスト表示は (direct, ephemeral) の
+    /// 組み合わせで「あ˙」/「A˙」を区別する（`mode_label_ephemeral` 参照）。
     ephemeral: Rc<Cell<bool>>,
     /// エンジンの sanitized runtime 状態が `gpu_active` のときだけ true。
     zenzai_gpu_active: Rc<Cell<bool>>,
@@ -337,8 +337,8 @@ mod tests {
         assert_eq!(mode_label_ephemeral(false, false), "あ");
         assert_eq!(mode_label_ephemeral(true, false), "A");
         assert_eq!(mode_label_ephemeral(false, true), "あ˙");
-        // direct 中は ephemeral 状態自体が存在しない＝フラグは無視される。
-        assert_eq!(mode_label_ephemeral(true, true), "A");
+        // 一時英数（Issue #8）も同じドットで一時モードであることを示す。
+        assert_eq!(mode_label_ephemeral(true, true), "A˙");
     }
 
     #[test]
@@ -346,6 +346,7 @@ mod tests {
         assert_eq!(mode_label_with_zenzai(true, false, true), "A✦");
         assert_eq!(mode_label_with_zenzai(false, false, true), "あ✦");
         assert_eq!(mode_label_with_zenzai(false, true, true), "あ˙✦");
+        assert_eq!(mode_label_with_zenzai(true, true, true), "A˙✦");
         assert_eq!(mode_label_with_zenzai(false, false, false), "あ");
     }
 }

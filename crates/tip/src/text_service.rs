@@ -927,7 +927,7 @@ pub struct TextService {
     pub(crate) showing: Cell<bool>,
     pub(crate) local_clauses: RefCell<Option<crate::clause_conversion::ClauseConversion>>,
     /// Clause metadata for the successfully applied live display anchor.
-    live_clauses: RefCell<Option<crate::clause_conversion::ClauseConversion>>,
+    pub(crate) live_clauses: RefCell<Option<crate::clause_conversion::ClauseConversion>>,
     pub(crate) local_clause_redraw_pending: Cell<bool>,
     pub(crate) local_clause_redraw_deadline: Cell<Option<Instant>>,
     pub(crate) conversion_queue: RefCell<crate::conversion_queue::ConversionQueue>,
@@ -1129,6 +1129,14 @@ pub struct TextService {
     /// compartment 自体は enter/exit が直接 NATIVE/direct へ SetValue する — このフラグは
     /// 「direct へ戻すべき」マーカーに徹する（設計ロック: 開始トリガ節）。
     pub(crate) ephemeral_kana: Cell<bool>,
+    /// ephemeral 英数モード（Issue #8）: native から一時的に半角英数入力へ入っている最中か。
+    /// `enter_ephemeral_direct` で true、`exit_ephemeral_to_native` または明示トグルの
+    /// compartment 書込み成立後で false。かな側と対称に compartment は直接 direct/native へ
+    /// SetValue し、フラグは「native へ戻すべき」マーカー。書込みが失敗した間は保持し、
+    /// 次の冪等な exit で再試行する。
+    /// 英数入力は composition を張らないため、終息はトリガキー再押下・明示トグル・フォーカス
+    /// 喪失・非活性化のみ（確定を起点にしない）。
+    pub(crate) ephemeral_direct: Cell<bool>,
     /// configurable keymap: Activate で settings から解決した全コマンドのバインド（D7 — 1回読み）。
     pub(crate) keymap: Cell<crate::keymap::Keymap>,
     /// C-1: DLL_REF で生存数を数える RAII ガード。他の全 `#[implement]` COM オブジェクトと
@@ -1322,6 +1330,7 @@ impl TextService {
             shift_latin_compose: Cell::new(true),
             undo_armed: Cell::new(false),
             ephemeral_kana: Cell::new(false),
+            ephemeral_direct: Cell::new(false),
             keymap: Cell::new(crate::keymap::Keymap::default()),
             _guard: ComObjectGuard::new(),
         }
@@ -2008,6 +2017,13 @@ impl TextService_Impl {
             self.langbar_ephemeral.set(false);
             tip_log("ev=ephemeral_exit abandoned=deactivate");
         }
+        // ephemeral 英数（Issue #8）も同様: 非活性化で native へ復帰し、保留を持ち越さない。
+        self.exit_ephemeral_to_native(None);
+        if self.ephemeral_direct.replace(false) {
+            self.direct_mode_owned.set(false);
+            self.langbar_ephemeral.set(false);
+            tip_log("ev=ephemeral_direct_exit abandoned=deactivate");
+        }
         // SP7: 上の「ephemeral 復帰失敗」以外では default_direct_applied / direct_mode_owned を
         // **意図的にリセットしない**。毎回リセットすると IME 切替の往復
         // （Deactivate→Activate）でユーザが無変換により選んだモードを巻き戻すため。
@@ -2410,6 +2426,8 @@ impl TextService_Impl {
             // ephemeral かな: 別窓へフォーカスが動いた＝押し忘れの言語モードを持ち越さない
             // （thread compartment を direct へ。ctx 無しでも冪等に呼べる）。
             self.exit_ephemeral_to_direct(None);
+            // ephemeral 英数も同様（native へ戻す。Issue #8）。
+            self.exit_ephemeral_to_native(None);
         }
         Ok(())
     }
@@ -2484,6 +2502,8 @@ impl TextService_Impl {
         self.disarm_undo();
         // ephemeral かな: 前面フォーカスが別プロセスへ移った＝別窓へモードを漏らさない。
         self.exit_ephemeral_to_direct(None);
+        // ephemeral 英数も同様（native へ戻す。Issue #8）。
+        self.exit_ephemeral_to_native(None);
         Ok(())
     }
 }
@@ -5886,6 +5906,9 @@ impl TextService_Impl {
             self.update_langbar_mode(false, false, ctx);
             return true;
         }
+        // ephemeral_direct marker はここでは落とさない。compartment 取得や SetValue に失敗して
+        // 実値が direct のままになると、marker 無しでは以後の exit_ephemeral_to_native が
+        // no-op になり一時英数が通常英数のように残留する。解除は書込み成立後（成功経路）に限る。
         let Some(c) = self.conversion_compartment() else {
             tip_log("ev=mode_toggle skip=no_compartment");
             return false;
@@ -5907,17 +5930,28 @@ impl TextService_Impl {
             // 実 compartment から分岐する。所有権を放棄し、HRESULT 失敗後の実値へ同期する。
             self.direct_mode_owned.set(false);
             let live_direct = crate::conversion_mode::is_direct(after);
-            // ephemeral からの明示トグルが失敗し native のままなら復帰 marker/表示を保つ。
-            // 外部変更で既に direct なら marker だけ解消し、実値 A へ収束する。
-            let retry_ephemeral = self.ephemeral_kana.get() && !live_direct;
-            if self.ephemeral_kana.get() && live_direct {
-                self.ephemeral_kana.set(false);
-            }
+            // ephemeral marker は実値が既に目的側へ達していれば解消、まだなら復帰要求を
+            // 保持して次の冪等な exit 呼出しで再試行する（exit_ephemeral_to_* と同じ方針）。
+            let (keep_kana, keep_direct) =
+                crate::conversion_mode::retain_ephemeral_markers_on_failed_toggle(
+                    self.ephemeral_kana.get(),
+                    self.ephemeral_direct.get(),
+                    live_direct,
+                );
+            self.ephemeral_kana.set(keep_kana);
+            self.ephemeral_direct.set(keep_direct);
             tip_log(&format!(
-                "ev=mode_toggle failed before={before:#06x} next={next:#06x} after={after:#06x} tid={tid}"
+                "ev=mode_toggle failed before={before:#06x} next={next:#06x} after={after:#06x} tid={tid} keep_kana={keep_kana} keep_direct={keep_direct}"
             ));
-            self.update_langbar_mode(live_direct, retry_ephemeral, ctx);
+            self.update_langbar_mode(live_direct, keep_kana || keep_direct, ctx);
             return false;
+        }
+        if self.ephemeral_direct.get() {
+            // 一時英数中の明示トグル＝日本語へ戻す意志。書込みが成立したので marker を落として
+            // 以降の XOR トグルに任せる。後続の exit_ephemeral_to_native は marker 無し
+            // no-op になる＝永続扱い。
+            self.ephemeral_direct.set(false);
+            tip_log("ev=mode_toggle exits=ephemeral_direct");
         }
         self.direct_mode_owned.set(true);
         tip_log(&format!(
@@ -6108,6 +6142,72 @@ impl TextService_Impl {
         } else {
             // 保留を落とすと direct 復帰を二度と試せないため、取得不能時は marker を維持する。
             tip_log("ev=ephemeral_exit no_compartment(retry)");
+        }
+    }
+
+    /// ephemeral 英数モード開始（Issue #8）: native から一時的に半角英数へ入る。
+    /// `enter_ephemeral_kana` の鏡像 — compartment を direct へ落とし、フラグは
+    /// 「native へ戻すべき」マーカー。開始に失敗した打鍵を成功扱いにしない。
+    pub(crate) fn enter_ephemeral_direct(&self, ctx: Option<&ITfContext>) {
+        let Some(c) = self.conversion_compartment() else {
+            tip_log("ev=ephemeral_direct_enter skip=no_compartment");
+            return;
+        };
+        let before = self.conversion_mode_value();
+        let next = crate::conversion_mode::to_direct(before);
+        let v = VARIANT::from(next as i32);
+        let ok = unsafe { c.SetValue(self.tid.get(), &v).is_ok() };
+        let after = self.conversion_mode_value();
+        if !ok {
+            self.ephemeral_direct.set(false);
+            self.direct_mode_owned.set(false);
+            tip_log(&format!(
+                "ev=ephemeral_direct_enter failed next={next:#06x} after={after:#06x}"
+            ));
+            self.update_langbar_mode(crate::conversion_mode::is_direct(after), false, ctx);
+            return;
+        }
+        self.ephemeral_direct.set(true);
+        self.direct_mode_owned.set(true);
+        tip_log(&format!(
+            "ev=ephemeral_direct_enter set_ok={ok} next={next:#06x} after={after:#06x}"
+        ));
+        self.update_langbar_mode(true, true, ctx);
+    }
+
+    /// ephemeral 英数モード復帰: `ephemeral_direct` が立っているときだけ compartment を
+    /// NATIVE へ戻しフラグを落とす（`exit_ephemeral_to_direct` の鏡像・冪等）。
+    pub(crate) fn exit_ephemeral_to_native(&self, ctx: Option<&ITfContext>) {
+        if !self.ephemeral_direct.get() {
+            return;
+        }
+        if let Some(c) = self.conversion_compartment() {
+            let next = self.conversion_mode_value() | crate::conversion_mode::CONVMODE_NATIVE;
+            let v = VARIANT::from(next as i32);
+            let ok = unsafe { c.SetValue(self.tid.get(), &v).is_ok() };
+            let after = self.conversion_mode_value();
+            if !ok {
+                // 失敗後も direct なら復帰要求を保留し、次の冪等な exit 呼出しで再試行する。
+                // 実値が既に native なら外部変更で目的は達成済みなので保留だけ解消する。
+                let live_native = !crate::conversion_mode::is_direct(after);
+                self.ephemeral_direct.set(!live_native);
+                self.direct_mode_owned.set(false);
+                tip_log(&format!(
+                    "ev=ephemeral_direct_exit failed next={next:#06x} after={after:#06x} retry={}",
+                    !live_native
+                ));
+                self.update_langbar_mode(!live_native, !live_native, ctx);
+                return;
+            }
+            self.ephemeral_direct.set(false);
+            self.direct_mode_owned.set(true);
+            tip_log(&format!(
+                "ev=ephemeral_direct_exit set_ok={ok} next={next:#06x} after={after:#06x}"
+            ));
+            self.update_langbar_mode(false, false, ctx);
+        } else {
+            // 保留を落とすと native 復帰を二度と試せないため、取得不能時は marker を維持する。
+            tip_log("ev=ephemeral_direct_exit no_compartment(retry)");
         }
     }
 
@@ -8448,6 +8548,84 @@ mod deactivate_preflight_tests {
                 identity: snapshot.identity, text: "押したら".into(),
             })).immediate.is_none());
         }
+    }
+
+    #[test]
+    fn notation_rotate_treats_live_conversion_display_as_converted() {
+        // Issue #6: ライブ変換表示（live_clauses。local_clauses への昇格は Space 経路のみ）
+        // の「今日」を見ている無変換連打は、変換済み扱いでひらがな（読み）起点へ戻す。
+        // local_clauses だけを見ると false になり、カタカナから巡回してしまう。
+        use crate::input_module::{
+            BackgroundIntent, EngineResult, InputEvent, KeyEvent, ReplayMode, TextStyle,
+        };
+        use crate::keymap::Notation;
+        use ipc::clause::{ClauseId, ClauseState, ReadingPosition, SnapshotClauseData, WireClause};
+        let service = super::TextService::new().into_outer();
+        for ch in "きょう".chars() {
+            service
+                .state
+                .borrow_mut()
+                .handle(InputEvent::Key(KeyEvent::Text {
+                    ch,
+                    style: TextStyle::Kana,
+                    replay: ReplayMode::Full,
+                }));
+        }
+        let configuration = service.configuration_generation.get();
+        let connection = service.background_input.connection_generation();
+        let BackgroundIntent::LiveSnapshot { snapshot } = service
+            .state
+            .borrow_mut()
+            .live_snapshot(configuration, connection, None)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        service
+            .state
+            .borrow_mut()
+            .handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+                identity: snapshot.identity,
+                text: "今日".into(),
+            }));
+        let model = crate::clause_conversion::ClauseConversion::from_snapshot(
+            service
+                .state
+                .borrow()
+                .clause_identity(configuration, connection),
+            5,
+            SnapshotClauseData {
+                reading: "きょう".into(),
+                conversion_revision: 0,
+                request_id: 1,
+                sentence_token: Some("live sentence".into()),
+                clauses: vec![WireClause {
+                    id: ClauseId(1),
+                    reading_start: ReadingPosition(0),
+                    reading_end: ReadingPosition(3),
+                    state: ClauseState::Converted,
+                    surface: "今日".into(),
+                    candidate_token: Some("live token".into()),
+                }],
+            },
+            "今日",
+        )
+        .unwrap();
+        service.apply_live_preedit("今日", Some(model), || true);
+        assert!(service.local_clauses.borrow().is_none(), "live display must not promote to local clauses");
+        let display_converted = service.notation_display_converted();
+        assert!(display_converted, "live converted display counts as converted");
+        assert_eq!(
+            crate::keymap::next_notation(service.state.borrow().notation_fixed, display_converted),
+            Notation::Hiragana,
+            "first rotate from the live converted display returns to reading"
+        );
+        // 古い応答は anchor 不一致（anchor 破棄）で弾く。昇格経路と同じガード。
+        service.state.borrow_mut().invalidate_live_display();
+        assert!(
+            !service.notation_display_converted(),
+            "stale live model must not count as converted"
+        );
     }
 
     #[test]

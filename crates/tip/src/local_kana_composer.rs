@@ -20,8 +20,14 @@ pub struct ReplaySegment {
 pub struct LocalKanaComposer {
     stable: String,
     stable_segments: Vec<ReplaySegment>,
-    // Byte offsets of literals rejected by roman parsing, recoverable on deletion.
+    // Byte offsets of ASCII literals recoverable on deletion: roman parsing
+    // rejections and cursor-frozen unfinished roman. Offsets are relative to
+    // `stable`. Explicit Direct keys (push_with_resolver) clear both lists and
+    // seal prior literals.
     automatic_literals: Vec<usize>,
+    // Same bookkeeping for literals living in `suffix`, relative to its start.
+    // set_cursor re-splits move literals between the two regions and remap both.
+    suffix_literals: Vec<usize>,
     pending: String,
     reading: String,
     journal: crate::input_journal::InputJournal,
@@ -49,6 +55,7 @@ impl LocalKanaComposer {
             }
             InputStyle::Direct => {
                 self.automatic_literals.clear();
+                self.suffix_literals.clear();
                 // pending を Kana のまま stable へ送ると、状態保持エンジンが roman2kana で
                 // この文字を後続入力と再結合し、ローカル読みと分岐する。ローカル側はこの境界で
                 // 結合を終えているため、Direct リテラルとして凍結して送る。
@@ -101,6 +108,7 @@ impl LocalKanaComposer {
         self.suffix.clear();
         self.suffix_segments.clear();
         self.automatic_literals.clear();
+        self.suffix_literals.clear();
         self.stable.clear();
         self.stable_segments.clear();
         self.pending.clear();
@@ -113,6 +121,7 @@ impl LocalKanaComposer {
         self.suffix.clear();
         self.suffix_segments.clear();
         self.automatic_literals.clear();
+        self.suffix_literals.clear();
         self.stable.clear();
         self.stable_segments.clear();
         self.append_stable(reading, InputStyle::Kana);
@@ -217,6 +226,10 @@ impl LocalKanaComposer {
         self.set_cursor(end);
         self.stable.clear();
         self.stable_segments.clear();
+        // 採用した読みで stable を作り直すため、旧 stable のバイト offset 簿記は参照先を
+        // 失う。engine 由来のリテラル読みに再結合可能なローマ字は存在しないので破棄する。
+        self.automatic_literals.clear();
+        self.suffix_literals.clear();
         self.append_stable(reading, InputStyle::Direct);
         self.refresh_reading();
         true
@@ -233,26 +246,60 @@ impl LocalKanaComposer {
 
     /// Moving the caret preserves original units. Only a subsequent edit can
     /// invalidate a unit cut by the new caret. Unfinished roman input is frozen
-    /// at the old caret so typing elsewhere cannot recombine with it.
+    /// at the old caret so typing elsewhere cannot recombine with it; deletion
+    /// back to the frozen tail reopens it into pending (Issue #9) because the
+    /// caret is editing at that position again.
     pub fn set_cursor(&mut self, requested: ipc::clause::ReadingPosition) -> bool {
         let Ok(positions) = ipc::clause::legal_boundaries(&self.reading) else { return false; };
         let next = positions.into_iter().rev().find(|position| *position <= requested)
             .unwrap_or(ipc::clause::ReadingPosition(0));
         if next == self.cursor() { return false; }
+        let mut frozen: Option<(usize, String)> = None;
         if !self.pending.is_empty() {
             let current = self.cursor();
             let suffix = self.journal.detach_suffix(current);
             let pending = std::mem::take(&mut self.pending);
+            let start = self.stable.len();
             self.append_input_unit(&pending, InputStyle::Direct, &pending);
             self.journal.append_suffix(suffix, current);
+            frozen = Some((start, pending));
+        }
+        // 未確定ローマ字の凍結はここでは純 ASCII（is_roman_prefix を満たす間だけ pending に
+        // 残る不変条件）。凍結分も再結合可能な offset 簿記に預け、下の再 split で
+        // stable⇔suffix 間の移動を含めて一括して再配置する（Issue #9: 削除で caret が
+        // 凍結末尾へ戻ったら pending へ戻す）。明示 Direct 打鍵は push_with_resolver 側の
+        // clear でこれらも封印する（自動凍結と同一生命周期）。
+        if let Some((start, text)) = &frozen {
+            for offset in *start..start + text.len() {
+                self.automatic_literals.push(offset);
+            }
         }
         let split = self.reading.char_indices().nth(next.0 as usize).map_or(self.reading.len(), |(index, _)| index);
         let (before, after) = split_segments(self.replay_segments(), split);
+        let stable_len = self.stable.len();
         self.stable = self.reading[..split].to_owned();
         self.suffix = self.reading[split..].to_owned();
         self.stable_segments = before;
         self.suffix_segments = after;
-        self.automatic_literals.clear();
+        // 再 split 前の offset（stable 相対・suffix 相対）を新しい領域へ写す。
+        // stable 相対の offset はそのまま reading 相対でもある。suffix 相対は
+        // stable_len を足すと reading 相対になる。reading 相対が split 未満なら新しい
+        // stable、以降なら新しい suffix（開始 split 引き）へ移る。
+        let mut stable_offsets: Vec<usize> = Vec::new();
+        let mut suffix_offsets: Vec<usize> = Vec::new();
+        for reading_offset in self.automatic_literals.iter().copied()
+            .chain(self.suffix_literals.iter().map(|o| o + stable_len))
+        {
+            if reading_offset < split {
+                stable_offsets.push(reading_offset);
+            } else {
+                suffix_offsets.push(reading_offset - split);
+            }
+        }
+        stable_offsets.sort_unstable();
+        suffix_offsets.sort_unstable();
+        self.automatic_literals = stable_offsets;
+        self.suffix_literals = suffix_offsets;
         true
     }
 
@@ -266,6 +313,11 @@ impl LocalKanaComposer {
         self.journal.retain_prefix(current);
         self.journal.append_suffix(suffix_journal, current);
         self.suffix.drain(..bytes);
+        self.suffix_literals = self
+            .suffix_literals
+            .iter()
+            .filter_map(|offset| offset.checked_sub(bytes))
+            .collect();
         let (_, remaining) = split_segments(std::mem::take(&mut self.suffix_segments), bytes);
         self.suffix_segments = remaining;
         self.refresh_reading();
@@ -1120,6 +1172,104 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn issue9_deletion_back_to_cursor_frozen_tail_reopens_pending_romaji() {
+        // Issue #9: カーソル移動で Direct 凍結された未確定ローマ字（こんn）も、
+        // 削除で caret が末尾へ戻った時点で pending へ戻り、後続打鍵と再結合する。
+        use ipc::clause::ReadingPosition as P;
+        let mut composer = LocalKanaComposer::default();
+        for ch in "konn".chars() {
+            composer.push(ch, InputStyle::Kana);
+        }
+        composer.push('n', InputStyle::Kana);
+        assert_eq!(composer.reading(), "こんn");
+        assert!(composer.set_cursor(P(0)));
+        assert!(composer.set_cursor(P(3)), "caret を末尾へ戻しても凍結は維持");
+        composer.push('i', InputStyle::Kana);
+        assert_eq!(
+            composer.reading(),
+            "こんnい",
+            "削除せずに打った i は凍結 n と結合しない（凍結の設計どおり）"
+        );
+        composer.backspace();
+        assert_eq!(composer.reading(), "こんn");
+        composer.push('i', InputStyle::Kana);
+        assert_eq!(
+            composer.reading(),
+            "こんに",
+            "削除で戻った n はローマ字入力として再認識され n+i=ni で再結合する"
+        );
+    }
+
+    #[test]
+    fn issue9_reading_cursor_navigation_variant_reopens_frozen_tail() {
+        // InputModule の MoveReading/ReadingEnd と同じ move_cursor/set_cursor 経路で
+        // 凍結→復帰した場合も backspace_at_cursor の再 open が働くことを固定する。
+        use ipc::clause::ReadingPosition as P;
+        let mut composer = LocalKanaComposer::default();
+        for ch in "konnn".chars() {
+            composer.push(ch, InputStyle::Kana);
+        }
+        assert!(composer.move_cursor(-1));
+        assert!(composer.set_cursor(P(u32::MAX)));
+        assert_eq!(composer.reading(), "こんn");
+        composer.push('i', InputStyle::Kana);
+        assert_eq!(composer.reading(), "こんnい");
+        composer.backspace_at_cursor();
+        assert_eq!(composer.reading(), "こんn");
+        // reopen した pending "n" は末尾 Kana ランへマージされる（replay_segments の
+        // 通常形状）。Direct 凍結のままなら Kana ランに溶け込まない。
+        assert_eq!(
+            composer.replay_segments(),
+            vec![ReplaySegment { text: "こんn".into(), style: InputStyle::Kana }]
+        );
+        composer.push('i', InputStyle::Kana);
+        assert_eq!(composer.reading(), "こんに");
+    }
+
+    #[test]
+    fn issue9_deletion_reopens_multi_char_frozen_romaji_as_a_roman_prefix() {
+        use ipc::clause::ReadingPosition as P;
+        let mut composer = LocalKanaComposer::default();
+        for ch in "konnky".chars() {
+            composer.push(ch, InputStyle::Kana);
+        }
+        assert_eq!(composer.reading(), "こんky");
+        assert!(composer.set_cursor(P(0)));
+        assert!(composer.set_cursor(P(4)), "caret を末尾へ戻しても凍結は維持");
+        composer.push('a', InputStyle::Kana);
+        assert_eq!(composer.reading(), "こんkyあ");
+        composer.backspace();
+        assert_eq!(composer.reading(), "こんky");
+        composer.push('a', InputStyle::Kana);
+        assert_eq!(
+            composer.reading(),
+            "こんきゃ",
+            "ky 全体が pending へ戻り kya=きゃ として再結合する"
+        );
+    }
+
+    #[test]
+    fn explicit_direct_key_seals_cursor_frozen_romaji_against_reopening() {
+        // push(Direct) は automatic_literals を clear する — カーソル凍結分も
+        // 明示 Direct 打鍵以降は封印され、削除で戻っても再結合しない。
+        use ipc::clause::ReadingPosition as P;
+        let mut composer = LocalKanaComposer::default();
+        for ch in "konn".chars() {
+            composer.push(ch, InputStyle::Kana);
+        }
+        composer.push('n', InputStyle::Kana);
+        assert!(composer.set_cursor(P(0)));
+        assert!(composer.set_cursor(P(3)));
+        composer.push('A', InputStyle::Direct);
+        assert_eq!(composer.reading(), "こんnA");
+        composer.backspace();
+        composer.backspace();
+        assert_eq!(composer.reading(), "こん");
+        composer.push('i', InputStyle::Kana);
+        assert_eq!(composer.reading(), "こんい", "封印された n は再結合しない");
     }
 
     #[test]

@@ -400,6 +400,52 @@ fn is_autorepeat(lparam: LPARAM) -> bool {
     (lparam.0 & (1 << 30)) != 0
 }
 
+/// F8 トリガ（Ephemeral と EphemeralDirect は同一 chord のモード別解決）で実行する遷移。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EphemeralTrigger {
+    /// 一時英数を畳んで native へ戻す（開始時の通常かなへ）
+    FoldToNative,
+    /// 一時かなを畳んで direct へ戻す（開始時の通常英数へ）
+    FoldToDirect,
+    /// 通常英数から一時かなを開始
+    EnterKana,
+    /// 通常かなから一時英数を開始
+    EnterDirect,
+}
+
+/// 一時モードトリガの遷移先を marker から決める。新規 enter は反対側の marker が
+/// 落ちているときだけ。一時かな中の EphemeralDirect で enter を重ねると両 marker が
+/// 立ち、フォーカス喪失時の復帰が開始時と異なるモードへ混線する（通常英数 → F8 → F8
+/// の2打鍵で到達する）。自動リピートは初回の切替に任せて消費だけ（None）— 長押しで
+/// 偶数次リピートが元モードへ戻し、離すタイミングで切替が消えるのを防ぐ。
+pub(crate) fn resolve_ephemeral_trigger(
+    action: crate::keymap::KeyAction,
+    ephemeral_kana: bool,
+    ephemeral_direct: bool,
+    autorepeat: bool,
+) -> Option<EphemeralTrigger> {
+    if autorepeat {
+        return None;
+    }
+    match action {
+        crate::keymap::KeyAction::Ephemeral => {
+            if ephemeral_direct {
+                Some(EphemeralTrigger::FoldToNative)
+            } else {
+                Some(EphemeralTrigger::EnterKana)
+            }
+        }
+        crate::keymap::KeyAction::EphemeralDirect => {
+            if ephemeral_kana {
+                Some(EphemeralTrigger::FoldToDirect)
+            } else {
+                Some(EphemeralTrigger::EnterDirect)
+            }
+        }
+        _ => None,
+    }
+}
+
 fn key_to_char(vk: u32, lparam: LPARAM) -> Option<char> {
     let scancode = ((lparam.0 >> 16) & 0xFF) as u32;
     let mut state = [0u8; 256];
@@ -1000,6 +1046,7 @@ impl TextService_Impl {
                 }
             } else if !self.showing.get() {
                 self.exit_ephemeral_to_direct(Some(&ctx));
+                self.exit_ephemeral_to_native(Some(&ctx));
             }
             return Ok(TRUE);
         }
@@ -1010,13 +1057,29 @@ impl TextService_Impl {
         // パスワード欄内で composition は始まらない（全キー素通しのため）。合成中に外から
         // パスワード欄へフォーカス移動した場合の旧 composition はホストの
         // OnCompositionTerminated / フォーカス遷移 settle が既存機構で畳む。
-        // ephemeral かなモード開始トリガ: direct+idle でトリガキー（既定 F8）が来たら
-        // compartment を NATIVE へ切替えて ephemeral かなへ入る。パスワード欄より後（欄内で
-        // トリガキーを食わない）・direct 早期 return より前（トリガキー自体は素通しでなく消費する）。
-        // enter の副作用は OnKeyDown 側でのみ行う（OnTestKeyDown は食う判定の一致のみ）。
-        // action==Ephemeral 自体は Ctrl ゲートより前で計算済み（上記）— ここでは消費のみ、再計算しない。
-        if action == crate::keymap::KeyAction::Ephemeral {
-            self.enter_ephemeral_kana(Some(&ctx));
+        // ephemeral モード開始トリガ: idle でトリガキー（既定 F8）が来たら現在モードの対へ
+        // 一時的に入る（direct → 一時かな / native → 一時英数。Issue #8）。一時モード中の
+        // 再押下は enter を重ねず畳んで元のモードへ戻す（resolve_ephemeral_trigger の対称性）。
+        // 自動リピートは消費だけ。パスワード欄より後（欄内でトリガキーを食わない）・
+        // direct 早期 return より前（トリガキー自体は素通しでなく消費する）。enter の副作用は
+        // OnKeyDown 側でのみ行う（OnTestKeyDown は食う判定の一致のみ）。action 自体は Ctrl
+        // ゲートより前で計算済み（上記）— ここでは消費のみ、再計算しない。
+        if matches!(
+            action,
+            crate::keymap::KeyAction::Ephemeral | crate::keymap::KeyAction::EphemeralDirect
+        ) {
+            match resolve_ephemeral_trigger(
+                action,
+                self.ephemeral_kana.get(),
+                self.ephemeral_direct.get(),
+                is_autorepeat(lparam),
+            ) {
+                Some(EphemeralTrigger::FoldToNative) => self.exit_ephemeral_to_native(Some(&ctx)),
+                Some(EphemeralTrigger::FoldToDirect) => self.exit_ephemeral_to_direct(Some(&ctx)),
+                Some(EphemeralTrigger::EnterKana) => self.enter_ephemeral_kana(Some(&ctx)),
+                Some(EphemeralTrigger::EnterDirect) => self.enter_ephemeral_direct(Some(&ctx)),
+                None => {} // リピート分は初回の切替に任せて消費だけ
+            }
             return Ok(TRUE); // トリガキー自体は文字を出さず消費
         }
 
@@ -1893,7 +1956,10 @@ impl TextService_Impl {
                     // Resolve rotation after earlier accepted transforms have taken effect.
                     let kind = match &action {
                         A::Transform { kind, .. } => *kind,
-                        _ => crate::keymap::next_notation(self.state.borrow().notation_fixed),
+                        _ => crate::keymap::next_notation(
+                            self.state.borrow().notation_fixed,
+                            self.notation_display_converted(),
+                        ),
                     };
                     let changed = {
                         let mut state = self.local_clauses.borrow_mut();
@@ -2075,6 +2141,28 @@ impl TextService_Impl {
         }
     }
 
+    /// NotationRotate の None 起点で「表示が変換済みか」。明示変換のローカル文節モデルの
+    /// 表面が読みと異なるか。ライブ変換中は local_clauses へ昇格しない（Space の
+    /// begin_explicit_snapshot_wait 経路のみ）ため、local_clauses だけ見ると Issue #6 の
+    /// 想定ケース（ライブ変換「今日」からの無変換連打）で変換済み扱いが漏れ、カタカナ
+    /// 起点に戻る。そこで anchor 一致する live_clauses も対象にする。anchor 一致＝
+    /// 現在の表示と同期済みで、古い応答は弾ける（昇格経路と同じガード）。
+    pub(crate) fn notation_display_converted(&self) -> bool {
+        if let Some(model) = self.local_clauses.borrow().as_ref() {
+            return model.text() != model.reading;
+        }
+        let state = self.state.borrow();
+        if !state.composing || state.notation_fixed.is_some() {
+            return false;
+        }
+        let live = self.live_clauses.borrow();
+        let Some(model) = live.as_ref() else {
+            return false;
+        };
+        state.live_display_anchor_matches(&model.reading, &model.text())
+            && model.text() != model.reading
+    }
+
     /// NotationRotate(無変換連打)のディスパッチ。現在表記(notation_fixed)から次を導出して
     /// apply_notation へ。OnKeyDown の KeyAction::NotationRotate と OnPreservedKey の
     /// ToggleMode 委譲(受理配送ホスト)の両経路が共有し、二重実装のズレを防ぐ(spec §6.3)。
@@ -2082,7 +2170,10 @@ impl TextService_Impl {
         if self.handle_conversion_wait_key(ctx, vk, LPARAM(0), crate::keymap::KeyAction::NotationRotate) {
             return Ok(TRUE);
         }
-        let next = crate::keymap::next_notation(self.state.borrow().notation_fixed);
+        let next = crate::keymap::next_notation(
+            self.state.borrow().notation_fixed,
+            self.notation_display_converted(),
+        );
         self.apply_notation(ctx, vk, next)
     }
 
@@ -2347,29 +2438,22 @@ impl TextService_Impl {
         }
         // 候補確定が部分確定だった場合・候補非表示の場合とも、composition が残っていれば
         // VK_RETURN の候補非表示枝と同一の「ライブ変換結果（無ければ読み）」で全確定する。
-        // 巡10(round10): 候補 FullReset 拒否(drop_engine 済み)でここに来た場合、
-        // engine_live_convert は None なので plan_live_enter は live_text(最後のライブ変換
-        // 結果。ライブ OFF 時は読み)→空なら読み、の順で素材を拾う — 選択中の候補ではなく
-        // 表示済み文字列が確定され得るが、preedit を閉じる手段を失う(確定を試みない)
-        // よりは良い(稀経路: 同一コンテキストで1発目拒否・2発目成功)。
+        // 巡10(round10): 候補 FullReset 拒否(drop_engine 済み)でここに来た場合も
+        // plan_live_enter は live_text(最後のライブ変換結果。ライブ OFF 時は読み)→空なら
+        // 読み、の順で素材を拾う — 選択中の候補ではなく表示済み文字列が確定され得るが、
+        // preedit を閉じる手段を失う(確定を試みない)よりは良い(稀経路: 同一コンテキスト
+        // で1発目拒否・2発目成功)。
         if self.state.borrow().composing {
-            // ライブ変換 OFF / 表記固定中は engine のライブ変換を参照しない
-            // （Enter の VK_RETURN 枝と同じ規律）— 表示中の live_text をそのまま確定して畳む。
-            let live = if self.should_consult_live_engine() {
-                let seq = self.state.borrow_mut().bump_live_seq();
-                // auto_commit=false: settle は続けて commit_and_reset で全確定するため
-                // （エンジンに読みを消費させると確定文字列から prefix が欠ける）。
-                self.engine_live_convert(seq, false).map(|(t, _, _)| t)
-            } else {
-                None
-            };
+            // Enter の VK_RETURN 枝と同じ規律: 素材は表示中の live_text(最後のライブ変換
+            // 結果。ライブ OFF 時は読み)→空なら読み、の順で拾い、engine へ再照会しない。
+            // Why not(live_enabled 時に engine_live_convert の fresh 結果を優先する):
+            // fresh 変換は表示されたことがない文字列（間で）になり得る。「まで」が見えて
+            // いるのに確定だけ「間で」になる WYSIWYG 違反が Issue #7 の本体。settle は
+            // モードトグル/カーソル移動に付随する暗黙確定で学習にも乗せないため、
+            // 再照会には得が無い（巡5 GLM I-1 の直確定方針は不変）。
             let live_text = self.live_text.borrow().clone();
             let last_reading = self.last_reading.borrow().clone();
-            // Why not(Enter と同じく EngineCommit を engine_commit(0) へ通す): settle は
-            // モードトグル/カーソル移動に付随する暗黙確定。2 度目のエンジン往復は失敗経路を
-            // 増やすだけなので、素材の優先順位だけを Enter と共有し（`plan_live_enter`）
-            // 確定は常に直確定にする。成否は戻り値で呼び出し側が判定する（巡5 GLM I-1）。
-            let text = match plan_live_enter(live, &live_text, &last_reading) {
+            let text = match plan_live_enter(None, &live_text, &last_reading) {
                 LiveEnterPlan::EngineCommit { text } | LiveEnterPlan::DirectCommit { text } => text,
             };
             let _ = self.commit_and_reset(ctx, &text, source, None);
@@ -3057,10 +3141,10 @@ mod tests {
     use super::{
         apply_and_complete_module_operation, backspace_route,
         cancel_explicit_wait_for_actual_keydown, commit_keeps_records, commit_session_cleanup_plan,
-        ephemeral_idle_abort, is_cmd_modifier, reseed_background,
-        resolve_candidate_commit, will_handle, will_handle_awaiting, will_handle_gated,
-        CommitSessionCleanup, ModuleCommitOutcome, ModuleInputSegment, ModuleIntent,
-        ModuleOperation, ModuleRequestId, ModuleTextStyle,
+        ephemeral_idle_abort, is_cmd_modifier, reseed_background, resolve_candidate_commit,
+        resolve_ephemeral_trigger, will_handle, will_handle_awaiting, will_handle_gated,
+        CommitSessionCleanup, EphemeralTrigger, ModuleCommitOutcome, ModuleInputSegment,
+        ModuleIntent, ModuleOperation, ModuleRequestId, ModuleTextStyle,
     };
     use crate::keymap::{resolve_action, ActionInput, KeyAction, Keymap};
     use std::cell::Cell;
@@ -4535,6 +4619,66 @@ mod tests {
         ));
     }
 
+    /// F8 トリガの遷移表。一時モード中の再押下は enter を重ねず畳む（対称性）。
+    #[test]
+    fn ephemeral_trigger_folds_the_open_ephemeral_mode_instead_of_stacking_a_second_one() {
+        // 通常かな → EphemeralDirect: 一時英数を開始
+        assert_eq!(
+            resolve_ephemeral_trigger(KeyAction::EphemeralDirect, false, false, false),
+            Some(EphemeralTrigger::EnterDirect)
+        );
+        // 一時かな中（ephemeral_kana=true。compartment が NATIVE のため EphemeralDirect に
+        // 解決される）: enter を重ねず direct へ畳む。重ねると両 marker が立ち、フォーカス
+        // 喪失時の復帰先が開始時と混線する。
+        assert_eq!(
+            resolve_ephemeral_trigger(KeyAction::EphemeralDirect, true, false, false),
+            Some(EphemeralTrigger::FoldToDirect)
+        );
+        // 通常英数 → Ephemeral: 一時かなを開始
+        assert_eq!(
+            resolve_ephemeral_trigger(KeyAction::Ephemeral, false, false, false),
+            Some(EphemeralTrigger::EnterKana)
+        );
+        // 一時英数中（ephemeral_direct=true）: native へ畳む
+        assert_eq!(
+            resolve_ephemeral_trigger(KeyAction::Ephemeral, false, true, false),
+            Some(EphemeralTrigger::FoldToNative)
+        );
+    }
+
+    /// 通常英数 → F8（一時かな開始）→ F8 は通常英数へ戻り、どの marker も残らない。
+    #[test]
+    fn second_f8_while_ephemeral_kana_folds_back_to_direct_without_markers() {
+        let first = resolve_ephemeral_trigger(KeyAction::Ephemeral, false, false, false);
+        assert_eq!(first, Some(EphemeralTrigger::EnterKana));
+        // 1 回目で ephemeral_kana=true・compartment が NATIVE になったため、2 回目の F8 は
+        // EphemeralDirect に解決される。開始時の通常英数へ戻ること。
+        let second = resolve_ephemeral_trigger(KeyAction::EphemeralDirect, true, false, false);
+        assert_eq!(second, Some(EphemeralTrigger::FoldToDirect));
+    }
+
+    /// 自動リピートは状態を決めず消費だけ。長押しの偶数次リピートで元モードへ戻る
+    /// （＝離すタイミング次第で切替が消える）のを防ぐ。
+    #[test]
+    fn autorepeat_resolves_to_none_and_leaves_the_mode_decision_to_the_first_keydown() {
+        assert_eq!(
+            resolve_ephemeral_trigger(KeyAction::Ephemeral, false, false, true),
+            None
+        );
+        assert_eq!(
+            resolve_ephemeral_trigger(KeyAction::EphemeralDirect, false, false, true),
+            None
+        );
+        assert_eq!(
+            resolve_ephemeral_trigger(KeyAction::Ephemeral, false, true, true),
+            None
+        );
+        assert_eq!(
+            resolve_ephemeral_trigger(KeyAction::EphemeralDirect, true, false, true),
+            None
+        );
+    }
+
     #[test]
     fn ephemeral_action_is_eaten_at_both_entrypoints() {
         // will_handle_gated / will_handle_awaiting の先頭 carve-out（action != None）。
@@ -4558,6 +4702,17 @@ mod tests {
             false,
             false,
             KeyAction::None
+        ));
+        // 対の一時英数（native+idle, Issue #8）も同じ carve-out で消費される。
+        assert!(will_handle_gated(
+            0x77,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            KeyAction::EphemeralDirect
         ));
         // Ctrl 併用チョードでも殺されない（cmd_modifier=true でも action != None 優先）。
         assert!(will_handle_awaiting(
@@ -4761,9 +4916,19 @@ mod tests {
                                                             if new != old {
                                                                 // 厳格化された修飾 = shift、または AltGr(ctrl&&alt は cmd_modifier を
                                                                 // 抜けるが既定チョードは無修飾なので新実装は食わない)。
+                                                                // 例外: 一時英数（Issue #8）— native+idle の F8 は旧実装の
+                                                                // 素通し(false)から消費(true)へ意図的に変わる。
+                                                                let ephemeral_direct_case = eph_en
+                                                                    && !direct
+                                                                    && !composing
+                                                                    && !showing
+                                                                    && vk == 0x77
+                                                                    && !cmd
+                                                                    && !shift;
                                                                 assert!(
-                        old && !new && (shift || (ctrl && alt)),
-                        "許容外の差分: vk={vk:#04x} composing={composing} showing={showing} \
+                                                                    (old && !new && (shift || (ctrl && alt)))
+                                                                        || (ephemeral_direct_case && !old && new),
+                                                                    "許容外の差分: vk={vk:#04x} composing={composing} showing={showing} \
                          direct={direct} ctrl={ctrl} shift={shift} alt={alt} armed={armed} \
                          awaiting={awaiting} typo={typo_en} llm={llm_en} symbol={symbol} \
                          eph_en={eph_en} old={old} new={new}"

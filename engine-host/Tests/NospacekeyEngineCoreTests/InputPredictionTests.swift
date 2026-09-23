@@ -22,6 +22,14 @@ final class InputPredictionTests: XCTestCase {
         XCTAssertEqual(service.recentLearningCountForTesting, 0)
     }
 
+    func testWholeConversionCandidatesAreExcludedFromPredictions() throws {
+        let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+            learning: .init(enabled: false, memoryDir: nil))
+        let result = service.inputPredictions(request("きょう"))
+        // 「今日」は「きょう」を丸ごと消費する全文変換で、Space変換の管轄。先出し予測には混ぜない。
+        XCTAssertFalse(result.candidates.contains { $0.surface == "今日" }, "\(result.candidates)")
+    }
+
     func testPredictionReceiptLearnsFullReadingOnceAndChecksConsumedReading() throws {
         final class Learned: @unchecked Sendable {
             let lock = NSLock()

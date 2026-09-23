@@ -30,7 +30,7 @@ const SEARCH: SearchEntry[] = [
   { page: "input", target: "setting-input-prediction", title: "入力中の予測候補", description: "読みから候補を表示しTabで選択", terms: "予測 補完 Tab" },
   { page: "input", target: "setting-live-conversion", title: "ライブ変換", description: "入力中に自動で変換", terms: "自動" },
   { page: "input", target: "setting-live-search-width", title: "ライブ変換の探索幅", description: "速度優先（1）・精度優先（10）", terms: "候補 探索範囲 N_best スペース" },
-  { page: "keys", target: "key-ephemeral", title: "一時かなモード開始", description: "開始キーの割当・無効。日本語を確定すると半角英数へ戻る", terms: "vim ターミナル f8 一時かな入力" },
+  { page: "keys", target: "key-ephemeral", title: "一時かな・一時英数モード", description: "半角英数中は一時かな、かな中は一時英数へ。もう一度押すかフォーカス移動で戻る", terms: "vim ターミナル f8 一時かな入力 一時英数 英字 test" },
   { page: "input", target: "setting-symbol-width", title: "記号", description: "全角にする記号を選ぶ", terms: "半角 全角 句読点" },
   { page: "keys", target: "key-mode_toggle", title: "キー操作", description: "操作ごとのショートカット", terms: "ショートカット キーバインド 半角" },
   { page: "display", target: "setting-appearance-theme", title: "候補の明暗", description: "OS／ライト／ダーク", terms: "テーマ" },

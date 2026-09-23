@@ -2715,8 +2715,11 @@ public final class ConversionService: @unchecked Sendable {
         var seen = Set<String>()
         let candidates = (learned + dictionary).filter { candidate in
             let fullReading = ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined())
+            // 全文変換(rubyが読みと一致)はSpace変換の管轄で、混ぜると先出しが「変換一覧」になる。
+            // MS IME式に、読みを延長する補完だけを予測として出す。読みが長いほど補完は枯渇し、候補0件で先出しは静かになる。
             return !candidate.text.isEmpty && candidate.text != reading
-                && fullReading.hasPrefix(reading) && seen.insert(candidate.text).inserted
+                && fullReading.hasPrefix(reading) && fullReading.count > reading.count
+                && seen.insert(candidate.text).inserted
         }.prefix(9)
         let now = clauseClock()
         clauseTokens = clauseTokens.filter { now - $0.value.issuedAt < 60 }
