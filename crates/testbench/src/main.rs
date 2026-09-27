@@ -1941,7 +1941,7 @@ fn run_keymap_smoke_reconvert_frees_convert_key(dir: &std::path::Path) -> bool {
 /// ToggleMode 委譲経路、拒否されると OnKeyDown 経路を通る。両経路は dispatch_notation_rotate を
 /// 共有するため ev=notation の assert はどちらでも有意。主経路(実 JIS: 拒否→OnKeyDown)の
 /// 実機担保は受入 item3。
-/// 自己証明: ev=notation vk=0x1d を 3 回観測し、preedit が最終的にひらがなへ戻ること。
+/// 変換済み表示では最初に読みに戻す。4 回の押下と表示を照合し、巡回を一周確認する。
 /// ModeToggle に化けていれば notation は出ず preedit も消える(確定→direct 化)ので偽 PASS しない。
 fn run_keymap_smoke_notation_rotate(dir: &std::path::Path) -> bool {
     if let Err(e) = std::fs::write(
@@ -1963,12 +1963,15 @@ fn run_keymap_smoke_notation_rotate(dir: &std::path::Path) -> bool {
                 let _ = host.feed_key(k.0);
             }
             host.settle_debounce();
-            let _ = host.feed_key(scenarios::NONCONVERT.0); // → カタカナ
+            let before = host.store.preedit();
+            let _ = host.feed_key(scenarios::NONCONVERT.0); // → ひらがな（読み）
             let p1 = host.store.preedit();
-            let _ = host.feed_key(scenarios::NONCONVERT.0); // → 半角カナ
+            let _ = host.feed_key(scenarios::NONCONVERT.0); // → カタカナ
             let p2 = host.store.preedit();
-            let _ = host.feed_key(scenarios::NONCONVERT.0); // → ひらがな
+            let _ = host.feed_key(scenarios::NONCONVERT.0); // → 半角カナ
             let p3 = host.store.preedit();
+            let _ = host.feed_key(scenarios::NONCONVERT.0); // → ひらがな
+            let p4 = host.store.preedit();
 
             let evs: Vec<log_parse::Ev> = log_parse::read_events(pid)
                 .into_iter()
@@ -1979,10 +1982,15 @@ fn run_keymap_smoke_notation_rotate(dir: &std::path::Path) -> bool {
                 .filter(|e| matches!(e, log_parse::Ev::Notation { vk } if *vk == 0x1D))
                 .count();
 
-            let passed = rotate_count == 3 && p1 == "ニホンゴ" && p2 == "ﾆﾎﾝｺﾞ" && p3 == "にほんご";
+            let passed = before == "日本語"
+                && rotate_count == 4
+                && p1 == "にほんご"
+                && p2 == "ニホンゴ"
+                && p3 == "ﾆﾎﾝｺﾞ"
+                && p4 == "にほんご";
             println!(
                 "keymap-smoke:notation_rotate : {} (rotate_count={rotate_count} \
-                 p1={p1:?} p2={p2:?} p3={p3:?})",
+                 before={before:?} p1={p1:?} p2={p2:?} p3={p3:?} p4={p4:?})",
                 if passed { "PASS" } else { "FAIL" }
             );
             passed
