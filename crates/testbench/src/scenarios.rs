@@ -348,6 +348,7 @@ pub fn all() -> Vec<Scenario> {
             name: "mode toggle mid-composition commits preedit",
             keys: {
                 let mut k = typed("nihongo");
+                k.push(WAIT_CONVERSION);
                 k.push(HANKAKU_ZENKAKU);
                 k
             },
