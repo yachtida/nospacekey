@@ -1,0 +1,111 @@
+# 非同期同一性の契約例（計画書 11・7.2）。
+# 古い応答を適用しないことを、エピソードの注記として表現する。
+# 応答の検証そのものは PR3/PR6 の結合試験で実装する。
+
+[[episode]]
+id = "asy-001"
+category = "async_identity"
+source = "githubnotukaikata"
+expected = [
+  { kind = "literal", text = "github" },
+  { kind = "japanese", text = "notukaikata" },
+]
+events = ["type:githubnotukaikata", "annotate:stale_response_plan_a"]
+notes = "A 要求の応答が遅れて返っても適用しない"
+
+[[episode]]
+id = "asy-002"
+category = "async_identity"
+source = "githubnotukaikata"
+expected = [
+  { kind = "literal", text = "github" },
+  { kind = "japanese", text = "notukaikata" },
+]
+events = ["type:githubno", "annotate:stale_response_plan_b", "delete_backward:2", "type:notukaikata"]
+notes = "編集後の古い応答は破棄する"
+
+[[episode]]
+id = "asy-003"
+category = "async_identity"
+source = "made"
+expected = "all_japanese"
+events = ["type:made", "annotate:stale_after_edit"]
+notes = "曖昧語の古い解釈も新しい編集より弱い"
+
+[[episode]]
+id = "asy-004"
+category = "async_identity"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "annotate:stale_live_response"]
+notes = "ライブ変換の遅延応答"
+
+[[episode]]
+id = "asy-005"
+category = "async_identity"
+source = "meetingnoato"
+expected = [
+  { kind = "literal", text = "meeting" },
+  { kind = "japanese", text = "noato" },
+]
+events = ["type:meetingnoato", "annotate:stale_candidate_selection"]
+notes = "候補選択中の古い候補リストの到着"
+
+[[episode]]
+id = "asy-006"
+category = "async_identity"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "annotate:request_superseded"]
+notes = "最新要求優先。古い仕事をキューに溜めない"
+
+[[episode]]
+id = "asy-007"
+category = "async_identity"
+source = "kyouhaPythonw"
+expected = "all_japanese"
+events = ["type:kyouhaPythonwotukau", "annotate:response_after_delete", "delete_backward:6"]
+notes = "削除後に到着した応答を適用しない"
+
+[[episode]]
+id = "asy-008"
+category = "async_identity"
+source = "githubnotukaikata"
+expected = [
+  { kind = "literal", text = "github" },
+  { kind = "japanese", text = "notukaikata" },
+]
+events = ["type:githubnotukaikata", "annotate:response_after_reinterpret", "reinterpret:0:6:literal"]
+notes = "明示変更後の古い応答は採用解釈を壊さない"
+
+[[episode]]
+id = "asy-009"
+category = "async_identity"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "annotate:stale_engine_response"]
+notes = "エンジンの遅い応答が後から届く"
+
+[[episode]]
+id = "asy-010"
+category = "async_identity"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "annotate:stale_prefix_commit", "commit_prefix:6"]
+notes = "部分確定後の古い応答は残り区間を壊さない"

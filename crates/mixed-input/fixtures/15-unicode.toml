@@ -1,0 +1,80 @@
+# Unicode の契約例（計画書 11）。位置は Unicode scalar であり、暗黙正規化をしない。
+# surrogate pair（1 scalar / 2 UTF-16 code unit）と結合文字（2 scalar / 1 書記素）を
+# 明示的に混ぜて、UTF-16 や書記素との取り違えを検出できる形にする。
+
+[[episode]]
+id = "uni-001"
+category = "unicode"
+source = "ｋｙｏｕｈａ"
+expected = "all_japanese"
+events = ["type:ｋｙｏｕｈａ"]
+notes = "全角ローマ字。1 scalar = 1 UTF-16 code unit"
+
+[[episode]]
+id = "uni-002"
+category = "unicode"
+source = "Python🌍wotukau"
+expected = [
+  { kind = "literal", text = "Python🌍" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:Python🌍wotukau"]
+notes = "surrogate pair は 1 scalar。原文保持に含める"
+
+[[episode]]
+id = "uni-003"
+category = "unicode"
+source = "cafe\u0301womituketa"
+expected = [
+  { kind = "literal", text = "cafe\u0301" },
+  { kind = "japanese", text = "womituketa" },
+]
+events = ["type:cafe\u0301womituketa"]
+notes = "結合文字は 2 scalar。区切りの位置は scalar で決まり書記素では決まらない"
+
+[[episode]]
+id = "uni-004"
+category = "unicode"
+source = "build🚀gadekita"
+expected = [
+  { kind = "literal", text = "build🚀" },
+  { kind = "japanese", text = "gadekita" },
+]
+events = ["type:build🚀gadekita"]
+notes = "surrogate pair を含む区間の範囲ずれ検出用"
+
+[[episode]]
+id = "uni-005"
+category = "unicode"
+source = "ＡＰＩwocallsuru"
+expected = [
+  { kind = "literal", text = "ＡＰＩ" },
+  { kind = "japanese", text = "wo" },
+  { kind = "literal", text = "call" },
+  { kind = "japanese", text = "suru" },
+]
+events = ["type:ＡＰＩwocallsuru"]
+notes = "全角英字は原文保持。半角へ暗黙変換しない"
+
+[[episode]]
+id = "uni-006"
+category = "unicode"
+source = "きょうはPythonwotukau"
+expected = [
+  { kind = "japanese", text = "きょうは" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["annotate:resolved_kana_no_literal_restore", "type:きょうは", "type:Pythonwotukau"]
+notes = "読み途中由来のかなは元文字復元を禁止する（ResolvedKana、計画書 4.3）"
+
+[[episode]]
+id = "uni-007"
+category = "unicode"
+source = "①wotsukau"
+expected = [
+  { kind = "literal", text = "①" },
+  { kind = "japanese", text = "wotsukau" },
+]
+events = ["type:①wotsukau"]
+notes = "記号1字も原文保持し、番号化などへ置換しない"

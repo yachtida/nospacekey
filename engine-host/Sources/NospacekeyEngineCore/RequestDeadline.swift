@@ -20,6 +20,9 @@ struct RequestEnvelope: Decodable {
         case .liveSnapshot(_, _, _, _, _, let explicit, _, _, _, _): budget = explicit ? 1_200 : 400
         case .inputPredictions: budget = 400
         case .clauseCandidates, .convertClauses: budget = 1_200
+        // 混在変換は明示変換と同じ予算。区間数で積み増しせず、要求全体で共有する
+        // （実装計画 §6.4 — MixedConversionService が残り時間を各区間へ配る）。
+        case .mixedConvert: budget = 1_200
         default: return nil // Never drop commits, receipts, or lifecycle operations.
         }
         let limit = receivedAt.addingReportingOverflow(budget)
@@ -31,6 +34,14 @@ struct RequestEnvelope: Decodable {
 struct RequestDeadline: Sendable {
     let tickMilliseconds: UInt64
     var expired: Bool { GetTickCount64() >= tickMilliseconds }
+
+    /// 残り予算（秒）。期限切れ後は 0。下位の変換呼び出しが「この待機を始めても
+    /// 要求全体の期限に収まるか」を判定するのに使う（GPU ワーカーの予算と比較）。
+    var remainingSeconds: TimeInterval {
+        let now = GetTickCount64()
+        guard now < tickMilliseconds else { return 0 }
+        return Double(tickMilliseconds - now) / 1_000
+    }
 
     func acquire(_ lock: NSLock) -> Bool {
         while true {

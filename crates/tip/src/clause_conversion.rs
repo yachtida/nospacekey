@@ -63,6 +63,27 @@ struct CachedCandidates {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LocalEditOutcome { Unchanged, Changed, ReadingChanged, Empty, Editing, Exhausted }
 
+/// 文節クリックでの編集開始遷移（読み採用 → 文節編集開始 → カーソル移動 →
+/// identity 同期）。clause_mouse の本番経路と回帰テストが同じ関数を通る。
+/// テストが同期だけを独自に呼ぶ構造だと、本番経路の identity 同期の呼び漏れを
+/// 検出できない。戻り値は begin_reading_edit 準拠（採用失敗は Unchanged）。
+pub(crate) fn begin_click_reading_edit(
+    input: &mut crate::input_module::InputModule,
+    model: &mut ClauseConversion,
+    index: usize,
+    cursor: ReadingPosition,
+) -> LocalEditOutcome {
+    if !input.adopt_conversion_reading(&model.reading) { return LocalEditOutcome::Unchanged; }
+    match model.begin_reading_edit(index) {
+        LocalEditOutcome::Exhausted => return LocalEditOutcome::Exhausted,
+        LocalEditOutcome::Changed => {}
+        other => return other,
+    }
+    input.set_reading_cursor(cursor);
+    model.sync_identity_revision(input.reading_revision());
+    LocalEditOutcome::Changed
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CancelStage { None, SelectedReading }
 
@@ -249,6 +270,16 @@ impl ClauseConversion {
     pub fn editing_range(&self) -> Option<(ReadingPosition, ReadingPosition)> {
         if self.mode != OperationMode::Editing { return None; }
         self.clauses.iter().find(|clause| Some(clause.id) == self.editing_clause).map(|clause| (clause.start, clause.end))
+    }
+
+    /// input 側の composition revision が読み不変で進むケース（末尾 pending の
+    /// 凍結を伴うカーソル移動・文節クリック経路の移動）で identity を入力側に揃える。
+    /// 後退はさせない。揃えないと、以降の要求と結果照合が旧世代のままになり、
+    /// 凍結前の世代の非同期結果が受け入れられる。
+    pub fn sync_identity_revision(&mut self, reading_revision: u64) {
+        if self.identity.revision < reading_revision {
+            self.identity.revision = reading_revision;
+        }
     }
 
     /// The input module changes only the active reading interval. All other
@@ -1649,6 +1680,61 @@ mod tests {
         model.next_clause_id = Some(4);
         model.learning_identity = Some(ipc::client::EngineLearningIdentity { engine_epoch: "epoch".into(), learning_generation: 1 });
         model
+    }
+
+    #[test]
+    fn clause_click_transition_syncs_model_identity_after_tail_pending_freeze() {
+        use crate::input_module::{InputEvent, KeyEvent, ReplayMode, TextStyle};
+        // 文節クリック経路。clause_mouse と共用の begin_click_reading_edit を通す
+        // （テストだけが sync_identity_revision を直接呼ぶ構造だと、本番経路の
+        // 同期呼び漏れを検出できない）。末尾 pending を残した状態でクリック相当の
+        // 遷移を実行すると、読み不変の adopt no-op の後 set_reading_cursor が
+        // pending を凍結して input の世代だけが進む。遷移が identity を揃えないと、
+        // 直後の Space の変換要求が凍結前の世代で発行される。
+        let mut input = crate::input_module::InputModule::default();
+        for ch in "nny".chars() {
+            input.handle(InputEvent::Key(KeyEvent::Text {
+                ch,
+                style: TextStyle::Kana,
+                replay: ReplayMode::Delta,
+                original: None,
+            }));
+        }
+        assert_eq!(input.canonical_reading(), "んy");
+        let mut model = ClauseConversion::from_reading(
+            SnapshotIdentity {
+                composition: 1,
+                revision: input.reading_revision(),
+                configuration_generation: 1,
+                connection_generation: 1,
+            },
+            input.canonical_reading().to_owned(),
+        )
+        .unwrap();
+        let revision_before_click = input.reading_revision();
+
+        assert_eq!(
+            begin_click_reading_edit(&mut input, &mut model, 0, ReadingPosition(0)),
+            LocalEditOutcome::Changed
+        );
+        assert_ne!(
+            input.reading_revision(),
+            revision_before_click,
+            "凍結を伴う移動で input の世代だけが進む"
+        );
+        assert_eq!(
+            model.identity.revision,
+            input.reading_revision(),
+            "遷移がモデル identity を入力側の世代へ同期する"
+        );
+
+        model.mode = OperationMode::Converting;
+        let request = model.open_boundary_conversion(20, Instant::now()).unwrap();
+        assert_eq!(
+            request.key.identity.revision,
+            input.reading_revision(),
+            "直後の変換要求も同期後の世代で発行される"
+        );
     }
 
     #[test]

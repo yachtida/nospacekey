@@ -1,0 +1,167 @@
+# 複数区間の混在契約例。多区間でも欠落・重複・範囲ずれが無いことを被覆契約で表現する（計画書 11）。
+
+[[episode]]
+id = "mm-001"
+category = "multi_mixed"
+source = "APIwocallsuru"
+expected = [
+  { kind = "literal", text = "API" },
+  { kind = "japanese", text = "wo" },
+  { kind = "literal", text = "call" },
+  { kind = "japanese", text = "suru" },
+]
+events = ["type:APIwocallsuru"]
+notes = "APIをcallする"
+
+[[episode]]
+id = "mm-002"
+category = "multi_mixed"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau"]
+notes = "今日はPythonを使う。受入例の正本"
+
+[[episode]]
+id = "mm-003"
+category = "multi_mixed"
+source = "rebyuunipullrequestwodasita"
+expected = [
+  { kind = "japanese", text = "rebyuuni" },
+  { kind = "literal", text = "pullrequest" },
+  { kind = "japanese", text = "wodasita" },
+]
+events = ["type:rebyuunipullrequestwodasita"]
+notes = "レビューにpullrequestを出した"
+
+[[episode]]
+id = "mm-004"
+category = "multi_mixed"
+source = "tokendebugwositekaramergesita"
+expected = [
+  { kind = "japanese", text = "tokende" },
+  { kind = "literal", text = "bug" },
+  { kind = "japanese", text = "wositekara" },
+  { kind = "literal", text = "merge" },
+  { kind = "japanese", text = "sita" },
+]
+events = ["type:tokendebugwositekaramergesita"]
+notes = "毎度bugをしてからmergeした"
+
+[[episode]]
+id = "mm-005"
+category = "multi_mixed"
+source = "jsonnoparsehaconfigyominikui"
+expected = [
+  { kind = "literal", text = "json" },
+  { kind = "japanese", text = "no" },
+  { kind = "literal", text = "parse" },
+  { kind = "japanese", text = "ha" },
+  { kind = "literal", text = "config" },
+  { kind = "japanese", text = "yominikui" },
+]
+events = ["type:jsonnoparsehaconfigyominikui"]
+notes = "jsonのparseはconfig読みにくい。助詞単位の細かい切れ目"
+
+[[episode]]
+id = "mm-006"
+category = "multi_mixed"
+source = "gitnopullwositekaraconflictganatta"
+expected = [
+  { kind = "literal", text = "git" },
+  { kind = "japanese", text = "no" },
+  { kind = "literal", text = "pull" },
+  { kind = "japanese", text = "wositekara" },
+  { kind = "literal", text = "conflict" },
+  { kind = "japanese", text = "ganatta" },
+]
+events = ["type:gitnopullwositekaraconflictganatta"]
+notes = "gitのpullをしてからconflictがあった"
+
+[[episode]]
+id = "mm-007"
+category = "multi_mixed"
+source = "kyouhaAPIwocallsitekaramailwokaku"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "API" },
+  { kind = "japanese", text = "wocallsitekara" },
+  { kind = "literal", text = "mail" },
+  { kind = "japanese", text = "wokaku" },
+]
+events = ["type:kyouhaAPIwocallsitekaramailwokaku"]
+notes = "今日はAPIをcallしてからmailを書く"
+
+[[episode]]
+id = "mm-008"
+category = "multi_mixed"
+source = "Zoomdekaigowositekaramemowokaku"
+expected = [
+  { kind = "literal", text = "Zoom" },
+  { kind = "japanese", text = "dekaigowositekara" },
+  { kind = "literal", text = "memo" },
+  { kind = "japanese", text = "wokaku" },
+]
+events = ["type:Zoomdekaigowositekaramemowokaku"]
+notes = "Zoomで会議をしてからmemoを書く"
+
+[[episode]]
+id = "mm-009"
+category = "multi_mixed"
+source = "pythonyorirustnohougahayai"
+expected = [
+  { kind = "literal", text = "python" },
+  { kind = "japanese", text = "yori" },
+  { kind = "literal", text = "rust" },
+  { kind = "japanese", text = "nohougahayai" },
+]
+events = ["type:pythonyorirustnohougahayai"]
+notes = "pythonよりrustの方が速い"
+
+[[episode]]
+id = "mm-010"
+category = "multi_mixed"
+source = "notepaddekaisiteutf8desavesita"
+expected = [
+  { kind = "literal", text = "notepad" },
+  { kind = "japanese", text = "dekaisite" },
+  { kind = "literal", text = "utf8" },
+  { kind = "japanese", text = "de" },
+  { kind = "literal", text = "save" },
+  { kind = "japanese", text = "sita" },
+]
+events = ["type:notepaddekaisiteutf8desavesita"]
+notes = "notepadで開いてutf8でsaveした"
+
+[[episode]]
+id = "mm-011"
+category = "multi_mixed"
+source = "bughaWIPnotokorosidekaigenni"
+expected = [
+  { kind = "literal", text = "bug" },
+  { kind = "japanese", text = "ha" },
+  { kind = "literal", text = "WIP" },
+  { kind = "japanese", text = "notokorosidekaigenni" },
+]
+events = ["type:bughaWIPnotokorosidekaigenni"]
+notes = "bugはWIPのところで改元に。略語区間"
+
+[[episode]]
+id = "mm-012"
+category = "multi_mixed"
+source = "maildenotiwotukuriGitHubnipushsita"
+expected = [
+  { kind = "literal", text = "mail" },
+  { kind = "japanese", text = "de" },
+  { kind = "literal", text = "noti" },
+  { kind = "japanese", text = "wotukuri" },
+  { kind = "literal", text = "GitHub" },
+  { kind = "japanese", text = "ni" },
+  { kind = "literal", text = "push" },
+  { kind = "japanese", text = "sita" },
+]
+events = ["type:maildenotiwotukuriGitHubnipushsita"]
+notes = "mailでnotiを作りGitHubにpushした。8区間の被覆"

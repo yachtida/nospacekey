@@ -25,6 +25,50 @@ struct SnapshotSegment: Codable, Equatable {
     let style: String?
 }
 
+/// 混在変換要求の1区間。Rust `ipc::protocol::MixedSpan` と対（一字一句一致規約）。
+/// kind は "japanese" / "literal"。reading_start/end は読み上の Unicode scalar 半開区間。
+/// text は Japanese=その区間の読み、Literal=原文（一字不動）。
+struct MixedSpan: Codable, Equatable {
+    let kind: String
+    let readingStart: UInt32
+    let readingEnd: UInt32
+    let text: String
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case readingStart = "reading_start"
+        case readingEnd = "reading_end"
+        case text
+    }
+}
+
+/// 混在変換応答の1区間。Rust `ipc::protocol::MixedSpanResult` と対（一字一句一致規約）。
+/// candidateToken は Japanese 区間だけが持ち、確定 receipt の学習 token に使う
+/// （Literal は nil＝キー省略で学習対象外）。
+struct MixedSpanResult: Codable, Equatable {
+    let kind: String
+    let readingStart: UInt32
+    let readingEnd: UInt32
+    let text: String
+    let candidateToken: String?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case readingStart = "reading_start"
+        case readingEnd = "reading_end"
+        case text
+        case candidateToken = "candidate_token"
+    }
+
+    init(kind: String, readingStart: UInt32, readingEnd: UInt32, text: String, candidateToken: String? = nil) {
+        self.kind = kind
+        self.readingStart = readingStart
+        self.readingEnd = readingEnd
+        self.text = text
+        self.candidateToken = candidateToken
+    }
+}
+
 enum Request: Decodable {
     case ping
     case startSession
@@ -77,6 +121,14 @@ enum Request: Decodable {
     case moveClause(session: Int64, offset: Int, baseIndex: Int, leftContext: String?)
     case selectClauseCandidate(session: Int64, index: Int)
     case commitClauses(session: Int64)
+    // 混在入力の変換要求（ADR-0007 / 実装計画 §7.1）。Rust 側 `Request::MixedConvert`
+    // と対（一字一句一致規約）。StartSession 応答の capabilities に "mixed_input_v1"
+    // を含むエンジンだけが受け取る（TIP 側で送信を capability で制御する）。
+    case mixedConvert(session: Int64, composition: UInt64, revision: UInt64,
+                      configurationGeneration: UInt64, connectionGeneration: UInt64,
+                      conversionRevision: UInt64, requestID: UInt64,
+                      sourceRevision: UInt64, planID: UInt64,
+                      spans: [MixedSpan], leftContext: String?)
 
     private enum Keys: String, CodingKey { case method, params }
     private struct InsertParams: Decodable { let session: Int64; let text: String; let style: String? }
@@ -115,6 +167,16 @@ enum Request: Decodable {
         let session: Int64; let offset: Int; let base_index: UInt32; let left_context: String?
     }
     private struct SelectClauseCandidateParams: Decodable { let session: Int64; let index: UInt32 }
+    /// 混在変換。Rust `Request::MixedConvert` のフィールドと一字一句一致させること。
+    /// left_context は Convert と同じ Optional 規約（Rust 側は None でキー省略）。
+    private struct MixedConvertParams: Decodable {
+        let session: Int64
+        let composition: UInt64; let revision: UInt64
+        let configuration_generation: UInt64; let connection_generation: UInt64
+        let conversion_revision: UInt64; let request_id: UInt64
+        let source_revision: UInt64; let plan_id: UInt64
+        let spans: [MixedSpan]; let left_context: String?
+    }
     /// UU-5: ReloadConfig の params。Rust `Request::ReloadConfig` のフィールドと一字一句一致させること。
     struct ReloadConfigParams: Decodable {
         let llm_enabled: Bool
@@ -197,6 +259,14 @@ enum Request: Decodable {
         case "CommitClauses":
             let p = try c.decode(SessionParams.self, forKey: .params)
             self = .commitClauses(session: p.session)
+        case "MixedConvert":
+            let p = try c.decode(MixedConvertParams.self, forKey: .params)
+            self = .mixedConvert(session: p.session, composition: p.composition, revision: p.revision,
+                                 configurationGeneration: p.configuration_generation,
+                                 connectionGeneration: p.connection_generation,
+                                 conversionRevision: p.conversion_revision, requestID: p.request_id,
+                                 sourceRevision: p.source_revision, planID: p.plan_id,
+                                 spans: p.spans, leftContext: p.left_context)
         case let m: throw DecodingError.dataCorruptedError(forKey: .method, in: c, debugDescription: "unknown method \(m)")
         }
     }
@@ -214,7 +284,7 @@ enum Response: Encodable {
     case convertClausesResult(ConvertClausesResult)
     case commitReceiptAck(CommitReceiptAck)
     // wire世代とEngineHost buildの完全一致だけをTIPが採用する。Rust `Response::Session` と対。
-    case session(Int64, proto: UInt32?, boot: String?, engineEpoch: String, learningGeneration: UInt64)
+    case session(Int64, proto: UInt32?, boot: String?, engineEpoch: String, learningGeneration: UInt64, capabilities: [String]?)
     case reading(String)
     case candidates([String])
     case ok
@@ -234,6 +304,15 @@ enum Response: Encodable {
     case committed(text: String, reading: String)
     // 文節ナビゲーションのビュー。Rust 側 `Response::ClauseView` と対（一字一句一致規約）。
     case clauseView(segments: [String], selected: Int, candidates: [String], candidateIndex: Int)
+    // 混在変換の応答。Rust 側 `Response::MixedResult` と対（一字一句一致規約）。
+    // 同一性キーは要求の値をエコーし、TIP が stale 照合に使う。engineEpoch/
+    // learningGeneration は日本語区間の学習 token を発行したエンジンの同一性
+    // （確定 receipt の学習先と合せる）。
+    case mixedResult(composition: UInt64, revision: UInt64,
+                     configurationGeneration: UInt64, connectionGeneration: UInt64,
+                     requestID: UInt64, sourceRevision: UInt64, planID: UInt64,
+                     engineEpoch: String, learningGeneration: UInt64,
+                     text: String, spans: [MixedSpanResult])
     // Rust 側 `Response::ZenzaiStatus` と対（一字一句一致規約）。latency_* は
     // 集約速度統計（ユーザー内容を含まない）。旧エンジン互換で nil なら省略する。
     case zenzaiStatus(state: String, backend: String?, device: String?, reason: String?,
@@ -248,6 +327,8 @@ enum Response: Encodable {
         case candidateIndex = "candidate_index"
         case candidateRemaining = "candidate_remaining", baseline, autoCommit = "auto_commit"
         case engineEpoch = "engine_epoch", learningGeneration = "learning_generation"
+        case capabilities, requestID = "request_id", sourceRevision = "source_revision"
+        case planID = "plan_id", spans
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: Keys.self)
@@ -265,7 +346,7 @@ enum Response: Encodable {
         case .commitReceiptAck(let response):
             try c.encode("CommitReceiptAck", forKey: .result)
             try response.encode(to: encoder)
-        case .session(let s, let proto, let boot, let engineEpoch, let learningGeneration):
+        case .session(let s, let proto, let boot, let engineEpoch, let learningGeneration, let capabilities):
             try c.encode("Session", forKey: .result)
             try c.encode(s, forKey: .session)
             try c.encode(engineEpoch, forKey: .engineEpoch)
@@ -273,6 +354,9 @@ enum Response: Encodable {
             // nil のときキー省略＝handshake 導入前と wire 形一致（旧TIP互換。Rust 側 Option と対）。
             try c.encodeIfPresent(proto, forKey: .proto)
             try c.encodeIfPresent(boot, forKey: .boot)
+            // capability 広告（ADR-0006: optional 項目は proto 世代を上げない）。
+            // nil のときキー省略＝capability 導入前と wire 形一致。
+            try c.encodeIfPresent(capabilities, forKey: .capabilities)
         case .reading(let r): try c.encode("Reading", forKey: .result); try c.encode(r, forKey: .reading)
         case .candidates(let cs): try c.encode("Candidates", forKey: .result); try c.encode(cs, forKey: .candidates)
         case .liveResult(let seq, let text, let reading, let committed):
@@ -338,6 +422,22 @@ enum Response: Encodable {
             try c.encodeIfPresent(reason, forKey: .reason)
             try c.encodeIfPresent(liveLatency, forKey: .latencyLive)
             try c.encodeIfPresent(convertLatency, forKey: .latencyConvert)
+        case .mixedResult(let composition, let revision, let configurationGeneration,
+                          let connectionGeneration, let requestID, let sourceRevision,
+                          let planID, let engineEpoch, let learningGeneration,
+                          let text, let spans):
+            try c.encode("MixedResult", forKey: .result)
+            try c.encode(composition, forKey: .composition)
+            try c.encode(revision, forKey: .revision)
+            try c.encode(configurationGeneration, forKey: .configurationGeneration)
+            try c.encode(connectionGeneration, forKey: .connectionGeneration)
+            try c.encode(requestID, forKey: .requestID)
+            try c.encode(sourceRevision, forKey: .sourceRevision)
+            try c.encode(planID, forKey: .planID)
+            try c.encode(engineEpoch, forKey: .engineEpoch)
+            try c.encode(learningGeneration, forKey: .learningGeneration)
+            try c.encode(text, forKey: .text)
+            try c.encode(spans, forKey: .spans)
         case .ok: try c.encode("Ok", forKey: .result)
         case .error(let m): try c.encode("Error", forKey: .result); try c.encode(m, forKey: .message)
         }
@@ -371,7 +471,8 @@ extension Request {
              .convert(let session, _),
              .endSession(let session),
              .selectClauseCandidate(let session, _),
-             .commitClauses(let session):
+             .commitClauses(let session),
+             .mixedConvert(let session, _, _, _, _, _, _, _, _, _, _):
             return session
         }
     }

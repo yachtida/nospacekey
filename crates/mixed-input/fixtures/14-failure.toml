@@ -1,0 +1,61 @@
+# 障害時の契約例（計画書 8.5・11）。Zenzai 停止でも採用済み Literal は保持し、
+# 通常入力が停止しないことを表現する。実装は PR3 の障害時保持で行う。
+
+[[episode]]
+id = "fail-001"
+category = "failure"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "annotate:zenzai_stopped"]
+notes = "Zenzai 停止時は Literal を保持し日本語区間だけ古典変換へ"
+
+[[episode]]
+id = "fail-002"
+category = "failure"
+source = "githubnotukaikata"
+expected = "all_japanese"
+events = ["type:githubnotukaikata", "annotate:engine_disconnected"]
+notes = "エンジン切断時もローカル読み・表示を維持"
+
+[[episode]]
+id = "fail-003"
+category = "failure"
+source = "kyouhaPythonwotukau"
+expected = "all_japanese"
+events = ["type:kyouhaPythonwotukau", "annotate:model_corrupt"]
+notes = "モデル破損時は混在機能のみ無効化"
+
+[[episode]]
+id = "fail-004"
+category = "failure"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "annotate:gpu_worker_stopped"]
+notes = "GPU ワーカー停止でも通常入力は止めない"
+
+[[episode]]
+id = "fail-005"
+category = "failure"
+source = "githubnotukaikata"
+expected = [
+  { kind = "literal", text = "github" },
+  { kind = "japanese", text = "notukaikata" },
+]
+events = ["type:githubnotukaikata", "annotate:engine_reconnect_mid_input"]
+notes = "再接続先が非対応でも採用済み Literal を再解釈して壊さない"
+
+[[episode]]
+id = "fail-006"
+category = "failure"
+source = "meetingnoato"
+expected = "all_japanese"
+events = ["type:meetingnoato", "annotate:model_load_failed"]
+notes = "モデル読込失敗時は従来候補を利用"

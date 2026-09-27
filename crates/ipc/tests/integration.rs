@@ -308,6 +308,147 @@ fn tip_like_per_char_over_unique_pipe() {
     assert!(cands.iter().any(|s| s == "日本語"), "got {:?}", cands);
 }
 
+/// 混在変換（ADR-0007 / 実装計画 §6.1）: 固定 Plan を MixedConvert へ渡し、
+/// Literal の原文保持・日本語区間の変換と token 発行・確定 receipt の学習分離を
+/// 実エンジン（古典変換。NOSPACEKEY_ZENZAI は engine 起動時の既定）で検証する。
+/// 実行: cargo test -p ipc --test integration mixed_convert -- --ignored --nocapture
+#[test]
+#[ignore]
+fn mixed_convert_keeps_literal_and_converts_japanese_over_unique_pipe() {
+    use std::process::Command;
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
+    let engine = IsolatedEngine::stage();
+    let exe = engine.exe();
+    let pipe = isolated_pipe("mixed");
+    let _child = start_engine(Command::new(&exe).arg(&pipe).arg("--persist")
+        .creation_flags(0x08000000)
+        .env("NOSPACEKEY_ZENZAI", "off").env("NOSPACEKEY_LEARNING", "0")
+        .env("NOSPACEKEY_MEMORY_DIR", engine.root.join("memory"))
+        .env("TEMP", &engine.root).env("TMP", &engine.root)
+        .stdout(Stdio::null()).stderr(Stdio::null()));
+    let mut c = match EngineClient::connect_to(&pipe, Duration::from_secs(5)) {
+        Ok(c) => c,
+        Err(e) => panic!("connect_to({pipe}) failed: {e}"),
+    };
+
+    // StartSession: 新エンジンは capability 広告を出す（mixed_input_v1）。
+    let (sid, engine_epoch, learning_generation) = match c.request(&Request::StartSession).unwrap() {
+        Response::Session { session, engine_epoch, learning_generation, capabilities: Some(list), .. }
+            if list.iter().any(|capability| capability == "mixed_input_v1") =>
+        {
+            (session, engine_epoch, learning_generation)
+        }
+        other => panic!("expected capable Session, got {:?}", other),
+    };
+
+    let spans = vec![
+        ipc::protocol::MixedSpan {
+            kind: "japanese".into(),
+            reading_start: 0,
+            reading_end: 4,
+            text: "きょうは".into(),
+        },
+        ipc::protocol::MixedSpan {
+            kind: "literal".into(),
+            reading_start: 4,
+            reading_end: 10,
+            text: "Python".into(),
+        },
+        ipc::protocol::MixedSpan {
+            kind: "japanese".into(),
+            reading_start: 10,
+            reading_end: 14,
+            text: "にほんご".into(),
+        },
+    ];
+    let request = Request::MixedConvert {
+        session: sid,
+        composition: 8,
+        revision: 13,
+        configuration_generation: 2,
+        connection_generation: 5,
+        conversion_revision: 0,
+        request_id: 4,
+        source_revision: 9,
+        plan_id: 3,
+        spans: spans.clone(),
+        left_context: None,
+    };
+    let (text, result_spans) = match c.request_within(&request,
+        std::time::Instant::now() + Duration::from_millis(1_200)).unwrap() {
+        Response::MixedResult { text, spans, .. } => (text, spans),
+        other => panic!("expected MixedResult, got {:?}", other),
+    };
+    assert_eq!(result_spans.len(), 3);
+    // Literal は原文を一字不動で保持し、学習 token を持たない。
+    assert_eq!(result_spans[1].text, "Python");
+    assert_eq!(result_spans[1].candidate_token, None);
+    // 日本語区間は空でなく token を発行する。
+    assert!(!result_spans[0].text.is_empty());
+    let first_token = result_spans[0].candidate_token.clone().expect("japanese token");
+    assert!(result_spans[2].candidate_token.is_some());
+    // 全体テキストは span 表示の連結。
+    assert_eq!(text, result_spans.iter().map(|span| span.text.as_str()).collect::<String>());
+
+    // 確定 receipt: 日本語区間だけ Candidate token で学習し、Literal は学習対象外。
+    let receipt = ipc::clause::CommitReceipt {
+        commit_id: ipc::clause::CommitId {
+            // engine は client_instance を UUID として検証する（UUID でなければ
+            // InvalidIntervals で拒否）。
+            client_instance: "11111111-1111-4111-8111-111111111111".into(),
+            sequence: 1,
+        },
+        engine_epoch,
+        learning_generation,
+        reading: "きょうはPythonにほんご".into(),
+        text: text.clone(),
+        intervals: result_spans
+            .iter()
+            .map(|span| ipc::clause::CommitInterval {
+                reading_start: ipc::clause::ReadingPosition(span.reading_start),
+                reading_end: ipc::clause::ReadingPosition(span.reading_end),
+                surface: span.text.clone(),
+                learning: if span.kind == "literal" {
+                    ipc::clause::IntervalLearning::None {
+                        reason: ipc::clause::NoLearningReason::NotLearningTarget,
+                    }
+                } else {
+                    ipc::clause::IntervalLearning::Candidate {
+                        token: span.candidate_token.clone().unwrap(),
+                        explicitly_selected: true,
+                    }
+                },
+            })
+            .collect(),
+        sentence_token: None,
+    };
+    receipt.validate(|token, interval| {
+        spans_are_consistent(token, interval, &result_spans)
+    })
+    .expect("receipt keeps its invariants");
+    let _ = first_token;
+    match c.request_within(&Request::CommitReceipt(receipt),
+        std::time::Instant::now() + Duration::from_millis(1_200)).unwrap() {
+        Response::CommitReceiptAck { status: ipc::clause::ReceiptStatus::Applied, .. } => {}
+        other => panic!("expected applied receipt ack, got {:?}", other),
+    }
+}
+
+fn spans_are_consistent(
+    token: &str,
+    interval: &ipc::clause::CommitInterval,
+    spans: &[ipc::protocol::MixedSpanResult],
+) -> bool {
+    spans.iter().any(|span| {
+        span.kind == "japanese"
+            && span.candidate_token.as_deref() == Some(token)
+            && span.reading_start == interval.reading_start.0
+            && span.reading_end == interval.reading_end.0
+    })
+}
+
 /// ライブ変換: 1文字ずつ Insert→LiveConvert し、seq エコーと最終 text=日本語 を検証。
 /// 実行: cargo test -p ipc --test integration live_convert -- --ignored --nocapture
 #[test]
@@ -511,6 +652,10 @@ fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
 }
 
 fn engine_build_dir() -> std::path::PathBuf {
+    // Stage an explicitly chosen release build into the same isolated test layout.
+    if let Some(path) = std::env::var_os("NOSPACEKEY_TEST_ENGINE_DIR") {
+        return std::path::PathBuf::from(path);
+    }
     // CARGO_MANIFEST_DIR = <workspace>/crates/ipc
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()

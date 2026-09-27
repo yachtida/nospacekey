@@ -16,7 +16,7 @@ const LIFETIME: Duration = Duration::from_secs(30);
 const REQUEST_BUDGET: Duration = Duration::from_millis(1200);
 const RETRIES: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(1000)];
 
-fn next_commit_id() -> Option<ipc::clause::CommitId> {
+pub(crate) fn next_commit_id() -> Option<ipc::clause::CommitId> {
     static INSTANCE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let client_instance = INSTANCE

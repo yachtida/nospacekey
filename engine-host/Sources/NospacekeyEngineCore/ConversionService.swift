@@ -1525,7 +1525,8 @@ public final class ConversionService: @unchecked Sendable {
         _ input: ComposingText,
         leftContext: String?,
         nBest: Int,
-        deadline: GPUWorkerDeadlineTier = .convert
+        deadline: GPUWorkerDeadlineTier = .convert,
+        overallDeadline: RequestDeadline? = nil
     ) -> ConversionResult {
         let poolSize = max(10, nBest)
         let classicOptions = makeOptions(
@@ -1536,13 +1537,22 @@ public final class ConversionService: @unchecked Sendable {
               !input.convertTarget.isEmpty else {
             return classic
         }
+        // 古典候補生成の後に残り予算を再確認する（§6.4: 要求全体の期限を区間数で
+        // 積み増しせず、残り時間を下位へ渡す）。不足なら生成済みの古典結果を返し、
+        // 待機するときも残り時間に収まる予算でワーカーを呼ぶ。
+        var workerBudget = deadline.workerBudget
+        if let overallDeadline {
+            let remaining = overallDeadline.remainingSeconds
+            guard remaining >= deadline.workerBudget + 0.05 else { return classic }
+            workerBudget = min(workerBudget, remaining - 0.05)
+        }
         let decision = gpuWorkerSupervisor.rerank(
             classic: classic,
             snapshot: GPUWorkerCompositionSnapshot(input),
             leftContext: leftContext,
             nBest: poolSize,
             inferenceLimit: config.inferenceLimit,
-            deadline: deadline.workerBudget,
+            deadline: workerBudget,
             caller: deadline == .live ? .live : .convert)
         if let failure = decision.failure {
             // Only the sanitized category is logged; no input/candidate text.
@@ -3029,6 +3039,92 @@ public final class ConversionService: @unchecked Sendable {
         else { response = ConvertClausesResult(key: request.key, outcome: .ready(clauses)) }
         clauseConversionReplies[request.key] = (request, response, now)
         return response
+    }
+
+    /// 混在変換の1要求あたり Zenzai 推論の呼出上限（実装計画 §6.4 の初期案。
+    /// 品質と速度は PR7 で実測調整する）。超過分の日本語区間は古典変換。
+    static let mixedZenzaiCallBudget = 2
+
+    /// 混在変換の区間処理（実装計画 §6.2–6.4、MixedConversionService から呼ぶ）。
+    /// span 列を先頭から順に処理し、Japanese span は対象区間変換で変換して左文脈へ
+    /// 積み、Literal span は原文を一字不動で出力する（Literal を削って日本語を連結
+    /// しない・マスク置換もしない）。要求全体で admissionDeadline を共有し、期限切れ・
+    /// 全被覆候補なし・token 上限のときは nil（呼出側は Error へ落とす）。
+    /// Japanese span の候補だけ token を発行する（確定 receipt の学習用。Literal は出さない）。
+    func mixedIntervalSurfaces(spans: [MixedSpan], leftContext: String?,
+                               admissionDeadline: RequestDeadline?) -> (text: String, spans: [MixedSpanResult])? {
+        guard RequestDeadline.acquire(converterLock, before: admissionDeadline) else { return nil }
+        defer { converterLock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        let generation = currentLearningGeneration
+        clauseTokens = clauseTokens.filter { now - $0.value.issuedAt < 60 }
+        var context = leftContext ?? ""
+        var text = ""
+        var results: [MixedSpanResult] = []
+        var zenzaiBudget = Self.mixedZenzaiCallBudget
+        for span in spans {
+            if span.kind == MixedConversionService.literalKind {
+                text += span.text
+                context += span.text
+                results.append(MixedSpanResult(kind: span.kind, readingStart: span.readingStart,
+                                               readingEnd: span.readingEnd, text: span.text))
+                continue
+            }
+            // GPU 待機を始めるのは、残り予算がワーカー予算（.convert 0.9s）と
+            // 応答・後始末の余裕を含めて間に合うときだけ（実装計画 §6.4: 残り時間を
+            // 各区間に渡す。待ち終わってから期限超過を検出しても全体の上限を守れない）。
+            // 予算が残っていても残り時間が足りなければ古典で通す。
+            let gpuFitsDeadline = zenzaiBudget > 0
+                && (admissionDeadline?.remainingSeconds ?? 0) >= GPUWorkerDeadlineTier.convert.workerBudget + 0.05
+            let native = mixedIntervalCandidatesLocked(reading: span.text,
+                context: context.isEmpty ? nil : context, allowZenzai: gpuFitsDeadline,
+                overallDeadline: admissionDeadline)
+            if gpuFitsDeadline { zenzaiBudget -= 1 }
+            guard let top = native.candidates.first else { return nil }
+            let retained = retainClauseCandidateLocked(top, start: span.readingStart,
+                end: span.readingEnd, generation: generation, now: now,
+                originalSurface: top.text, modelTop: native.modelTop)
+            guard let retained else { return nil }
+            text += retained.surface
+            context += retained.surface
+            results.append(MixedSpanResult(kind: span.kind, readingStart: span.readingStart,
+                                           readingEnd: span.readingEnd, text: retained.surface,
+                                           candidateToken: retained.token))
+            if admissionDeadline?.expired == true || ProcessInfo.processInfo.systemUptime - now >= 1.2 { return nil }
+        }
+        return (text, results)
+    }
+
+    /// 混在変換の日本語区間の候補抽出。intervalCandidatesLocked と同じ全被覆
+    /// フィルタ（ruby == 読み）。予算内（allowZenzai）の区間は本番の監視付き
+    /// conversion seam（requestClassicAndRerankLocked = classic pool + GPU ワーカー
+    /// rerank）を通す — main プロセスの Zenzai 固定 off を bypass して直接 Zenzai を
+    /// 動かさない。要求全体の残り予算（overallDeadline）は古典候補生成後・rerank 直前
+    /// にも再確認され、不足なら古典結果がそのまま返る。ワーカー不使用環境では
+    /// classic pool がそのまま返り、weight/runtime 不備は silent fallback するため、
+    /// Zenzai 停止時も Literal を保持したまま日本語区間だけ古典へ戻る（§8.5）。
+    private func mixedIntervalCandidatesLocked(reading: String, context: String?, allowZenzai: Bool,
+                                               overallDeadline: RequestDeadline?)
+        -> (candidates: [Candidate], modelTop: String?) {
+        var composing = ComposingText()
+        composing.insertAtCursorPosition(reading, inputStyle: .direct)
+        stopCompositionLocked()
+        let results: [Candidate]
+        if allowZenzai {
+            results = requestClassicAndRerankLocked(composing, leftContext: context, nBest: 100,
+                                                    overallDeadline: overallDeadline).mainResults
+        } else {
+            let options = makeOptions(nBest: 100, leftSideContext: context, forceClassic: true)
+            results = requestCandidatesLocked(composing, options: options).mainResults
+        }
+        func matches(_ candidate: Candidate) -> Bool {
+            let ruby = ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined())
+            guard !candidate.text.isEmpty, !ruby.isEmpty else { return false }
+            return ruby.utf8.elementsEqual(reading.utf8)
+        }
+        let matching = results.filter(matches)
+        let displayed = (promoted(matching, composing: composing) ?? matching).filter(matches)
+        return (displayed, matching.first?.text)
     }
 
     private func snapshotAutoCommitProposalLocked(

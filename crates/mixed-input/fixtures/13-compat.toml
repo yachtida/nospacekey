@@ -1,0 +1,34 @@
+# 新旧組合せの互換契約例（計画書 7.1・11）。capability 不在で保持制約を
+# 黙殺しない。従来 wire への退避を全体日本語の解釈で表現する。
+
+[[episode]]
+id = "cmp-001"
+category = "compat"
+source = "githubnotukaikata"
+expected = "all_japanese"
+events = ["type:githubnotukaikata", "annotate:old_tip_new_engine"]
+notes = "旧 TIP は混在要求を送らないため従来どおり"
+
+[[episode]]
+id = "cmp-002"
+category = "compat"
+source = "githubnotukaikata"
+expected = "all_japanese"
+events = ["type:githubnotukaikata", "annotate:new_tip_old_engine"]
+notes = "新 TIP は旧エンジンへ capability 確認前に混在要求を送らない"
+
+[[episode]]
+id = "cmp-003"
+category = "compat"
+source = "kyouhaPythonwotukau"
+expected = "all_japanese"
+events = ["type:kyouhaPythonwotukau", "annotate:capability_missing_fallback"]
+notes = "capability 不在の新規入力は従来 wire で始める"
+
+[[episode]]
+id = "cmp-004"
+category = "compat"
+source = "kyouhaPythonwotukau"
+expected = "all_japanese"
+events = ["type:kyouhaPythonwotukau", "annotate:literal_constraint_unsupported_fallback"]
+notes = "保持制約を認識しない相手に制約を送って黙殺させない"

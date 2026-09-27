@@ -118,7 +118,8 @@ final class ClauseContractTests: XCTestCase {
                 case .session(let session):
                     try roundtrip(session)
                     let response = Response.session(session.session, proto: session.proto, boot: session.boot,
-                        engineEpoch: session.engine_epoch, learningGeneration: session.learning_generation)
+                        engineEpoch: session.engine_epoch, learningGeneration: session.learning_generation,
+                        capabilities: nil)
                     XCTAssertEqual(try JSONDecoder().decode(SessionWire.self, from: JSONEncoder().encode(response)), session)
                 case .enhancementWait(let key, let pending):
                     try roundtrip(key)

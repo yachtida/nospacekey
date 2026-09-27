@@ -104,6 +104,7 @@ code { font-family: ui-monospace, "Cascadia Mono", monospace; }
 .segmented input { position: absolute; opacity: 0; }
 .segmented span { display: grid; place-items: center; min-height: 32px; padding: 3px 10px; border-radius: 7px; color: var(--muted); white-space: nowrap; }
 .segmented label.selected span { background: var(--surface); color: var(--text); box-shadow: 0 1px 4px rgba(20,40,70,.12); font-weight: 600; }
+.segmented input:disabled + span { opacity: .5; cursor: not-allowed; }
 .segmented input:focus-visible + span { outline: 3px solid color-mix(in srgb, var(--accent) 40%, transparent); }
 
 .status-message { padding: 11px 13px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-subtle); }

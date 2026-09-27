@@ -1,0 +1,278 @@
+# 曖昧例の契約。一意に決まらない入力を無理に決めず、
+# 既定は日本語のまま、英字解釈は候補としてだけ存在する（計画書 5.3・8.2）。
+# mode = "auto" にしない: 曖昧な区間を自動適用しない契約の 表現。
+
+[[episode]]
+id = "am-001"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "made"
+expected = "all_japanese"
+alternative_literal = "made"
+events = ["type:made"]
+notes = "まで / made。候補で選ばれるまで英字にしない"
+
+[[episode]]
+id = "am-002"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "are"
+expected = "all_japanese"
+alternative_literal = "are"
+events = ["type:are"]
+notes = "あれ / are"
+
+[[episode]]
+id = "am-003"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "no"
+expected = "all_japanese"
+alternative_literal = "no"
+events = ["type:no"]
+notes = "の / no"
+
+[[episode]]
+id = "am-004"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "to"
+expected = "all_japanese"
+alternative_literal = "to"
+events = ["type:to"]
+notes = "と / to"
+
+[[episode]]
+id = "am-005"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "go"
+expected = "all_japanese"
+alternative_literal = "go"
+events = ["type:go"]
+notes = "ご / go"
+
+[[episode]]
+id = "am-006"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "kite"
+expected = "all_japanese"
+alternative_literal = "kite"
+events = ["type:kite"]
+notes = "かいて / kite。和英同形語"
+
+[[episode]]
+id = "am-007"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "mine"
+expected = "all_japanese"
+alternative_literal = "mine"
+events = ["type:mine"]
+notes = "みね / mine"
+
+[[episode]]
+id = "am-008"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "sake"
+expected = "all_japanese"
+alternative_literal = "sake"
+events = ["type:sake"]
+notes = "さけ / sake"
+
+[[episode]]
+id = "am-009"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "hi"
+expected = "all_japanese"
+alternative_literal = "hi"
+events = ["type:hi"]
+notes = "ひ / hi"
+
+[[episode]]
+id = "am-010"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "he"
+expected = "all_japanese"
+alternative_literal = "he"
+events = ["type:he"]
+notes = "へ / he"
+
+[[episode]]
+id = "am-011"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "me"
+expected = "all_japanese"
+alternative_literal = "me"
+events = ["type:me"]
+notes = "め / me"
+
+[[episode]]
+id = "am-012"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "sen"
+expected = "all_japanese"
+alternative_literal = "sen"
+events = ["type:sen"]
+notes = "せん / sen"
+
+[[episode]]
+id = "am-013"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "shi"
+expected = "all_japanese"
+alternative_literal = "shi"
+events = ["type:shi"]
+notes = "し / shi"
+
+[[episode]]
+id = "am-014"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "sushi"
+expected = "all_japanese"
+alternative_literal = "sushi"
+events = ["type:sushi"]
+notes = "すし / sushi。英語辞書にもある和語借用"
+
+[[episode]]
+id = "am-015"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "kobe"
+expected = "all_japanese"
+alternative_literal = "kobe"
+events = ["type:kobe"]
+notes = "こうべ / Kobe"
+
+[[episode]]
+id = "am-016"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "ninja"
+expected = "all_japanese"
+alternative_literal = "ninja"
+events = ["type:ninja"]
+notes = "にんじゃ / ninja"
+
+[[episode]]
+id = "am-017"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "karate"
+expected = "all_japanese"
+alternative_literal = "karate"
+events = ["type:karate"]
+notes = "からて / karate"
+
+[[episode]]
+id = "am-018"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "tsunami"
+expected = "all_japanese"
+alternative_literal = "tsunami"
+events = ["type:tsunami"]
+notes = "つなみ / tsunami"
+
+[[episode]]
+id = "am-019"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "udon"
+expected = "all_japanese"
+alternative_literal = "udon"
+events = ["type:udon"]
+notes = "うどん / udon"
+
+[[episode]]
+id = "am-020"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "ramen"
+expected = "all_japanese"
+alternative_literal = "ramen"
+events = ["type:ramen"]
+notes = "らーめん / ramen"
+
+[[episode]]
+id = "am-021"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "solo"
+expected = "all_japanese"
+alternative_literal = "solo"
+events = ["type:solo"]
+notes = "そろ / solo"
+
+[[episode]]
+id = "am-022"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "koto"
+expected = "all_japanese"
+alternative_literal = "koto"
+events = ["type:koto"]
+notes = "こと / koto（琴）"
+
+[[episode]]
+id = "am-023"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "mono"
+expected = "all_japanese"
+alternative_literal = "mono"
+events = ["type:mono"]
+notes = "もの / mono"
+
+[[episode]]
+id = "am-024"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "hana"
+expected = "all_japanese"
+alternative_literal = "hana"
+events = ["type:hana"]
+notes = "はな / Hana（名前）"
+
+[[episode]]
+id = "am-025"
+category = "ambiguous"
+mode = "candidates"
+intent = "ambiguous"
+source = "example.comnotukaikata"
+expected = "all_japanese"
+alternative_literal = "example.com"
+events = ["type:example.comnotukaikata"]
+notes = "計画書 2.2 の URL 例。区切り無しは自動対応を保証せず曖昧として扱う"

@@ -81,7 +81,7 @@ export function SegmentedChoice<T extends string>({
 }: {
   label: string;
   value: T;
-  options: Array<{ value: T; label: string }>;
+  options: Array<{ value: T; label: string; disabled?: boolean }>;
   onChange: (value: T) => void;
 }) {
   return (
@@ -94,7 +94,8 @@ export function SegmentedChoice<T extends string>({
             name={label}
             value={option.value}
             checked={value === option.value}
-            onChange={() => onChange(option.value)}
+            disabled={option.disabled}
+            onChange={() => { if (!option.disabled) onChange(option.value); }}
           />
           <span>{option.label}</span>
         </label>

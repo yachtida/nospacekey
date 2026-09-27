@@ -56,6 +56,10 @@ pub enum KeyEvent {
         ch: char,
         style: TextStyle,
         replay: ReplayMode,
+        /// 正規化前の打鍵原文字。CapsLock 大文字をかな読み用の小文字へ正規化して
+        /// 渡すときなどに ch と違い、journal の unit original（元入力）になる。
+        /// None は ch がそのまま原文字。
+        original: Option<char>,
     },
     Backspace,
     Delete,
@@ -530,7 +534,7 @@ impl InputModule {
 
     fn handle_key(&mut self, key: KeyEvent) -> ModuleOutput {
         match key {
-            KeyEvent::Text { ch, style, replay } => {
+            KeyEvent::Text { ch, style, replay, original } => {
                 let cursor_edit = self.cursor_replay_pending || !self.local_kana.cursor_at_end();
                 if !self.state.composing {
                     self.composition = self.composition.wrapping_add(1);
@@ -541,13 +545,19 @@ impl InputModule {
                 match style {
                     TextStyle::Kana => {
                         self.state.on_char(ch);
-                        self.local_kana
-                            .push(ch, crate::local_kana_composer::InputStyle::Kana);
+                        self.local_kana.push_with_original(
+                            ch,
+                            crate::local_kana_composer::InputStyle::Kana,
+                            original,
+                        );
                     }
                     TextStyle::Direct => {
                         self.state.on_char_latin(ch);
-                        self.local_kana
-                            .push(ch, crate::local_kana_composer::InputStyle::Direct);
+                        self.local_kana.push_with_original(
+                            ch,
+                            crate::local_kana_composer::InputStyle::Direct,
+                            original,
+                        );
                         // Direct 挿入で作曲ジャーナルにスタイル付きの境界が生じる。raw と
                         // latin_from からの再生は latin 境界より後のかな入力まで Direct 化して
                         // しまうため、以降の Full 再生は composer 側のセグメントを権威にする
@@ -576,13 +586,11 @@ impl InputModule {
                 }
             }
             KeyEvent::MoveReading(direction) if self.state.composing => {
-                let moved = self.local_kana.move_cursor(direction);
-                self.reading_navigation_output(moved)
+                self.navigate_reading(|composer| composer.move_cursor(direction))
             }
             KeyEvent::ReadingHome | KeyEvent::ReadingEnd if self.state.composing => {
                 let position = if key == KeyEvent::ReadingHome { 0 } else { u32::MAX };
-                let moved = self.local_kana.set_cursor(ipc::clause::ReadingPosition(position));
-                self.reading_navigation_output(moved)
+                self.navigate_reading(|composer| composer.set_cursor(ipc::clause::ReadingPosition(position)))
             }
             KeyEvent::Delete if self.state.composing => {
                 if !self.local_kana.delete_forward() { return ModuleOutput { eaten: true, ..ModuleOutput::default() }; }
@@ -1011,11 +1019,101 @@ impl InputModule {
     pub(crate) fn reading_cursor(&self) -> ipc::clause::ReadingPosition { self.local_kana.cursor() }
 
     pub(crate) fn set_reading_cursor(&mut self, cursor: ipc::clause::ReadingPosition) -> ModuleOutput {
-        let moved = self.local_kana.set_cursor(cursor);
-        self.reading_navigation_output(moved)
+        self.navigate_reading(|composer| composer.set_cursor(cursor))
     }
 
     pub(crate) fn reading_revision(&self) -> u64 { self.revision }
+
+    /// 混在表示の採用判定に使う composition 世代（PR3。revision は reading_revision）。
+    pub(crate) fn composition_id(&self) -> u64 { self.composition }
+
+    /// 混在入力の混在 Plan を composer（編集状態）へ反映する（PR3）。元打鍵の由来
+    /// （Typed/Direct/不明）と再合成の境界は adoption unit が保持し、journal へ
+    /// 反映される。末尾の未完ローマ字は pending として保持する（合成継続の意味を
+    /// 保存）。読み・unit 列・由来のいずれかが変わるとき（厳密な no-op 以外）
+    /// revision を進める — 読みが同じでも source の意味（由来・スタイル・対応単位）
+    /// が変われば別世代（PR2 の source_revision 契約）。旧 JP-only snapshot
+    /// （expected_snapshot）と自動確定保留は失効させる（§7.2）。
+    pub(crate) fn adopt_mixed_projection(
+        &mut self,
+        projection: &mixed_input::projection::Projection,
+    ) -> bool {
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        let units = projection.adoption_units();
+        let reading_before = self.local_kana.reading().to_string();
+        let triples_before = self.effective_unit_triples();
+        let saved = self.local_kana.clone();
+        self.local_kana.rebuild_units(&units);
+        // 再構築の読みは Projection と一字一致していなければならない（採用は
+        // 解釈の変更であって文字順の変更ではない）。一致しない再構築は破棄して
+        // 採用前の状態へ戻す（表示・確定へ出さない）。
+        if self.local_kana.reading() != projection.reading() {
+            self.local_kana = saved;
+            self.invalidate_live_snapshot();
+            self.invalidate_live_display();
+            return false;
+        }
+        let changed = reading_before != self.local_kana.reading()
+            || triples_before != self.effective_unit_triples();
+        if changed {
+            self.revision = revision;
+        }
+        self.clear_candidates();
+        self.reanchor_after_surface_edit(self.state.latin_mode());
+        self.invalidate_live_snapshot();
+        self.invalidate_live_display();
+        true
+    }
+
+    /// composer の完全な複製を返す（混在採用の失敗ロールバック用。PR3）。
+    /// journal の unit 列だけでなく、ResolvedKana 相当の読み・pending・suffix・
+    /// カーソル凍結まで含む。
+    pub(crate) fn snapshot_composer(
+        &self,
+    ) -> crate::local_kana_composer::LocalKanaComposer {
+        self.local_kana.clone()
+    }
+
+    /// snapshot_composer の複製へ戻す（混在採用の失敗ロールバック）。復元も編集と
+    /// して revision を進める — 古い非同期要求の同一性を復活させない（§7.2）。
+    /// 旧 snapshot の失効（invalidate_live_snapshot）は復元しない。
+    pub(crate) fn restore_composer(
+        &mut self,
+        saved: crate::local_kana_composer::LocalKanaComposer,
+    ) -> bool {
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.local_kana = saved;
+        self.revision = revision;
+        self.clear_candidates();
+        self.reanchor_after_surface_edit(self.state.latin_mode());
+        self.invalidate_live_snapshot();
+        self.invalidate_live_display();
+        true
+    }
+
+    /// 現在の実効 unit 列（読み・journal 登録スタイル・元打鍵）。採用が source の
+    /// 意味を変えたかの判定に使う。
+    pub(crate) fn effective_unit_triples(&self) -> Vec<(String, bool, String)> {
+        self.local_kana
+            .effective_input_units()
+            .into_iter()
+            .map(|unit| {
+                let literal = unit.style == crate::local_kana_composer::InputStyle::Direct;
+                let reading: String = self
+                    .local_kana
+                    .reading()
+                    .chars()
+                    .skip(unit.start.0 as usize)
+                    .take((unit.end.0 - unit.start.0) as usize)
+                    .collect();
+                (reading, literal, unit.original)
+            })
+            .collect()
+    }
 
     pub(crate) fn finalize_pending_n(&mut self) -> Option<bool> {
         let mut composer = self.local_kana.clone();
@@ -1031,7 +1129,15 @@ impl InputModule {
     }
 
     pub(crate) fn adopt_conversion_reading(&mut self, reading: &str) -> bool {
+        // 読みの一致は no-op（composer が早期 return する）なので世代を進めない。
+        // それ以外の採用は読み・完成状態・由来スタイルを変えるため、composition
+        // source の内容が変わる。plan_id + source_revision で同一性を判定する後続
+        // 処理が取り込み前後の対応表を区別できるよう、編集と同じく世代を進める。
+        let changes = self.local_kana.reading() != reading;
         if !self.local_kana.adopt_conversion_reading(reading) { return false; }
+        if changes {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.reanchor_after_surface_edit(self.state.latin_mode());
         self.invalidate_live_snapshot();
         self.invalidate_live_display();
@@ -1047,8 +1153,33 @@ impl InputModule {
         self.local_kana.original_input(start, end)
     }
 
+    /// 現在の未確定入力の元入力ソース（混在入力 PR2）。元入力の世代には
+    /// composition revision を使う。表示・変換への接続は PR3 以降。
+    #[allow(dead_code)]
+    pub(crate) fn composition_source(&self) -> mixed_input::source::CompositionSource {
+        self.local_kana.composition_source(self.revision)
+    }
+
     pub(crate) fn preserve_last_literal_original(&mut self, original: char) {
         self.local_kana.preserve_last_literal_original(original);
+    }
+
+    /// 読みナビゲーション共通（MoveReading / ReadingHome / ReadingEnd /
+    /// set_reading_cursor）。末尾 pending を凍結する移動は、canonical reading が
+    /// 不変でも composition source の由来を実効 Kana → Direct 凍結へ替えるため、
+    /// 同じ plan_id + source_revision で異なる Projection が成立しないよう世代を
+    /// 進める。unit を凍結しない純粋な移動は世代を進めない（source 内容も不変）。
+    fn navigate_reading(
+        &mut self,
+        move_composer: impl FnOnce(&mut crate::local_kana_composer::LocalKanaComposer) -> bool,
+    ) -> ModuleOutput {
+        let freezes_tail_pending =
+            !self.local_kana.reading_parts().1.is_empty() && self.local_kana.cursor_at_end();
+        let moved = move_composer(&mut self.local_kana);
+        if moved && freezes_tail_pending {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        self.reading_navigation_output(moved)
     }
 
     fn reading_navigation_output(&mut self, moved: bool) -> ModuleOutput {
@@ -1155,6 +1286,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mixed_prefix_reconstructs_source_only_after_successful_commit() {
+        use mixed_input::{live::{commit_fence, source_after_prefix}, plan::{InterpretationPlan, SegmentKind}, projection::Projection};
+        let mut module = InputModule::default();
+        for ch in "kyouhaRustnotukaikata".chars() { module.handle(key(ch)); }
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(&source.source_text(), &[
+            (SegmentKind::Japanese,"kyouha".into()), (SegmentKind::Literal,"Rust".into()),
+            (SegmentKind::Japanese,"notukaikata".into())]).unwrap();
+        let projection = Projection::build(1,&source,&plan).unwrap();
+        let fence = commit_fence(&source,&projection,&[plan],false,None);
+        let expected = source_after_prefix(&source,&projection,fence,8,2).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        let operation = ImmediateOperation::Commit { text:"今日はRust".into(), candidate:None,
+            remaining:Some("のつかいかた".into()), remaining_latin_from:None };
+        let before = module.composition_source();
+        module.complete(&operation,false);
+        assert_eq!(module.composition_source(),before);
+        module.complete(&operation,true);
+        assert_eq!(module.canonical_reading(),"のつかいかた");
+        assert_eq!(module.composition_source().elements(),expected.elements());
+        for ch in "desu".chars() { module.handle(key(ch)); }
+        assert_eq!(module.composition_source().source_text(),"notukaikatadesu");
+        assert_eq!(module.canonical_reading(),"のつかいかたです");
+    }
+
+    #[test]
     fn idle_keys_pass_and_cancel_rejection_preserves_the_actual_composition() {
         let mut module = InputModule::default();
         for event in [KeyEvent::Enter, KeyEvent::Escape] {
@@ -1202,6 +1359,993 @@ mod tests {
     }
 
     #[test]
+    fn composition_source_tracks_typed_provenance_and_revision_across_edits() {
+        use mixed_input::position::SourceRange;
+        use mixed_input::source::Provenance;
+        // 混在入力 PR2: InputModule 経由で元入力ソースを導出し、英字の大小と
+        // 由来・世代（revision）が正しく追従することを固定する。
+        let mut module = InputModule::default();
+        for event in "kyou".chars().map(key).chain([direct_key('P'), direct_key('y')]) {
+            module.handle(event);
+        }
+        assert_eq!(module.canonical_reading(), "きょうPy");
+
+        let source = module.composition_source();
+        assert_eq!(source.revision(), module.revision);
+        assert_eq!(source.source_text(), "kyouPy");
+        assert_eq!(source.reading_text(), "きょうPy");
+        assert!(source.is_original_recoverable(SourceRange::new(0, 6)));
+        // Direct 打鍵部分も元文字（大小）が分かる Typed。
+        assert_eq!(source.elements()[2].provenance, Provenance::Typed { style: mixed_input::source::SourceStyle::Direct });
+
+        // 編集で revision が進み、旧世代のソースは stale と判定できる。
+        let stale_revision = source.revision();
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        let source = module.composition_source();
+        assert_eq!(module.canonical_reading(), "きょうP");
+        assert_eq!(source.source_text(), "kyouP");
+        assert_ne!(source.revision(), stale_revision);
+        assert_eq!(source.revision(), module.revision);
+    }
+
+    #[test]
+    fn mixed_projection_adoption_updates_the_editing_state() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // nihongoka（読み にほんごか）へ Japanese(nihongo) + Literal(ka) を採用する。
+        // 採用は composer（読み・編集・元打鍵の由来）へ反映され、読みは にほんごka
+        // になる。採用後の Backspace は Literal の a を削り、採用前の読みの か を
+        // 対象にしない（表示と編集対象の不一致を残さない）。
+        let mut module = InputModule::default();
+        for ch in "nihongoka".chars() {
+            module.handle(key(ch));
+        }
+        assert_eq!(module.canonical_reading(), "にほんごか");
+        let projection = {
+            let source = module.composition_source();
+            let plan = InterpretationPlan::build(
+                &source.source_text(),
+                &[
+                    (SegmentKind::Japanese, "nihongo".to_string()),
+                    (SegmentKind::Literal, "ka".to_string()),
+                ],
+            )
+            .unwrap();
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap()
+        };
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "にほんごka");
+        // 元打鍵の由来は保存される（Literal は原文 ka、Japanese はローマ字）。
+        let source = module.composition_source();
+        assert_eq!(source.source_text(), "nihongoka");
+        assert_eq!(source.reading_text(), "にほんごka");
+
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(
+            module.canonical_reading(),
+            "にほんごk",
+            "Backspace は Literal 末尾の a を削る（採用前の か ではない）"
+        );
+        let source = module.composition_source();
+        assert_eq!(source.source_text(), "nihongok");
+    }
+
+    #[test]
+    fn mixed_adoption_invalidates_pending_live_snapshots() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 採用前に発行した旧 JP-only snapshot への応答は、採用後には適用しない
+        // （expected_snapshot の失効 — §7.2。旧解釈の表示で Literal を上書きさせない）。
+        let mut module = InputModule::default();
+        for ch in "nihongo".chars() {
+            module.handle(key(ch));
+        }
+        let BackgroundIntent::LiveSnapshot { snapshot } = module.live_snapshot(1, 1, None).unwrap()
+        else { unreachable!() };
+        let projection = {
+            let source = module.composition_source();
+            let plan = InterpretationPlan::build(
+                &source.source_text(),
+                &[(SegmentKind::Japanese, source.source_text())],
+            )
+            .unwrap();
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap()
+        };
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(
+            module.handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+                identity: snapshot.identity,
+                text: "日本語".into(),
+            })),
+            ModuleOutput::default(),
+            "採用後に届いた旧 snapshot 応答は拒否される"
+        );
+    }
+
+    #[test]
+    fn mixed_adoption_rollback_restores_the_previous_units() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 採用の失敗ロールバック: 採用前の composer の完全な複製（ResolvedKana
+        // 相当の読み・pending・suffix を含む）を保存しておき、復元で読み・由来を
+        // もとに戻せる（編集として revision は進む）。
+        let mut module = InputModule::default();
+        for ch in "nihongoka".chars() {
+            module.handle(key(ch));
+        }
+        // journal の対応を失った読み（ResolvedKana 相当）も含めて保存されることの
+        // 確認: kyo → Backspace で 元打鍵不明の き を作り、Direct の X を足す。
+        let mut edited = InputModule::default();
+        for ch in "kyo".chars() {
+            edited.handle(key(ch));
+        }
+        edited.handle(InputEvent::Key(KeyEvent::Backspace));
+        edited.handle(InputEvent::Key(KeyEvent::Text {
+            ch: 'X',
+            style: TextStyle::Direct,
+            replay: ReplayMode::Delta,
+            original: None,
+        }));
+        assert_eq!(edited.canonical_reading(), "きX");
+        let saved_edited = edited.snapshot_composer();
+
+        let saved = module.snapshot_composer();
+        let projection = {
+            let source = module.composition_source();
+            let plan = InterpretationPlan::build(
+                &source.source_text(),
+                &[
+                    (SegmentKind::Japanese, "nihongo".to_string()),
+                    (SegmentKind::Literal, "ka".to_string()),
+                ],
+            )
+            .unwrap();
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap()
+        };
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "にほんごka");
+        assert!(module.restore_composer(saved));
+        assert_eq!(module.canonical_reading(), "にほんごか");
+        let source = module.composition_source();
+        assert_eq!(source.source_text(), "nihongoka");
+
+        // ResolvedKana 相当の読み（き）を含む状態の復元でも文字が欠落しない。
+        let projection = {
+            let source = edited.composition_source();
+            let plan = InterpretationPlan::build(
+                &source.source_text(),
+                &[
+                    (SegmentKind::Japanese, "き".to_string()),
+                    (SegmentKind::Literal, "X".to_string()),
+                ],
+            )
+            .unwrap();
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap()
+        };
+        assert!(edited.adopt_mixed_projection(&projection));
+        assert_eq!(edited.canonical_reading(), "きX");
+        assert!(edited.restore_composer(saved_edited));
+        assert_eq!(edited.canonical_reading(), "きX", "不明由来のきが欠落しない");
+        let source = edited.composition_source();
+        assert_eq!(source.source_text(), "きX");
+    }
+
+    #[test]
+    fn mixed_adoption_keeps_direct_boundaries_and_unknown_provenance() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // Direct("n"→"n") + Kana("na"→"な") + Direct("X") に Japanese("nna") +
+        // Literal("X") を採用する。採用後の再 Projection で n と na が同じ再合成
+        // run に混入せず（Direct 境界の保存）、読みが composer と一致する。
+        let mut module = InputModule::default();
+        module.handle(InputEvent::Key(KeyEvent::Text {
+            ch: 'n',
+            style: TextStyle::Direct,
+            replay: ReplayMode::Delta,
+            original: None,
+        }));
+        for ch in "na".chars() {
+            module.handle(key(ch));
+        }
+        module.handle(InputEvent::Key(KeyEvent::Text {
+            ch: 'X',
+            style: TextStyle::Direct,
+            replay: ReplayMode::Delta,
+            original: None,
+        }));
+        assert_eq!(module.canonical_reading(), "nなX");
+        let projection = {
+            let source = module.composition_source();
+            let plan = InterpretationPlan::build(
+                &source.source_text(),
+                &[
+                    (SegmentKind::Japanese, "nna".to_string()),
+                    (SegmentKind::Literal, "X".to_string()),
+                ],
+            )
+            .unwrap();
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap()
+        };
+        assert_eq!(projection.reading(), "nなX", "採用前の Projection は Direct 境界を保存");
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "nなX");
+        // 採用後の再 Projection も同じ読み（run 混入で んあX にならない）。
+        let reprojected = {
+            let source = module.composition_source();
+            let plan = InterpretationPlan::build(
+                &source.source_text(),
+                &[
+                    (SegmentKind::Japanese, "nna".to_string()),
+                    (SegmentKind::Literal, "X".to_string()),
+                ],
+            )
+            .unwrap();
+            mixed_input::projection::Projection::build(2, &source, &plan).unwrap()
+        };
+        assert_eq!(
+            reprojected.reading(),
+            module.canonical_reading(),
+            "採用後の再 Projection は composer の読みと一致する"
+        );
+    }
+
+    #[test]
+    fn mixed_adoption_keeps_unknown_provenance_unknown() {
+        use mixed_input::position::SourceRange;
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 元打鍵不明の き（ResolvedKana）は、Japanese として採用しても Typed に
+        // ならない（original_input は None を維持し、Literal 化は拒否される）。
+        let mut module = InputModule::default();
+        for ch in "kyo".chars() {
+            module.handle(key(ch));
+        }
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "き");
+        let source = module.composition_source();
+        assert_eq!(source.original(SourceRange::new(0, 1)), None);
+
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[(SegmentKind::Japanese, source.source_text())],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "き");
+        let source = module.composition_source();
+        assert_eq!(
+            source.original(SourceRange::new(0, 1)),
+            None,
+            "採用で元打鍵不明の範囲を既知にしない"
+        );
+        // Literal への再解釈は原文が復元できないため Projection が拒否する。
+        let literal_plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[(SegmentKind::Literal, source.source_text())],
+        )
+        .unwrap();
+        assert!(matches!(
+            mixed_input::projection::Projection::build(2, &source, &literal_plan),
+            Err(mixed_input::projection::ProjectionError::LiteralOriginalUnknown { .. })
+        ));
+    }
+
+    #[test]
+    fn mixed_adoption_keeps_trailing_pending_composition() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 未完 Kana の k（pending）を含む Literal("X") + Japanese("k") の採用は、
+        // 末尾を pending として保持する。次の a は k と合成して か になる
+        // （stable 固定で Xkあ にならない）。
+        let mut module = InputModule::default();
+        module.handle(InputEvent::Key(KeyEvent::Text {
+            ch: 'X',
+            style: TextStyle::Direct,
+            replay: ReplayMode::Delta,
+            original: None,
+        }));
+        module.handle(key('k'));
+        assert_eq!(module.canonical_reading(), "Xk");
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[
+                (SegmentKind::Literal, "X".to_string()),
+                (SegmentKind::Japanese, "k".to_string()),
+            ],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "Xk");
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "Xか", "未完 k は a と合成を続ける");
+    }
+
+    #[test]
+    fn mixed_adoption_keeps_a_plan_split_unfinished_tail_pending() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // Plan 境界が未完ローマ字を分割するケース: ky へ Literal("k") + Japanese("y")
+        // を採用すると、未完の残り y は pending として保持される。次の a は y と
+        // 合成して や になる（kや。stable 固定で kyあ にならない）。
+        let mut module = InputModule::default();
+        for ch in "ky".chars() {
+            module.handle(key(ch));
+        }
+        assert_eq!(module.canonical_reading(), "ky");
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[
+                (SegmentKind::Literal, "k".to_string()),
+                (SegmentKind::Japanese, "y".to_string()),
+            ],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert_eq!(projection.reading(), "ky");
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "ky");
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "kや", "分割された未完 y は a と合成を続ける");
+    }
+
+    #[test]
+    fn mixed_adoption_keeps_source_order_when_a_sealed_unit_follows_the_pending_tail() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 上の対称ケース: ky 全体が pending の状態で Japanese("k") + Literal("y")
+        // を採用する。sealed な y を stable へ戻すと再構築順（stable → pending →
+        // suffix）で "yk" と逆転するため、y は pending の後ろ（suffix 側）へ置き
+        // 読み "ky" を保つ。次の a は k と合成して かy になる（kyあ にならない）。
+        let mut module = InputModule::default();
+        for ch in "ky".chars() {
+            module.handle(key(ch));
+        }
+        assert_eq!(module.canonical_reading(), "ky");
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[
+                (SegmentKind::Japanese, "k".to_string()),
+                (SegmentKind::Literal, "y".to_string()),
+            ],
+        )
+        .unwrap();
+        let projection = mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert_eq!(projection.reading(), "ky");
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "ky", "採用で文字順が逆転しない");
+        module.handle(key('a'));
+        assert_eq!(
+            module.canonical_reading(),
+            "かy",
+            "未完 k は a と合成し、sealed な y は後ろに残る"
+        );
+    }
+
+    #[test]
+    fn mixed_adoption_keeps_frozen_roman_reopenable_but_seals_explicit_direct() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // カーソル移動で凍結したローマ字（ky）は、採用を挟んでも「削除で再開できる」
+        // を維持する: 採用 → Backspace（y を削る）→ a で Xか。一方で明示 Direct は
+        // 採用後も再開しない（封印のまま）。
+        let mut module = InputModule::default();
+        module.handle(InputEvent::Key(KeyEvent::Text {
+            ch: 'X',
+            style: TextStyle::Direct,
+            replay: ReplayMode::Delta,
+            original: None,
+        }));
+        for ch in "ky".chars() {
+            module.handle(key(ch));
+        }
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(3)).eaten);
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[
+                (SegmentKind::Literal, "X".to_string()),
+                (SegmentKind::Japanese, "ky".to_string()),
+            ],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "Xky");
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "Xk", "凍結末尾の削除で未完 k が再開する");
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "Xか", "再開した k は a と合成する");
+
+        // 明示 Direct（採用前に凍結一覧へ無い）は採用後も再開しない: Japanese("X")
+        // として採用しても、Backspace は X を削るだけで pending へ戻さない。
+        let mut sealed = InputModule::default();
+        sealed.handle(InputEvent::Key(KeyEvent::Text {
+            ch: 'X',
+            style: TextStyle::Direct,
+            replay: ReplayMode::Delta,
+            original: None,
+        }));
+        let source = sealed.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[(SegmentKind::Japanese, "X".to_string())],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(sealed.adopt_mixed_projection(&projection));
+        sealed.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(sealed.canonical_reading(), "", "明示 Direct は再開せず削除される");
+    }
+
+    #[test]
+    fn mixed_adoption_keeps_unknown_pending_unfinished() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 元打鍵不明の未完（凍結 unit の部分削除で reopen した k。pending_originals 空）
+        // は、採用で stable 化せず未完を引き継ぐ。次の a は k と合成して か に
+        // なり、原文字不明も維持する（捏造しない）。
+        let mut module = InputModule::default();
+        module.handle(InputEvent::Key(KeyEvent::Text {
+            ch: 'X',
+            style: TextStyle::Direct,
+            replay: ReplayMode::Delta,
+            original: None,
+        }));
+        for ch in "ky".chars() {
+            module.handle(key(ch));
+        }
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(3)).eaten);
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "Xk");
+        let source = module.composition_source();
+        assert_eq!(source.original(mixed_input::position::SourceRange::new(1, 2)), None);
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[
+                (SegmentKind::Literal, "X".to_string()),
+                (SegmentKind::Japanese, "k".to_string()),
+            ],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "Xk");
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "Xか", "不明由来の未完 k も合成を続ける");
+        let source = module.composition_source();
+        assert_eq!(
+            source.original(mixed_input::position::SourceRange::new(1, 2)),
+            None,
+            "再合成後も原文字不明を維持する"
+        );
+    }
+
+    #[test]
+    fn mixed_adoption_reopen_inheritance_is_position_anchored() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 誤継承の排除: 明示 Direct の k（先頭）と凍結ローマ字の k（末尾）が同文。
+        /// 再開可能なのは末尾だけ。Japanese(kak) 採用 → BS2 → a で kあ（先頭 k が
+        /// pending へ戻って か にはならない）。
+        let mut module = InputModule::default();
+        module.handle(InputEvent::Key(KeyEvent::Text {
+            ch: 'k',
+            style: TextStyle::Direct,
+            replay: ReplayMode::Delta,
+            original: None,
+        }));
+        for ch in "ak".chars() {
+            module.handle(key(ch));
+        }
+        assert_eq!(module.canonical_reading(), "kあk");
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(3)).eaten);
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[(SegmentKind::Japanese, source.source_text())],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "kあk");
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "k", "先頭の明示 Direct は再開しない");
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "kあ");
+
+        // 継承漏れの排除: 別々に凍結した k と y（run 文字列 "ky" と完全一致する
+        /// unit がない）でも、source 範囲の包含で両方が再開可能を継承する。
+        let mut split = InputModule::default();
+        split.handle(InputEvent::Key(KeyEvent::Text {
+            ch: 'X',
+            style: TextStyle::Direct,
+            replay: ReplayMode::Delta,
+            original: None,
+        }));
+        split.handle(key('k'));
+        assert!(split.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(split.set_reading_cursor(ipc::clause::ReadingPosition(2)).eaten);
+        split.handle(key('y'));
+        assert!(split.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(split.set_reading_cursor(ipc::clause::ReadingPosition(3)).eaten);
+        let source = split.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[
+                (SegmentKind::Literal, "X".to_string()),
+                (SegmentKind::Japanese, "ky".to_string()),
+            ],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(split.adopt_mixed_projection(&projection));
+        split.handle(InputEvent::Key(KeyEvent::Backspace));
+        split.handle(key('a'));
+        assert_eq!(split.canonical_reading(), "Xか", "分割凍結でも再開を継承する");
+    }
+
+    #[test]
+    fn mixed_adoption_inherits_suffix_side_frozen_regions() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // カーソル後方（suffix 側）に置かれた凍結ローマ字も継承する: Home だけ実行
+        // して ky を suffix へ凍結した状態で採用 → End → BS → a で Xか。
+        let mut module = InputModule::default();
+        module.handle(InputEvent::Key(KeyEvent::Text {
+            ch: 'X',
+            style: TextStyle::Direct,
+            replay: ReplayMode::Delta,
+            original: None,
+        }));
+        for ch in "ky".chars() {
+            module.handle(key(ch));
+        }
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[
+                (SegmentKind::Literal, "X".to_string()),
+                (SegmentKind::Japanese, "ky".to_string()),
+            ],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "Xky");
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(3)).eaten);
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        module.handle(key('a'));
+        assert_eq!(
+            module.canonical_reading(),
+            "Xか",
+            "suffix 側の凍結も採用を挟んで再開できる"
+        );
+    }
+
+    #[test]
+    fn mixed_adoption_handles_resolved_kana_offsets_without_false_inheritance() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 元打鍵不明の「き」のあとの凍結 k: source 座標は composition_source と同じ
+        // 歩行（不明範囲も読み長で数える）から求める。ずれていると あ→あ の unit に
+        // 再開可能を誤継承し、削除で多バイト文字の内部を切って panic し得る。
+        let mut module = InputModule::default();
+        for ch in "kya".chars() {
+            module.handle(key(ch));
+        }
+        module.handle(InputEvent::Key(KeyEvent::Backspace)); // き ゚→き（元打鍵不明）
+        assert_eq!(module.canonical_reading(), "き");
+        module.handle(key('a'));
+        module.handle(key('k'));
+        assert_eq!(module.canonical_reading(), "きあk");
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(3)).eaten);
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[(SegmentKind::Japanese, source.source_text())],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "きあk");
+        // BS は末尾 k を削り、誤継承がなく「あ」の内部を切らない。
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "きあ");
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "き", "あ の unit は再開可能を継承しない");
+    }
+
+    #[test]
+    fn mixed_adoption_splits_a_straddling_unknown_unit() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 元打鍵不明の stable（き）と元打鍵不明の pending（k）が 1 つの Unknown に
+        // まとまるケース。pending 境界で分割し、未完 k は合成を続ける。
+        let mut module = InputModule::default();
+        for ch in "kya".chars() {
+            module.handle(key(ch));
+        }
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        for ch in "ky".chars() {
+            module.handle(key(ch));
+        }
+        assert_eq!(module.canonical_reading(), "きky");
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(4)).eaten);
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "きk");
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[(SegmentKind::Japanese, source.source_text())],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "きk");
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "きか", "Unknown 内の pending 境界も分割して引き継ぐ");
+    }
+
+    #[test]
+    fn mixed_adoption_inherits_reopen_for_unknown_frozen_regions() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 元打鍵不明のまま再凍結した k（原文字不明だが削除で再開できる）も、採用で
+        // 再開可能性を失わない。BS→a で Xか。
+        let mut module = InputModule::default();
+        module.handle(InputEvent::Key(KeyEvent::Text {
+            ch: 'X',
+            style: TextStyle::Direct,
+            replay: ReplayMode::Delta,
+            original: None,
+        }));
+        for ch in "ky".chars() {
+            module.handle(key(ch));
+        }
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(3)).eaten);
+        module.handle(InputEvent::Key(KeyEvent::Backspace)); // 不明の k を reopen
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(2)).eaten);
+        module.handle(key('i'));
+        assert_eq!(module.canonical_reading(), "Xkい", "凍結 k の後の i は即 い になる");
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[
+                (SegmentKind::Literal, "X".to_string()),
+                (SegmentKind::Japanese, "ki".to_string()),
+            ],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "Xk");
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "Xか", "不明凍結 k の再開可能性を継承する");
+    }
+
+    #[test]
+    fn mixed_adoption_maps_suffix_offsets_with_pending() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // pending（k）がある状態での suffix 側凍結（ky）: 読み座標は stable+pending
+        // を加算し、source 座標も歩行から求める。End→BS→a で kか。
+        let mut module = InputModule::default();
+        for ch in "ky".chars() {
+            module.handle(key(ch));
+        }
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        module.handle(key('k'));
+        assert_eq!(module.canonical_reading(), "kky");
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[(SegmentKind::Japanese, source.source_text())],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(3)).eaten);
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "kか", "suffix 凍結の再開も pending 込みの座標で継承する");
+    }
+
+    #[test]
+    fn mixed_adoption_does_not_split_a_completed_unit_across_the_pending_boundary() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // nnn（読み んn、末尾 n が pending）へ Literal(n)+Japanese(nn) を採用。
+        /// nn→ん は完成済みの非1:1 unit なので途中で切らず、pending も空になる
+        /// （原文字を残して次打鍵の原文字として消費させない）。次の a で
+        /// source は nnna のまま nnn に縮まない。
+        let mut module = InputModule::default();
+        for ch in "nnn".chars() {
+            module.handle(key(ch));
+        }
+        assert_eq!(module.canonical_reading(), "んn");
+        let source = module.composition_source();
+        assert_eq!(source.source_text(), "nnn");
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[
+                (SegmentKind::Literal, "n".to_string()),
+                (SegmentKind::Japanese, "nn".to_string()),
+            ],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "nん");
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "nんあ");
+        let source = module.composition_source();
+        assert_eq!(source.source_text(), "nnna", "元打鍵が欠落しない");
+    }
+
+    #[test]
+    fn mixed_adoption_does_not_take_suffix_side_unknown_as_pending() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // ky→Home→End→BS（不明の k を suffix 側へ再凍結）→ Home → s（pending）。
+        /// pending の source は [0,1) で k は [1,2)（範囲外）。末尾が roman prefix
+        /// でも pending へ戻さず、suffix の凍結を維持する。採用→End→BS→a で
+        /// skあ（sか にならない）。
+        let mut module = InputModule::default();
+        for ch in "ky".chars() {
+            module.handle(key(ch));
+        }
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(2)).eaten);
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        module.handle(key('s'));
+        assert_eq!(module.canonical_reading(), "sk");
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[(SegmentKind::Japanese, source.source_text())],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(2)).eaten);
+        module.handle(key('a'));
+        assert_eq!(
+            module.canonical_reading(),
+            "skあ",
+            "suffix 側の k は pending へ戻らず、a は単独で あ になる"
+        );
+    }
+
+    #[test]
+    fn mixed_adoption_keeps_a_middle_pending_with_suffix_after_it() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 同じセットアップで採用直後にその場で a を打つ: 本物の pending s は
+        // pending のまま保持され（suffix k は範囲外として除外）、s+a が再合成
+        // される（さk）。End を挟んだ上のテストと対で、middle pending の継承を固定する。
+        let mut module = InputModule::default();
+        for ch in "ky".chars() {
+            module.handle(key(ch));
+        }
+        assert!(
+            module
+                .set_reading_cursor(ipc::clause::ReadingPosition(0))
+                .eaten
+        );
+        assert!(
+            module
+                .set_reading_cursor(ipc::clause::ReadingPosition(2))
+                .eaten
+        );
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert!(
+            module
+                .set_reading_cursor(ipc::clause::ReadingPosition(0))
+                .eaten
+        );
+        module.handle(key('s'));
+        assert_eq!(module.canonical_reading(), "sk");
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[(SegmentKind::Japanese, source.source_text())],
+        )
+        .unwrap();
+        let projection = mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "sk");
+        module.handle(key('a'));
+        assert_eq!(
+            module.canonical_reading(),
+            "さk",
+            "pending s は pending のまま残り a と再合成される。suffix k は後ろに残る"
+        );
+    }
+
+    #[test]
+    fn mixed_adoption_inherits_partial_frozen_overlap_of_unknown_units() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // き（不明）+ k（不明のまま再凍結・再開可能）が 1 つの Unknown unit に
+        // まとまるケース。凍結範囲との交差部分（k だけ）を再開可能へ登録する。
+        /// BS→a で きか（きkあ にならない）。
+        let mut module = InputModule::default();
+        for ch in "kya".chars() {
+            module.handle(key(ch));
+        }
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        for ch in "ky".chars() {
+            module.handle(key(ch));
+        }
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(4)).eaten);
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(0)).eaten);
+        assert!(module.set_reading_cursor(ipc::clause::ReadingPosition(2)).eaten);
+        module.handle(key('i'));
+        assert_eq!(module.canonical_reading(), "きkい");
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build(
+            &source.source_text(),
+            &[(SegmentKind::Japanese, source.source_text())],
+        )
+        .unwrap();
+        let projection =
+            mixed_input::projection::Projection::build(1, &source, &plan).unwrap();
+        assert!(module.adopt_mixed_projection(&projection));
+        assert_eq!(module.canonical_reading(), "きkい");
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "きk");
+        module.handle(key('a'));
+        assert_eq!(module.canonical_reading(), "きか", "交差部分の k だけ再開可能を継承する");
+    }
+
+    #[test]
+    fn caps_lock_kana_keeps_the_typed_case_in_the_composition_source() {
+        use mixed_input::position::SourceRange;
+        // CapsLock 相当のかな打鍵（ToUnicode が大文字を返し、読み合成は小文字へ
+        // 正規化する経路）。読みは従来どおり小文字ローマ字のままで、元入力の
+        // Typed だけが実打鍵の大文字を保存する。
+        let mut module = InputModule::default();
+        for (ch, original) in [('a', 'A'), ('p', 'P'), ('i', 'I')] {
+            module.handle(InputEvent::Key(KeyEvent::Text {
+                ch,
+                style: TextStyle::Kana,
+                replay: ReplayMode::Delta,
+                original: Some(original),
+            }));
+        }
+        assert_eq!(module.canonical_reading(), "あぴ");
+        let source = module.composition_source();
+        assert_eq!(source.source_text(), "API");
+        assert_eq!(source.reading_text(), "あぴ");
+        assert_eq!(source.original(SourceRange::new(0, 3)).as_deref(), Some("API"));
+    }
+
+    #[test]
+    fn reading_adoption_advances_the_source_revision() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 読みの取り込みはソースの読み・由来を変える。同じ plan_id +
+        // source_revision で異なる対応表が存在しないよう、取り込みで世代が進む。
+        // 旧世代の Projection は source_revision で stale と判定できる。
+        let mut module = InputModule::default();
+        module.handle(key('n'));
+        let BackgroundIntent::LiveSnapshot { snapshot } = module.live_snapshot(1, 1, None).unwrap()
+        else { unreachable!() };
+        let before = module.composition_source();
+        assert_eq!(before.source_text(), "n");
+        assert_eq!(before.reading_text(), "n");
+        assert_eq!(before.revision(), module.revision);
+
+        assert!(module.adopt_conversion_reading("ん"));
+        let after = module.composition_source();
+        assert_eq!(after.source_text(), "n", "元入力は変わらない");
+        assert_eq!(after.reading_text(), "ん", "読みは取り込みで変わる");
+        assert_ne!(
+            after.revision(),
+            before.revision(),
+            "取り込み前後のソースは別世代"
+        );
+        assert_eq!(after.revision(), module.revision);
+
+        let plan_for = |source: &mixed_input::source::CompositionSource| {
+            InterpretationPlan::build(
+                &source.source_text(),
+                &[(SegmentKind::Japanese, source.source_text())],
+            )
+            .unwrap()
+        };
+        let before_projection =
+            mixed_input::projection::Projection::build(5, &before, &plan_for(&before)).unwrap();
+        let after_projection =
+            mixed_input::projection::Projection::build(5, &after, &plan_for(&after)).unwrap();
+        assert_ne!(
+            before_projection.source_revision, after_projection.source_revision,
+            "同じ plan_id の Projection でも世代で区別できる"
+        );
+        assert_eq!(
+            module.handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+                identity: snapshot.identity,
+                text: "n".into(),
+            })),
+            ModuleOutput::default(),
+            "取り込み前の世代の snapshot 結果は受け入れ口で拒否される"
+        );
+
+        // 同じ読みの再取り込みは no-op なので世代を進めない。
+        let revision = module.revision;
+        assert!(module.adopt_conversion_reading("ん"));
+        assert_eq!(module.revision, revision);
+    }
+
+    #[test]
+    fn tail_pending_freeze_by_cursor_move_advances_the_source_revision() {
+        use mixed_input::plan::{InterpretationPlan, SegmentKind};
+        // 末尾 pending を残したカーソル移動は、その実効由来を Kana → Direct 凍結へ
+        // 替える。canonical reading が不変でも Projection の結果（nny → nんy）が
+        // 変わるので、この移動だけ世代を進め、凍結しない純粋な移動は進めない。
+        let mut module = InputModule::default();
+        for ch in "nny".chars() { module.handle(key(ch)); }
+        assert_eq!(module.canonical_reading(), "んy");
+        let BackgroundIntent::LiveSnapshot { snapshot } = module.live_snapshot(1, 1, None).unwrap()
+        else { unreachable!() };
+
+        let before = module.composition_source();
+        assert_eq!(before.revision(), module.revision);
+        let plan_for = |source: &mixed_input::source::CompositionSource| {
+            InterpretationPlan::build(
+                &source.source_text(),
+                &[
+                    (SegmentKind::Literal, "n".to_string()),
+                    (SegmentKind::Japanese, "ny".to_string()),
+                ],
+            )
+            .unwrap()
+        };
+        let before_projection =
+            mixed_input::projection::Projection::build(3, &before, &plan_for(&before)).unwrap();
+        assert_eq!(before_projection.reading(), "nny");
+
+        module.handle(InputEvent::Key(KeyEvent::ReadingHome));
+        module.handle(InputEvent::Key(KeyEvent::ReadingEnd));
+
+        let after = module.composition_source();
+        assert_eq!(after.reading_text(), before.reading_text(), "canonical reading は不変");
+        assert_ne!(
+            after.revision(), before.revision(),
+            "凍結を伴う移動は source 内容が変わるので世代が進む"
+        );
+        assert_eq!(after.revision(), module.revision);
+        let after_projection =
+            mixed_input::projection::Projection::build(3, &after, &plan_for(&after)).unwrap();
+        assert_eq!(after_projection.reading(), "nんy", "凍結で再合成の境界が変わる");
+        assert_eq!(
+            module.handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+                identity: snapshot.identity,
+                text: "んy".into(),
+            })),
+            ModuleOutput::default(),
+            "凍結前の世代の snapshot 結果は受け入れ口で拒否される"
+        );
+
+        // pending のない純粋なカーソル移動は source 内容が不変なので世代を進めない。
+        let revision = module.revision;
+        module.handle(InputEvent::Key(KeyEvent::ReadingHome));
+        assert_eq!(module.composition_source().revision(), revision);
+    }
+
+    #[test]
     fn interior_pending_input_cannot_combine_with_existing_suffix_on_replay() {
         let mut module = InputModule::default();
         for ch in "au".chars() { module.handle(key(ch)); }
@@ -1222,7 +2366,10 @@ mod tests {
         module.handle(InputEvent::Key(KeyEvent::ReadingHome));
         module.handle(InputEvent::Key(KeyEvent::ReadingEnd));
         let BackgroundIntent::LiveSnapshot { snapshot: new } = module.live_snapshot(1, 1, None).unwrap() else { unreachable!() };
-        assert_eq!(old.identity.revision, new.identity.revision);
+        // 末尾 pending を凍結する Home→End は source の実効由来を替えるため、世代は
+        // 編集と同様に進む（凍結しない純粋な移動は不変。tail_pending_freeze テスト参照）。
+        // このテストの契約は request 単位での identity 再利用禁止であること。
+        assert_ne!(old.identity.revision, new.identity.revision);
         assert_ne!(old.segments, new.segments);
         assert_ne!(old.identity.request, new.identity.request);
         assert_eq!(module.handle(InputEvent::Engine(EngineResult::LiveSnapshot { identity: old.identity, text: "ん".into() })), ModuleOutput::default());
@@ -1267,7 +2414,7 @@ mod tests {
     #[test]
     fn reading_cursor_converts_scalar_position_to_utf16_without_splitting_surrogates() {
         let mut module = InputModule::default();
-        for ch in "a😀b".chars() { module.handle(InputEvent::Key(KeyEvent::Text { ch, style: TextStyle::Direct, replay: ReplayMode::Full })); }
+        for ch in "a😀b".chars() { module.handle(InputEvent::Key(KeyEvent::Text { ch, style: TextStyle::Direct, replay: ReplayMode::Full, original: None })); }
         assert_eq!(module.reading_cursor_utf16().0, 4);
         module.handle(InputEvent::Key(KeyEvent::MoveReading(-1)));
         assert_eq!(module.reading_cursor_utf16().0, 3);
@@ -1313,6 +2460,7 @@ mod tests {
                             ch,
                             style: TextStyle::Kana,
                             replay,
+                            original: None,
                         })
                     };
                     let output = module.handle(event);
@@ -1404,6 +2552,7 @@ mod tests {
             ch,
             style: TextStyle::Kana,
             replay: ReplayMode::Delta,
+            original: None,
         })
     }
 
@@ -1412,6 +2561,7 @@ mod tests {
             ch,
             style: TextStyle::Direct,
             replay: ReplayMode::Delta,
+            original: None,
         })
     }
 
@@ -2086,6 +3236,7 @@ mod tests {
                 ch,
                 style: TextStyle::Direct,
                 replay: ReplayMode::Delta,
+                original: None,
             }));
         }
         let output = direct.handle(InputEvent::Key(KeyEvent::Backspace));
@@ -2375,6 +3526,7 @@ mod tests {
             ch,
             style: TextStyle::Direct,
             replay: ReplayMode::Delta,
+            original: None,
         })
     }
 
@@ -2511,6 +3663,7 @@ mod tests {
             ch: 'A',
             style: TextStyle::Direct,
             replay: ReplayMode::Delta,
+            original: None,
         }));
         assert_eq!(
             direct.immediate,
@@ -2928,11 +4081,13 @@ mod tests {
             ch: 'B',
             style: TextStyle::Direct,
             replay: ReplayMode::Delta,
+            original: None,
         }));
         let output = module.handle(InputEvent::Key(KeyEvent::Text {
             ch: 'C',
             style: TextStyle::Direct,
             replay: ReplayMode::Full,
+            original: None,
         }));
         assert!(matches!(
             output.background,

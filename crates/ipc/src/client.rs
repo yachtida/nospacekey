@@ -1191,6 +1191,7 @@ mod win_pipe_tests {
                 session: 42,
                 proto: None,
                 boot: None,
+                capabilities: None,
             },
         );
         let mut client =
@@ -1223,6 +1224,7 @@ mod win_pipe_tests {
                 session: 42,
                 proto: None,
                 boot: None,
+                capabilities: None,
             }
         );
         assert!(!client.is_pending());
@@ -1405,6 +1407,7 @@ mod pipe_name_tests {
                 boot: boot.map(str::to_owned),
                 engine_epoch: "running-engine".into(),
                 learning_generation: 7,
+                capabilities: None,
             })
             .unwrap();
             assert_eq!(session, 41);
@@ -1438,6 +1441,7 @@ mod pipe_name_tests {
             session: 41,
             proto: Some(crate::protocol::PROTO_VERSION),
             boot: Some(env!("CARGO_PKG_VERSION").into()),
+                capabilities: None,
         };
         assert_eq!(verify_session_identity(matching).unwrap(), 41);
 
@@ -1448,6 +1452,7 @@ mod pipe_name_tests {
                 session: 41,
                 proto: Some(crate::protocol::PROTO_VERSION + 1),
                 boot: Some(env!("CARGO_PKG_VERSION").into()),
+                capabilities: None,
             },
             Response::Session {
                 engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
@@ -1455,6 +1460,7 @@ mod pipe_name_tests {
                 session: 41,
                 proto: Some(crate::protocol::PROTO_VERSION - 1),
                 boot: Some("different-build".into()),
+                capabilities: None,
             },
             Response::Session {
                 engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
@@ -1462,6 +1468,7 @@ mod pipe_name_tests {
                 session: 41,
                 proto: None,
                 boot: None,
+                capabilities: None,
             },
         ] {
             assert!(matches!(
@@ -1482,6 +1489,7 @@ mod pipe_name_tests {
                 session: 9,
                 proto: Some(crate::protocol::PROTO_VERSION - 1),
                 boot: Some("loaded-old-build".into()),
+                capabilities: None,
             })
         });
         assert!(matches!(result, Err(EngineIdentityError::Mismatch { .. })));

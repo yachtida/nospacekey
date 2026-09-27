@@ -1,0 +1,103 @@
+# 明示入力の契約例。利用者の選択は自動推定より強い（計画書 2.1・8.2）。
+# 一時英数・Direct・無変換の既存キー割当は fixture では注記として表現し、
+# 実キー割当の決定は PR5 が行う。
+
+[[episode]]
+id = "ex-001"
+category = "explicit_input"
+source = "made"
+expected = [
+  { kind = "literal", text = "made" },
+]
+events = ["type:made", "reinterpret:0:4:literal"]
+notes = "曖昧語を利用者が英字のままに明示指定"
+
+[[episode]]
+id = "ex-002"
+category = "explicit_input"
+source = "made"
+expected = "all_japanese"
+events = ["type:made", "reinterpret:0:4:literal", "reinterpret:0:4:japanese"]
+notes = "逆方向の再解釈。両方向で対象区間だけ直せる"
+
+[[episode]]
+id = "ex-003"
+category = "explicit_input"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "reinterpret:6:12:literal"]
+notes = "該当区間だけ明示保持"
+
+[[episode]]
+id = "ex-004"
+category = "explicit_input"
+source = "Python"
+expected = [
+  { kind = "literal", text = "Python" },
+]
+events = ["type:Python", "annotate:temporary_alfanumeric"]
+notes = "一時英数で入った区間は自動推定に渡さない"
+
+[[episode]]
+id = "ex-005"
+category = "explicit_input"
+source = "API"
+expected = [
+  { kind = "literal", text = "API" },
+]
+events = ["type:API", "annotate:temporary_alfanumeric"]
+notes = "一時英数の大文字"
+
+[[episode]]
+id = "ex-006"
+category = "explicit_input"
+source = "githubnotukaikata"
+expected = [
+  { kind = "literal", text = "github" },
+  { kind = "japanese", text = "notukaikata" },
+]
+events = ["type:githubnotukaikata", "reinterpret:0:6:literal"]
+notes = "利用者が選んだ解釈を非同期処理で上書きしない"
+
+[[episode]]
+id = "ex-007"
+category = "explicit_input"
+source = "Pythonwotukau"
+expected = [
+  { kind = "literal", text = "Pythonwotukau" },
+]
+events = ["type:Pythonwotukau", "annotate:temporary_alfanumeric"]
+notes = "一時英数から通常入力へ続いた区間の明示範囲"
+
+[[episode]]
+id = "ex-008"
+category = "explicit_input"
+source = "madekite"
+expected = [
+  { kind = "literal", text = "made" },
+  { kind = "japanese", text = "kite" },
+]
+events = ["type:madekite", "reinterpret:0:4:literal"]
+notes = "曖昧語が隣接しても該当区間だけ直せる"
+
+[[episode]]
+id = "ex-009"
+category = "explicit_input"
+source = "madekite"
+expected = "all_japanese"
+events = ["type:madekite", "reinterpret:0:4:literal", "escape"]
+notes = "Escape で明示変更を戻す範囲は候補オブジェクトの契約（計画書 8.2）"
+
+[[episode]]
+id = "ex-010"
+category = "explicit_input"
+source = "no"
+expected = [
+  { kind = "literal", text = "no" },
+]
+events = ["type:no", "reinterpret:0:2:literal"]
+notes = "最短の曖昧語でも明示指定できる"

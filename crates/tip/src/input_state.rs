@@ -482,6 +482,14 @@ pub fn should_widen_digits(
         && !matches!(source, "candidate" | "candidate_prefix" | "clause")
 }
 
+/// 確定本文の数字全角化を適用するか（commit_and_reset_core のゲート）。
+/// 混在確定の検証済み表示と一致する本文は Literal の原文を一字不動で出すため
+/// 全角化しない（実装計画 §6.3。全角化すると検証済み結果と不一致になり
+/// Mixed receipt も作れなくなる）。
+pub fn widens_commit_digits(text: &str, mixed_commit_text: Option<&str>) -> bool {
+    mixed_commit_text != Some(text)
+}
+
 /// 文節ナビゲーション: 文節ビューの選択文節を preedit（UTF-16）上の区間へ写す純関数。
 /// 戻り値は (開始, 長さ)。TSF の ITfRange::ShiftStart/ShiftEnd は UTF-16 コード単位で数える
 /// ため、Rust の文字数（char）でなく encode_utf16 の長さで合算する（サロゲートペアの絵文字/
@@ -1053,6 +1061,15 @@ mod tests {
         assert_eq!(to_zenkaku_digits("2024年"), "２０２４年"); // 漢字は不変
         assert_eq!(to_zenkaku_digits("a-b"), "a-b"); // 英字/記号は不変
         assert_eq!(to_zenkaku_digits("こーひー"), "こーひー"); // かなは不変
+    }
+
+    #[test]
+    fn mixed_commit_text_bypasses_digit_widening() {
+        // 混在確定の本文は Literal の原文を一字不動で出す（§6.3）。検証済み表示と
+        // 一致する本文（Python3 等）は全角化せず、一致しない本文・採用なしは従来どおり。
+        assert!(!widens_commit_digits("Python3を使う", Some("Python3を使う")));
+        assert!(widens_commit_digits("Python３を使う", Some("Python3を使う")));
+        assert!(widens_commit_digits("Python3を使う", None));
     }
 
     #[test]

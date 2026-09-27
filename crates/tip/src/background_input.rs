@@ -1851,6 +1851,7 @@ mod tests {
             session: 41,
             proto: Some(PROTO_VERSION - 1),
             boot: Some("old-build".into()),
+                capabilities: None,
         })]
         .into_iter();
         let outcome = configure_snapshot_protocol(&test_reload_config(), |request| {
@@ -1884,6 +1885,7 @@ mod tests {
                     Request::StartSession => Some(Response::Session {
                         session: 91, proto: Some(PROTO_VERSION), boot: Some(env!("CARGO_PKG_VERSION").into()),
                         engine_epoch: "new-engine".into(), learning_generation: 42,
+                capabilities: None,
                     }),
                     Request::EndSession { session: 91 } if closed => Some(Response::Ok),
                     _ => None,
@@ -1906,6 +1908,7 @@ mod tests {
                 session: 42,
                 proto: Some(PROTO_VERSION),
                 boot: Some("compatible-older-build".into()),
+                capabilities: None,
             }),
             Some(Response::Ok),
             Some(Response::Ok),
@@ -3826,6 +3829,7 @@ mod tests {
                     ch,
                     style: TextStyle::Kana,
                     replay: crate::input_module::ReplayMode::Delta,
+                    original: None,
                 },
             ));
         }
@@ -3849,6 +3853,7 @@ mod tests {
                 ch: 'g',
                 style: TextStyle::Kana,
                 replay: crate::input_module::ReplayMode::Delta,
+                original: None,
             },
         ));
         let crate::input_module::BackgroundIntent::LiveSnapshot { snapshot } = module
@@ -4788,6 +4793,7 @@ mod tests {
                 ch: 'n',
                 style: TextStyle::Kana,
                 replay: crate::input_module::ReplayMode::Delta,
+                original: None,
             },
         ));
         let crate::input_module::BackgroundIntent::LiveSnapshot { snapshot } = module

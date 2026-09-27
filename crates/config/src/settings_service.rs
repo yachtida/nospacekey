@@ -44,6 +44,7 @@ pub struct PublicSettings {
     pub weight_path: String,
     pub zenzai_inference_limit: u32,
     pub live_enabled: bool,
+    pub mixed_input: settings::MixedInputMode,
     pub input_prediction_enabled: bool,
     pub live_search_width: u32,
     pub default_direct: bool,
@@ -73,6 +74,7 @@ impl From<&settings::Settings> for PublicSettings {
             weight_path: dto.weight_path,
             zenzai_inference_limit: dto.zenzai_inference_limit,
             live_enabled: dto.live_enabled,
+            mixed_input: settings.mixed_input,
             input_prediction_enabled: dto.input_prediction_enabled,
             live_search_width: dto.live_search_width,
             default_direct: dto.default_direct,
@@ -119,6 +121,7 @@ pub struct KeyBindingChange {
 pub enum SettingChange {
     DefaultDirect(bool),
     LiveEnabled(bool),
+    MixedInput(settings::MixedInputMode),
     InputPredictionEnabled(bool),
     LiveSearchWidth(u32),
 
@@ -408,6 +411,7 @@ fn apply_changes(
         match change {
             SettingChange::DefaultDirect(value) => settings.default_direct = *value,
             SettingChange::InputPredictionEnabled(value) => settings.input_prediction_enabled = *value,
+            SettingChange::MixedInput(value) => settings.mixed_input = *value,
             SettingChange::LiveEnabled(value) => settings.live_conversion.enabled = *value,
             SettingChange::LiveSearchWidth(value) => settings.live_conversion.search_width = *value,
             SettingChange::ShiftLatinMode(value) => settings.shift_latin.mode = value.clone(),
@@ -563,7 +567,7 @@ pub fn settings_patch(
             let target = change.target();
             let condition = if target == "update_include_beta" {
                 "次回の更新確認"
-            } else if target == "live_search_width" {
+            } else if matches!(target.as_str(), "live_search_width" | "mixed_input") {
                 "入力先を開き直した後"
             } else if target.starts_with("appearance_") {
                 "候補または読み表示の次回描画"
@@ -623,6 +627,20 @@ mod tests {
             settings: settings::Settings::default(), outcome: settings::LoadOutcome::Corrupt, contents: None,
         });
         assert_eq!(recovered.revision, "missing", "successful quarantine leaves a missing file");
+    }
+
+    #[test]
+    fn mixed_input_patch_roundtrips_without_changing_other_fields() {
+        for mode in ["off", "candidates", "auto"] {
+            let original = settings::Settings::default();
+            let change = serde_json::from_value(serde_json::json!({"field":"mixed_input", "value":mode})).unwrap();
+            let changed = apply_changes(original.clone(), &[change]).unwrap();
+            let restored = settings::Settings::from_json_str(&changed.to_json());
+            assert_eq!(serde_json::to_value(PublicSettings::from(&restored)).unwrap()["mixedInput"], mode);
+            assert_eq!(restored.live_conversion.enabled, original.live_conversion.enabled);
+            assert_eq!(restored.learning.enabled, original.learning.enabled);
+        }
+        assert!(serde_json::from_value::<SettingChange>(serde_json::json!({"field":"mixed_input", "value":"unsupported"})).is_err());
     }
 
     #[test]

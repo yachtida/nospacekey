@@ -106,6 +106,21 @@ impl LiveSettings {
     }
 }
 
+/// Mixed input is opt-in. Automatic remains unavailable until its separate quality gate passes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MixedInputMode {
+    #[default]
+    Off,
+    Candidates,
+    Auto,
+}
+impl MixedInputMode {
+    pub fn effective(self) -> Self {
+        match self { Self::Auto => Self::Candidates, mode => mode }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearningSettings {
     pub enabled: bool,
@@ -276,6 +291,8 @@ pub struct Settings {
     pub zenzai: ZenzaiSettings,
     #[serde(default)]
     pub live_conversion: LiveSettings,
+    #[serde(default)]
+    pub mixed_input: MixedInputMode,
     /// 入力中の辞書予測候補。旧設定からの移行も既定ON。
     #[serde(default = "default_true")]
     pub input_prediction_enabled: bool,
@@ -326,6 +343,7 @@ impl Default for Settings {
             llm: Default::default(),
             zenzai: Default::default(),
             live_conversion: Default::default(),
+            mixed_input: Default::default(),
             input_prediction_enabled: true,
             learning: Default::default(),
             default_direct: false,
@@ -2556,4 +2574,19 @@ mod tests {
         assert!(keymap::find_conflicts(&settings.keymap, "f8", false).is_empty());
     }
 
+}
+
+#[cfg(test)]
+mod mixed_mode_tests {
+    use super::*;
+    #[test]
+    fn older_settings_stay_off_and_automatic_is_not_released() {
+        let old = Settings::from_json_str(r#"{"version":2}"#);
+        assert_eq!(old.mixed_input, MixedInputMode::Off);
+        assert_eq!(MixedInputMode::Auto.effective(), MixedInputMode::Candidates);
+        let mut settings = Settings::default();
+        settings.mixed_input = MixedInputMode::Candidates;
+        assert_eq!(Settings::from_json_str(&settings.to_json()).mixed_input, MixedInputMode::Candidates);
+        assert!(serde_json::from_str::<MixedInputMode>(r#""unknown""#).is_err());
+    }
 }

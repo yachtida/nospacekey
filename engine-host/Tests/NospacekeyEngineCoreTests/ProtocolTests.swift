@@ -112,7 +112,12 @@ final class ProtocolTests: XCTestCase {
     func testEncodeResponseNeverEmpty() {
         let cases: [Response] = [
             .pong,
-            .session(7, proto: nil, boot: nil, engineEpoch: "fixture-engine", learningGeneration: 0),
+            .session(7, proto: nil, boot: nil, engineEpoch: "fixture-engine", learningGeneration: 0, capabilities: nil),
+            .session(7, proto: nil, boot: nil, engineEpoch: "fixture-engine", learningGeneration: 0, capabilities: ["mixed_input_v1"]),
+            .mixedResult(composition: 8, revision: 13, configurationGeneration: 2,
+                         connectionGeneration: 5, requestID: 4, sourceRevision: 9, planID: 3,
+                         engineEpoch: "fixture-engine", learningGeneration: 0,
+                         text: "今日はPython", spans: []),
             .reading(""),                                   // 空読みでもフレーム本体は非空
             .candidates([]),                                // 空候補でもフレーム本体は非空
             .ok,
@@ -278,17 +283,78 @@ final class ProtocolTests: XCTestCase {
 
     func testEncodeSessionCarriesProto() throws {
         // 新エンジン: Session 応答に proto を載せる。dict 比較（キー順非保証のためバイト一致比較はしない）。
-        let res = Response.session(7, proto: 9, boot: BuildInfo.version, engineEpoch: "fixture-engine", learningGeneration: 6)
+        let res = Response.session(7, proto: 9, boot: BuildInfo.version, engineEpoch: "fixture-engine", learningGeneration: 6, capabilities: nil)
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
         XCTAssertEqual(obj["session"] as? Int, 7)
         XCTAssertEqual(obj["proto"] as? Int, 9)
         XCTAssertEqual(obj["boot"] as? String, BuildInfo.version)
+        XCTAssertNil(obj["capabilities"], "nil はキー省略＝capability 導入前と wire 形一致")
+    }
+
+    func testEncodeSessionCapabilities() throws {
+        // capability 広告。Rust `Response::Session.capabilities` と対（一字一句一致規約）。
+        let res = Response.session(7, proto: 9, boot: nil, engineEpoch: "fixture-engine", learningGeneration: 6, capabilities: ["mixed_input_v1"])
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
+        XCTAssertEqual(obj["capabilities"] as? [String], ["mixed_input_v1"])
+    }
+
+    func testDecodeMixedConvert() throws {
+        // Rust `Request::MixedConvert` の wire 形と対。left_context 省略形（None）も受ける。
+        let json = #"{"method":"MixedConvert","params":{"session":7,"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"conversion_revision":1,"request_id":4,"source_revision":9,"plan_id":3,"spans":[{"kind":"japanese","reading_start":0,"reading_end":4,"text":"きょうは"},{"kind":"literal","reading_start":4,"reading_end":10,"text":"Python"}]}}"#
+        let req = try JSONDecoder().decode(Request.self, from: Data(json.utf8))
+        guard case .mixedConvert(let session, let composition, let revision,
+                                 let configurationGeneration, let connectionGeneration,
+                                 let conversionRevision, let requestID, let sourceRevision,
+                                 let planID, let spans, let leftContext) = req
+        else { return XCTFail("not mixedConvert: \(req)") }
+        XCTAssertEqual(session, 7)
+        XCTAssertEqual(composition, 8)
+        XCTAssertEqual(revision, 13)
+        XCTAssertEqual(configurationGeneration, 2)
+        XCTAssertEqual(connectionGeneration, 5)
+        XCTAssertEqual(conversionRevision, 1)
+        XCTAssertEqual(requestID, 4)
+        XCTAssertEqual(sourceRevision, 9)
+        XCTAssertEqual(planID, 3)
+        XCTAssertEqual(spans, [
+            MixedSpan(kind: "japanese", readingStart: 0, readingEnd: 4, text: "きょうは"),
+            MixedSpan(kind: "literal", readingStart: 4, readingEnd: 10, text: "Python"),
+        ])
+        XCTAssertNil(leftContext)
+        XCTAssertEqual(req.sessionId, 7, "所有権ガードの対象")
+    }
+
+    func testEncodeMixedResult() throws {
+        // Rust `Response::MixedResult` の wire 形と対。同一性キーは要求のエコー。
+        let res = Response.mixedResult(composition: 8, revision: 13, configurationGeneration: 2,
+                                       connectionGeneration: 5, requestID: 4, sourceRevision: 9,
+                                       planID: 3, engineEpoch: "11111111-1111-4111-8111-111111111111",
+                                       learningGeneration: 6,
+                                       text: "今日はPython",
+                                       spans: [MixedSpanResult(kind: "japanese", readingStart: 0,
+                                                               readingEnd: 4, text: "今日は",
+                                                               candidateToken: "engine-epoch:7"),
+                                               MixedSpanResult(kind: "literal", readingStart: 4,
+                                                               readingEnd: 10, text: "Python")])
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
+        XCTAssertEqual(obj["result"] as? String, "MixedResult")
+        XCTAssertEqual(obj["source_revision"] as? Int, 9)
+        XCTAssertEqual(obj["plan_id"] as? Int, 3)
+        XCTAssertEqual(obj["engine_epoch"] as? String, "11111111-1111-4111-8111-111111111111")
+        XCTAssertEqual(obj["learning_generation"] as? Int, 6)
+        XCTAssertEqual(obj["text"] as? String, "今日はPython")
+        let spans = obj["spans"] as! [[String: Any]]
+        XCTAssertEqual(spans[0]["kind"] as? String, "japanese")
+        XCTAssertEqual(spans[0]["reading_start"] as? Int, 0)
+        XCTAssertEqual(spans[0]["text"] as? String, "今日は")
+        XCTAssertEqual(spans[0]["candidate_token"] as? String, "engine-epoch:7")
+        XCTAssertNil(spans[1]["candidate_token"], "Literal（token なし）はキーを省略する")
     }
 
     func testEncodeSessionWithoutProtoOmitsKey() throws {
         // proto=nil はキー自体を省略＝handshake 導入前と wire 形一致（旧TIP互換。Rust 側 Option と対）。
-        let res = Response.session(7, proto: nil, boot: nil, engineEpoch: "fixture-engine", learningGeneration: 0)
+        let res = Response.session(7, proto: nil, boot: nil, engineEpoch: "fixture-engine", learningGeneration: 0, capabilities: nil)
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(res)) as! [String: Any]
         XCTAssertEqual(obj["result"] as? String, "Session")
         XCTAssertEqual(obj["session"] as? Int, 7)

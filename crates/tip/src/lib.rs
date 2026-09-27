@@ -9,6 +9,10 @@ mod candidate_window;
 mod class_factory;
 #[allow(dead_code)]
 mod clause_conversion;
+mod composition_source;
+mod mixed_conversion;
+mod mixed_worker;
+mod mixed_candidates;
 mod grapheme;
 mod input_journal;
 #[allow(dead_code)]

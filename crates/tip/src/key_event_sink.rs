@@ -228,7 +228,9 @@ fn shift_down() -> bool {
 pub enum AzRoute {
     DirectCommit(char),
     Latin(char),
-    Kana(char),
+    /// `ch` は読み合成用の小文字。`original` は ToUnicode が返した実打鍵が大文字の
+    /// とき（CapsLock 等）だけ Some になり、journal の元入力として保存される。
+    Kana { ch: char, original: Option<char> },
 }
 
 /// A–Z 打鍵の経路決定の純関数（COM 非依存 — testbench に Shift 注入が無いため単体テストで担保）。
@@ -239,7 +241,8 @@ pub enum AzRoute {
 ///   取れなければ大文字化）を直接確定する。idle でも composition 中でも同じ
 ///   （呼び出し側が開いている合成を先に settle して畳む）。
 /// - 無修飾かつ非 latin_mode: 従来のかな経路（AltGr 等の非英字レイアウト文字は尊重、
-///   素の A–Z は小文字へ正規化。CapsLock で大文字が来ても shift 無しなら小文字正規化）。
+///   素の A–Z は小文字へ正規化。CapsLock で大文字が来ても shift 無しなら読み合成は
+///   小文字のままだが、元入力には実打鍵の大文字を残す）。
 pub fn resolve_az_char(
     vk: u32,
     shift: bool,
@@ -259,8 +262,11 @@ pub fn resolve_az_char(
         return AzRoute::DirectCommit(key_char.unwrap_or(lower.to_ascii_uppercase()));
     }
     match key_char {
-        Some(c) if !c.is_ascii_alphabetic() => AzRoute::Kana(c),
-        _ => AzRoute::Kana(lower),
+        Some(c) if !c.is_ascii_alphabetic() => AzRoute::Kana { ch: c, original: None },
+        // CapsLock 等で ToUnicode が大文字を返した打鍵。読み合成は小文字で通し、
+        // 元入力（journal original）にだけ大文字を残す。
+        Some(c) if c.is_ascii_uppercase() => AzRoute::Kana { ch: lower, original: Some(c) },
+        _ => AzRoute::Kana { ch: lower, original: None },
     }
 }
 
@@ -1159,6 +1165,7 @@ impl TextService_Impl {
             return Ok(FALSE);
         }
 
+        if self.handle_mixed_key(&ctx, vk, shift_down(), cmd_modifier_down()) { return Ok(TRUE); }
         if self.handle_input_prediction_key(&ctx, vk, action, cmd_modifier_down() || shift_down()) { return Ok(TRUE); }
         if self.handle_conversion_wait_key(&ctx, vk, lparam, action) { return Ok(TRUE); }
         if self.mixed_editing() && action == crate::keymap::KeyAction::Convert {
@@ -1295,7 +1302,7 @@ impl TextService_Impl {
                 ) {
                     AzRoute::DirectCommit(ch) => self.commit_char_direct(&ctx, ch),
                     AzRoute::Latin(ch) => self.input_char(&ctx, ch, InsertStyle::Direct),
-                    AzRoute::Kana(ch) => self.input_char(&ctx, ch, InsertStyle::Kana),
+                    AzRoute::Kana { ch, original } => self.input_char_with_original(&ctx, ch, InsertStyle::Kana, original),
                 }
             }
 
@@ -1721,12 +1728,12 @@ impl TextService_Impl {
                 VK_1..=VK_9 if (queued_digit_selects_candidate(barrier, target.candidate_window) || (boundary_loading && !barrier)) && !shift_down() => return true,
                 VK_A..=VK_Z => {
                     let latin = !barrier && self.state.borrow().latin_mode();
-                    let (ch, style, direct_commit) = match resolve_az_char(vk, shift_down(), key_to_char(vk, lparam), self.shift_latin_compose.get(), latin) {
-                        AzRoute::Kana(ch) => (ch, ModuleTextStyle::Kana, false),
-                        AzRoute::Latin(ch) => (ch, ModuleTextStyle::Direct, false),
-                        AzRoute::DirectCommit(ch) => (ch, ModuleTextStyle::Direct, true),
+                    let (ch, style, direct_commit, original) = match resolve_az_char(vk, shift_down(), key_to_char(vk, lparam), self.shift_latin_compose.get(), latin) {
+                        AzRoute::Kana { ch, original } => (ch, ModuleTextStyle::Kana, false, original),
+                        AzRoute::Latin(ch) => (ch, ModuleTextStyle::Direct, false, None),
+                        AzRoute::DirectCommit(ch) => (ch, ModuleTextStyle::Direct, true, None),
                     };
-                    Some(A::Insert { text: ch.to_string(), original: None, style, direct_commit })
+                    Some(A::Insert { text: ch.to_string(), original: original.map(|ch| ch.to_string()), style, direct_commit })
                 }
                 _ => key_to_char(vk, lparam).map(|ch| {
                     let original = ch;
@@ -1871,7 +1878,11 @@ impl TextService_Impl {
                 }
                 A::Commit => {
                     let fallback = self.conversion_queue.borrow().initial_reading.clone();
-                    let text = if self.state.borrow().notation_fixed.is_some() {
+                    // 混在表示が現在の入力に一致するときはその本文で確定する
+                    // （receipt は do_commit の文書反映後に mixed receipt が出る）。
+                    let text = if let Some(mixed) = self.mixed_commit_text() {
+                        mixed
+                    } else if self.state.borrow().notation_fixed.is_some() {
                         self.live_text.borrow().clone()
                     } else {
                         fallback.unwrap_or_else(|| self.state.borrow().canonical_reading().to_string())
@@ -2016,7 +2027,7 @@ impl TextService_Impl {
     }
 
     fn edit_reading(&self, ctx: &ITfContext, key: ModuleKeyEvent) -> Result<BOOL> {
-        if self.mixed_editing() { return self.edit_mixed_reading(ctx, key, None); }
+        if self.mixed_editing() { return self.edit_mixed_reading(ctx, key); }
         if self.showing.get() {
             self.candidate_ui.borrow_mut().hide();
             self.showing.set(false);
@@ -2485,6 +2496,7 @@ impl TextService_Impl {
         let composing = self.state.borrow().composing;
         if composing {
             self.disarm_debounce();
+            if self.begin_mixed_candidates() { return; }
             self.begin_explicit_snapshot_wait();
             if self.local_converting() { self.render_local_edit(ctx); }
         }
@@ -2634,7 +2646,7 @@ impl TextService_Impl {
         if self.mixed_editing() {
             return self.edit_mixed_reading(ctx, ModuleKeyEvent::Text { ch,
                 style: if style == InsertStyle::Direct { ModuleTextStyle::Direct } else { ModuleTextStyle::Kana },
-                replay: ModuleReplayMode::Full }, original);
+                replay: ModuleReplayMode::Full, original });
         }
         if self.local_converting() && !self.replaying_conversion_queue.get() {
             let style = match style { InsertStyle::Direct => ModuleTextStyle::Direct, InsertStyle::Kana => ModuleTextStyle::Kana };
@@ -2670,12 +2682,12 @@ impl TextService_Impl {
                     } else {
                         ModuleReplayMode::Delta
                     },
+                    original,
                 }));
         let displayed = match module_output.immediate.as_ref() {
             Some(ModuleOperation::SetPreedit { text }) => text.clone(),
             other => unreachable!("text input must produce local preedit, got {other:?}"),
         };
-        if let Some(original) = original { self.state.borrow_mut().preserve_last_literal_original(original); }
         let (request, segments, background_reseed) = match module_output.background {
             Some(ModuleIntent::Insert { request, segments }) => (request, segments, background_reseed),
             Some(ModuleIntent::Reseed { request, segments }) => (request, segments, true),
@@ -2780,8 +2792,17 @@ impl TextService_Impl {
     ) -> bool {
         self.disarm_debounce();
         // ④: 既定確定（候補選択でない）はかなモード全角設定に従い数字を全角化する。
-        // 以降のログ/remember/do_commit はすべて widened を使う（shadowing）。
-        let widened = self.widen_commit_text(text, source);
+        // 混在確定の本文は例外（input_state::widens_commit_digits）— Literal の原文を
+        // 一字不動で出す契約（§6.3）。以降のログ/remember/do_commit はすべて widened
+        // を使う（shadowing）。
+        let widened = if crate::input_state::widens_commit_digits(
+            text,
+            self.mixed_commit_text().as_deref(),
+        ) {
+            self.widen_commit_text(text, source)
+        } else {
+            text.to_string()
+        };
         let text = widened.as_str();
         // 品質ループ②: 構造化フィールドはクリア**前**に採取する（reading/候補数はこの後の
         // reset/hide で消える）。cand_n は候補確定時のみ意味を持つ（ライブ確定は 0）。
@@ -2884,6 +2905,7 @@ impl TextService_Impl {
         index: usize,
         resolved_text: &str,
     ) {
+        if self.commit_mixed_selection(ctx, index) { return; }
         self.disarm_debounce();
         // 再変換中の確定は対象外（g1 リプレイ由来の別セッション）。従来確定へフォールバック。
         if self.reconverting.get() {
@@ -3823,21 +3845,22 @@ mod tests {
         // 無修飾はかな経路（小文字へ正規化）— 従来挙動。設定・英語モードに依らない。
         assert_eq!(
             resolve_az_char(0x41, false, Some('a'), false, false),
-            AzRoute::Kana('a')
+            AzRoute::Kana { ch: 'a', original: None }
         );
         assert_eq!(
             resolve_az_char(0x41, false, None, false, false),
-            AzRoute::Kana('a')
+            AzRoute::Kana { ch: 'a', original: None }
         );
         // AltGr 等の非英字レイアウト文字は従来どおり尊重（かな経路のまま）。
         assert_eq!(
             resolve_az_char(0x41, false, Some('á'), false, false),
-            AzRoute::Kana('á')
+            AzRoute::Kana { ch: 'á', original: None }
         );
-        // CapsLock（shift 無しで大文字が来る）は従来どおり小文字正規化のかな経路。
+        // CapsLock（shift 無しで大文字が来る）も読み合成は従来どおり小文字のかな経路。
+        // 元入力には実打鍵の大文字を残す（CompositionSource の Typed が大小文字を保存）。
         assert_eq!(
             resolve_az_char(0x43, false, Some('C'), false, false),
-            AzRoute::Kana('c')
+            AzRoute::Kana { ch: 'c', original: Some('C') }
         );
     }
 
@@ -3883,7 +3906,7 @@ mod tests {
         // compose 設定でも Shift 無し・非英語モードなら従来のかな経路。
         assert_eq!(
             resolve_az_char(0x41, false, Some('a'), true, false),
-            AzRoute::Kana('a')
+            AzRoute::Kana { ch: 'a', original: None }
         );
     }
 

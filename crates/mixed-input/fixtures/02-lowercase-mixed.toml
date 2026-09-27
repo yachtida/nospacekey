@@ -1,0 +1,327 @@
+# 小文字だけの混在契約例。大文字や記号に頼らず境界を検出できることを表現する（計画書 11）。
+# mode = "off" の例は、機能無効時に既存どおり全体日本語へ戻る基準（OFF 時基準テスト）。
+
+[[episode]]
+id = "lm-001"
+category = "lowercase_mixed"
+source = "githubnotukaikata"
+expected = [
+  { kind = "literal", text = "github" },
+  { kind = "japanese", text = "notukaikata" },
+]
+events = ["type:githubnotukaikata"]
+notes = "githubの使い方"
+
+[[episode]]
+id = "lm-002"
+category = "lowercase_mixed"
+source = "kyouharustwobenkyousiteiru"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "rust" },
+  { kind = "japanese", text = "wobenkyousiteiru" },
+]
+events = ["type:kyouharustwobenkyousiteiru"]
+notes = "今日はrustを勉強している"
+
+[[episode]]
+id = "lm-003"
+category = "lowercase_mixed"
+source = "meetingnoatodehanasou"
+expected = [
+  { kind = "literal", text = "meeting" },
+  { kind = "japanese", text = "noatodehanasou" },
+]
+events = ["type:meetingnoatodehanasou"]
+notes = "meetingの後で話そう"
+
+[[episode]]
+id = "lm-004"
+category = "lowercase_mixed"
+source = "pythondegakusyuusita"
+expected = [
+  { kind = "literal", text = "python" },
+  { kind = "japanese", text = "degakusyuusita" },
+]
+events = ["type:pythondegakusyuusita"]
+notes = "pythonで学習した"
+
+[[episode]]
+id = "lm-005"
+category = "lowercase_mixed"
+source = "puroguramuwarustdekaita"
+expected = [
+  { kind = "japanese", text = "puroguramuwa" },
+  { kind = "literal", text = "rust" },
+  { kind = "japanese", text = "dekaita" },
+]
+events = ["type:puroguramuwarustdekaita"]
+notes = "プログラムはrustで書いた"
+
+[[episode]]
+id = "lm-006"
+category = "lowercase_mixed"
+source = "dockercomposedetatiageru"
+expected = [
+  { kind = "literal", text = "dockercompose" },
+  { kind = "japanese", text = "detatiageru" },
+]
+events = ["type:dockercomposedetatiageru"]
+notes = "dockercomposeで立ち上げる"
+
+[[episode]]
+id = "lm-007"
+category = "lowercase_mixed"
+source = "endpointgawakaranai"
+expected = [
+  { kind = "literal", text = "endpoint" },
+  { kind = "japanese", text = "gawakaranai" },
+]
+events = ["type:endpointgawakaranai"]
+notes = "endpointが分からない"
+
+[[episode]]
+id = "lm-008"
+category = "lowercase_mixed"
+source = "buggakowaretahazuganai"
+expected = [
+  { kind = "literal", text = "bug" },
+  { kind = "japanese", text = "gakowaretahazuganai" },
+]
+events = ["type:buggakowaretahazuganai"]
+notes = "bugが壊れたはずがない"
+
+[[episode]]
+id = "lm-009"
+category = "lowercase_mixed"
+source = "arraynokatagawakaranai"
+expected = [
+  { kind = "literal", text = "array" },
+  { kind = "japanese", text = "nokatagawakaranai" },
+]
+events = ["type:arraynokatagawakaranai"]
+notes = "arrayの型が分からない"
+
+[[episode]]
+id = "lm-010"
+category = "lowercase_mixed"
+source = "servernisurutokihamayou"
+expected = [
+  { kind = "literal", text = "server" },
+  { kind = "japanese", text = "nisurutokihamayou" },
+]
+events = ["type:servernisurutokihamayou"]
+notes = "serverにする時は迷う"
+
+[[episode]]
+id = "lm-011"
+category = "lowercase_mixed"
+source = "moduleniwaketayo"
+expected = [
+  { kind = "literal", text = "module" },
+  { kind = "japanese", text = "niwaketayo" },
+]
+events = ["type:moduleniwaketayo"]
+notes = "moduleに分けたよ"
+
+[[episode]]
+id = "lm-012"
+category = "lowercase_mixed"
+source = "cachebukienaitokiha"
+expected = [
+  { kind = "literal", text = "cache" },
+  { kind = "japanese", text = "bukienaitokiha" },
+]
+events = ["type:cachebukienaitokiha"]
+notes = "cacheが消えない時は"
+
+[[episode]]
+id = "lm-013"
+category = "lowercase_mixed"
+source = "tokennotigengakireru"
+expected = [
+  { kind = "literal", text = "token" },
+  { kind = "japanese", text = "notigengakireru" },
+]
+events = ["type:tokennotigengakireru"]
+notes = "tokenの期限が切れる"
+
+[[episode]]
+id = "lm-014"
+category = "lowercase_mixed"
+source = "laptopwokattanodesuga"
+expected = [
+  { kind = "literal", text = "laptop" },
+  { kind = "japanese", text = "wokattanodesuga" },
+]
+events = ["type:laptopwokattanodesuga"]
+notes = "laptopを買ったのですが"
+
+[[episode]]
+id = "lm-015"
+category = "lowercase_mixed"
+source = "wifinotsunagaranaikotoaru"
+expected = [
+  { kind = "literal", text = "wifi" },
+  { kind = "japanese", text = "notsunagaranaikotoaru" },
+]
+events = ["type:wifinotsunagaranaikotoaru"]
+notes = "wifiの繋がらないことある"
+
+[[episode]]
+id = "lm-016"
+category = "lowercase_mixed"
+source = "blognikizukikakukotoni"
+expected = [
+  { kind = "literal", text = "blog" },
+  { kind = "japanese", text = "nikizukikakukotoni" },
+]
+events = ["type:blognikizukikakukotoni"]
+notes = "blogに気づき書くことに"
+
+[[episode]]
+id = "lm-017"
+category = "lowercase_mixed"
+source = "grepdokensakugahayai"
+expected = [
+  { kind = "literal", text = "grep" },
+  { kind = "japanese", text = "dokensakugahayai" },
+]
+events = ["type:grepdokensakugahayai"]
+notes = "grepで検索が速い"
+
+[[episode]]
+id = "lm-018"
+category = "lowercase_mixed"
+source = "repositariokaraclonesita"
+expected = [
+  { kind = "japanese", text = "repositariokara" },
+  { kind = "literal", text = "clone" },
+  { kind = "japanese", text = "sita" },
+]
+events = ["type:repositariokaraclonesita"]
+notes = "リポジトリからcloneした"
+
+[[episode]]
+id = "lm-019"
+category = "lowercase_mixed"
+source = "commitwowasurenaiyouni"
+expected = [
+  { kind = "literal", text = "commit" },
+  { kind = "japanese", text = "wowasurenaiyouni" },
+]
+events = ["type:commitwowasurenaiyouni"]
+notes = "commitを忘れないように"
+
+[[episode]]
+id = "lm-020"
+category = "lowercase_mixed"
+source = "buildugashippaisitara"
+expected = [
+  { kind = "literal", text = "build" },
+  { kind = "japanese", text = "ugashippaisitara" },
+]
+events = ["type:buildugashippaisitara"]
+notes = "buildが失敗したら"
+
+[[episode]]
+id = "lm-021"
+category = "lowercase_mixed"
+source = "testwohashiraseteiru"
+expected = [
+  { kind = "literal", text = "test" },
+  { kind = "japanese", text = "wohashiraseteiru" },
+]
+events = ["type:testwohashiraseteiru"]
+notes = "testを走らせている"
+
+[[episode]]
+id = "lm-022"
+category = "lowercase_mixed"
+source = "issuenokensakuhahayai"
+expected = [
+  { kind = "literal", text = "issue" },
+  { kind = "japanese", text = "nokensakuhahayai" },
+]
+events = ["type:issuenokensakuhahayai"]
+notes = "issueの検索は早い"
+
+[[episode]]
+id = "lm-023"
+category = "lowercase_mixed"
+source = "mainnikisokugaaru"
+expected = [
+  { kind = "literal", text = "main" },
+  { kind = "japanese", text = "nikisokugaaru" },
+]
+events = ["type:mainnikisokugaaru"]
+notes = "mainに規則がある"
+
+[[episode]]
+id = "lm-024"
+category = "lowercase_mixed"
+source = "python3woinsutorusita"
+expected = [
+  { kind = "literal", text = "python3" },
+  { kind = "japanese", text = "woinsutorusita" },
+]
+events = ["type:python3woinsutorusita"]
+notes = "python3をインストールした。数字を含む識別子も原文保持"
+
+[[episode]]
+id = "lm-025"
+category = "lowercase_mixed"
+source = "zipdekisakusitekara"
+expected = [
+  { kind = "literal", text = "zip" },
+  { kind = "japanese", text = "dekisakusitekara" },
+]
+events = ["type:zipdekisakusitekara"]
+notes = "zipで解凍してから"
+
+[[episode]]
+id = "lm-026"
+category = "lowercase_mixed"
+source = "apinoyobikata"
+expected = [
+  { kind = "literal", text = "api" },
+  { kind = "japanese", text = "noyobikata" },
+]
+events = ["type:apinoyobikata"]
+notes = "apiの呼び方"
+
+[[episode]]
+id = "lm-027"
+category = "lowercase_mixed"
+mode = "off"
+source = "lognojyunbidekita"
+expected = "all_japanese"
+events = ["type:lognojyunbidekita"]
+notes = "OFF時は既存どおり全体を日本語として扱う"
+
+[[episode]]
+id = "lm-028"
+category = "lowercase_mixed"
+mode = "off"
+source = "keyboardgakowareta"
+expected = "all_japanese"
+events = ["type:keyboardgakowareta"]
+notes = "OFF時は英字候補も自動適用も出さない"
+
+[[episode]]
+id = "lm-029"
+category = "lowercase_mixed"
+mode = "off"
+source = "scriptwokaitanode"
+expected = "all_japanese"
+events = ["type:scriptwokaitanode"]
+notes = "OFF時の従来候補順を変えない"
+
+[[episode]]
+id = "lm-030"
+category = "lowercase_mixed"
+mode = "off"
+source = "mappunogenzaiichiwomiru"
+expected = "all_japanese"
+events = ["type:mappunogenzaiichiwomiru"]
+notes = "OFF時は既存入力から一切変わらない"

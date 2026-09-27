@@ -12,6 +12,9 @@ ipc = { path = "../ipc" }
 ids = { path = "../ids" }
 settings = { path = "../settings" }
 nospacekey-lifetime = { path = "../lifetime" }
+# 混在入力の契約型（CompositionSource/Projection）。判別器（PR4）・変換経路
+# （PR3）もこの crate を経由する。ここから TSF/IPC への依存を増やさない。
+mixed-input = { path = "../mixed-input" }
 # P5 display deletion is fixed to UAX #29 / Unicode 15.1.
 unicode-segmentation = "=1.11.0"
 semver = "1"
@@ -67,5 +70,7 @@ features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_Storage_FileSystem"
 winresource = "0.1"
 
 [features]
+# Development only: live adoption; automatic prefix commits remain disabled.
+mixed-input-live-trial = []
 # Fault checkpoints are absent from normal product builds.
 tsf-test-hooks = []

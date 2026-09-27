@@ -17,7 +17,7 @@ const initial: SettingsSnapshot = {
   notices: [],
   values: {
     defaultDirect: false,
-    liveEnabled: true,
+    liveEnabled: true, mixedInput: "off",
     zenzaiInferenceLimit: 3,
     appearance: { theme: "auto" },
     keymap: {},
@@ -236,4 +236,18 @@ it("compares conflicts against the newest snapshot when a conflict reply is dela
   expect(result.current.conflict?.fields[0].saved).toBe(6);
   expect(result.current.values?.zenzaiInferenceLimit).toBe(5);
   expect(result.current.snapshot?.revision).toBe("r3");
+});
+
+
+it("keeps mixed input opt-in visible while its typed patch is saving", async () => {
+  let finish!: (value: unknown) => void;
+  vi.mocked(command).mockResolvedValueOnce(initial).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  const { result } = renderSettings();
+  await waitFor(() => expect(result.current.values?.mixedInput).toBe("off"));
+  act(() => result.current.save({ field: "mixed_input", value: "candidates" }));
+  await waitFor(() => expect(result.current.saveState).toBe("saving"));
+  expect(result.current.values?.mixedInput).toBe("candidates");
+  await act(async () => finish({ kind: "saved", operationId: "trial", effects: [], snapshot: snapshot("r2", { mixedInput: "candidates" }) }));
+  await waitFor(() => expect(result.current.saveState).toBe("saved"));
+  expect(result.current.values?.mixedInput).toBe("candidates");
 });

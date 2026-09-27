@@ -3,7 +3,7 @@ import { resetChanges } from "./DiagnosticsPage";
 
 const defaults = {
   liveSearchWidth: 1,
-  defaultDirect: false, liveEnabled: true, inputPredictionEnabled: true,
+  defaultDirect: false, liveEnabled: true, mixedInput: "off", inputPredictionEnabled: true,
   shiftLatinMode: "compose", numberFullWidth: true, punctuationFullWidth: true,
   symbolFullWidth: false, symbolFullWidthChars: ["!"],
   keymap: { mode_toggle: null, ephemeral: null, llm_convert: "Ctrl+Alt+L" },
@@ -20,6 +20,8 @@ it("scoped reset never touches dictionary, learning, models, consent, or hidden 
   expect(fields.some((field) => field.startsWith("llm"))).toBe(false);
   expect(resetChanges(defaults, ["keys"]).some((change) => change.field === "key_binding" && change.value.function === "llm_convert")).toBe(false);
   expect(fields).not.toContain("ephemeral_legacy_trigger");
+  expect(resetChanges(defaults, ["input"])).toContainEqual({ field: "mixed_input", value: "off" });
+  expect(resetChanges(defaults, ["keys", "display"]).map((change) => change.field)).not.toContain("mixed_input");
   expect(resetChanges(defaults, ["input"])).toContainEqual({ field: "live_search_width", value: 1 });
   expect(resetChanges(defaults, ["keys", "display"]).map((change) => change.field)).not.toContain("live_search_width");
 });

@@ -509,17 +509,23 @@ impl ITfEditSession_Impl for QueryCaretRect_Impl {
     }
 }
 
-/// 読みモニタ用アンカー矩形（スクリーン座標）を取る読み取り専用セッション。
+/// 読みモニタ（統合パネル）用アンカー矩形（スクリーン座標）を取る読み取り専用セッション。
 /// composition **先頭**の矩形が第一候補（ライブ変換の preedit 全置換でキャレット=末尾の
 /// X が打鍵ごとに跳ねるため、静止する先頭に窓を置く）。取れなければ同じ ec でキャレット
 /// （既定選択）矩形へ落ちる — 独立した2セッションに分けないのは、NOLAYOUT ホストでは
 /// 両者が同一 view の GetTextExt で同時に失敗し、2本目が空振りセッションを毎打鍵
 /// 1本増やすだけだから（spec 性能C1）。ev ログは出さない（打鍵ごとに走るフック用）。
+///
+/// 併せて composition **全体**の矩形（`out_extent`）も1セッションで取得する。統合パネルの
+/// 幅は「未確定文字列の表示幅」を基本にするため。折り返しをまたぐと bounding box になる
+/// （行単位の幅ではない）— 呼び出し側は max クランプで受ける（行単位の厳密追従はしない）。
 #[implement(ITfEditSession)]
 pub struct QueryMonitorAnchorRect {
     pub context: ITfContext,
     pub composition: Rc<RefCell<Option<ITfComposition>>>,
     pub out: Rc<RefCell<Option<RECT>>>,
+    /// composition 全体の矩形（パネル幅の基本）。取得失敗は None。
+    pub out_extent: Rc<RefCell<Option<RECT>>>,
     pub(crate) _guard: ComObjectGuard,
 }
 
@@ -534,6 +540,15 @@ impl ITfEditSession_Impl for QueryMonitorAnchorRect_Impl {
                 let comp = self.composition.borrow().clone();
                 if let Some(comp) = comp {
                     if let Ok(range) = comp.GetRange() {
+                        let mut ext = RECT::default();
+                        let mut ext_clipped = BOOL(0);
+                        if view
+                            .GetTextExt(ec, &range, &mut ext, &mut ext_clipped)
+                            .is_ok()
+                            && !(ext.left == 0 && ext.top == 0 && ext.right == 0 && ext.bottom == 0)
+                        {
+                            *self.out_extent.borrow_mut() = Some(ext);
+                        }
                         if let Ok(start) = range.Clone() {
                             let _ = start.Collapse(ec, TF_ANCHOR_START);
                             let mut rc = RECT::default();
@@ -608,7 +623,7 @@ impl ITfEditSession_Impl for RefreshAnchorOnLayout_Impl {
             unsafe {
                 // 失敗時も pending 解消のため None,None で apply を呼ぶ（relayout は
                 // last_valid_anchor を使うので座標が失われるわけではない）。
-                let fail = || crate::text_service::layout_refresh_apply(self.gen, None, None);
+                let fail = || crate::text_service::layout_refresh_apply(self.gen, None, None, None);
 
                 let Ok(view) = self.context.GetActiveView() else {
                     fail();
@@ -675,12 +690,33 @@ impl ITfEditSession_Impl for RefreshAnchorOnLayout_Impl {
                 };
                 let monitor = head.or(caret);
 
+                // composition 全体の矩形（統合パネルの幅の基本）。折り返しをまたぐと
+                // bounding box になる — 呼び出し側は max クランプで受ける。失敗は None
+                // （パネル幅は読み・候補の実測だけで決まる劣化）。
+                let extent = {
+                    let comp = self.composition.borrow().clone();
+                    comp.and_then(|c| c.GetRange().ok()).and_then(|r| {
+                        let mut erc = RECT::default();
+                        let mut eclipped = BOOL(0);
+                        view.GetTextExt(ec, &r, &mut erc, &mut eclipped)
+                            .ok()
+                            .filter(|_| {
+                                !(erc.left == 0
+                                    && erc.top == 0
+                                    && erc.right == 0
+                                    && erc.bottom == 0)
+                            })
+                            .map(|_| erc)
+                    })
+                };
+
                 let to_anchor =
                     |r: Option<RECT>| r.and_then(crate::candidate_window::caret_rect_to_anchor);
                 crate::text_service::layout_refresh_apply(
                     self.gen,
                     to_anchor(caret),
                     to_anchor(monitor),
+                    extent,
                 );
             }
             Ok(())

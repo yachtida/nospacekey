@@ -84,9 +84,6 @@ pub trait CandidateUI {
         anchor: CaretAnchor,
         theme: crate::theme::Theme,
     );
-    fn show_preview(&mut self, candidates: &[String], anchor: CaretAnchor, theme: crate::theme::Theme) {
-        self.show(candidates, 0, anchor, theme);
-    }
     fn hide(&mut self);
     fn selected(&self) -> usize;
     fn move_selection(&mut self, delta: i32);

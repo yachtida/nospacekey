@@ -232,6 +232,38 @@ pub enum Request {
     CommitClauses {
         session: i64,
     },
+    /// 混在入力の変換要求（ADR-0007 / 実装計画 §7.1）。採用中の Plan を読み上の
+    /// span 列（過不足なく被覆）で渡し、エンジンは Japanese span だけを変換して
+    /// Literal span は原文を一字不動で連結する。同一性は LiveSnapshot と同じ鍵に
+    /// `source_revision`（元入力の世代）と `plan_id`（解釈の世代）を加える。
+    /// StartSession 応答の capabilities に `mixed_input_v1` を返さないエンジンへは
+    /// 送らない（capability 不在の旧エンジンはこの要求を解釈できないため）。
+    /// Swift 側 Protocol.swift / EngineHost.swift と対（一字一句一致規約）。
+    MixedConvert {
+        session: i64,
+        composition: u64,
+        revision: u64,
+        configuration_generation: u64,
+        connection_generation: u64,
+        conversion_revision: u64,
+        request_id: u64,
+        source_revision: u64,
+        plan_id: u64,
+        spans: Vec<MixedSpan>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        left_context: Option<String>,
+    },
+}
+
+/// 混在変換要求の1区間。`kind` は `mixed_input::plan::SegmentKind` の文字列表現
+/// （"japanese" / "literal"）。`reading_start`/`reading_end` は読み上の Unicode scalar
+/// 半開区間。`text` は Japanese=その区間の読み、Literal=原文（一字不動）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MixedSpan {
+    pub kind: String,
+    pub reading_start: u32,
+    pub reading_end: u32,
+    pub text: String,
 }
 
 /// エンジン -> TIP への応答。
@@ -258,6 +290,9 @@ pub enum Response {
         status: crate::clause::ReceiptStatus,
     },
     /// StartSession 応答。proto が互換性を表し、boot は診断用の製品バージョン。
+    /// `capabilities` は任意機能の広告（ADR-0006: optional 項目は世代を上げない）。
+    /// `mixed_input_v1` を含むエンジンだけが MixedConvert を解釈できる。旧エンジンは
+    /// このフィールドを返さず（None＝wire 形は従来と同一）、旧 TIP は未知キーを無視する。
     Session {
         session: i64,
         engine_epoch: String,
@@ -266,6 +301,8 @@ pub enum Response {
         proto: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         boot: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<Vec<String>>,
     },
     Reading {
         reading: String,
@@ -363,6 +400,38 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         latency_convert: Option<ZenzaiLatencyTier>,
     },
+    /// MixedConvert の応答。`text` は Literal を原文連結した全体表示。`spans` は
+    /// 要求 span と同じ順序・読み範囲で、各区間の表示文字列を返す（Japanese=変換結果、
+    /// Literal=原文）。同一性キー（source_revision/plan_id を含む）は要求の値を
+    /// エコーし、TIP は適用前に照合して stale 破棄する。`engine_epoch`/
+    /// `learning_generation` は日本語区間の学習 token を発行したエンジンの同一性で、
+    /// 確定 receipt はこの値で学習先と合せる（token は発行エンジンにしか検証されない）。
+    MixedResult {
+        composition: u64,
+        revision: u64,
+        configuration_generation: u64,
+        connection_generation: u64,
+        request_id: u64,
+        source_revision: u64,
+        plan_id: u64,
+        engine_epoch: String,
+        learning_generation: u64,
+        text: String,
+        spans: Vec<MixedSpanResult>,
+    },
+}
+
+/// 混在変換応答の1区間。読み範囲は要求と同一（Japanese 変換で読みは変わらない）。
+/// `candidate_token` は Japanese 区間だけが持ち、確定 receipt の学習 token として
+/// 使う（Literal は None＝学習対象外）。省略時は None。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MixedSpanResult {
+    pub kind: String,
+    pub reading_start: u32,
+    pub reading_end: u32,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_token: Option<String>,
 }
 
 #[cfg(test)]
@@ -971,6 +1040,7 @@ mod tests {
             learning_generation: 6,
             proto: Some(PROTO_VERSION),
             boot: Some(env!("CARGO_PKG_VERSION").into()),
+            capabilities: None,
         };
         assert_eq!(
             serde_json::to_string(&r).unwrap(),
@@ -1003,6 +1073,109 @@ mod tests {
         let r: OldTipResponse =
             serde_json::from_str(r#"{"result":"Session","session":7,"proto":5}"#).unwrap();
         assert_eq!(r, OldTipResponse::Session { session: 7 });
+    }
+
+    #[test]
+    fn session_capabilities_are_optional_and_wire_compatible() {
+        // 旧エンジンは capabilities を出さない（None）。None のとき wire 形は従来と
+        // 同一（キー自体を省略）なので、旧 TIP との相互運用を壊さない。
+        let legacy = serde_json::from_str::<Response>(
+            r#"{"result":"Session","session":7,"engine_epoch":"11111111-1111-4111-8111-111111111111","learning_generation":6,"proto":11}"#,
+        )
+        .unwrap();
+        match legacy {
+            Response::Session { capabilities: None, .. } => {}
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let capable = Response::Session {
+            session: 7,
+            engine_epoch: "11111111-1111-4111-8111-111111111111".into(),
+            learning_generation: 6,
+            proto: Some(PROTO_VERSION),
+            boot: None,
+            capabilities: Some(vec!["mixed_input_v1".to_string()]),
+        };
+        let js = serde_json::to_string(&capable).unwrap();
+        assert!(js.contains(r#""capabilities":["mixed_input_v1"]"#), "{js}");
+        assert_eq!(
+            serde_json::from_str::<Response>(&js).unwrap(),
+            capable,
+            "capabilities 付き Session は往復する"
+        );
+    }
+
+    #[test]
+    fn mixed_convert_roundtrips_and_keeps_legacy_wire_shape() {
+        let request = Request::MixedConvert {
+            session: 7,
+            composition: 8,
+            revision: 13,
+            configuration_generation: 2,
+            connection_generation: 5,
+            conversion_revision: 1,
+            request_id: 4,
+            source_revision: 9,
+            plan_id: 3,
+            spans: vec![
+                MixedSpan {
+                    kind: "japanese".to_string(),
+                    reading_start: 0,
+                    reading_end: 4,
+                    text: "きょうは".to_string(),
+                },
+                MixedSpan {
+                    kind: "literal".to_string(),
+                    reading_start: 4,
+                    reading_end: 10,
+                    text: "Python".to_string(),
+                },
+            ],
+            left_context: None,
+        };
+        let js = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            js,
+            r#"{"method":"MixedConvert","params":{"session":7,"composition":8,"revision":13,"configuration_generation":2,"connection_generation":5,"conversion_revision":1,"request_id":4,"source_revision":9,"plan_id":3,"spans":[{"kind":"japanese","reading_start":0,"reading_end":4,"text":"きょうは"},{"kind":"literal","reading_start":4,"reading_end":10,"text":"Python"}]}}"#,
+            "left_context=None はキーを省略する（既存規約）"
+        );
+        assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), request);
+
+        let response = Response::MixedResult {
+            composition: 8,
+            revision: 13,
+            configuration_generation: 2,
+            connection_generation: 5,
+            request_id: 4,
+            source_revision: 9,
+            plan_id: 3,
+            engine_epoch: "11111111-1111-4111-8111-111111111111".to_string(),
+            learning_generation: 6,
+            text: "今日はPython".to_string(),
+            spans: vec![MixedSpanResult {
+                kind: "japanese".to_string(),
+                reading_start: 0,
+                reading_end: 4,
+                text: "今日は".to_string(),
+                candidate_token: Some("engine-epoch:7".to_string()),
+            }],
+        };
+        let js = serde_json::to_string(&response).unwrap();
+        assert!(js.contains(r#""result":"MixedResult""#), "{js}");
+        assert!(js.contains(r#""source_revision":9"#), "{js}");
+        assert!(js.contains(r#""candidate_token":"engine-epoch:7""#), "{js}");
+        assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), response);
+        // token なし（Literal）はキーを省略する。
+        let literal = MixedSpanResult {
+            kind: "literal".to_string(),
+            reading_start: 4,
+            reading_end: 10,
+            text: "Python".to_string(),
+            candidate_token: None,
+        };
+        let js = serde_json::to_string(&literal).unwrap();
+        assert!(!js.contains("candidate_token"), "{js}");
+        assert_eq!(serde_json::from_str::<MixedSpanResult>(&js).unwrap(), literal);
     }
 
     #[test]

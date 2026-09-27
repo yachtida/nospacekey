@@ -1,4 +1,4 @@
-use crate::clause_conversion::LocalEditOutcome;
+use crate::clause_conversion::{begin_click_reading_edit, LocalEditOutcome};
 use crate::text_service::TextService_Impl;
 use windows::core::{implement, IUnknownImpl, Interface, Result, BOOL};
 use std::cell::Cell;
@@ -58,13 +58,14 @@ impl TextService_Impl {
         // inferred character correspondence inside e.g. 今日 / きょう.
         let cursor = model.clauses[index].start;
         let mut input = self.state.borrow().clone();
-        if !input.adopt_conversion_reading(&model.reading) { return BOOL(0); }
-        match model.begin_reading_edit(index) {
+        // 読み採用 → 編集開始 → カーソル移動 → identity 同期は ClauseConversion の
+        // 共通遷移で行う。末尾 pending 凍結で input 側の世代だけが進むため、モデルの
+        // identity を揃えないと直後の Space 変換が凍結前の世代で発行される。
+        match begin_click_reading_edit(&mut input, &mut model, index, cursor) {
             LocalEditOutcome::Exhausted => { self.queue_local_clause_commit(&context); return BOOL(1); }
             LocalEditOutcome::Changed => {}
             _ => return BOOL(0),
         }
-        input.set_reading_cursor(cursor);
         input.clear_notation();
         input.invalidate_live_snapshot();
         *self.state.borrow_mut() = input;

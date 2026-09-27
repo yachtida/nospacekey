@@ -10,7 +10,7 @@ impl TextService_Impl {
         self.local_clauses.borrow().as_ref().is_some_and(|model| model.editing_range().is_some())
     }
 
-    pub(crate) fn edit_mixed_reading(&self, context: &ITfContext, key: KeyEvent, original: Option<char>) -> Result<BOOL> {
+    pub(crate) fn edit_mixed_reading(&self, context: &ITfContext, key: KeyEvent) -> Result<BOOL> {
         let Some(mut model) = self.local_clauses.borrow().clone() else { return Ok(TRUE); };
         let Some((start, end)) = model.editing_range() else { return Ok(TRUE); };
         let mut input = self.state.borrow().clone();
@@ -19,17 +19,18 @@ impl TextService_Impl {
             || matches!(key, KeyEvent::Delete) && cursor >= end { return Ok(TRUE); }
         let accepted_key = key.clone();
         if matches!(key, KeyEvent::Text { .. } | KeyEvent::Backspace | KeyEvent::Delete) && input.reading_revision() == u64::MAX {
-            return Ok(self.end_mixed_at_capacity(context, accepted_key, original));
+            return Ok(self.end_mixed_at_capacity(context, accepted_key));
         }
         match key {
             KeyEvent::ReadingHome => { input.set_reading_cursor(start); }
             KeyEvent::ReadingEnd => { input.set_reading_cursor(end); }
             _ => { input.handle(InputEvent::Key(key)); }
         }
-        if let Some(original) = original { input.preserve_last_literal_original(original); }
+        // 打鍵原文字は KeyEvent::Text の original フィールドが composer の
+        // journal まで運ぶため、ここでは追加の保存処理は不要。
         if input.canonical_reading() != model.reading {
             match model.replace_edited_reading(input.canonical_reading(), input.reading_revision()) {
-                LocalEditOutcome::Exhausted => return Ok(self.end_mixed_at_capacity(context, accepted_key, original)),
+                LocalEditOutcome::Exhausted => return Ok(self.end_mixed_at_capacity(context, accepted_key)),
                 LocalEditOutcome::Unchanged => return Ok(TRUE),
                 LocalEditOutcome::Empty => {
                     if self.do_cancel(context) { self.state.borrow_mut().reset(); self.clear_clause_nav(); }
@@ -45,6 +46,10 @@ impl TextService_Impl {
             }
         } else {
             input.set_reading_cursor(input.reading_cursor().max(start).min(end));
+            // 読みが不変でも、末尾 pending の凍結を伴う移動で input 側の source
+            // 世代が進むことがある。identity を揃えないと、以降のモデル要求と結果
+            // 照合が旧世代のままになり、凍結前の非同期結果が受け入れられる。
+            model.sync_identity_revision(input.reading_revision());
         }
         input.clear_notation();
         *self.last_reading.borrow_mut() = input.canonical_reading().to_owned();
@@ -57,9 +62,9 @@ impl TextService_Impl {
         Ok(TRUE)
     }
 
-    fn end_mixed_at_capacity(&self, context: &ITfContext, key: KeyEvent, original: Option<char>) -> BOOL {
+    fn end_mixed_at_capacity(&self, context: &ITfContext, key: KeyEvent) -> BOOL {
         if let Some(model) = self.local_clauses.borrow_mut().as_mut() { model.mode = OperationMode::Converting; }
-        if let KeyEvent::Text { ch, style, .. } = key {
+        if let KeyEvent::Text { ch, style, original, .. } = key {
             if self.replaying_conversion_queue.get() {
                 self.conversion_queue.borrow_mut().prepend_commit_for_insert();
                 return BOOL(0);
@@ -76,10 +81,10 @@ impl TextService_Impl {
         let Some(mut model) = self.local_clauses.borrow().clone() else { return; };
         let mut input = self.state.borrow().clone();
         match input.finalize_pending_n() {
-            None => { let _ = self.end_mixed_at_capacity(context, KeyEvent::Space, None); return; }
+            None => { let _ = self.end_mixed_at_capacity(context, KeyEvent::Space); return; }
             Some(true) => {
                 if model.replace_edited_reading(input.canonical_reading(), input.reading_revision()) == LocalEditOutcome::Exhausted {
-                    let _ = self.end_mixed_at_capacity(context, KeyEvent::Space, None);
+                    let _ = self.end_mixed_at_capacity(context, KeyEvent::Space);
                     return;
                 }
                 *self.last_reading.borrow_mut() = input.canonical_reading().to_owned();

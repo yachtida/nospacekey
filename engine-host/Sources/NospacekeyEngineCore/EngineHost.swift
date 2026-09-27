@@ -121,10 +121,15 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
             case .ping: response = .error("ping routing error")
             // 接続id を渡してセッションの所有者を記録する（切断時に cleanupConnection で掃除するため）。
             case .startSession:
+                // capability 広告（ADR-0006: optional 項目なので proto 世代はそのまま）。
+                // mixed_input_v1 = MixedConvert を解釈できる。広告がないエンジンへは
+                // TIP が混在要求を送らない（旧エンジンとの相互運用の境界）。
                 response = .session(
                     Int64(service.startSession(connection: connId)),
                     proto: ProtocolVersion.current,
-                    boot: BuildInfo.version, engineEpoch: service.engineEpoch, learningGeneration: service.currentLearningGeneration)
+                    boot: BuildInfo.version, engineEpoch: service.engineEpoch,
+                    learningGeneration: service.currentLearningGeneration,
+                    capabilities: ["mixed_input_v1"])
             case .inputPredictions(let request):
                 response = .inputPredictionsResult(service.inputPredictions(request, admissionDeadline: deadline))
             case .clauseCandidates(let request):
@@ -281,6 +286,25 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                     response = .committed(text: r.text, reading: r.reading)
                 } else {
                     response = .error("no clause view")
+                }
+            case .mixedConvert(_, let composition, let revision,
+                              let configurationGeneration, let connectionGeneration,
+                              _, let requestID, let sourceRevision,
+                              let planID, let spans, let leftContext):
+                // span 列の検証と変換は MixedConversionService が持つ。変換できない
+                // ときは Error（TIP は従来の候補経路を維持 — 実装計画 §8.5）。
+                if let output = MixedConversionService.convert(service: service, spans: spans,
+                                                               leftContext: leftContext,
+                                                               admissionDeadline: deadline) {
+                    response = .mixedResult(composition: composition, revision: revision,
+                                            configurationGeneration: configurationGeneration,
+                                            connectionGeneration: connectionGeneration,
+                                            requestID: requestID, sourceRevision: sourceRevision,
+                                            planID: planID, engineEpoch: service.engineEpoch,
+                                            learningGeneration: service.currentLearningGeneration,
+                                            text: output.text, spans: output.spans)
+                } else {
+                    response = .error("mixed conversion unavailable")
                 }
             case .shutdown:
                 // graceful 停止: 学習を flush してから応答を返し、その後 NamedPipeServer が exit する。

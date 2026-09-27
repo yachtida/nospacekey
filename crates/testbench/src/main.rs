@@ -32,6 +32,7 @@ mod text_service {
 }
 mod driver;
 mod input_prediction_acceptance;
+mod mixed_input_acceptance;
 mod log_parse;
 mod report;
 mod scenarios;
@@ -69,6 +70,7 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let code = match mode {
+        "--mixed-input" => mixed_input_acceptance::run(),
         "--apply-faults" => apply_faults::run(),
         "--clause-navigation" => clause_navigation::run(),
         "--clause-deferred-commit" => clause_navigation::run_deferred_commit(),

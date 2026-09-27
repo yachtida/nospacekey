@@ -1,8 +1,16 @@
-//! ライブ変換中に生の読み（ひらがな）をキャレット上側へ常時表示する読みモニタ（Win32 popup）。
+//! ライブ変換中に生の読み（ひらがな）を本文に近い位置へ常時表示し、辞書予測候補を
+//! 上段に同居させる統合パネル（Win32 popup）。
 //!
 //! ライブ変換は preedit を変換結果（漢字かな交じり）へ全置換するため、「今何を打ったか」が
 //! 画面から消える。読みを候補窓/HUD と同じ popup 基盤の小窓で並走表示する
 //! （spec: docs/design/2026-07-21-reading-monitor-design.md）。
+//!
+//! 予測（input prediction）は従来候補窓の preview モードで流用表示していたが、本窓へ
+//! 統合した: 読み行を下段（=本文に近い位置）に固定し、候補欄はその上に広がる。入力を
+//! 再開してもパネルは閉じず、読み行だけ即時更新し、新しい応答が届けば候補欄の中身だけ
+//! 差し替える（閉じ→開きをしない）。読みが進んで古くなった候補（stale）は薄色で選択
+//! 対象外を示す（確定は identity 突合で拒否される）。選択モード（Tab）は従来どおり
+//! 文節変換の候補窓へ移るため、本窓に選択強調は存在しない。
 //!
 //! mode_hud との差分は 2 点だけ: 自動消去タイマを持たない（明示 hide まで表示）、
 //! テキストが打鍵ごとに更新され幅が文字列に追従する。mode_hud を汎用化せず同型の
@@ -43,22 +51,84 @@ const PAD_V_TOTAL: i32 = 12;
 const MIN_TEXT_W: i32 = 24;
 /// キャレット上端と窓下端の間隔（dp）。
 const GAP: i32 = 6;
+/// パネルの予測候補は 3 行固定。エンジンは 9 件まで返すが、パネルは先頭 3 件の
+/// コンパクト表示に留め、全件は Tab で選択モードに入った後の候補窓で選ぶ。
+pub(crate) const PANEL_PREVIEW_ROWS: usize = 3;
+/// 候補 1 行の高さ（dp）。候補窓の ROW_HEIGHT と同じ見た目。
+const ROW_H: i32 = 28;
+/// 読み行と候補欄の間の区切り帯（dp）。中央にヘアライン 1px を引く。
+const SEP_BAND: i32 = 7;
+/// 候補行のガター幅（dp）。1 行目だけ "Tab" を描く（候補窓の番号ガター 22dp に合わせる）。
+const GUTTER_W: i32 = 22;
+/// パネル幅の下限（dp）。候補が読める最小幅（候補窓の MIN_W と同じ）—「未確定文字列の
+/// 表示幅を基本に、読み・候補が読める最小幅を確保する」の下限側。
+const MIN_PANEL_W: i32 = 160;
 
 static CLASS_ATOM: OnceLock<u16> = OnceLock::new();
 
-/// 表示条件の唯一の真実源（純関数）。
-/// ライブ変換 OFF は preedit に読みがそのまま見えるので出さない。候補窓表示中は隠す
-/// （ユーザ確認済みの決定 — 候補選択中は候補窓に集中する）。
-pub(crate) fn should_show(
-    enabled: bool,
+/// パネルの予測候補行。`stale` は読みが進んで旧世代になった応答で、薄色表示・選択不可。
+/// 新しい応答が届けば中身だけ差し替わる（パネルは閉じない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PanelCandidate {
+    pub text: String,
+    pub stale: bool,
+}
+
+/// パネルの表示計画（純関数・唯一の真実源）。読み行と候補欄は**独立**した条件で、
+/// どちらか片方だけの形態もある:
+/// - 読み行: 従来の should_show と同じ（設定ON && composing && ライブ変換ON && 候補窓非表示）。
+///   ライブ変換 OFF は preedit に読みがそのまま見えるので出さない。
+/// - 候補欄: composing && 候補窓非表示 && 予測候補あり。ライブ変換を要求しない
+///   （preedit 中なら読みと無関係に出てよい）。
+///
+/// 候補窓（文節変換）表示中はどちらも隠す（ユーザ確認済みの決定 — 候補選択中は候補窓に集中）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PanelPlan {
+    pub reading_row: bool,
+    pub candidate_rows: bool,
+}
+
+pub(crate) fn plan_panel(
+    reading_enabled: bool,
+    prediction_on: bool,
     composing: bool,
     live_enabled: bool,
     candidate_visible: bool,
-) -> bool {
-    enabled && composing && live_enabled && !candidate_visible
+) -> PanelPlan {
+    let blocked = !composing || candidate_visible;
+    PanelPlan {
+        reading_row: reading_enabled && live_enabled && !blocked,
+        candidate_rows: prediction_on && !blocked,
+    }
 }
 
-/// 幅上限（物理px）= max_chars × フォントem幅。読みモニタの中身はひらがな=全角のみで
+impl PanelPlan {
+    /// plan を**表示データへ反映**する（読み行 OFF=空文字、候補欄 OFF=空配列）。
+    /// 通常更新とレイアウト追従の共通組立（text_service::panel_sync_data 経由の唯一の適用箇所）。
+    /// plan を可否判定にだけ使って生データを show_or_update へ渡すと、受け側の
+    /// 「text 非空なら読み行を描く」規律が勝ち、読み表示 OFF／ライブ変換 OFF でも
+    /// 予測候補が出ている限り読み行まで表示されてしまう。
+    pub(crate) fn filter_display(
+        self,
+        reading: String,
+        candidates: Vec<PanelCandidate>,
+    ) -> (String, Vec<PanelCandidate>) {
+        (
+            if self.reading_row {
+                reading
+            } else {
+                String::new()
+            },
+            if self.candidate_rows {
+                candidates
+            } else {
+                Vec::new()
+            },
+        )
+    }
+}
+
+/// 幅上限（物理px）= max_chars × フォントem幅。読み行の中身はひらがな=全角のみで
 /// 全角グリフの advance ≒ em（フォントpx）のため「N文字」として実質正確（spec 方式B）。
 /// font_px は DPI スケール済みなので追加の scale は不要。
 pub(crate) fn max_text_w_px(max_chars: u32, font_px: i32) -> i32 {
@@ -114,28 +184,119 @@ pub(crate) fn plan_anchor(anchor: Option<CaretAnchor>, visible: bool) -> AnchorP
     }
 }
 
-/// 窓の (幅, 高さ)。`text_px_w` は実測テキスト幅（物理px）、`font_px` はフォント高（物理px）、
-/// `max_w_px` は px 上限（max_text_w_px 由来）。テキスト幅は [MIN, max_w_px] へクランプ —
-/// はみ出しは描画側の末尾寄せクリップが受ける。max 側は `.max(min_w)` で下駄を履かせる —
-/// clamp は min>max で panic するため（max_chars=10×小フォントで実在するエッジ）。
-pub(crate) fn monitor_window_size(
-    text_px_w: i32,
+/// 枠＋左右パディングぶんの窓幅増分（物理px）。panel_window_size が文字領域幅へ加算する
+/// 増分の唯一の出所。max_text_w_px は**文字領域**の上限なので、窓全体の幅を扱う側
+/// （show_or_update の幅保持クランプ）は panel_frame_w を加えた上限を使う — 文字領域の
+/// 上限で窓幅をクランプすると枠ぶん描画領域が痩せ、overflow 判定（max_text_w_px 基準）と
+/// 実際の描画幅が食い違って末尾（=最新の読み）が省略記号なしの右端クリップで消える。
+fn panel_frame_w(dpi: i32) -> i32 {
+    2 * BORDER + 2 * scale(PAD_H, dpi)
+}
+
+/// 幅保持後の窓幅クランプ上限 = 文字領域上限 + 枠・左右パディング（panel_frame_w）。
+fn max_window_w(max_text_w: i32, min_w: i32, dpi: i32) -> i32 {
+    (max_text_w + panel_frame_w(dpi)).max(min_w)
+}
+
+/// 統合パネルの (幅, 高さ)。幅 = max(composition 表示幅, 読み実測, 候補実測) を
+/// [scale(MIN_PANEL_W), max_w_px] へクランプ —「未確定文字列の表示幅を基本に、読み・候補が
+/// 読める最小幅を確保する」の唯一の計算箇所。はみ出しは描画側の末尾寄せ/省略記号が受ける。
+/// 高さ = 枠 + 読み行（上下パディング+フォント）+（候補行があるとき区切り帯 + rows×行高）。
+/// `with_reading_row=false`（ライブ変換 OFF で候補欄のみの形態）は読み行帯と区切り帯を省く。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn panel_window_size(
+    comp_px_w: i32,
+    reading_px_w: i32,
+    candidate_px_w: i32,
+    with_reading_row: bool,
+    rows: usize,
     font_px: i32,
     dpi: i32,
     max_w_px: i32,
 ) -> (i32, i32) {
-    let min_w = scale(MIN_TEXT_W, dpi);
-    let clamped = text_px_w.clamp(min_w, max_w_px.max(min_w));
-    let w = 2 * BORDER + 2 * scale(PAD_H, dpi) + clamped;
-    let h = 2 * BORDER + scale(PAD_V_TOTAL, dpi) + font_px;
+    let min_w = scale(MIN_PANEL_W, dpi);
+    let content = comp_px_w.max(reading_px_w).max(candidate_px_w);
+    let clamped = content.clamp(min_w, max_w_px.max(min_w));
+    let w = panel_frame_w(dpi) + clamped;
+    let mut h = 2 * BORDER;
+    if with_reading_row {
+        h += scale(PAD_V_TOTAL, dpi) + font_px;
+        if rows > 0 {
+            h += scale(SEP_BAND, dpi);
+        }
+    }
+    h += rows as i32 * scale(ROW_H, dpi);
     (w, h)
+}
+
+/// 同一 composition 中は幅を縮めない（候補の長さ変動で幅が揺れて視線を外すのを防ぐ）。
+/// composition が替わったら実績幅を捨てる。純関数。戻り値は呼び出し側で max クランプに
+/// 再収めしてから使う（設定/DPI 変更で上限が下がった場合に備える）。
+pub(crate) fn held_width(prev: i32, composition_changed: bool, w: i32) -> i32 {
+    if composition_changed {
+        w
+    } else {
+        prev.max(w)
+    }
+}
+
+/// text 色を bg 色と半分ブレンドした「更新待ちの旧候補（stale）」の色。GDI は不透明前提
+/// （COLORREF はアルファを捨てる）なのでアルファでなく実ブレンドにし、D2D/GDI の両パスで
+/// 同じ見た目にする。
+pub(crate) fn dim_text(text: crate::theme::Rgba, bg: crate::theme::Rgba) -> crate::theme::Rgba {
+    fn mix(t: u8, b: u8) -> u8 {
+        ((t as u32 + b as u32) / 2) as u8
+    }
+    crate::theme::Rgba {
+        r: mix(text.r, bg.r),
+        g: mix(text.g, bg.g),
+        b: mix(text.b, bg.b),
+        a: 255,
+    }
+}
+
+/// 読み行帯の上端（クライアント座標、下辺からの帯 = パディング+フォント）。区切り線は
+/// この直上 SEP_BAND/2、候補行 i の下端は（区切り線位置 − i×ROW_H）。panel_window_size の
+/// 高さ式と対応させる帯計算の唯一の出所（paint_gdi / paint_d2d が共有）。
+pub(crate) fn reading_band_top(
+    client_bottom: i32,
+    with_reading_row: bool,
+    font_px: i32,
+    dpi: i32,
+) -> i32 {
+    if with_reading_row {
+        client_bottom - scale(PAD_V_TOTAL, dpi) - font_px
+    } else {
+        client_bottom
+    }
+}
+
+/// 候補欄の下端 y（クライアント座標、paint_gdi / paint_d2d の共有出所）。読み行がある
+/// ときは区切り線位置（候補第1行の下端 = 線の上端）、無いとき（ライブ変換 OFF + 候補欄
+/// のみ）は**下枠の直上** — 区切り帯は読み行との境界なので、無い形態でまで差し引くと
+/// 最上段の候補 top が負になり描画ループの `top < rc.top` で全行描かれない
+/// （panel_window_size が読み行なしで SEP_BAND を積まない高さ式と対応）。
+pub(crate) fn candidate_rows_bottom(
+    client_bottom: i32,
+    with_reading_row: bool,
+    font_px: i32,
+    dpi: i32,
+) -> i32 {
+    if with_reading_row {
+        reading_band_top(client_bottom, true, font_px, dpi) - scale(SEP_BAND, dpi) / 2
+    } else {
+        client_bottom - BORDER
+    }
 }
 
 /// HWND ごとの描画状態（GWLP_USERDATA に格納）。
 struct MonitorState {
     layout_dpi: i32,
-    /// 現在の読み（ひらがな）。打鍵ごとに更新される。
+    /// 現在の読み（ひらがな）。打鍵ごとに更新される。空なら読み行を描かない
+    /// （ライブ変換 OFF で候補欄のみの形態）。
     text: String,
+    /// 予測候補欄（空なら読み行のみの従来形態）。stale 行は薄色で描く。
+    candidates: Vec<PanelCandidate>,
     theme: crate::theme::Theme,
     backend: Backend,
     /// 実測幅が上限超過（末尾寄せ描画中）か。show_or_update が設定し paint が読む。
@@ -144,6 +305,9 @@ struct MonitorState {
     /// （renderer.resize に同一サイズ早期リターンが無く、累積 ON では上限到達後も
     /// 毎打鍵フル再構築になるため — spec 性能C2）。
     last_size: (i32, i32),
+    /// 同一 composition 中の実績幅（幅縮小抑制 — held_width）。composition 切替で 0 に戻る。
+    held_w: i32,
+    held_comp: u64,
 }
 
 impl PopupState for MonitorState {
@@ -235,24 +399,97 @@ fn paint_gdi(hwnd: HWND) {
         let point_tenths = state.theme.font_point_tenths;
         let hfont = state.backend.font_for_dpi(&family, point_tenths, dpi);
         let old = hfont.map(|f| SelectObject(hdc, f.into()));
-        let _ = SetTextColor(hdc, COLORREF(colors.text.colorref()));
-        let mut text: Vec<u16> = state.text.encode_utf16().collect();
-        // 左右パディング分を除いた領域へ 1 行描画（候補窓と同じ DT_SINGLELINE|DT_END_ELLIPSIS）。
         let pad = scale(PAD_H, dpi);
-        let mut tr = RECT {
-            left: rc.left + pad,
-            top: rc.top,
-            right: rc.right - pad,
-            bottom: rc.bottom,
-        };
-        // 上限超過は末尾寄せ: DT_RIGHT + rect クリップで頭側が切れる（DT_END_ELLIPSIS だと
-        // 末尾=最新の読みが消える）。
-        let flags = if state.overflow {
-            DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX
-        } else {
-            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX
-        };
-        let _ = DrawTextW(hdc, &mut text, &mut tr, flags);
+        let with_reading = !state.text.is_empty();
+        let rows = state.candidates.len();
+        let font_px = font_size_px(point_tenths, dpi).ceil() as i32;
+        // 帯の割り出しは reading_band_top（panel_window_size と対応する唯一の出所）経由。
+        // 候補欄は読み行の上側に広がる（読み行の位置は候補の有無で動かない — 統合パネルの
+        // 視線固定要件）。候補行は candidate_rows_bottom（読み行あり=区切り線位置 / なし=
+        // 下枠直上）から上へ ROW_H 刻み。区切り線は読み行との境界なので読み行があるとき
+        // だけ描く。
+        let reading_top = reading_band_top(rc.bottom, with_reading, font_px, dpi);
+        if rows > 0 {
+            let rows_bottom = candidate_rows_bottom(rc.bottom, with_reading, font_px, dpi);
+            let row_h = scale(ROW_H, dpi);
+            if with_reading {
+                let line = CreateSolidBrush(COLORREF(colors.border.colorref()));
+                let _ = FillRect(
+                    hdc,
+                    &RECT {
+                        left: rc.left,
+                        top: rows_bottom,
+                        right: rc.right,
+                        bottom: rows_bottom + 1,
+                    },
+                    line,
+                );
+                let _ = DeleteObject(line.into());
+            }
+            for (i, cand) in state.candidates.iter().enumerate() {
+                let bottom = rows_bottom - i as i32 * row_h;
+                let top = bottom - row_h;
+                if top < rc.top {
+                    break;
+                }
+                let color = if cand.stale {
+                    dim_text(colors.text, colors.bg)
+                } else {
+                    colors.text
+                };
+                let _ = SetTextColor(hdc, COLORREF(color.colorref()));
+                let mut text: Vec<u16> = cand.text.encode_utf16().collect();
+                let mut tr = RECT {
+                    left: rc.left + pad + scale(GUTTER_W, dpi),
+                    top,
+                    right: rc.right - pad,
+                    bottom,
+                };
+                let _ = DrawTextW(
+                    hdc,
+                    &mut text,
+                    &mut tr,
+                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+                // ガターは 1 行目だけ "Tab"（候補窓 preview の preview_index 規約を踏襲）。
+                // 選択色は付けない（選べる情報が出ているだけの表示）。
+                if i == 0 {
+                    let _ = SetTextColor(hdc, COLORREF(colors.index.colorref()));
+                    let mut tab: Vec<u16> = "Tab".encode_utf16().collect();
+                    let mut gr = RECT {
+                        left: rc.left + pad,
+                        top,
+                        right: rc.left + pad + scale(GUTTER_W, dpi),
+                        bottom,
+                    };
+                    let _ = DrawTextW(
+                        hdc,
+                        &mut tab,
+                        &mut gr,
+                        DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                    );
+                }
+            }
+        }
+        if with_reading {
+            let _ = SetTextColor(hdc, COLORREF(colors.text.colorref()));
+            let mut text: Vec<u16> = state.text.encode_utf16().collect();
+            // 左右パディング分を除いた領域へ 1 行描画（候補窓と同じ DT_SINGLELINE|DT_END_ELLIPSIS）。
+            let mut tr = RECT {
+                left: rc.left + pad,
+                top: reading_top,
+                right: rc.right - pad,
+                bottom: rc.bottom,
+            };
+            // 上限超過は末尾寄せ: DT_RIGHT + rect クリップで頭側が切れる（DT_END_ELLIPSIS だと
+            // 末尾=最新の読みが消える）。
+            let flags = if state.overflow {
+                DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX
+            } else {
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX
+            };
+            let _ = DrawTextW(hdc, &mut text, &mut tr, flags);
+        }
         if let Some(o) = old {
             let _ = SelectObject(hdc, o);
         }
@@ -292,7 +529,8 @@ unsafe fn paint_d2d(hwnd: HWND) {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let font_px = font_size_px(state.theme.font_point_tenths, dpi);
+    let font_px_f = font_size_px(state.theme.font_point_tenths, dpi);
+    let font_px = font_px_f.ceil() as i32;
     // 上限超過は末尾寄せ+トリミング無し（トリミングは整列と無関係に末尾を削るため、
     // TRAILING+トリミング有りだと最新の読みが…で消える。頭側は CLIP が切る）。
     let (align, trim) = if state.overflow {
@@ -300,8 +538,16 @@ unsafe fn paint_d2d(hwnd: HWND) {
     } else {
         (DWRITE_TEXT_ALIGNMENT_LEADING, true)
     };
-    let Some(fmt) = state.backend.text_format(&family, font_px, align, trim) else {
+    let Some(fmt) = state.backend.text_format(&family, font_px_f, align, trim) else {
         return;
+    };
+    // 候補行は常に先頭寄せ（読み行の overflow 規律とは独立）。
+    let candidate_fmt = if state.candidates.is_empty() {
+        None
+    } else {
+        state
+            .backend
+            .text_format(&family, font_px_f, DWRITE_TEXT_ALIGNMENT_LEADING, true)
     };
     // 以降 state への書き込みは end_draw 後にしか無いので、テーマは不変借用で読む。
     let t = &state.theme;
@@ -337,22 +583,98 @@ unsafe fn paint_d2d(hwnd: HWND) {
     }
 
     let pad = scale(PAD_H, dpi) as f32;
-    let text_rect = D2D_RECT_F {
-        left: rectf.left + pad,
-        top: rectf.top,
-        right: rectf.right - pad,
-        bottom: rectf.bottom,
-    };
-    let text_utf16: Vec<u16> = state.text.encode_utf16().collect();
-    if let Some(b) = brush(t.colors.text) {
-        ctx.DrawText(
-            &text_utf16,
-            &fmt,
-            &text_rect,
-            &b,
-            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-            DWRITE_MEASURING_MODE_NATURAL,
-        );
+    let with_reading = !state.text.is_empty();
+    let rows = state.candidates.len();
+    // 帯の割り出しは reading_band_top 経由（GDI パスと同一の出所）。候補欄は読み行の
+    // 上側に広がる — 読み行の位置は候補の有無で動かない（統合パネルの視線固定要件）。
+    // 候補行の下端は candidate_rows_bottom（読み行なしは下枠直上）— GDI パスと共有の
+    // 出所。区切り線は読み行との境界なので読み行があるときだけ描く。
+    let reading_top = reading_band_top(rc.bottom, with_reading, font_px, dpi) as f32;
+    if rows > 0 {
+        let row_h = scale(ROW_H, dpi) as f32;
+        let rows_bottom = candidate_rows_bottom(rc.bottom, with_reading, font_px, dpi) as f32;
+        let gutter_w = scale(GUTTER_W, dpi) as f32;
+        if with_reading {
+            if let Some(b) = brush(t.colors.border) {
+                ctx.FillRectangle(
+                    &D2D_RECT_F {
+                        left: rectf.left,
+                        top: rows_bottom,
+                        right: rectf.right,
+                        bottom: rows_bottom + 1.0,
+                    },
+                    &b,
+                );
+            }
+        }
+        for (i, cand) in state.candidates.iter().enumerate() {
+            let bottom = rows_bottom - i as f32 * row_h;
+            let top = bottom - row_h;
+            if top < rc.top as f32 {
+                break;
+            }
+            let color = if cand.stale {
+                dim_text(t.colors.text, t.colors.bg)
+            } else {
+                t.colors.text
+            };
+            let Some(b) = brush(color) else { continue };
+            let Some(cf) = candidate_fmt.as_ref() else {
+                break;
+            };
+            let text_utf16: Vec<u16> = cand.text.encode_utf16().collect();
+            ctx.DrawText(
+                &text_utf16,
+                cf,
+                &D2D_RECT_F {
+                    left: rectf.left + pad + gutter_w,
+                    top,
+                    right: rectf.right - pad,
+                    bottom,
+                },
+                &b,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+            // ガターは 1 行目だけ "Tab"（preview_index 規約の踏襲）。選択色は付けない。
+            if i == 0 {
+                if let Some(ib) = brush(t.colors.index) {
+                    let tab: Vec<u16> = "Tab".encode_utf16().collect();
+                    ctx.DrawText(
+                        &tab,
+                        cf,
+                        &D2D_RECT_F {
+                            left: rectf.left + pad,
+                            top,
+                            right: rectf.left + pad + gutter_w,
+                            bottom,
+                        },
+                        &ib,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+            }
+        }
+    }
+    if with_reading {
+        let text_rect = D2D_RECT_F {
+            left: rectf.left + pad,
+            top: reading_top,
+            right: rectf.right - pad,
+            bottom: rectf.bottom,
+        };
+        let text_utf16: Vec<u16> = state.text.encode_utf16().collect();
+        if let Some(b) = brush(t.colors.text) {
+            ctx.DrawText(
+                &text_utf16,
+                &fmt,
+                &text_rect,
+                &b,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
     }
 
     if let Some(b) = brush(t.colors.border) {
@@ -375,9 +697,14 @@ unsafe fn paint_d2d(hwnd: HWND) {
     }
 }
 
-/// GDI パス用のテキスト幅実測（物理px）。フォントが作れない/測れないときは None（呼び出し側は
-/// MIN_TEXT_W クランプで劣化）。
-unsafe fn measure_text_gdi(hwnd: HWND, state: &mut MonitorState, dpi: i32) -> Option<i32> {
+/// GDI パス用のテキスト幅実測（物理px、複数文字列の最大値）。フォントが作れない/測れない
+/// ときは None（呼び出し側は MIN クランプで劣化）。
+unsafe fn measure_texts_gdi(
+    hwnd: HWND,
+    state: &mut MonitorState,
+    dpi: i32,
+    texts: &[&str],
+) -> Option<i32> {
     let hdc = GetDC(Some(hwnd));
     if hdc.is_invalid() {
         return None;
@@ -386,19 +713,24 @@ unsafe fn measure_text_gdi(hwnd: HWND, state: &mut MonitorState, dpi: i32) -> Op
     let hfont = state
         .backend
         .font_for_dpi(&family, state.theme.font_point_tenths, dpi);
-    let mut size = SIZE::default();
+    let mut best = 0;
     let ok = match hfont {
         Some(f) => {
             let old = SelectObject(hdc, f.into());
-            let utf16: Vec<u16> = state.text.encode_utf16().collect();
-            let r = GetTextExtentPoint32W(hdc, &utf16, &mut size).as_bool();
+            for t in texts {
+                let utf16: Vec<u16> = t.encode_utf16().collect();
+                let mut size = SIZE::default();
+                if GetTextExtentPoint32W(hdc, &utf16, &mut size).as_bool() {
+                    best = best.max(size.cx);
+                }
+            }
             let _ = SelectObject(hdc, old);
-            r
+            best > 0
         }
         None => false,
     };
     let _ = ReleaseDC(Some(hwnd), hdc);
-    ok.then_some(size.cx)
+    ok.then_some(best)
 }
 
 /// 読みモニタ本体。`hwnd` は遅延生成（初回 `show_or_update` まで null）。
@@ -450,7 +782,8 @@ impl ReadingMonitor {
         }
         unsafe {
             // text=0 は必ず MIN 幅へクランプされるため第4引数の値は初期窓に影響しない。
-            let (width, height) = monitor_window_size(0, 14, 96, max_text_w_px(34, 14));
+            let (width, height) =
+                panel_window_size(0, 0, 0, true, 0, 14, 96, max_text_w_px(34, 14));
             let Some((hwnd, renderer)) = popup::create_backed_popup(CLASS_NAME, width, height)
             else {
                 self.hwnd = HWND(std::ptr::null_mut());
@@ -468,27 +801,39 @@ impl ReadingMonitor {
                 Box::new(MonitorState {
                     layout_dpi: 96,
                     text: String::new(),
+                    candidates: Vec::new(),
                     theme,
                     backend: Backend::new(renderer),
                     overflow: false,
                     last_size: (0, 0),
+                    held_w: 0,
+                    held_comp: 0,
                 }),
             );
         }
     }
 
-    /// 読み `text` を composition 先頭アンカーの上側に表示/更新する。表示条件の判定は
-    /// 呼び出し側（TextService::update_reading_monitor — should_show が唯一の真実源）。
-    /// `anchor=None`（矩形取得失敗）は表示中なら前回位置保持・非表示なら既定座標（plan_anchor）。
-    /// HWND 生成失敗は劣化（何もしない）、空文字は hide。
+    /// 読み `text` と予測候補 `candidates` を composition 先頭アンカーの上側に1窓で
+    /// 表示/更新する（統合パネル）。表示条件の判定は呼び出し側（plan_panel が唯一の
+    /// 真実源）。`anchor=None`（矩形取得失敗）は表示中なら前回位置保持・非表示なら
+    /// 既定座標（plan_anchor）。`comp_width` は未確定文字列の表示幅の実測（物理px）で
+    /// パネル幅の基本 — None なら読み・候補の実測だけで幅を決める。`composition_id`
+    /// は幅縮小抑制のリセット区切り（同一 composition 中は幅を縮めない）。
+    /// HWND 生成失敗は劣化（何もしない）、text 空+候補なしは hide。
+    #[allow(clippy::too_many_arguments)]
     pub fn show_or_update(
         &mut self,
         text: &str,
+        candidates: &[PanelCandidate],
         anchor: Option<CaretAnchor>,
+        comp_width: Option<i32>,
+        composition_id: u64,
         max_chars: u32,
         theme: crate::theme::Theme,
     ) {
-        if text.is_empty() {
+        let with_reading_row = !text.is_empty();
+        let rows = candidates.len();
+        if !with_reading_row && rows == 0 {
             self.hide();
             return;
         }
@@ -500,6 +845,7 @@ impl ReadingMonitor {
         unsafe {
             if let Some(state) = monitor_state(self.hwnd) {
                 state.text = text.to_string();
+                state.candidates = candidates.to_vec();
                 // DWM chrome に効く属性（角丸/アクリル）が変わったときだけ再適用する
                 // （色だけの変化は後段の InvalidateRect による再描画で足りる — HUD と同じ）。
                 let chrome_changed =
@@ -553,25 +899,66 @@ impl ReadingMonitor {
             let font_px_f = font_size_px(state.theme.font_point_tenths, dpi);
             let font_px = font_px_f.ceil() as i32;
             // テキスト幅は描画と同一エンジンで実測（D2D=DWrite / GDI=GetTextExtentPoint32W）。
-            // 測れなければ 0 → monitor_window_size の MIN クランプで最小幅に劣化。
+            // 測れなければ 0 → panel_window_size の MIN クランプで最小幅に劣化。
             let max_w = max_text_w_px(max_chars, font_px);
             let family = popup::family_utf16z(&state.theme.font_family);
-            let text_w = if state.backend.renderer.is_some() {
+            // 実測は &mut state を要する（フォントキャッシュ）ため、測定対象は先に複製して
+            // state への借用を切っておく。
+            let reading_text = state.text.clone();
+            let reading_w = if !with_reading_row {
+                0
+            } else if state.backend.renderer.is_some() {
                 state
                     .backend
                     .measure_max_width_dwrite(
                         &family,
                         font_px_f,
-                        std::slice::from_ref(&state.text),
+                        std::slice::from_ref(&reading_text),
                         max_w,
                     )
                     .unwrap_or(0)
             } else {
-                measure_text_gdi(self.hwnd, state, dpi).unwrap_or(0)
+                measure_texts_gdi(self.hwnd, state, dpi, &[reading_text.as_str()]).unwrap_or(0)
             };
-            // 巡3 P10: クランプの照会点も同じ「窓を置く側」の y で統一（上記 DPI と同じ点）。
-            let (w, h) = monitor_window_size(text_w, font_px, dpi, max_w);
-            state.overflow = text_overflows(text_w, max_w);
+            // 候補欄の幅 = 候補本文の最大実測 + "Tab" ガター。stale 行も同幅で測る
+            // （応答差し替えで stale→fresh になっても幅は変わらない）。
+            let candidate_w = if rows == 0 {
+                0
+            } else {
+                let owned: Vec<String> = state.candidates.iter().map(|c| c.text.clone()).collect();
+                let body = if state.backend.renderer.is_some() {
+                    state
+                        .backend
+                        .measure_max_width_dwrite(&family, font_px_f, &owned, max_w)
+                        .unwrap_or(0)
+                } else {
+                    let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+                    measure_texts_gdi(self.hwnd, state, dpi, &refs).unwrap_or(0)
+                };
+                body + scale(GUTTER_W, dpi)
+            };
+            let comp_w = comp_width.unwrap_or(0);
+            let (mut w, h) = panel_window_size(
+                comp_w,
+                reading_w,
+                candidate_w,
+                with_reading_row,
+                rows,
+                font_px,
+                dpi,
+                max_w,
+            );
+            state.overflow = text_overflows(reading_w, max_w);
+            // 同一 composition 中は幅を縮めない（held_width）。設定/DPI 変更で上限が
+            // 下がった場合に備え、実績幅も最新の上限へ収めておく。上限は**窓幅**基準
+            // （文字領域上限 + 枠・左右パディング）— 文字領域上限で窓幅をクランプすると
+            // 枠ぶん描画領域が痩せて overflow 判定と描画が食い違う（panel_frame_w 注記）。
+            let min_w = scale(MIN_PANEL_W, dpi);
+            let comp_changed = state.held_comp != composition_id;
+            state.held_comp = composition_id;
+            state.held_w = held_width(state.held_w, comp_changed, w)
+                .clamp(min_w, max_window_w(max_w, min_w, dpi));
+            w = state.held_w;
             // アンカー上側（caret_top の上に GAP 空けて）。caret_top 不明（無害位置劣化）は
             // アンカー位置へそのまま（下側）— そのときは実キャレットも不明なので上下の
             // 使い分けに意味がない。クランプは**アンカーモニタの作業領域**で行う
@@ -636,9 +1023,10 @@ impl ReadingMonitor {
                 popup::play_entrance(state, motion, was_visible);
             }
             tip_log(&format!(
-                "ev=reading_monitor action={} len={}",
+                "ev=reading_monitor action={} reading_len={} rows={}",
                 if was_visible { "update" } else { "show" },
-                text.chars().count()
+                text.chars().count(),
+                rows
             ));
         }
     }
@@ -702,33 +1090,84 @@ mod tests {
         unsafe {
             popup::register_class(&CLASS_ATOM, CLASS_NAME, Some(wnd_proc)).unwrap();
             let hwnd = popup::create_popup(CLASS_NAME, Default::default(), 50, 50).unwrap();
-            popup::install_state(hwnd, Box::new(MonitorState {
-                layout_dpi: 96,
-                text: String::new(), theme: Default::default(), backend: Backend::new(None),
-                overflow: false, last_size: (0, 0),
-            }));
+            popup::install_state(
+                hwnd,
+                Box::new(MonitorState {
+                    layout_dpi: 96,
+                    text: String::new(),
+                    candidates: Vec::new(),
+                    theme: Default::default(),
+                    backend: Backend::new(None),
+                    overflow: false,
+                    last_size: (0, 0),
+                    held_w: 0,
+                    held_comp: 0,
+                }),
+            );
             let mut monitor = ReadingMonitor { hwnd };
             for dpi in [192, 96, 288] {
                 popup::TEST_ANCHOR_DPI.set(Some(dpi));
-                let anchor = CaretAnchor { x: 100, y: 100, caret_top: Some(80) };
-                monitor.show_or_update("にほんご", Some(anchor), 34, Default::default());
+                let anchor = CaretAnchor {
+                    x: 100,
+                    y: 100,
+                    caret_top: Some(80),
+                };
+                monitor.show_or_update(
+                    "にほんご",
+                    &[],
+                    Some(anchor),
+                    None,
+                    1,
+                    34,
+                    Default::default(),
+                );
                 popup::TEST_ANCHOR_DPI.set(None);
                 paint_gdi(hwnd);
-                assert_eq!(monitor_state(hwnd).unwrap().backend.cached_font_dpi(), Some(dpi));
+                assert_eq!(
+                    monitor_state(hwnd).unwrap().backend.cached_font_dpi(),
+                    Some(dpi)
+                );
             }
         }
     }
     use super::*;
 
     #[test]
-    fn should_show_requires_all_of_enabled_composing_live_and_no_candidates() {
-        // 全条件成立のときだけ表示。
-        assert!(should_show(true, true, true, false));
-        // 設定 OFF / 非合成中 / ライブ変換 OFF / 候補窓表示中 のいずれかで非表示。
-        assert!(!should_show(false, true, true, false));
-        assert!(!should_show(true, false, true, false));
-        assert!(!should_show(true, true, false, false));
-        assert!(!should_show(true, true, true, true));
+    fn plan_panel_maps_reading_and_candidate_rows_independently() {
+        // 読み行は従来の should_show と同じ4条件、候補欄はライブ変換を要求しない。
+        // どちらも composing && 候補窓非表示が共通の前提。
+        let p = |reading_enabled: bool,
+                 prediction_on: bool,
+                 composing: bool,
+                 live: bool,
+                 showing: bool| {
+            plan_panel(reading_enabled, prediction_on, composing, live, showing)
+        };
+        // 両方出る（統合パネルの基本形態）。
+        assert!(p(true, true, true, true, false).reading_row);
+        assert!(p(true, true, true, true, false).candidate_rows);
+        // ライブ変換 OFF: 読み行は出ないが候補欄は出る（独立条件）。
+        let off = p(true, true, true, false, false);
+        assert!(!off.reading_row);
+        assert!(off.candidate_rows);
+        // 候補が無い: 読み行のみ（従来の読みモニタと同じ）。
+        let only = p(true, false, true, true, false);
+        assert!(only.reading_row);
+        assert!(!only.candidate_rows);
+        // 非合成中 / 候補窓表示中は blocked でどちらの行も出ない。
+        for (re, po, co, li, sh) in [
+            (true, true, false, true, false),
+            (true, true, true, true, true),
+        ] {
+            let plan = p(re, po, co, li, sh);
+            assert!(!plan.reading_row && !plan.candidate_rows);
+        }
+        // 読み設定 OFF は読み行だけが消え、候補欄は出る（独立条件）。
+        let no_reading_setting = p(false, true, true, true, false);
+        assert!(!no_reading_setting.reading_row);
+        assert!(no_reading_setting.candidate_rows);
+        // 候補窓表示中は予測候補があっても隠れる（候補窓に集中する — ユーザ確認済み決定）。
+        assert!(!p(true, true, true, true, true).candidate_rows);
     }
 
     #[test]
@@ -785,20 +1224,198 @@ mod tests {
     }
 
     #[test]
-    fn monitor_window_size_scales_and_clamps() {
-        // 96DPI・フォント14px・テキスト100px: w=2+20+100=122, h=2+12+14=28。
-        assert_eq!(monitor_window_size(100, 14, 96, 480), (122, 28));
-        // 192DPI で pad が倍にスケール（テキスト実測幅・px上限は呼び出し側が実DPIで計算）。
+    fn panel_window_size_literal_at_96dpi() {
+        // 期待値は実装と独立に手計算したリテラルで固定する（同じ scale()/定数で再導出すると
+        // 符号・定数取り違えを検出できない — candidate_window の window_size テストと同一規律）。
+        // 96DPI(scale=1)・フォント14px・読み100px・候補0px・読み行あり・候補0行:
+        // 幅 = 2*1 + 2*10 + clamp(max(0,100,0), 160, 480) = 2+20+160 = 182（MIN_PANEL_W 下駄）。
+        // 高さ = 2*1 + 12 + 14 = 28（読み行のみ = 従来の読みモニタと同値）。
         assert_eq!(
-            monitor_window_size(100, 28, 192, 960),
-            (2 + 40 + 100, 2 + 24 + 28)
+            panel_window_size(0, 100, 0, true, 0, 14, 96, 480),
+            (182, 28)
         );
-        // 幅下限: 空文字相当でも最小幅を保つ（96DPI: 24px）。
-        assert_eq!(monitor_window_size(0, 14, 96, 480).0, 2 + 20 + 24);
-        // 幅上限: 巨大テキストは max_w_px でクランプ。
-        assert_eq!(monitor_window_size(10_000, 14, 96, 480).0, 2 + 20 + 480);
+        // 候補3行: 高さに区切り帯7 + 3*28 を足す = 28 + 7 + 84 = 119。
+        // 幅は候補実測 200 + Tab ガター22 分を呼び出し側が candidate_px_w に積んで渡す前提。
+        assert_eq!(
+            panel_window_size(0, 100, 222, true, 3, 14, 96, 480),
+            (2 + 20 + 222, 119)
+        );
+        // composition 幅が最も広いときはそれが幅になる（未確定文字列の表示幅を基本にする）。
+        assert_eq!(
+            panel_window_size(300, 100, 50, true, 3, 14, 96, 480).0,
+            2 + 20 + 300
+        );
+        // ライブ変換 OFF 相当（読み行なし）: 高さは枠 + 候補行のみ = 2 + 84 = 86。
+        assert_eq!(panel_window_size(0, 0, 222, false, 3, 14, 96, 480).1, 86);
+        // 幅上限: 巨大 composition は max_w_px でクランプ。
+        assert_eq!(
+            panel_window_size(10_000, 0, 0, true, 0, 14, 96, 480).0,
+            2 + 20 + 480
+        );
+    }
+
+    #[test]
+    fn panel_window_size_scales_at_192dpi() {
+        // 192DPI(scale=2)・フォント28px・読み100px・候補0行:
+        // 幅 = 2*1 + 2*20 + clamp(100, 320, 960) = 2+40+320 = 362（MIN_PANEL_W のスケール下駄）。
+        // 高さ = 2*1 + 24 + 28 = 54。
+        assert_eq!(
+            panel_window_size(0, 100, 0, true, 0, 28, 192, 960),
+            (362, 54)
+        );
+        // 候補3行: 54 + 14 + 3*56 = 236。
+        assert_eq!(
+            panel_window_size(0, 100, 500, true, 3, 28, 192, 960).1,
+            54 + 14 + 168
+        );
+    }
+
+    #[test]
+    fn panel_window_size_survives_max_below_min() {
         // min>max 防御: max_w_px が下限未満でも clamp が panic せず下限に落ちる
         // (max_chars=10×小フォントで実在するエッジ)。
-        assert_eq!(monitor_window_size(0, 14, 96, 1).0, 2 + 20 + 24);
+        assert_eq!(
+            panel_window_size(0, 0, 0, true, 0, 14, 96, 1).0,
+            2 + 20 + 160
+        );
+    }
+
+    #[test]
+    fn held_width_never_shrinks_within_a_composition() {
+        // 同一 composition: 縮まない（候補が短くなっても幅を保つ）。
+        assert_eq!(held_width(300, false, 200), 300);
+        // 伸びる場合は追従。
+        assert_eq!(held_width(300, false, 400), 400);
+        // composition 切替: 実績幅を捨てて新しい幅から始める。
+        assert_eq!(held_width(300, true, 200), 200);
+    }
+
+    #[test]
+    fn panel_plan_filters_the_data_passed_to_the_panel() {
+        // plan は可否判定だけでなく show_or_update へ渡すデータそのものを落とす。
+        // 受け側は「text 非空なら読み行を描く」ので、plan.reading_row=false でも生の
+        // 読みを渡すと読み表示 OFF／ライブ変換 OFF なのに読み行が出てしまう。
+        let candidates = vec![PanelCandidate {
+            text: "がぞう".into(),
+            stale: false,
+        }];
+        // 読み行 OFF（読み表示設定 OFF / ライブ変換 OFF）でも候補欄は生きる — 読みだけ落とす。
+        let (reading, rows) = PanelPlan {
+            reading_row: false,
+            candidate_rows: true,
+        }
+        .filter_display("がぞう".to_string(), candidates.clone());
+        assert!(reading.is_empty());
+        assert_eq!(rows, candidates);
+        // 候補欄 OFF でも読み行は生きる（読みモニタ単体の従来形態）。
+        let (reading, rows) = PanelPlan {
+            reading_row: true,
+            candidate_rows: false,
+        }
+        .filter_display("がぞう".to_string(), candidates.clone());
+        assert_eq!(reading, "がぞう");
+        assert!(rows.is_empty());
+        // blocked（非合成中 / 候補窓表示中）は両方落とす — 呼び出し側は空を見て hide する。
+        let (reading, rows) = PanelPlan {
+            reading_row: false,
+            candidate_rows: false,
+        }
+        .filter_display("がぞう".to_string(), candidates);
+        assert!(reading.is_empty());
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn width_limit_clamps_window_width_so_reading_tail_stays_visible() {
+        // レビュー再現条件: 96DPI・フォント14px・max_chars 34 → 文字領域上限 476px。
+        // 実測読み 476px は上限ちょうど（overflow=false）。窓幅 = 476+枠・左右余白22 = 498px
+        // なのに、これを**文字領域**上限の 476px でクランプすると文字領域が 456px に痩せ、
+        // 末尾寄せへ切り替わらないまま最新の読みの末尾が右端で切れていた。
+        let max_w = max_text_w_px(34, 14);
+        let (w, _) = panel_window_size(0, 476, 0, true, 0, 14, 96, max_w);
+        assert_eq!(w, 2 + 20 + 476);
+        // show_or_update と同じ幅確定（held_width → クランプ。クランプ上限は窓幅基準）。
+        let min_w = scale(MIN_PANEL_W, 96);
+        let settled = held_width(0, true, w).clamp(min_w, max_window_w(max_w, min_w, 96));
+        assert_eq!(settled, 498);
+        // 最終文字領域 >= 実測幅: overflow=false のままで全体が描ける（末尾が消えない）。
+        assert!(settled - panel_frame_w(96) >= 476);
+        // 上限超過時は文字領域が上限ちょうどになり、overflow=true で末尾寄せへ切り替わる。
+        let (w, _) = panel_window_size(0, 520, 0, true, 0, 14, 96, max_w);
+        let settled = held_width(0, true, w).clamp(min_w, max_window_w(max_w, min_w, 96));
+        assert_eq!(settled - panel_frame_w(96), max_w);
+        assert!(text_overflows(520, max_w));
+        // 設定変更で上限が下がった（max_chars 半減）場合も、実績幅は新しい**窓幅**上限へ収まる。
+        let half = max_window_w(max_w / 2, min_w, 96);
+        let settled = held_width(settled, false, settled).clamp(min_w, half);
+        assert!(settled <= half);
+        assert!(settled - panel_frame_w(96) <= max_w / 2);
+    }
+
+    #[test]
+    fn candidate_rows_fit_the_client_area_with_and_without_reading_row() {
+        // 読み行なしの形態（ライブ変換 OFF + 候補欄）でも区切り帯を差し引くと最上段の
+        // 候補 top が負になり、描画ループの `top < rc.top` で全行描かれない（96DPI・候補
+        // 1件なら top=-1）。panel_window_size の高さ式と candidate_rows_bottom の対応で、
+        // 読み行あり/なし × 候補1〜3件 × 96/192DPI の全組合せで全候補行がクライアント
+        // 領域内に収まることを固定する（描画ループと同一の判定で検証する）。
+        for (dpi, font_px) in [(96, 14), (192, 28)] {
+            for with_reading in [true, false] {
+                for rows in [1usize, 2, 3] {
+                    let (_, h) = panel_window_size(
+                        0,
+                        if with_reading { 100 } else { 0 },
+                        0,
+                        with_reading,
+                        rows,
+                        font_px,
+                        dpi,
+                        max_text_w_px(34, font_px),
+                    );
+                    let row_h = scale(ROW_H, dpi);
+                    let rows_bottom = candidate_rows_bottom(h, with_reading, font_px, dpi);
+                    for i in 0..rows {
+                        let bottom = rows_bottom - i as i32 * row_h;
+                        let top = bottom - row_h;
+                        assert!(
+                            top >= 0,
+                            "row {i} clipped: dpi={dpi} reading={with_reading} rows={rows} top={top}"
+                        );
+                        assert!(bottom <= h);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dim_text_blends_halfway_to_background() {
+        let bg = crate::theme::Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let text = crate::theme::Rgba {
+            r: 10,
+            g: 200,
+            b: 255,
+            a: 255,
+        };
+        let dimmed = dim_text(text, bg);
+        // 50% ブレンド = (t+b)/2。
+        assert_eq!(dimmed.r, 5);
+        assert_eq!(dimmed.g, 100);
+        assert_eq!(dimmed.b, 127);
+        // GDI は不透明前提なのでアルファは 255 のまま。
+        assert_eq!(dimmed.a, 255);
+    }
+
+    #[test]
+    fn reading_band_top_places_reading_row_at_the_bottom() {
+        // 96DPI・フォント14: 読み行帯の上端 = 下辺 - 12(パディング) - 14(フォント)。
+        assert_eq!(reading_band_top(100, true, 14, 96), 74);
+        // 読み行なし形態（ライブ変換 OFF + 候補欄のみ）は下辺まで空ける。
+        assert_eq!(reading_band_top(100, false, 14, 96), 100);
     }
 }

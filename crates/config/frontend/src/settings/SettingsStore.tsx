@@ -58,6 +58,9 @@ export function applyLocalChange(values: PublicSettings, change: SettingChange):
     case "input_prediction_enabled":
       next.inputPredictionEnabled = Boolean(change.value);
       break;
+    case "mixed_input":
+      next.mixedInput = change.value;
+      break;
     case "live_enabled":
       next.liveEnabled = Boolean(change.value);
       break;
@@ -151,6 +154,7 @@ function changeValue(values: PublicSettings, change: SettingChange): unknown {
   switch (change.field) {
     case "default_direct": return values.defaultDirect;
     case "input_prediction_enabled": return values.inputPredictionEnabled;
+    case "mixed_input": return values.mixedInput;
     case "live_enabled": return values.liveEnabled;
     case "shift_latin_mode": return values.shiftLatinMode;
     case "number_full_width": return values.numberFullWidth;

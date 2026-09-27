@@ -1,0 +1,60 @@
+# 保存・学習の契約例（計画書 6.3・11）。二重挿入・二重学習が無いことを表現する。
+# 学習 receipt の実装は PR3、検証はその結合試験で行う。
+
+[[episode]]
+id = "per-001"
+category = "persistence"
+source = "githubnotukaikata"
+expected = [
+  { kind = "literal", text = "github" },
+  { kind = "japanese", text = "notukaikata" },
+]
+events = ["type:githubnotukaikata", "annotate:tsf_apply_rejected"]
+notes = "TSF 拒否時はソース消費・学習を進めない"
+
+[[episode]]
+id = "per-002"
+category = "persistence"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "commit_prefix:6", "annotate:receipt_resent"]
+notes = "receipt 再送でも二重学習しない"
+
+[[episode]]
+id = "per-003"
+category = "persistence"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "annotate:learning_generation_changed"]
+notes = "学習世代が変わった応答は採用しない"
+
+[[episode]]
+id = "per-004"
+category = "persistence"
+source = "meetingnoato"
+expected = [
+  { kind = "literal", text = "meeting" },
+  { kind = "japanese", text = "noato" },
+]
+events = ["type:meetingnoato", "annotate:double_insertion_guarded"]
+notes = "部分適用での二重挿入を防止する"
+
+[[episode]]
+id = "per-005"
+category = "persistence"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "commit_prefix:6", "annotate:commit_receipt_mismatch"]
+notes = "確定 receipt 不整合時に残り source を壊さない"

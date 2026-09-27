@@ -34,6 +34,7 @@ export type PublicSettings = {
   weightPath: string;
   zenzaiInferenceLimit: number;
   liveEnabled: boolean;
+  mixedInput: "off" | "candidates" | "auto";
   inputPredictionEnabled: boolean;
   liveSearchWidth: number;
   defaultDirect: boolean;
@@ -66,6 +67,7 @@ export type SettingsSnapshot = {
 export type FieldError = { field: string; message: string };
 
 export type SettingChange =
+  | { field: "mixed_input"; value: "off" | "candidates" | "auto" }
   | { field: "default_direct" | "live_enabled" | "input_prediction_enabled" | "number_full_width" | "punctuation_full_width" | "symbol_full_width" | "reading_monitor_enabled" | "reading_monitor_accumulate" | "user_dictionary_enabled" | "learning_enabled" | "zenzai_enabled" | "update_include_beta"; value: boolean }
   | { field: "appearance_font_family" | "weight_path"; value: string }
   | { field: "shift_latin_mode"; value: PublicSettings["shiftLatinMode"] }

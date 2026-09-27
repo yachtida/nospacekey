@@ -446,6 +446,7 @@ fn response_kind(response: &Response) -> &'static str {
         Response::LlmResult { .. } => "llm_result",
         Response::ClauseView { .. } => "clause_view",
         Response::ZenzaiStatus { .. } => "zenzai_status",
+        Response::MixedResult { .. } => "mixed_result",
     }
 }
 
@@ -862,6 +863,17 @@ pub struct TextService {
     pub(crate) next_client_generation: Cell<u64>,
     pub(crate) engine_session: Cell<i64>,
     pub(crate) state: RefCell<InputModule>,
+    /// 現在の engine 接続の capability 広告（StartSession 応答）。None は旧エンジン
+    /// （広告なし）。混在変換（mixed_input_v1）はこれがある接続だけで使う。
+    /// 再接続のたびに start_and_store が書き換える（ADR-0007 §7.1）。
+    pub(crate) engine_capabilities: RefCell<Option<Vec<String>>>,
+    /// 採用中の混在表示（実装計画 §8.2。PR3 は固定 Plan の試験経路から設定し、
+    /// PR4 は判別器・PR5 は候補選択から繋ぐ）。編集や確定で composition/revision が
+    /// 動くと is_current が不成立になり、表示・確定は通常の読み経路へ戻る。
+    pub(crate) mixed_candidates: RefCell<crate::mixed_candidates::Controller>,
+    pub(crate) mixed_display: RefCell<Option<crate::mixed_conversion::MixedDisplay>>,
+    pub(crate) next_mixed_request_id: Cell<u64>,
+    pub(crate) next_mixed_plan_id: Cell<u64>,
     /// 通常打鍵のIPCだけを所有するbounded worker。STA側の変換sessionとは共有しない。
     pub(crate) background_input: crate::background_input::BackgroundInputWorker,
     pub(crate) configuration_generation: Cell<u64>,
@@ -1213,6 +1225,11 @@ impl TextService {
             next_client_generation: Cell::new(0),
             engine_session: Cell::new(0),
             state: RefCell::new(InputModule::default()),
+            engine_capabilities: RefCell::new(None),
+            mixed_candidates: RefCell::new(crate::mixed_candidates::Controller::default()),
+            mixed_display: RefCell::new(None),
+            next_mixed_request_id: Cell::new(0),
+            next_mixed_plan_id: Cell::new(0),
             background_input: crate::background_input::BackgroundInputWorker::start(
                 crate::engine_link::stable_pipe_name(),
                 64,
@@ -1573,6 +1590,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             // SP6b/SP7 の設定反映（settings は F-1 のため上の PreserveKey 登録前に読み込み済み）。
             let live_on = s.live_conversion.enabled;
             self.live_enabled.set(live_on);
+            self.mixed_candidates.borrow_mut().configured = s.mixed_input;
             self.input_prediction_enabled.set(s.input_prediction_enabled);
             self.live_search_width.set(s.live_conversion.effective_search_width());
             // 外部LLM変換(Shift+Tab)のフィーチャーフラグ。開発凍結中(settings::LLM_CONVERT_FROZEN)に
@@ -2612,7 +2630,7 @@ impl TextService_Impl {
     /// logon session で安定なエンジン用パイプ名。
     /// 同一 logon session 内の全 TIP インスタンスが同じ名を返すので、単一の共有エンジンと接続できる。
     /// 初回に算出して `self.pipe_name` にキャッシュし、以後は同値を返す。
-    fn engine_pipe_name(&self) -> String {
+    pub(crate) fn engine_pipe_name(&self) -> String {
         {
             let n = self.pipe_name.borrow();
             if !n.is_empty() {
@@ -2673,11 +2691,14 @@ impl TextService_Impl {
                 session,
                 proto,
                 boot,
+                capabilities,
                 ..
             }) => {
                 // version handshake は接続確立時（fresh StartSession）にだけ効かせる。proto はエンジン
                 // プロセスの属性で、一度確立した接続の途中では変わらないため、既存接続に StartSession を
                 // 貼り直す ensure_session 側では判定しない（この start_and_store が全 fresh 接続経路の合流点）。
+                // capability 広告も同じ接続スコープで保存する（旧エンジンは None）。
+                *self.engine_capabilities.borrow_mut() = capabilities;
                 match decide_handshake(proto) {
                     HandshakeAction::Accept => {
                         self.engine_session.set(session);
@@ -2755,6 +2776,7 @@ impl TextService_Impl {
     pub(crate) fn engine_reload_config(&self) {
         self.begin_configuration_change();
         let s = settings::load();
+        self.mixed_candidates.borrow_mut().configured = s.mixed_input;
         let key_plain = if s.llm.api_key_dpapi.is_empty() {
             None
         } else {
@@ -3245,6 +3267,234 @@ impl TextService_Impl {
             }
             None => false, // client 無し（劣化動作中）: 従来どおり何もしない
         }
+    }
+
+    /// 混在変換の要求送信と検証（実装計画 §7.1–7.2、PR3 は固定 Plan から呼ぶ）。
+    /// capability（mixed_input_v1）がある接続にだけ送る — 旧エンジンへこの要求を
+    /// 送ると保持制約が黙殺されるため。応答は mixed_conversion::validate_mixed_result
+    /// で同一性・内容を検証し、不整合・失敗は None（呼出側は従来の候補経路を維持）。
+    pub(crate) fn request_mixed_conversion(
+        &self,
+        identity: &crate::mixed_conversion::MixedIdentity,
+        spans: Vec<ipc::protocol::MixedSpan>,
+        left_context: Option<String>,
+    ) -> Option<crate::mixed_conversion::ValidatedMixed> {
+        if !self.ensure_session() {
+            return None;
+        }
+        if !crate::mixed_conversion::engine_supports_mixed(self.engine_capabilities.borrow().as_ref()) {
+            tip_log("ev=mixed_skip reason=no_capability");
+            return None;
+        }
+        let request = Request::MixedConvert {
+            session: self.engine_session.get(),
+            composition: identity.composition,
+            revision: identity.revision,
+            configuration_generation: identity.configuration_generation,
+            connection_generation: identity.connection_generation,
+            conversion_revision: 0,
+            request_id: identity.request_id,
+            source_revision: identity.source_revision,
+            plan_id: identity.plan_id,
+            spans,
+            left_context,
+        };
+        // borrow は result ブロック内で完結させ、drop 後に drop_engine を呼ぶ
+        // （ensure_session と同じ規律）。
+        let result = {
+            let mut guard = self.client.borrow_mut();
+            guard.as_mut().map(|client| {
+                timed_request(client, &request, IPC_TIMEOUT_CONVERT, "mixed_convert")
+            })
+        };
+        match result {
+            Some(Ok(Response::MixedResult {
+                composition,
+                revision,
+                configuration_generation,
+                connection_generation,
+                request_id,
+                source_revision,
+                plan_id,
+                engine_epoch,
+                learning_generation,
+                text,
+                spans: result_spans,
+            })) => crate::mixed_conversion::validate_mixed_result(
+                identity,
+                match &request {
+                    Request::MixedConvert { spans, .. } => spans,
+                    _ => unreachable!("request は MixedConvert"),
+                },
+                composition,
+                revision,
+                configuration_generation,
+                connection_generation,
+                request_id,
+                source_revision,
+                plan_id,
+                &engine_epoch,
+                learning_generation,
+                &text,
+                &result_spans,
+            ),
+            Some(Ok(other)) => {
+                tip_log(&engine_failure_event("mixed_convert", &Ok(other)));
+                None
+            }
+            Some(Err(error)) => {
+                tip_log(&engine_failure_event("mixed_convert", &Err(error)));
+                None
+            }
+            None => None, // client 無し（劣化動作中）: 従来どおり何もしない
+        }
+    }
+
+    /// 固定 Plan を現在の未確定入力へ適用する混在変換の接続試験入口（実装計画 §6.1。
+    /// PR4 は判別器の出力、PR5 は候補選択をここへ繋ぐ）。Projection を composer
+    /// （読み・編集・元打鍵の由来）へ反映してから、capability がある接続へ
+    /// MixedConvert を送り、検証済み結果を採用して表示へ反映する。変換に失敗した
+    /// ときは composer を採用前の unit 列へ戻し、表示も従来へ戻す（§8.5）。
+    /// plan_id は採用ごとに進む（同一入力へ別 Plan を採り直した区別）。
+    pub(crate) fn adopt_mixed_plan(
+        &self,
+        plan: &mixed_input::plan::InterpretationPlan,
+    ) -> Option<String> {
+        let plan_id = self.next_mixed_plan_id.get().checked_add(1)?;
+        // ① 現在の source から Projection を組み、composer へ反映する。反映で読み・
+        ///  revision が動くため、以後の同一性は反映後の状態で組む。失敗時に備えて
+        ///  composer の完全な複製（ResolvedKana 相当の読み・pending・suffix・カーソル
+        ///  凍結を含む）を保存する。
+        let saved_composer = {
+            let mut state = self.state.borrow_mut();
+            if !state.composing {
+                return None;
+            }
+            let source = state.composition_source();
+            let projection =
+                mixed_input::projection::Projection::build(plan_id, &source, plan).ok()?;
+            let saved = state.snapshot_composer();
+            if !state.adopt_mixed_projection(&projection) {
+                return None;
+            }
+            saved
+        };
+        self.next_mixed_plan_id.set(plan_id);
+        // ② 反映後の状態で source/Projection を作り直し、要求を送る。
+        let display_text = {
+            let (source, projection) = {
+                let state = self.state.borrow();
+                let source = state.composition_source();
+                let projection =
+                    mixed_input::projection::Projection::build(plan_id, &source, plan).ok()?;
+                (source, projection)
+            };
+            let identity = crate::mixed_conversion::MixedIdentity {
+                composition: {
+                    let state = self.state.borrow();
+                    state.composition_id()
+                },
+                revision: {
+                    let state = self.state.borrow();
+                    state.reading_revision()
+                },
+                configuration_generation: self.configuration_generation.get(),
+                connection_generation: self.background_input.connection_generation(),
+                request_id: self.next_mixed_request_id.get().checked_add(1)?,
+                source_revision: source.revision(),
+                plan_id,
+            };
+            let spans = crate::mixed_conversion::spans_from_projection(&projection);
+            match self.request_mixed_conversion(&identity, spans, None) {
+                Some(display) => {
+                    self.next_mixed_request_id.set(identity.request_id);
+                    let text = display.text.clone();
+                    *self.mixed_display.borrow_mut() = Some(crate::mixed_conversion::MixedDisplay {
+                        projection,
+                        identity,
+                        display,
+                    });
+                    text
+                }
+                None => {
+                    // 変換失敗: composer を採用前の完全な複製へ戻し、混合表示も採らない。
+                    ///  復元も編集として世代を進める（旧 snapshot の同一性は復活させない）。
+                    let rolled_back = {
+                        let mut state = self.state.borrow_mut();
+                        state.restore_composer(saved_composer)
+                    };
+                    if !rolled_back {
+                        tip_log("ev=mixed_adopt_rollback_failed");
+                    }
+                    return None;
+                }
+            }
+        };
+        // ③ 表示へ反映。採用で旧 snapshot は失効済み（adopt_mixed_projection）。
+        // debounce・背景要求も閉じて、旧 JP-only 結果の適用経路を断つ（§7.2）。
+        self.disarm_debounce();
+        self.background_input.request_close();
+        let text = display_text;
+        *self.live_text.borrow_mut() = text.clone();
+        if let Some(ctx) = self.current_context.borrow().clone() {
+            self.run_preedit(&ctx, &text);
+        }
+        tip_log(&format!(
+            "ev=mixed_adopted plan_id={} revision={}",
+            {
+                let state = self.state.borrow();
+                state.reading_revision()
+            },
+            plan_id
+        ));
+        Some(text)
+    }
+
+    /// 混在確定に使う本文。採用中の混在表示が現在の composition/revision に一致
+    /// するときだけその表示テキストを返す。1打鍵でも編集が入れば revision が進む
+    /// ので不成立になり、呼出側は従来の読み確定へ戻る。
+    pub(crate) fn mixed_commit_text(&self) -> Option<String> {
+        let mixed = self.mixed_display.borrow().clone()?;
+        let current = {
+            let state = self.state.borrow();
+            (state.composition_id(), state.reading_revision())
+        };
+        mixed
+            .is_current(current.0, current.1)
+            .then(|| mixed.display.text.clone())
+    }
+
+    /// 混在確定の receipt を文書反映後に送る Closure。本文が採用中の表示と一致し、
+    /// かつ表示が現在の composition/revision に一致するときだけ作る。確定に失敗
+    /// しても状態はここでは消さない（再試行の Enter が同じ表示で確定できる。
+    /// 成功時の reset で composition が進み、採用状態は自動的に不成立になる）。
+    pub(crate) fn prepare_mixed_receipt(&self, text: &str) -> Option<Box<dyn FnOnce()>> {
+        let mixed = self.mixed_display.borrow().clone()?;
+        let current = {
+            let state = self.state.borrow();
+            (state.composition_id(), state.reading_revision())
+        };
+        if !mixed.is_current(current.0, current.1) {
+            return None;
+        }
+        let commit_id = crate::receipt_outbox::next_commit_id()?;
+        let receipt = crate::mixed_conversion::commit_receipt(
+            commit_id,
+            &mixed.projection,
+            &mixed.display,
+            text,
+        )?;
+        let mut outbox = self.receipt_outbox.borrow_mut();
+        if outbox.is_none() {
+            *outbox = crate::receipt_outbox::ReceiptOutbox::start(
+                crate::engine_link::stable_pipe_name(),
+            )
+            .ok();
+        }
+        let outbox = outbox.as_ref()?.clone();
+        Some(Box::new(move || {
+            outbox.text_applied(receipt, Instant::now());
+        }))
     }
 
     /// A' 送信前ドレインの結果。呼び出し側（engine_live_convert/engine_insert）が次の動作を決める。
@@ -3757,6 +4007,7 @@ impl TextService_Impl {
     /// Space/Enter で SP1 候補フローに任せる（既存タイマがあれば畳むだけ）。
     pub(crate) fn arm_debounce(&self) {
         self.disarm_debounce();
+        if self.mixed_holds_interpretation() && !self.partial_preedit_redraw_pending.get() { return; }
         if (self.local_clauses.borrow().is_some() || self.explicit_snapshot_pending.get())
             && !self.partial_preedit_redraw_pending.get() { return; }
         if !self.live_enabled.get() && !self.input_prediction_enabled.get() && !self.partial_preedit_redraw_pending.get() {
@@ -4115,11 +4366,21 @@ impl TextService_Impl {
             self.arm_partial_preedit_redraw_retry();
             return;
         }
+        if self.mixed_holds_interpretation() { return; }
+        if self.begin_mixed_live() { return; }
         self.submit_input_predictions(&ctx);
         // A late prediction reply (or an already queued timer) must not replace the
         // explicit snapshot identity while Space is waiting for its result.
         if !self.live_enabled.get() || self.local_clauses.borrow().is_some()
             || self.explicit_snapshot_pending.get() {
+            return;
+        }
+        self.submit_ordinary_live();
+    }
+
+    pub(crate) fn submit_ordinary_live(&self) {
+        if !self.live_enabled.get() || self.local_clauses.borrow().is_some()
+            || self.explicit_snapshot_pending.get() || self.mixed_holds_interpretation() {
             return;
         }
         let configuration = self.configuration_generation.get();
@@ -4295,6 +4556,7 @@ impl TextService_Impl {
             );
         let Some(interval) = snapshot_poll_interval(
             self.live_result_deadline.get().is_some()
+                || self.mixed_candidates.borrow().pending()
                 || self.input_predictions.borrow().pending()
                 || self.local_clause_loading()
                 || self.local_clause_redraw_deadline.get().is_some()
@@ -4347,7 +4609,7 @@ impl TextService_Impl {
     }
 
     fn disarm_snapshot_poll_if_idle(&self) {
-        if !self.input_predictions.borrow().pending() && !self.snapshot_configuration_pending.get() && self.live_result_deadline.get().is_none()
+        if !self.mixed_candidates.borrow().pending() && !self.input_predictions.borrow().pending() && !self.snapshot_configuration_pending.get() && self.live_result_deadline.get().is_none()
             && self.local_clause_redraw_deadline.get().is_none()
             && self.display_end_context.borrow().is_none()
             && !self.clause_worker.learning_pending()
@@ -4375,6 +4637,7 @@ impl TextService_Impl {
     }
 
     fn poll_live_result(&self) {
+        self.poll_mixed_candidates();
         self.expire_input_predictions();
         let capacity_context = self.display_end_context.borrow_mut().take();
         if let Some(context) = capacity_context { self.end_display_at_capacity(&context); }
@@ -4510,6 +4773,7 @@ impl TextService_Impl {
             {
                 continue;
             }
+            if result.auto_commit.is_some() && self.mixed_mode_active() { continue; }
             if let Some(proposal) = result.auto_commit.clone() {
                 let output =
                     self.state
@@ -4934,7 +5198,12 @@ impl TextService_Impl {
         let session_obj: ITfEditSession = CommitText {
             // Local clause commits use the semantic queue. Legacy entrances
             // still own their existing learning path until their migration.
-            on_text_applied: RefCell::new(if queued_commit { self.prepare_commit_receipt(text) } else { None }),
+            // 混在確定は検証済み表示と本文が一致するときだけ mixed receipt を出す
+            // （prepare_mixed_receipt は不一致で None を返す）。
+            on_text_applied: RefCell::new(
+                self.prepare_mixed_receipt(text)
+                    .or_else(|| if queued_commit { self.prepare_commit_receipt(text) } else { None }),
+            ),
             #[cfg(feature = "tsf-test-hooks")]
             fail_attributes: Rc::clone(&self.commit_fail_attributes),
             caret: Rc::clone(&self.composition_end_caret),
@@ -5278,6 +5547,7 @@ impl TextService_Impl {
     /// `showing` を見ずに呼ぶと、候補が閉じた後に保留 flush された選択要求が composition の
     /// 無い状態で run_preedit を呼び、新規 composition をキャレット位置に開いてしまう。
     pub(crate) fn sync_preedit_to_selection(&self, ctx: &ITfContext) {
+        if self.preview_mixed_selection(ctx) { return; }
         if !self.showing.get() {
             return;
         }
@@ -5308,6 +5578,7 @@ impl TextService_Impl {
     /// （不変条件: clause_nav が Some ⇒ showing。残すと次に候補窓を開いたとき
     /// 選択同期/確定が文節ビューと取り違える）。
     pub(crate) fn clear_clause_nav(&self) {
+        self.mixed_candidates.borrow_mut().clear();
         self.clear_input_predictions();
         self.clear_clause_mouse();
         self.live_clauses.borrow_mut().take();
@@ -5509,23 +5780,23 @@ impl TextService_Impl {
         self.sync_preedit_to_selection(ctx);
     }
 
-    /// 読みモニタの表示状態を現在の入力状態に同期する。表示条件の唯一の真実源は
-    /// reading_monitor::should_show（設定ON && composing && live && 候補窓非表示）。
-    /// run_preedit 末尾の一点フック＋候補窓を閉じて composition 継続する枝から呼ぶ。
-    /// 同期 read セッション 1 回ぶんのコストだが、呼び出し元は既に書き込みセッション
-    /// （preedit 更新）を張った直後で相対的に安価。
+    /// 統合パネル（読み行 + 予測候補欄）の表示状態を現在の入力状態に同期する。表示条件の
+    /// 唯一の真実源は reading_monitor::plan_panel（読み行と候補欄は独立条件）。
+    /// run_preedit 末尾の一点フック＋候補窓を閉じて composition 継続する枝＋予測応答の
+    /// accept（候補欄の差し替え）から呼ぶ。同期 read セッション 1 回ぶんのコストだが、
+    /// 呼び出し元は既に書き込みセッション（preedit 更新）を張った直後で相対的に安価。
     /// 外部LLM変換の待機中（preedit=🌐変換中…）も条件を満たせば表示する — 読み確認として
     /// むしろ有用で、awaiting_llm の除外条件は足さない（条件を複雑化しない — spec §表示ルール）。
+    /// 予測を取り下げない方針（入力再開でも消さない）は input_prediction 側の責務で、
+    /// ここは input_predictions の現在値をただパネルへ写すだけ。
     pub(crate) fn update_reading_monitor(&self, ctx: &ITfContext) {
-        if self.input_predictions.borrow().visible() { self.reading_monitor.borrow_mut().hide(); return; }
-        let visible = crate::reading_monitor::should_show(
-            self.reading_monitor_enabled.get(),
-            self.state.borrow().composing,
-            self.live_enabled.get(),
-            self.showing.get(),
-        );
-        let reading = self.monitor_reading_text();
-        if !visible || reading.is_empty() {
+        let Some((composition, reading, candidates)) = self.panel_sync_data() else {
+            // イマーシブホストが UIElement で候補を描いている間は、読み行も従来どおり
+            // 隠す（ホストの候補 UI との重なりを避ける — accept 時 hide の維持）。
+            self.reading_monitor.borrow_mut().hide();
+            return;
+        };
+        if reading.is_empty() && candidates.is_empty() {
             self.reading_monitor.borrow_mut().hide();
             return;
         }
@@ -5533,13 +5804,46 @@ impl TextService_Impl {
         // caret_point ではなく専用照会を使う理由（ev=caret ログ量産回避）は従来と同じ。
         // 矩形が取れないフレームは None を渡し、窓側 plan_anchor が
         // 表示中=位置保持 / 非表示=無害位置 に振り分ける。
-        let anchor = self
-            .query_monitor_anchor_rect(ctx)
-            .and_then(crate::candidate_window::caret_rect_to_anchor);
+        let (anchor_rect, extent) = self.query_monitor_anchor_rect(ctx);
+        let anchor = anchor_rect.and_then(crate::candidate_window::caret_rect_to_anchor);
         let theme = self.appearance.borrow_mut().current_theme();
-        self.reading_monitor
-            .borrow_mut()
-            .show_or_update(&reading, anchor, max_chars, theme);
+        self.reading_monitor.borrow_mut().show_or_update(
+            &reading,
+            &candidates,
+            anchor,
+            extent.map(|rc| rc.right - rc.left),
+            composition,
+            max_chars,
+            theme,
+        );
+    }
+
+    /// パネルへ渡す表示データの共通組立（通常更新 update_reading_monitor とレイアウト追従
+    /// relayout_popups_on_layout_inner の2経路が共有）。plan_panel の判定を**渡すデータへも
+    /// 反映する**（PanelPlan::filter_display）— plan を可否判定にだけ使うと、読み表示 OFF /
+    /// ライブ変換 OFF でも予測候補がある限り読み行が show_or_update 側の「text 非空なら
+    /// 読み行を描く」規律で出てしまう。ホスト描画中（イマーシブが UIElement で候補を描く
+    /// 間）は None を返し、パネルは触らない。戻り値は (composition id, 読み, 候補)。
+    fn panel_sync_data(
+        &self,
+    ) -> Option<(u64, String, Vec<crate::reading_monitor::PanelCandidate>)> {
+        let identity = self.prediction_identity();
+        let input_predictions = self.input_predictions.borrow();
+        let candidates = input_predictions.panel_candidates(identity);
+        let host_drawing = input_predictions.visible() && input_predictions.host_draws();
+        drop(input_predictions);
+        if host_drawing {
+            return None;
+        }
+        let plan = crate::reading_monitor::plan_panel(
+            self.reading_monitor_enabled.get(),
+            !candidates.is_empty(),
+            self.state.borrow().composing,
+            self.live_enabled.get(),
+            self.showing.get(),
+        );
+        let (reading, candidates) = plan.filter_display(self.monitor_reading_text(), candidates);
+        Some((identity.composition, reading, candidates))
     }
 
     /// 読みモニタの表示文字列（累積設定を反映）。通常更新(update_reading_monitor)と
@@ -5557,14 +5861,17 @@ impl TextService_Impl {
         }
     }
 
-    /// 読みモニタ用アンカー矩形（composition 先頭 → キャレットの2段試行を1セッションで）。
-    /// query_caret_rect と違いログを一切出さない（打鍵ごとに走る）。
-    fn query_monitor_anchor_rect(&self, ctx: &ITfContext) -> Option<RECT> {
+    /// パネル用アンカー矩形（composition 先頭 → キャレットの2段試行）と composition 全体
+    /// 矩形（パネル幅の基本）を1セッションで取得する。query_caret_rect と違いログを
+    /// 一切出さない（打鍵ごとに走る）。
+    fn query_monitor_anchor_rect(&self, ctx: &ITfContext) -> (Option<RECT>, Option<RECT>) {
         let out: Rc<RefCell<Option<RECT>>> = Rc::new(RefCell::new(None));
+        let out_extent: Rc<RefCell<Option<RECT>>> = Rc::new(RefCell::new(None));
         let sess: ITfEditSession = QueryMonitorAnchorRect {
             context: ctx.clone(),
             composition: Rc::clone(&self.composition),
             out: Rc::clone(&out),
+            out_extent: Rc::clone(&out_extent),
             _guard: ComObjectGuard::new(),
         }
         .into();
@@ -5575,8 +5882,11 @@ impl TextService_Impl {
                 TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READ.0),
             );
         }
+        // 末尾式のタプルにすると Ref の temporary が local の drop 後まで延命されるため
+        // 先に値へ写す（E0597）。
         let rc = *out.borrow();
-        rc
+        let extent = *out_extent.borrow();
+        (rc, extent)
     }
 
     // ------------------------------------------------------------------
@@ -5639,9 +5949,11 @@ impl TextService_Impl {
         self.layout_refresh_pending.set(false);
     }
 
-    /// 候補窓または読みモニタが表示中か（OnLayoutChange で再照会する価値があるかの判定）。
+    /// 候補窓または統合パネルが表示中か（OnLayoutChange で再照会する価値があるかの判定）。
+    /// 予測候補の見た目はパネルに統合されたため、パネルの可視で代替する（ホスト描画環境の
+    /// 予測は読みモニタも含めて隠れている＝再照会の適用先が無い）。
     fn popups_visible(&self) -> bool {
-        self.showing.get() || self.input_predictions.borrow().visible() || self.reading_monitor.borrow().is_visible()
+        self.showing.get() || self.reading_monitor.borrow().is_visible()
     }
 
     /// 非同期セッション内で取得済みのアンカーへ表示中のポップアップを再配置する。
@@ -5656,12 +5968,13 @@ impl TextService_Impl {
         &self,
         caret_anchor: Option<crate::candidate_window::CaretAnchor>,
         monitor_anchor: Option<crate::candidate_window::CaretAnchor>,
+        extent: Option<RECT>,
     ) {
         // 巡2 F7: 握り潰しはログ付きで（catch_com と同じ規律 — 保護発動の可視性）。
         // `.is_err()` は一時値の drop order を変えるため、COM 再入境界では形を維持する。
         #[allow(clippy::redundant_pattern_matching)]
         if let Err(_) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.guarded(|| self.relayout_popups_on_layout_inner(caret_anchor, monitor_anchor))
+            self.guarded(|| self.relayout_popups_on_layout_inner(caret_anchor, monitor_anchor, extent))
         })) {
             tip_log("ev=panic site=relayout");
         }
@@ -5671,6 +5984,7 @@ impl TextService_Impl {
         &self,
         caret_anchor: Option<crate::candidate_window::CaretAnchor>,
         monitor_anchor: Option<crate::candidate_window::CaretAnchor>,
+        extent: Option<RECT>,
     ) {
         if let Some(a) = caret_anchor {
             *self.last_valid_anchor.borrow_mut() = Some(a);
@@ -5682,8 +5996,7 @@ impl TextService_Impl {
         // Ref は残る）。COM コールアウト中の再入 borrow_mut と衝突して panic → 保護の
         // 無い入口では abort になるため、先に let 束縛して文末で Ref を解放する。
         let anchor = *self.last_valid_anchor.borrow();
-        let preview = self.input_predictions.borrow().visible();
-        if self.showing.get() || preview {
+        if self.showing.get() {
             if let Some(anchor) = anchor {
                 let items = self.cand_state.borrow().items().to_vec();
                 if !items.is_empty() {
@@ -5692,25 +6005,26 @@ impl TextService_Impl {
                     // items/selected の借用は各行の文末で解放済み。COM コールアウトを
                     // またいで保持されるのは candidate_ui の RefMut のみ（presenter の
                     // 規律上不可避）— 再入は guarded が捌く。
-                    if preview { self.candidate_ui.borrow_mut().show_preview(&items, anchor, theme); }
-                    else { self.candidate_ui.borrow_mut().show(&items, selected, anchor, theme); }
+                    self.candidate_ui.borrow_mut().show(&items, selected, anchor, theme);
                 }
             }
         }
-        // 読みモニタの表示条件の真実源は should_show（通常更新と同じ）。
-        let visible = crate::reading_monitor::should_show(
-            self.reading_monitor_enabled.get(),
-            self.state.borrow().composing,
-            self.live_enabled.get(),
-            self.showing.get(),
-        );
-        let reading = self.monitor_reading_text();
-        if visible && !preview && !reading.is_empty() {
+        // 統合パネル（読み行 + 予測候補欄）。表示データの組立は通常更新と同じ
+        // panel_sync_data（plan_panel の判定をデータへも反映）。予測候補は input_predictions
+        // から stale 判定付きで写すだけ — パネルの位置決めは通常更新と同じ composition
+        // 先頭基準に一本化されている。ホスト描画中は触らない（読み行も隠れている）。
+        let Some((composition, reading, candidates)) = self.panel_sync_data() else {
+            return;
+        };
+        if !reading.is_empty() || !candidates.is_empty() {
             let max_chars = self.reading_monitor_max_chars.get();
             let theme = self.appearance.borrow_mut().current_theme();
             self.reading_monitor.borrow_mut().show_or_update(
                 &reading,
+                &candidates,
                 monitor_anchor,
+                extent.map(|rc| rc.right - rc.left),
+                composition,
                 max_chars,
                 theme,
             );
@@ -6799,6 +7113,7 @@ pub(crate) fn layout_refresh_apply(
     gen: u64,
     caret_anchor: Option<crate::candidate_window::CaretAnchor>,
     monitor_anchor: Option<crate::candidate_window::CaretAnchor>,
+    extent: Option<RECT>,
 ) {
     LAYOUT_TS.with(|p| {
         let ptr = p.get();
@@ -6811,7 +7126,7 @@ pub(crate) fn layout_refresh_apply(
             return;
         }
         ts.layout_refresh_pending.set(false);
-        ts.relayout_popups_on_layout(caret_anchor, monitor_anchor);
+        ts.relayout_popups_on_layout(caret_anchor, monitor_anchor, extent);
     });
 }
 
@@ -7882,6 +8197,7 @@ mod a8_tests {
                 session: 7,
                 proto: None,
                 boot: None,
+                capabilities: None,
             })),
             Some(7)
         );
@@ -8491,7 +8807,7 @@ mod deactivate_preflight_tests {
             let service = super::TextService::new().into_outer();
             for ch in "おしたら".chars() {
                 service.state.borrow_mut().handle(InputEvent::Key(KeyEvent::Text {
-                    ch, style: TextStyle::Kana, replay: ReplayMode::Full,
+                    ch, style: TextStyle::Kana, replay: ReplayMode::Full, original: None,
                 }));
             }
             let configuration = service.configuration_generation.get();
@@ -8518,7 +8834,7 @@ mod deactivate_preflight_tests {
                 "invalidated" => service.state.borrow_mut().invalidate_live_display(),
                 "suffix" | "pending_romaji" => {
                     let output = service.state.borrow_mut().handle(InputEvent::Key(KeyEvent::Text {
-                        ch: if case == "suffix" { 'の' } else { 'n' }, style: TextStyle::Kana, replay: ReplayMode::Full,
+                        ch: if case == "suffix" { 'の' } else { 'n' }, style: TextStyle::Kana, replay: ReplayMode::Full, original: None,
                     }));
                     let operation = output.immediate.unwrap();
                     let crate::input_module::ImmediateOperation::SetPreedit { text } = &operation else { panic!() };
@@ -8569,6 +8885,7 @@ mod deactivate_preflight_tests {
                     ch,
                     style: TextStyle::Kana,
                     replay: ReplayMode::Full,
+                    original: None,
                 }));
         }
         let configuration = service.configuration_generation.get();

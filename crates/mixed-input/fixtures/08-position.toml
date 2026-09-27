@@ -1,0 +1,114 @@
+# 位置対応の契約例。caret は元入力ソース上の Unicode scalar 位置で表す（計画書 4.2）。
+# 移動しても採用中の解釈・被覆が替わらないことを表現する。
+
+[[episode]]
+id = "pos-001"
+category = "position"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "move_to:6"]
+notes = "日本語/Literal 境界の直前に caret を置く"
+
+[[episode]]
+id = "pos-002"
+category = "position"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "move_to:12"]
+notes = "Literal 直後に移動"
+
+[[episode]]
+id = "pos-003"
+category = "position"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "move_to:0"]
+notes = "Home"
+
+[[episode]]
+id = "pos-004"
+category = "position"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "move_to:19"]
+notes = "End（末尾 scalar）"
+
+[[episode]]
+id = "pos-005"
+category = "position"
+source = "README.mdwohiraku"
+expected = [
+  { kind = "literal", text = "README.md" },
+  { kind = "japanese", text = "wohiraku" },
+]
+events = ["type:README.mdwohiraku", "move_to:9"]
+notes = "記号を含む Literal の直後に移動"
+
+[[episode]]
+id = "pos-006"
+category = "position"
+source = "APIwocallsuru"
+expected = [
+  { kind = "literal", text = "API" },
+  { kind = "japanese", text = "wo" },
+  { kind = "literal", text = "call" },
+  { kind = "japanese", text = "suru" },
+]
+events = ["type:APIwocallsuru", "move_to:3"]
+notes = "先頭 Literal の直後に移動"
+
+[[episode]]
+id = "pos-007"
+category = "position"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "move_to:9", "annotate:auto_reinterpret_paused"]
+notes = "Literal の途中への移動では自動再解釈を止める（計画書 4.4）"
+
+[[episode]]
+id = "pos-008"
+category = "position"
+source = "kyoukyouha"
+expected = "all_japanese"
+events = ["type:kyouha", "move_to:0", "type:kyou"]
+notes = "先頭への挿入"
+
+[[episode]]
+id = "pos-009"
+category = "position"
+source = "wotukaukyouha"
+expected = "all_japanese"
+events = ["type:kyouha", "move_to:0", "type:wotukau"]
+notes = "先頭への複数文字挿入"
+
+[[episode]]
+id = "pos-010"
+category = "position"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "move_to:6", "move_to:19"]
+notes = "移動往復で解釈が替わらない"

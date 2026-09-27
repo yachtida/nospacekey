@@ -1,0 +1,166 @@
+# 大文字・記号を含む原文保持の契約例。記号・大小文字・空白も原文どおり保持する（計画書 2.1）。
+
+[[episode]]
+id = "cs-001"
+category = "caps_symbol"
+source = "README.mdwohiraku"
+expected = [
+  { kind = "literal", text = "README.md" },
+  { kind = "japanese", text = "wohiraku" },
+]
+events = ["type:README.mdwohiraku"]
+notes = "README.mdを開く。受入例の正本"
+
+[[episode]]
+id = "cs-002"
+category = "caps_symbol"
+source = "Makefilewonaosita"
+expected = [
+  { kind = "literal", text = "Makefile" },
+  { kind = "japanese", text = "wonaosita" },
+]
+events = ["type:Makefilewonaosita"]
+notes = "Makefileを直した"
+
+[[episode]]
+id = "cs-003"
+category = "caps_symbol"
+source = "src/main.rsdekowareta"
+expected = [
+  { kind = "literal", text = "src/main.rs" },
+  { kind = "japanese", text = "dekowareta" },
+]
+events = ["type:src/main.rsdekowareta"]
+notes = "パス区切りも Literal 区間内の原文"
+
+[[episode]]
+id = "cs-004"
+category = "caps_symbol"
+source = "TodoListwosakusurusita"
+expected = [
+  { kind = "literal", text = "TodoList" },
+  { kind = "japanese", text = "wosakusurusita" },
+]
+events = ["type:TodoListwosakusurusita"]
+notes = "TodoListを作成した"
+
+[[episode]]
+id = "cs-005"
+category = "caps_symbol"
+source = "UIwokireinisuru"
+expected = [
+  { kind = "literal", text = "UI" },
+  { kind = "japanese", text = "wokireinisuru" },
+]
+events = ["type:UIwokireinisuru"]
+notes = "UIをきれいにする"
+
+[[episode]]
+id = "cs-006"
+category = "caps_symbol"
+source = "Windows11wokatta"
+expected = [
+  { kind = "literal", text = "Windows11" },
+  { kind = "japanese", text = "wokatta" },
+]
+events = ["type:Windows11wokatta"]
+notes = "Windows11を買った"
+
+[[episode]]
+id = "cs-007"
+category = "caps_symbol"
+source = "AtCoderdemainichimeeta"
+expected = [
+  { kind = "literal", text = "AtCoder" },
+  { kind = "japanese", text = "demainichimeeta" },
+]
+events = ["type:AtCoderdemainichimeeta"]
+notes = "AtCoderで毎日会えた"
+
+[[episode]]
+id = "cs-008"
+category = "caps_symbol"
+source = "iPhonewokattanoni"
+expected = [
+  { kind = "literal", text = "iPhone" },
+  { kind = "japanese", text = "wokattanoni" },
+]
+events = ["type:iPhonewokattanoni"]
+notes = "中間大文字。綴り・大小を補正しない"
+
+[[episode]]
+id = "cs-009"
+category = "caps_symbol"
+source = "Wi-Fiwotsukatta"
+expected = [
+  { kind = "literal", text = "Wi-Fi" },
+  { kind = "japanese", text = "wotsukatta" },
+]
+events = ["type:Wi-Fiwotsukatta"]
+notes = "Wi-Fiを使った。ハイフンを分離しない"
+
+[[episode]]
+id = "cs-010"
+category = "caps_symbol"
+source = "JavaScriptmokowarenikui"
+expected = [
+  { kind = "literal", text = "JavaScript" },
+  { kind = "japanese", text = "mokowarenikui" },
+]
+events = ["type:JavaScriptmokowarenikui"]
+notes = "JavaScriptも壊れにくい"
+
+[[episode]]
+id = "cs-011"
+category = "caps_symbol"
+source = "Ctrl+Cdekopisita"
+expected = [
+  { kind = "literal", text = "Ctrl+C" },
+  { kind = "japanese", text = "dekopisita" },
+]
+events = ["type:Ctrl+Cdekopisita"]
+notes = "Ctrl+Cでコピーした。+ 記号"
+
+[[episode]]
+id = "cs-012"
+category = "caps_symbol"
+source = "PDFnoinnsatugahayai"
+expected = [
+  { kind = "literal", text = "PDF" },
+  { kind = "japanese", text = "noinnsatugahayai" },
+]
+events = ["type:PDFnoinnsatugahayai"]
+notes = "PDFの印刷が速い"
+
+[[episode]]
+id = "cs-013"
+category = "caps_symbol"
+source = "USBwosashikaenai"
+expected = [
+  { kind = "literal", text = "USB" },
+  { kind = "japanese", text = "wosashikaenai" },
+]
+events = ["type:USBwosashikaenai"]
+notes = "USBを差し挿えない"
+
+[[episode]]
+id = "cs-014"
+category = "caps_symbol"
+source = "version2.0wohanasiteiru"
+expected = [
+  { kind = "literal", text = "version2.0" },
+  { kind = "japanese", text = "wohanasiteiru" },
+]
+events = ["type:version2.0wohanasiteiru"]
+notes = "version2.0を話している。数字と . の混在"
+
+[[episode]]
+id = "cs-015"
+category = "caps_symbol"
+source = "github copilotwotsukau"
+expected = [
+  { kind = "literal", text = "github copilot" },
+  { kind = "japanese", text = "wotsukau" },
+]
+events = ["type:github copilotwotsukau"]
+notes = "空白を含む区間。空白も原文のまま保持する（計画書 11 の空白・記号）"

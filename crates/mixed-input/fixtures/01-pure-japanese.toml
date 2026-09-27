@@ -1,0 +1,243 @@
+# 純日本語の契約例。意図が明確な文を英字に割らないことを表現する（計画書 11）。
+# made / are / no / to など和英同形の並びを含む文も、日本語側を既定とする。
+# 区分の合否は区間解釈で測り、変換出力（同音異義語）はこの区分で問わない。
+
+[[episode]]
+id = "pj-001"
+category = "pure_japanese"
+source = "sokomadematte"
+expected = "all_japanese"
+events = ["type:sokomadematte"]
+notes = "そこまで待って"
+
+[[episode]]
+id = "pj-002"
+category = "pure_japanese"
+source = "arehamadadesu"
+expected = "all_japanese"
+events = ["type:arehamadadesu"]
+notes = "あれはまだです"
+
+[[episode]]
+id = "pj-003"
+category = "pure_japanese"
+source = "konobenkyouhaomoshiroi"
+expected = "all_japanese"
+events = ["type:konobenkyouhaomoshiroi"]
+notes = "この勉強は面白い"
+
+[[episode]]
+id = "pj-004"
+category = "pure_japanese"
+source = "ashitanohaikemasen"
+expected = "all_japanese"
+events = ["type:ashitanohaikemasen"]
+notes = "明日は行けません"
+
+[[episode]]
+id = "pj-005"
+category = "pure_japanese"
+source = "kinounoasagohanniwotaberu"
+expected = "all_japanese"
+events = ["type:kinounoasagohanniwotaberu"]
+notes = "昨日の朝ご飯を食べる"
+
+[[episode]]
+id = "pj-006"
+category = "pure_japanese"
+source = "hatarakitainodekyouhayasumimasu"
+expected = "all_japanese"
+events = ["type:hatarakitainodekyouhayasumimasu"]
+notes = "働きたいので今日は休みます"
+
+[[episode]]
+id = "pj-007"
+category = "pure_japanese"
+source = "kitakunihekaerimasu"
+expected = "all_japanese"
+events = ["type:kitakunihekaerimasu"]
+notes = "北国へ帰ります"
+
+[[episode]]
+id = "pj-008"
+category = "pure_japanese"
+source = "madasangatsu"
+expected = "all_japanese"
+events = ["type:madasangatsu"]
+notes = "まだ三月"
+
+[[episode]]
+id = "pj-009"
+category = "pure_japanese"
+source = "arehanantonaku"
+expected = "all_japanese"
+events = ["type:arehanantonaku"]
+notes = "あれはなんとなく"
+
+[[episode]]
+id = "pj-010"
+category = "pure_japanese"
+source = "kyounoyoruhanetasugiru"
+expected = "all_japanese"
+events = ["type:kyounoyoruhanetasugiru"]
+notes = "今日の夜は寝たすぎる"
+
+[[episode]]
+id = "pj-011"
+category = "pure_japanese"
+source = "honwomitainodemachiniiku"
+expected = "all_japanese"
+events = ["type:honwomitainodemachiniiku"]
+notes = "本を読みたいので街に行く"
+
+[[episode]]
+id = "pj-012"
+category = "pure_japanese"
+source = "tanoshikattakioku"
+expected = "all_japanese"
+events = ["type:tanoshikattakioku"]
+notes = "楽しかった記憶"
+
+[[episode]]
+id = "pj-013"
+category = "pure_japanese"
+source = "annainwotanomu"
+expected = "all_japanese"
+events = ["type:annainwotanomu"]
+notes = "案内を頼む"
+
+[[episode]]
+id = "pj-014"
+category = "pure_japanese"
+source = "konosakiwanannmoiwanaide"
+expected = "all_japanese"
+events = ["type:konosakiwanannmoiwanaide"]
+notes = "この先は何も言わないで"
+
+[[episode]]
+id = "pj-015"
+category = "pure_japanese"
+source = "minnadeousamaninaru"
+expected = "all_japanese"
+events = ["type:minnadeousamaninaru"]
+notes = "みんなで王様になる"
+
+[[episode]]
+id = "pj-016"
+category = "pure_japanese"
+source = "yamanouriwokimirimashita"
+expected = "all_japanese"
+events = ["type:yamanouriwokimirimashita"]
+notes = "山の裏を見ました"
+
+[[episode]]
+id = "pj-017"
+category = "pure_japanese"
+source = "nihongonohajimarihaomoshiroi"
+expected = "all_japanese"
+events = ["type:nihongonohajimarihaomoshiroi"]
+notes = "日本語の始まりは面白い"
+
+[[episode]]
+id = "pj-018"
+category = "pure_japanese"
+source = "hanasunikitenai"
+expected = "all_japanese"
+events = ["type:hanasunikitenai"]
+notes = "話しに来てない"
+
+[[episode]]
+id = "pj-019"
+category = "pure_japanese"
+source = "syuumatuniwaonngakuwokiku"
+expected = "all_japanese"
+events = ["type:syuumatuniwaonngakuwokiku"]
+notes = "週末には音楽を聞く"
+
+[[episode]]
+id = "pj-020"
+category = "pure_japanese"
+source = "kyouhazangyouwanidesu"
+expected = "all_japanese"
+events = ["type:kyouhazangyouwanidesu"]
+notes = "今日は残業は無しです"
+
+[[episode]]
+id = "pj-021"
+category = "pure_japanese"
+source = "tukaretakarahayakunemasu"
+expected = "all_japanese"
+events = ["type:tukaretakarahayakunemasu"]
+notes = "疲れたから早く寝ます"
+
+[[episode]]
+id = "pj-022"
+category = "pure_japanese"
+source = "mizunomottomottekuru"
+expected = "all_japanese"
+events = ["type:mizunomottomottekuru"]
+notes = "水をもっと持ってくる"
+
+[[episode]]
+id = "pj-023"
+category = "pure_japanese"
+source = "karehananamowosiranai"
+expected = "all_japanese"
+events = ["type:karehananamowosiranai"]
+notes = "彼は何も知らない"
+
+[[episode]]
+id = "pj-024"
+category = "pure_japanese"
+source = "samuinodekootowokiru"
+expected = "all_japanese"
+events = ["type:samuinodekootowokiru"]
+notes = "寒いのでコートを着る"
+
+[[episode]]
+id = "pj-025"
+category = "pure_japanese"
+source = "ashitanohikigaerebayomimasu"
+expected = "all_japanese"
+events = ["type:ashitanohikigaerebayomimasu"]
+notes = "明日の日が変われば読みます"
+
+[[episode]]
+id = "pj-026"
+category = "pure_japanese"
+source = "korehamadakangaechuu"
+expected = "all_japanese"
+events = ["type:korehamadakangaechuu"]
+notes = "これはまだ考え中"
+
+[[episode]]
+id = "pj-027"
+category = "pure_japanese"
+source = "soremadejikkousitaraowari"
+expected = "all_japanese"
+events = ["type:soremadejikkousitaraowari"]
+notes = "それまで実行したら終わり"
+
+[[episode]]
+id = "pj-028"
+category = "pure_japanese"
+source = "kotobanoiminishizumu"
+expected = "all_japanese"
+events = ["type:kotobanoiminishizumu"]
+notes = "言葉の意味に沈む"
+
+[[episode]]
+id = "pj-029"
+category = "pure_japanese"
+source = "nanikagamitukattarahanasu"
+expected = "all_japanese"
+events = ["type:nanikagamitukattarahanasu"]
+notes = "何かが見つかったら話す"
+
+[[episode]]
+id = "pj-030"
+category = "pure_japanese"
+source = "hitoridenokyoukaiwokoeru"
+expected = "all_japanese"
+events = ["type:hitoridenokyoukaiwokoeru"]
+notes = "一人での境界を越える"

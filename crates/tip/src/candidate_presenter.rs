@@ -187,6 +187,26 @@ impl CandidatePresenter {
     pub fn destroy_window(&mut self) {
         self.window.destroy();
     }
+
+    /// 予測プレビューの**公開のみ**を行う（統合パネル移行後の予測経路）。
+    /// advertise（BeginUIElement）と候補データの state 設定までを済ませ、自前窓は出さない。
+    /// 戻り値 true = 自前描画を担える環境（デスクトップ pbShow=TRUE / mgr 無しフォール
+    /// バック）→ 読み+予測の統合パネルが見た目を担う（element は活性のまま維持 —
+    /// 従来 show_preview が pbShow=TRUE で自前窓を出すのと同じ契約の履行）。
+    /// false = ホスト描画環境（イマーシブ検索等の pbShow=FALSE）→ データ公開済みなので
+    /// ホストが候補リストを描く。既存 element の再公開なら CLUIE_FULL で再読み込みを促す。
+    /// 先に advertise を確定させるため、初回呼び出しからホスト/自前の判定が正しく分岐する。
+    pub fn publish_preview(&mut self, candidates: &[String]) -> bool {
+        self.state.borrow_mut().set(candidates.to_vec(), 0);
+        let first = self.element_id.is_none();
+        let begin = self.begin_if_needed();
+        let _ = effective_selection_after_begin(&self.state, candidates, 0, begin);
+        self.window.hide();
+        if !first {
+            self.signal_update(CLUIE_FULL);
+        }
+        should_draw_self(self.advertised(), self.pbshow)
+    }
 }
 
 impl CandidateUI for CandidatePresenter {
@@ -215,11 +235,6 @@ impl CandidateUI for CandidatePresenter {
             }
         }
     }
-    fn show_preview(&mut self, candidates: &[String], anchor: crate::candidate_window::CaretAnchor, theme: crate::theme::Theme) {
-        self.show(candidates, 0, anchor, theme);
-        self.window.set_preview(true);
-    }
-
     fn hide(&mut self) {
         self.window.hide();
         self.end();
@@ -244,6 +259,53 @@ impl CandidateUI for CandidatePresenter {
 mod tests {
     use super::*;
     use crate::candidate_uielement::{behavior_abort, behavior_finalize, behavior_set_selection};
+    use windows::Win32::Foundation::E_NOTIMPL;
+    use windows::Win32::UI::TextServices::{IEnumTfUIElements, ITfUIElementMgr_Impl};
+
+    /// ホスト（ITfUIElementMgr）の検出器。Begin/Update/End の呼出数だけ数える。
+    /// 「0 件応答の後始末（hide）が公開済み UIElement を End する」契約の受け側保証用
+    /// （input_prediction の 0 件経路が CandidateUI::hide を呼ぶことと対で成立する）。
+    struct MgrCounts {
+        pbshow: Cell<bool>,
+        begins: Cell<u32>,
+        updates: Cell<u32>,
+        ends: Cell<u32>,
+    }
+
+    #[windows::core::implement(ITfUIElementMgr)]
+    struct FakeUiElementMgr {
+        counts: Rc<MgrCounts>,
+    }
+
+    impl ITfUIElementMgr_Impl for FakeUiElementMgr_Impl {
+        fn BeginUIElement(
+            &self,
+            _pelement: windows::core::Ref<'_, ITfUIElement>,
+            pbshow: *mut BOOL,
+            pdwuielementid: *mut u32,
+        ) -> windows::core::Result<()> {
+            unsafe {
+                *pbshow = self.counts.pbshow.get().into();
+                *pdwuielementid = 1;
+            }
+            self.counts.begins.set(self.counts.begins.get() + 1);
+            Ok(())
+        }
+        fn UpdateUIElement(&self, _dwuielementid: u32) -> windows::core::Result<()> {
+            self.counts.updates.set(self.counts.updates.get() + 1);
+            Ok(())
+        }
+        fn EndUIElement(&self, _dwuielementid: u32) -> windows::core::Result<()> {
+            self.counts.ends.set(self.counts.ends.get() + 1);
+            Ok(())
+        }
+        fn GetUIElement(&self, _dwuielementid: u32) -> windows::core::Result<ITfUIElement> {
+            Err(E_NOTIMPL.into())
+        }
+        fn EnumUIElements(&self) -> windows::core::Result<IEnumTfUIElements> {
+            Err(E_NOTIMPL.into())
+        }
+    }
     #[test]
     fn route_selection() {
         assert!(should_draw_self(true, true)); // デスクトップ: 自前描画
@@ -315,5 +377,44 @@ mod tests {
         assert!(!active.get());
         assert_eq!(*outbox.borrow(), None);
         assert!(!dirty.get());
+    }
+
+    #[test]
+    fn publish_then_hide_ends_the_host_element_and_republish_begins_fresh() {
+        // 0 件応答の後始末（CandidateUI::hide）は公開済み UIElement を EndUIElement で
+        // 終了しなければならない — End を省くとホスト描画環境では TIP 内部の候補が消えて
+        // もホスト側に旧候補リストが描き続く（UILess モードの終了通知契約）。
+        // 取り下げ後の次回非空応答は新しい Begin で立て直す。
+        let counts = Rc::new(MgrCounts {
+            pbshow: Cell::new(false), // ホスト描画環境（pbShow=FALSE）を模す。
+            begins: Cell::new(0),
+            updates: Cell::new(0),
+            ends: Cell::new(0),
+        });
+        let mgr: ITfUIElementMgr = FakeUiElementMgr {
+            counts: Rc::clone(&counts),
+        }
+        .into();
+        let mut presenter = CandidatePresenter::new(
+            Rc::new(RefCell::new(CandidateState::default())),
+            Rc::new(RefCell::new(None)),
+            Rc::new(Cell::new(false)),
+            Rc::new(|| {}),
+        );
+        presenter.set_ui_mgr(Some(mgr));
+        // ホスト描画環境の公開: publish_preview はデータ公開のみで自前描画しない（false）。
+        assert!(!presenter.publish_preview(&["がぞう".to_string()]));
+        assert_eq!(counts.begins.get(), 1);
+        assert_eq!(counts.updates.get(), 0);
+        // 既存 element の再公開は End ではなく CLUIE_FULL で再読み込みを促す。
+        assert!(!presenter.publish_preview(&["がぞう".into(), "ぶぶん".into()]));
+        assert_eq!(counts.updates.get(), 1);
+        // hide（=0 件応答が呼ぶ後始末）は公開済み element を EndUIElement で終了する。
+        presenter.hide();
+        assert_eq!(counts.ends.get(), 1);
+        // 取り下げ後の次回応答は新規 Begin で立て直す（終了済み id を使い回さない）。
+        assert!(!presenter.publish_preview(&["がぞう".to_string()]));
+        assert_eq!(counts.begins.get(), 2);
+        assert_eq!(counts.updates.get(), 1);
     }
 }

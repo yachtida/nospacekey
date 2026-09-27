@@ -1,0 +1,96 @@
+# 部分確定の契約例（計画書 8.4）。expected は宣言ソース全体の解釈を被覆し、
+# commit_prefix はその接頭辞を確定することを表す。
+# 確定境界が Literal 区間の途中を割らないことを E_COMMIT_FENCE で要求する。
+
+[[episode]]
+id = "pc-001"
+category = "partial_commit"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "commit_prefix:6"]
+notes = "日本語 prefix を確定し、Literal を残す。境界は Literal 直前"
+
+[[episode]]
+id = "pc-002"
+category = "partial_commit"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "commit_prefix:12"]
+notes = "Literal 直後まで確定"
+
+[[episode]]
+id = "pc-003"
+category = "partial_commit"
+source = "kyouhaPythonwotukau"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukau" },
+]
+events = ["type:kyouhaPythonwotukau", "commit_all"]
+notes = "全確定"
+
+[[episode]]
+id = "pc-004"
+category = "partial_commit"
+source = "README.mdwohiraku"
+expected = [
+  { kind = "literal", text = "README.md" },
+  { kind = "japanese", text = "wohiraku" },
+]
+events = ["type:README.mdwohiraku", "commit_prefix:9"]
+notes = "記号を含む Literal 区間の直後まで確定"
+
+[[episode]]
+id = "pc-005"
+category = "partial_commit"
+source = "APIwocallsuru"
+expected = [
+  { kind = "literal", text = "API" },
+  { kind = "japanese", text = "wo" },
+  { kind = "literal", text = "call" },
+  { kind = "japanese", text = "suru" },
+]
+events = ["type:APIwocallsuru", "commit_prefix:3"]
+notes = "先頭 Literal を確定"
+
+[[episode]]
+id = "pc-006"
+category = "partial_commit"
+source = "made"
+expected = [
+  { kind = "literal", text = "made" },
+]
+events = ["type:made", "commit_prefix:4"]
+notes = "利用者が英字を選んだ曖昧語は確定できる"
+
+[[episode]]
+id = "pc-007"
+category = "partial_commit"
+source = "kyouhaPythonwotukausuguni"
+expected = [
+  { kind = "japanese", text = "kyouha" },
+  { kind = "literal", text = "Python" },
+  { kind = "japanese", text = "wotukausuguni" },
+]
+events = ["type:kyouhaPythonwotukau", "commit_prefix:12", "type:suguni"]
+notes = "部分確定後の入力継続"
+
+[[episode]]
+id = "pc-008"
+category = "partial_commit"
+source = "meetingnoato"
+expected = [
+  { kind = "literal", text = "meeting" },
+  { kind = "japanese", text = "noato" },
+]
+events = ["type:meetingnoato", "commit_prefix:7"]
+notes = "Literal を確定して日本語だけを残す"

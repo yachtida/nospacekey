@@ -1,0 +1,27 @@
+[package]
+name = "mixed-input"
+version.workspace = true
+edition = "2021"
+publish = false
+# 再生 CLI は公開名 mixed-input-replay でだけ出す。src/bin の自動検出に任せると
+# replay という名前になり、ドキュメントの使い方と食い違う。
+autobins = false
+
+[[bin]]
+name = "mixed-input-replay"
+path = "src/bin/replay.rs"
+
+[[bin]]
+name = "mixed-input-eval"
+path = "src/bin/eval.rs"
+
+[[bin]]
+name = "mixed-input-quality"
+path = "src/bin/quality.rs"
+
+[dependencies]
+# fixture 読込だけに serde/toml を使う。判別器本体（PR4）もこの crate に載るが、
+# ここから TSF・IPC・Swift・ネットワークへ依存させない（計画書 4.1）。
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+sha2 = "0.10"

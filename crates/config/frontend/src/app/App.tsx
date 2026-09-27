@@ -27,6 +27,7 @@ type SearchEntry = { page: PageId; target: string; title: string; description: s
 const SEARCH: SearchEntry[] = [
   { page: "engine", target: "setting-conversion-latency", title: "変換速度の詳細", description: "処理時間と時間切れの統計", terms: "遅い 応答 タイムアウト 計測" },
   { page: "input", target: "setting-default-direct", title: "開始時モード", description: "ひらがな／半角英数", terms: "初期 アプリ" },
+  { page: "input", target: "setting-mixed-input", title: "日本語・英字の混在入力", description: "OFF・候補のみ（試験）。自動は利用不可", terms: "英語 mixed github 試験" },
   { page: "input", target: "setting-input-prediction", title: "入力中の予測候補", description: "読みから候補を表示しTabで選択", terms: "予測 補完 Tab" },
   { page: "input", target: "setting-live-conversion", title: "ライブ変換", description: "入力中に自動で変換", terms: "自動" },
   { page: "input", target: "setting-live-search-width", title: "ライブ変換の探索幅", description: "速度優先（1）・精度優先（10）", terms: "候補 探索範囲 N_best スペース" },

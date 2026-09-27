@@ -56,6 +56,17 @@ export function InputPage() {
         >
           <Switch checked={values.liveEnabled} onChange={(value) => save({ field: "live_enabled", value })} label="ライブ変換" />
         </SettingRow>
+        <SettingRow id="mixed-input" title="日本語・英字の混在入力"
+          description="候補に英字を残す解釈を追加する試験機能です。精度は評価中のため、確定前に候補を確認してください。自動モードは利用できません。"
+          effect="入力先を開き直した後">
+          <SegmentedChoice
+            label="日本語・英字の混在入力"
+            value={values.mixedInput === "auto" ? "candidates" : values.mixedInput}
+            options={[{ value: "off", label: "OFF" }, { value: "candidates", label: "候補のみ（試験）" }, { value: "auto", label: "自動", disabled: true }]}
+            onChange={(value) => save({ field: "mixed_input", value })}
+          />
+          <InlineError errors={errors} field="mixed_input" />
+        </SettingRow>
         <SettingRow id="input-prediction" title="入力中の予測候補"
           description="読みの先を補う候補を表示します。Tabで選択、Enterまたはクリックで確定。Escで閉じ、次に読みを変えると再表示します。"
           effect="入力先を開き直した後">

@@ -1,0 +1,18 @@
+# mixed-input 判別器の技術用語辞書（baseline）。一般語と別レイヤーにして
+# 技術用語だけに最適化し過ぎない（計画書 9.3）。
+# 出典: 自作（本リポジトリ作成・公開の技術用語の一般的な綴りのみ）。
+# ライセンス: リポジトリ本体と同じ LICENSE に従う。# 始まりの行と空行は無視される。
+github
+docker
+python
+rust
+typescript
+kubernetes
+linux
+windows
+keyboard
+monitor
+compiler
+binary
+server
+client

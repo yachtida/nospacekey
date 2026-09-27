@@ -1,0 +1,134 @@
+# 辞書 holdout の契約例。架空の製品名・識別子で「辞書を覚えただけ」ではない
+# 汎化の対象を表現する（計画書 11・9.2）。実在語との混合を避けるため作例に限定する。
+
+[[episode]]
+id = "uw-001"
+category = "unknown_words"
+source = "zorbaxwonoru"
+expected = [
+  { kind = "literal", text = "zorbax" },
+  { kind = "japanese", text = "wonoru" },
+]
+events = ["type:zorbaxwonoru"]
+notes = "zorbaxを乗る。未知語＋末尾子音"
+
+[[episode]]
+id = "uw-002"
+category = "unknown_words"
+source = "quixeldegakusyusita"
+expected = [
+  { kind = "literal", text = "quixel" },
+  { kind = "japanese", text = "degakusyusita" },
+]
+events = ["type:quixeldegakusyusita"]
+notes = "quixelで学習した。ローマ字としても読めない q 開始"
+
+[[episode]]
+id = "uw-003"
+category = "unknown_words"
+source = "brontodbgakowareta"
+expected = [
+  { kind = "literal", text = "brontodb" },
+  { kind = "japanese", text = "gakowareta" },
+]
+events = ["type:brontodbgakowareta"]
+notes = "brontodbが壊れた。識別子形状"
+
+[[episode]]
+id = "uw-004"
+category = "unknown_words"
+source = "vaptideensyutusuru"
+expected = [
+  { kind = "literal", text = "vapti" },
+  { kind = "japanese", text = "deensyutusuru" },
+]
+events = ["type:vaptideensyutusuru"]
+notes = "vaptiで抽出する"
+
+[[episode]]
+id = "uw-005"
+category = "unknown_words"
+source = "hexlanenokenkyuusita"
+expected = [
+  { kind = "literal", text = "hexlane" },
+  { kind = "japanese", text = "nokenkyuusita" },
+]
+events = ["type:hexlanenokenkyuusita"]
+notes = "hexlaneの調査した"
+
+[[episode]]
+id = "uw-006"
+category = "unknown_words"
+source = "nulfoxnoinnsutusuruto"
+expected = [
+  { kind = "literal", text = "nulfox" },
+  { kind = "japanese", text = "noinnsutusuruto" },
+]
+events = ["type:nulfoxnoinnsutusuruto"]
+notes = "nulfoxの印字する時と。接頭辞でも読みに切れない"
+
+[[episode]]
+id = "uw-007"
+category = "unknown_words"
+source = "dravikwomitsuketahazugadeta"
+expected = [
+  { kind = "literal", text = "dravik" },
+  { kind = "japanese", text = "womitsuketahazugadeta" },
+]
+events = ["type:dravikwomitsuketahazugadeta"]
+notes = "dravikを見つけたはずがだ"
+
+[[episode]]
+id = "uw-008"
+category = "unknown_words"
+source = "ostrelixnotannikoukansita"
+expected = [
+  { kind = "literal", text = "ostrelix" },
+  { kind = "japanese", text = "notannikoukansita" },
+]
+events = ["type:ostrelixnotannikoukansita"]
+notes = "ostrelixの単位交換した"
+
+[[episode]]
+id = "uw-009"
+category = "unknown_words"
+source = "kymeragadenosita"
+expected = [
+  { kind = "literal", text = "kymera" },
+  { kind = "japanese", text = "gadenosita" },
+]
+events = ["type:kymeragadenosita"]
+notes = "kymeraが出のした。y 開始"
+
+[[episode]]
+id = "uw-010"
+category = "unknown_words"
+source = "talvorndeensyutusuru"
+expected = [
+  { kind = "literal", text = "talvorn" },
+  { kind = "japanese", text = "deensyutusuru" },
+]
+events = ["type:talvorndeensyutusuru"]
+notes = "talvornで抽出する。子音連続 rn"
+
+[[episode]]
+id = "uw-011"
+category = "unknown_words"
+source = "wexbitnotanniwokeru"
+expected = [
+  { kind = "literal", text = "wexbit" },
+  { kind = "japanese", text = "notanniwokeru" },
+]
+events = ["type:wexbitnotanniwokeru"]
+notes = "wexbitの単位に置ける"
+
+[[episode]]
+id = "uw-012"
+category = "unknown_words"
+source = "zonquadenosiyounikaita"
+expected = [
+  { kind = "literal", text = "zonqua" },
+  { kind = "japanese", text = "denosiyounikaita" },
+]
+events = ["type:zonquadenosiyounikaita"]
+notes = "zonquaでの使い様に書いた。q を含む未知語"

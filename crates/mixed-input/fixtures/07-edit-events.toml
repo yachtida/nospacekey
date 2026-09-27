@@ -1,0 +1,172 @@
+# 途中編集の契約例（計画書 11 の編集区分）。
+# source は打鍵列の再生結果として一致することを要求する（E_REPLAY_CONSISTENCY）。
+# PR1 の再生器は scalar 単位の素朴な削除。実際のかな削除・未完ローマ字の
+# 操作契約は既存 composer のままであり、PR2 の CompositionSource が由来を担う。
+
+[[episode]]
+id = "ed-001"
+category = "edit_events"
+source = "kyou"
+expected = "all_japanese"
+events = ["type:kyouha", "delete_backward:2"]
+notes = "後続2文字の削除で「きょは」から戻る"
+
+[[episode]]
+id = "ed-002"
+category = "edit_events"
+source = "kyouha"
+expected = "all_japanese"
+events = ["type:kyouhapythonwotukau", "delete_backward:13"]
+notes = "混在語まで入れた後に英字ごと削除して日本語へ戻る"
+
+[[episode]]
+id = "ed-003"
+category = "edit_events"
+source = "githubnotukaikat"
+expected = "all_japanese"
+events = ["type:githubnotukaikata", "delete_backward:1"]
+notes = "未完の途中も既定は日本語扱い。確定文字列を捏造しない"
+
+[[episode]]
+id = "ed-004"
+category = "edit_events"
+source = "kyu"
+expected = "all_japanese"
+events = ["type:kyo", "delete_backward:1", "type:u"]
+notes = "きょ→き→きゅ。途中の由来は PR2 で ResolvedKana 化"
+
+[[episode]]
+id = "ed-005"
+category = "edit_events"
+source = "soko"
+expected = "all_japanese"
+events = ["type:sokomade", "delete_backward:4"]
+notes = "曖昧語 made を丸ごと削る"
+
+[[episode]]
+id = "ed-006"
+category = "edit_events"
+source = "mada"
+expected = "all_japanese"
+events = ["type:made", "delete_backward:4", "type:mada"]
+notes = "made を全削除して mada へ訂正。元打鍵を捏造しない"
+
+[[episode]]
+id = "ed-007"
+category = "edit_events"
+source = "kite"
+expected = "all_japanese"
+events = ["type:kitemita", "delete_backward:4"]
+notes = "曖昧語が未完成の形で残る"
+
+[[episode]]
+id = "ed-008"
+category = "edit_events"
+source = "kyouha"
+expected = "all_japanese"
+events = ["type:kyouharustwobenkyou", "delete_backward:13"]
+notes = "rust 部分を含む後続をまとめて削除"
+
+[[episode]]
+id = "ed-009"
+category = "edit_events"
+source = "konnitiha"
+expected = "all_japanese"
+events = ["type:xyz", "delete_backward:3", "type:konnitiha"]
+notes = "全文削除からの再入力"
+
+[[episode]]
+id = "ed-010"
+category = "edit_events"
+source = "kanji"
+expected = "all_japanese"
+events = ["type:kan", "type:ji", "delete_backward:2", "type:ji"]
+notes = "末尾 n の再結合"
+
+[[episode]]
+id = "ed-011"
+category = "edit_events"
+source = "kitte"
+expected = "all_japanese"
+events = ["type:kit", "delete_backward:1", "type:t", "type:te"]
+notes = "促音のやり直し"
+
+[[episode]]
+id = "ed-012"
+category = "edit_events"
+source = "kyouhaPytho"
+expected = "all_japanese"
+events = ["type:kyouhaPython", "delete_backward:1"]
+notes = "英字の入り口を削って未完に戻す"
+
+[[episode]]
+id = "ed-013"
+category = "edit_events"
+source = "kyouhaPythonw"
+expected = "all_japanese"
+events = ["type:kyouhaPythonwotukau", "delete_backward:6"]
+notes = "混在採用が崩れた編集も既定日本語で継続"
+
+[[episode]]
+id = "ed-014"
+category = "edit_events"
+source = "areha"
+expected = "all_japanese"
+events = ["type:arehamada", "delete_backward:4"]
+notes = "曖昧語を含む列の後続削除"
+
+[[episode]]
+id = "ed-015"
+category = "edit_events"
+source = "sokomad"
+expected = "all_japanese"
+events = ["type:sokomade", "delete_backward:1"]
+notes = "末尾1文字の削除"
+
+[[episode]]
+id = "ed-016"
+category = "edit_events"
+source = "githubnotukaikata"
+expected = [
+  { kind = "literal", text = "github" },
+  { kind = "japanese", text = "notukaikata" },
+]
+events = ["type:githubno", "delete_backward:2", "type:notukaikata"]
+notes = "削除後の再入力で混在が成立する"
+
+[[episode]]
+id = "ed-017"
+category = "edit_events"
+source = "mada"
+expected = "all_japanese"
+events = ["type:m", "type:ade", "delete_backward:3", "type:ada"]
+notes = "分割入力と訂正の組合せ"
+
+[[episode]]
+id = "ed-018"
+category = "edit_events"
+source = "APIwocallsuru"
+expected = [
+  { kind = "literal", text = "API" },
+  { kind = "japanese", text = "wo" },
+  { kind = "literal", text = "call" },
+  { kind = "japanese", text = "suru" },
+]
+events = ["type:AP", "delete_backward:1", "type:PI", "type:wocallsuru"]
+notes = "大文字部分を訂正しながらの複数混在"
+
+[[episode]]
+id = "ed-019"
+category = "edit_events"
+source = "kyouha"
+expected = "all_japanese"
+events = ["type:k", "type:y", "delete_backward:1", "type:you", "type:ha"]
+notes = "1文字単位の入力と訂正"
+
+[[episode]]
+id = "ed-020"
+category = "edit_events"
+source = "honn"
+expected = "all_japanese"
+events = ["type:honne", "delete_backward:1"]
+notes = "んの → ん。末尾 n の契約"

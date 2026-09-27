@@ -1,0 +1,18 @@
+schema = 1
+kind = "char-ngram-linear"
+model_format = 1
+generation = "2026-09-27-trial.1"
+license = "MIT"
+source = "Self-authored repository dictionary and synthetic templates, PR4 training / PR7 validation seed 42"
+
+[model]
+bytes = 16773
+sha256 = "013ea4ee5a3b6519df617ce264850319a7a4fc5a75402c96d678fefa79cd1afd"
+
+[general]
+bytes = 420
+sha256 = "83bf8869e0fd2f3b3b0c854ede72636d2738e1bd13fe2eddd638dc8d379a3efe"
+
+[tech]
+bytes = 496
+sha256 = "e66195030f485b40e3d89957b8bcb691aaadcdd00052596d124cec319732120a"
