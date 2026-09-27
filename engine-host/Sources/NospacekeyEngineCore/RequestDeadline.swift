@@ -17,7 +17,7 @@ struct RequestEnvelope: Decodable {
     func admissionDeadline(receivedAt: UInt64) -> RequestDeadline? {
         let budget: UInt64
         switch request {
-        case .liveSnapshot(_, _, _, _, _, let explicit, _, _, _, _): budget = explicit ? 1_200 : 400
+        case .liveSnapshot(_, _, _, _, _, let explicit, _, _, _, _, _): budget = explicit ? 1_200 : 400
         case .inputPredictions: budget = 400
         case .clauseCandidates, .convertClauses: budget = 1_200
         // 混在変換は明示変換と同じ予算。区間数で積み増しせず、要求全体で共有する

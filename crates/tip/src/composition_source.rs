@@ -34,7 +34,9 @@ pub(crate) fn build(composer: &LocalKanaComposer, revision: u64) -> CompositionS
         // 取り込んだ後も元打鍵が Kana だった unit は Kana のまま解析できる。
         let _ = source.push(SourceElement {
             provenance: Provenance::Typed {
-                style: to_source_style(unit.style),
+                style: if unit.literal && unit.style == InputStyle::Kana {
+                    SourceStyle::LiteralKana
+                } else { to_source_style(unit.style) },
             },
             source_text: unit.original,
             reading: scalar_slice(&reading, start, end),

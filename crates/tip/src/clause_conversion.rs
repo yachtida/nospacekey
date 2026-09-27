@@ -100,6 +100,7 @@ impl ClauseRebaseline {
     pub fn original_key(&self) -> ClauseRequestKey { self.original.request.key }
     pub fn snapshot(&self, left_context: Option<String>) -> ipc::protocol::Request {
         ipc::protocol::Request::LiveSnapshot {
+            include_flat_candidates: false,
             composition: self.identity.composition,
             revision: self.identity.revision,
             configuration_generation: self.identity.configuration_generation,
@@ -1213,6 +1214,7 @@ mod tests {
             let attempt = m.prepare_rebaseline(original.key, 11, 12, now).unwrap();
             assert_eq!(attempt.deadline(), now + Duration::from_millis(1200));
             assert_eq!(attempt.snapshot(Some("前文".into())), ipc::protocol::Request::LiveSnapshot {
+                include_flat_candidates: false,
                 composition: 1, revision: 2, configuration_generation: 3, connection_generation: 5,
                 conversion_revision: before.revision, request_id: 11,
                 segments: vec![ipc::protocol::SnapshotSegment { text: "にほ".into(), style: Some("direct".into()) }],
@@ -1382,6 +1384,7 @@ mod tests {
                 request_id: 1,
                 clauses,
                 sentence_token: None,
+                flat_candidates: None,
             },
             "日本",
         )

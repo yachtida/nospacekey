@@ -681,7 +681,7 @@ mod tests {
                 sentence_token: Some("sentence".into()), clauses: vec![WireClause {
                     id: ClauseId(1), reading_start: ReadingPosition(0), reading_end: ReadingPosition(1),
                     state: ClauseState::Converted, surface: "亜".into(), candidate_token: Some("candidate".into()),
-                }] }, "亜").unwrap();
+                }], flat_candidates: None, }, "亜").unwrap();
         for (epoch, generation, rejected) in [("old", 8, false), ("new", 1, false), ("old", 7, true)] {
             model.learning_identity = Some(ipc::client::EngineLearningIdentity {
                 engine_epoch: epoch.into(), learning_generation: generation,
@@ -736,6 +736,7 @@ mod tests {
                         candidate_token: None,
                     })
                     .collect(),
+                flat_candidates: None,
             },
             "あいう",
         )

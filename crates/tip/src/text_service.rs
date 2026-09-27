@@ -5202,6 +5202,7 @@ impl TextService_Impl {
             // （prepare_mixed_receipt は不一致で None を返す）。
             on_text_applied: RefCell::new(
                 self.prepare_mixed_receipt(text)
+                    .or_else(|| self.prepare_mixed_ordinary_receipt(text))
                     .or_else(|| if queued_commit { self.prepare_commit_receipt(text) } else { None }),
             ),
             #[cfg(feature = "tsf-test-hooks")]
@@ -8825,6 +8826,7 @@ mod deactivate_preflight_tests {
                     clauses: vec![WireClause { id: ClauseId(1), reading_start: ReadingPosition(0),
                         reading_end: ReadingPosition(4), state: ClauseState::Converted,
                         surface: "推したら".into(), candidate_token: Some("live token".into()) }],
+                    flat_candidates: None,
                 }, "推したら").unwrap();
             let mut newer = model.clone();
             newer.clauses[0].surface = "押したら".into();
@@ -8924,6 +8926,7 @@ mod deactivate_preflight_tests {
                     surface: "今日".into(),
                     candidate_token: Some("live token".into()),
                 }],
+                flat_candidates: None,
             },
             "今日",
         )

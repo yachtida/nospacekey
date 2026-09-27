@@ -2620,15 +2620,15 @@ public final class ConversionService: @unchecked Sendable {
     typealias SnapshotResult = (text: String, reading: String, candidates: [String]?, candidateRemaining: [String]?, baseline: UInt64,
                                  autoCommit: SnapshotAutoCommitProposal?, clauseData: SnapshotClauseData)
 
-    func snapshot(_ segments: [SnapshotSegment], explicit: Bool, leftContext: String? = nil,
+    func snapshot(_ segments: [SnapshotSegment], explicit: Bool, includeFlatCandidates: Bool = false, leftContext: String? = nil,
                   enhancementKey: SnapshotEnhancementKey? = nil, snapshotConnection: Int = 0,
                   liveSearchWidth: Int = 1) -> SnapshotResult {
         // Direct callers have no transport deadline; IPC uses the admission overload.
-        snapshot(segments, explicit: explicit, leftContext: leftContext, enhancementKey: enhancementKey,
+        snapshot(segments, explicit: explicit, includeFlatCandidates: includeFlatCandidates, leftContext: leftContext, enhancementKey: enhancementKey,
                  snapshotConnection: snapshotConnection, liveSearchWidth: liveSearchWidth, admissionDeadline: nil)!
     }
 
-    func snapshot(_ segments: [SnapshotSegment], explicit: Bool, leftContext: String? = nil,
+    func snapshot(_ segments: [SnapshotSegment], explicit: Bool, includeFlatCandidates: Bool = false, leftContext: String? = nil,
                   enhancementKey: SnapshotEnhancementKey? = nil, snapshotConnection: Int = 0,
                   liveSearchWidth: Int = 1, admissionDeadline: RequestDeadline?) -> SnapshotResult? {
         let composing = Self.makeSnapshotComposing(segments)
@@ -2641,6 +2641,7 @@ public final class ConversionService: @unchecked Sendable {
         guard admissionDeadline?.expired != true else { return nil }
         if let snapshotCandidatesForTesting { classic.mainResults = snapshotCandidatesForTesting }
         let reading = composing.convertTarget
+        let modelTop = classic.mainResults.first?.text
         let ranked = recentLearning.rank(
             mainResults: classic.mainResults, firstClauseResults: classic.firstClauseResults,
             composing: composing)
@@ -2696,8 +2697,22 @@ public final class ConversionService: @unchecked Sendable {
                 classic: classic, snapshot: GPUWorkerCompositionSnapshot(composing),
                 leftContext: leftContext, inferenceLimit: config.inferenceLimit))
         }
-        let data = makeSnapshotClauseDataLocked(reading: reading,
+        var data = makeSnapshotClauseDataLocked(reading: reading,
             candidate: selected, key: enhancementKey)
+        if includeFlatCandidates {
+            let boundaries = Set((try? ClauseCoordinates.legalBoundaries(reading)) ?? [])
+            data.flat_candidates = results.enumerated().compactMap { index, candidate in
+                let consumed = ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined())
+                let end = UInt32(consumed.unicodeScalars.count)
+                guard !consumed.isEmpty, reading.unicodeScalars.starts(with: consumed.unicodeScalars),
+                      boundaries.contains(end) else { return nil }
+                return retainClauseCandidateLocked(candidate, start: 0, end: end,
+                    generation: currentLearningGeneration, now: now,
+                    originalSurface: selected?.text ?? candidate.text, modelTop: modelTop,
+                    sentenceAction: end == UInt32(reading.unicodeScalars.count)
+                        ? Self.sentenceAction(candidate, index: index, modelTop: modelTop, promoted: results.first?.text != modelTop) : nil)
+            }
+        }
         clauseBaselines[baseline]?.clauses = data.clauses
         return (data.clauses.map(\.surface).joined(), reading, candidates, remaining, baseline, nil, data)
     }

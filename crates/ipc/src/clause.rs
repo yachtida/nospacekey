@@ -29,6 +29,8 @@ pub struct SnapshotClauseData {
     pub clauses: Vec<WireClause>,
     #[serde(deserialize_with = "required_option")]
     pub sentence_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flat_candidates: Option<Vec<ClauseCandidate>>,
 }
 
 impl SnapshotClauseData {
@@ -53,6 +55,7 @@ impl SnapshotClauseData {
             request_id,
             clauses,
             sentence_token: None,
+            flat_candidates: None,
         }
     }
     pub fn validate(&self, text: &str) -> Result<(), ClauseValidationError> {

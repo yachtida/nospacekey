@@ -127,6 +127,8 @@ pub enum Request {
         segments: Vec<SnapshotSegment>,
         #[serde(default, skip_serializing_if = "is_false")]
         explicit: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_flat_candidates: bool,
         /// Classic live search width (1 or 10); omitted means the legacy width 1.
         /// Explicit conversion always uses 10, regardless of this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -439,8 +441,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_flat_candidate_tokens_are_optional_and_roundtrip() {
+        let mut data = crate::clause::SnapshotClauseData::from_reading("まで".into(), 0, 1);
+        let legacy = serde_json::to_value(&data).unwrap();
+        assert!(legacy.get("flat_candidates").is_none());
+        assert_eq!(serde_json::from_value::<crate::clause::SnapshotClauseData>(legacy).unwrap(), data);
+        data.flat_candidates = Some(vec![crate::clause::ClauseCandidate {
+            surface: "迄".into(), token: "selected".into(),
+            reading_start: crate::clause::ReadingPosition(0), reading_end: crate::clause::ReadingPosition(2),
+        }]);
+        assert_eq!(serde_json::from_str::<crate::clause::SnapshotClauseData>(&serde_json::to_string(&data).unwrap()).unwrap(), data);
+    }
+
+    #[test]
     fn live_snapshot_identity_and_styled_input_roundtrip() {
         let request = Request::LiveSnapshot {
+            include_flat_candidates: false,
             conversion_revision: 0,
             request_id: 1,
             composition: 8,
@@ -496,6 +512,7 @@ mod tests {
     #[test]
     fn explicit_snapshot_candidates_roundtrip_and_require_protocol_nine() {
         let request = Request::LiveSnapshot {
+            include_flat_candidates: false,
             conversion_revision: 0,
             request_id: 1,
             composition: 8,

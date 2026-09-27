@@ -35,16 +35,18 @@ struct SnapshotClauseData: Codable, Equatable, Sendable {
     let request_id: UInt64
     let clauses: [WireClause]
     let sentence_token: String?
+    var flat_candidates: [ClauseCandidate]? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         sameWireText(lhs.reading, rhs.reading) && lhs.conversion_revision == rhs.conversion_revision
             && lhs.request_id == rhs.request_id && lhs.clauses == rhs.clauses && sameWireText(lhs.sentence_token, rhs.sentence_token)
+            && lhs.flat_candidates == rhs.flat_candidates
     }
     init(reading: String, conversion_revision: UInt64, request_id: UInt64, clauses: [WireClause], sentence_token: String?) {
         self.reading = reading; self.conversion_revision = conversion_revision; self.request_id = request_id
         self.clauses = clauses; self.sentence_token = sentence_token
     }
-    private enum Keys: String, CodingKey { case reading, conversion_revision, request_id, clauses, sentence_token }
+    private enum Keys: String, CodingKey { case reading, conversion_revision, request_id, clauses, sentence_token, flat_candidates }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         reading = try c.decode(String.self, forKey: .reading)
@@ -52,12 +54,14 @@ struct SnapshotClauseData: Codable, Equatable, Sendable {
         request_id = try c.decode(UInt64.self, forKey: .request_id)
         clauses = try c.decode([WireClause].self, forKey: .clauses)
         sentence_token = try c.decode(String?.self, forKey: .sentence_token)
+        flat_candidates = try c.decodeIfPresent([ClauseCandidate].self, forKey: .flat_candidates)
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: Keys.self)
         try c.encode(reading, forKey: .reading); try c.encode(conversion_revision, forKey: .conversion_revision)
         try c.encode(request_id, forKey: .request_id); try c.encode(clauses, forKey: .clauses)
         try c.encode(sentence_token, forKey: .sentence_token)
+        try c.encodeIfPresent(flat_candidates, forKey: .flat_candidates)
     }
 }
 

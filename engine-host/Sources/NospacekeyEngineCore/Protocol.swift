@@ -89,7 +89,7 @@ enum Request: Decodable {
     case liveSnapshot(composition: UInt64, revision: UInt64,
                       configurationGeneration: UInt64, connectionGeneration: UInt64,
                       segments: [SnapshotSegment], explicit: Bool, leftContext: String?,
-                      conversionRevision: UInt64, requestID: UInt64, liveSearchWidth: Int)
+                      conversionRevision: UInt64, requestID: UInt64, liveSearchWidth: Int, includeFlatCandidates: Bool = false)
     case pollSnapshotEnhancement(composition: UInt64, revision: UInt64,
                                  configurationGeneration: UInt64, connectionGeneration: UInt64,
                                  baseline: UInt64, conversionRevision: UInt64, requestID: UInt64)
@@ -145,6 +145,7 @@ enum Request: Decodable {
         let configuration_generation: UInt64; let connection_generation: UInt64
         let segments: [SnapshotSegment]; let explicit: Bool?; let left_context: String?
         let live_search_width: Int?
+        let include_flat_candidates: Bool?
         let conversion_revision: UInt64; let request_id: UInt64
     }
     private struct SnapshotEnhancementParams: Decodable {
@@ -222,7 +223,7 @@ enum Request: Decodable {
                                  connectionGeneration: p.connection_generation,
                                  segments: p.segments, explicit: p.explicit ?? false,
                                  leftContext: p.left_context, conversionRevision: p.conversion_revision, requestID: p.request_id,
-                                 liveSearchWidth: p.live_search_width ?? 1)
+                                 liveSearchWidth: p.live_search_width ?? 1, includeFlatCandidates: p.include_flat_candidates ?? false)
         case "PollSnapshotEnhancement":
             let p = try c.decode(SnapshotEnhancementParams.self, forKey: .params)
             self = .pollSnapshotEnhancement(

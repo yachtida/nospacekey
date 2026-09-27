@@ -160,13 +160,13 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                     response = .error("no session")
                 }
             case .liveSnapshot(let composition, let revision, let configurationGeneration,
-                               let connectionGeneration, let segments, let explicit, let context, let conversionRevision, let requestID, let liveSearchWidth):
+                               let connectionGeneration, let segments, let explicit, let context, let conversionRevision, let requestID, let liveSearchWidth, let includeFlatCandidates):
                 let key = ConversionService.SnapshotEnhancementKey(
                     composition: composition, revision: revision,
                     configurationGeneration: configurationGeneration,
                     connectionGeneration: connectionGeneration, conversionRevision: conversionRevision, requestID: requestID)
                 guard let result = service.snapshot(
-                    segments, explicit: explicit, leftContext: context, enhancementKey: key,
+                    segments, explicit: explicit, includeFlatCandidates: includeFlatCandidates, leftContext: context, enhancementKey: key,
                     snapshotConnection: connId, liveSearchWidth: liveSearchWidth, admissionDeadline: deadline) else {
                     return (encodeResponse(.error("request expired before conversion")), false)
                 }

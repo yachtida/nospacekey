@@ -1441,6 +1441,7 @@ impl SnapshotTransport for EngineSnapshotTransport {
                     })
                     .collect(),
                 explicit: snapshot.purpose == SnapshotPurpose::Explicit,
+                include_flat_candidates: false,
                 live_search_width: (snapshot.purpose == SnapshotPurpose::Live)
                     .then_some(snapshot.live_search_width),
                 left_context: snapshot.left_context.clone(),

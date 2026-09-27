@@ -10,6 +10,7 @@ pub(crate) struct InputUnit {
     pub(crate) end: ReadingPosition,
     pub(crate) original: String,
     pub(crate) style: InputStyle,
+    pub(crate) literal: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -48,7 +49,12 @@ impl InputJournal {
             end,
             original: original.to_owned(),
             style,
+            literal: false,
         });
+    }
+
+    pub fn mark_literal(&mut self) {
+        if let Some(unit) = self.units.last_mut() { unit.literal = true; }
     }
 
     /// A boundary through e.g. kyo -> きょ has no original-input substring.

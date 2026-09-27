@@ -40,12 +40,20 @@ pub(crate) enum Choice {
     Ordinary {
         text: String,
         remaining: String,
+        learning: Option<OrdinaryLearning>,
     },
     Mixed {
         plan: InterpretationPlan,
         projection: Projection,
         display: ValidatedMixed,
     },
+}
+#[derive(Clone, Debug)]
+pub(crate) struct OrdinaryLearning {
+    pub identity: ipc::client::EngineLearningIdentity,
+    pub reading: String,
+    pub token: String,
+    pub sentence: bool,
 }
 impl Choice {
     pub fn text(&self) -> &str {
@@ -205,10 +213,11 @@ fn calculate(
     if !crate::mixed_conversion::engine_supports_mixed(capabilities.as_ref()) {
         return None;
     }
-    let session = ipc::client::verify_session_identity(session_reply).ok()?;
+    let (session, learning) = ipc::client::verify_session_metadata(session_reply).ok()?;
     let result = collect_choices(
         |request| client.request_within(request, work.deadline).ok(),
         session,
+        &learning,
         work,
         plans,
     );
@@ -221,6 +230,7 @@ fn calculate(
 fn collect_choices(
     mut send: impl FnMut(&Request) -> Option<Response>,
     session: i64,
+    learning: &ipc::client::EngineLearningIdentity,
     work: &Work,
     plans: Vec<InterpretationPlan>,
 ) -> Option<Vec<Choice>> {
@@ -228,6 +238,7 @@ fn collect_choices(
     let mut choices = Vec::new();
     if work.live.is_none() {
         let response = send(&Request::LiveSnapshot {
+            include_flat_candidates: true,
             composition: id.composition,
             revision: id.revision,
             configuration_generation: id.configuration,
@@ -249,6 +260,7 @@ fn collect_choices(
                 candidates,
                 candidate_remaining,
                 clause_data,
+                baseline,
                 ..
             } if (
                 composition,
@@ -272,10 +284,37 @@ fn collect_choices(
                 if remaining.len() != texts.len() {
                     return None;
                 }
+                let request = ipc::clause::ClauseCandidatesRequest {
+                    key: ipc::clause::ClauseRequestKey {
+                        identity: ipc::clause::SnapshotIdentity { composition, revision,
+                            configuration_generation, connection_generation },
+                        baseline, conversion_revision: clause_data.conversion_revision,
+                        clause_id: clause_data.clauses.first()?.id, request_id: id.request,
+                    },
+                    reading: clause_data.reading.clone(),
+                    reading_start: ipc::clause::ReadingPosition(0),
+                    reading_end: ipc::clause::ReadingPosition(clause_data.reading.chars().count() as u32),
+                    preceding_surfaces: vec![], include_prefix_candidates: true,
+                };
+                let tokens = if let Some(candidates) = &clause_data.flat_candidates {
+                    if request.validate_candidates(candidates).is_ok() { candidates.clone() } else { vec![] }
+                } else { match send(&Request::ClauseCandidates(request.clone())) {
+                    Some(Response::ClauseCandidatesResult { key, status: ipc::clause::ClauseCandidatesStatus::Ready { candidates } })
+                        if key == request.key && request.validate_candidates(&candidates).is_ok() => candidates,
+                    _ => vec![],
+                } };
                 texts
                     .into_iter()
                     .zip(remaining)
-                    .map(|(text, remaining)| Choice::Ordinary { text, remaining })
+                    .map(|(text, remaining)| {
+                        let metadata = clause_data.reading.strip_suffix(&remaining).and_then(|consumed| {
+                            tokens.iter().find(|candidate| candidate.surface == text
+                                && candidate.reading_end.0 == consumed.chars().count() as u32)
+                                .map(|candidate| OrdinaryLearning { identity: learning.clone(),
+                                    reading: consumed.into(), token: candidate.token.clone(), sentence: remaining.is_empty() })
+                        });
+                        Choice::Ordinary { text, remaining, learning: metadata }
+                    })
                     .collect::<Vec<_>>()
             }
             _ => return None,
@@ -392,6 +431,68 @@ mod tests {
             auto_commit: None,
         }
     }
+
+    #[test]
+    fn snapshot_owned_tokens_do_not_requery_or_reorder_candidates() {
+        let work = work();
+        let identity = ipc::client::EngineLearningIdentity { engine_epoch: "epoch".into(), learning_generation: 1 };
+        let choices = collect_choices(|request| {
+            assert!(matches!(request, Request::LiveSnapshot { include_flat_candidates: true, .. }), "snapshot token pool needs no second search");
+            let mut response = normal(&work);
+            if let Response::SnapshotResult { clause_data, .. } = &mut response {
+                clause_data.flat_candidates = Some(vec![
+                    ipc::clause::ClauseCandidate { surface: "まで".into(), token: "first".into(), reading_start: ipc::clause::ReadingPosition(0), reading_end: ipc::clause::ReadingPosition(2) },
+                    ipc::clause::ClauseCandidate { surface: "迄".into(), token: "chosen".into(), reading_start: ipc::clause::ReadingPosition(0), reading_end: ipc::clause::ReadingPosition(2) },
+                ]);
+            }
+            Some(response)
+        }, 1, &identity, &work, vec![]).unwrap();
+        assert_eq!(choices.iter().map(Choice::text).collect::<Vec<_>>(), ["まで", "迄"]);
+        assert!(matches!(&choices[1], Choice::Ordinary { learning: Some(metadata), .. } if metadata.token == "chosen" && metadata.sentence));
+    }
+
+    #[test]
+    fn ordinary_learning_is_bound_to_selected_surface_consumed_reading_and_reply_key() {
+        for stale in [false, true] {
+            let mut work = work();
+            work.source = mixed_input::classify::tune::source_from_str("toukyouniiku");
+            let identity = ipc::client::EngineLearningIdentity { engine_epoch: "epoch".into(), learning_generation: 7 };
+            let choices = collect_choices(|request| match request {
+                Request::LiveSnapshot { .. } => {
+                    let mut response = normal(&work);
+                    if let Response::SnapshotResult { candidates, candidate_remaining, .. } = &mut response {
+                        *candidates = Some(vec!["東京に行く".into(), "東京".into()]);
+                        *candidate_remaining = Some(vec!["".into(), "にいく".into()]);
+                    }
+                    Some(response)
+                }
+                Request::ClauseCandidates(request) => {
+                    assert!(request.include_prefix_candidates);
+                    let mut key = request.key;
+                    if stale { key.request_id += 1; }
+                    Some(Response::ClauseCandidatesResult { key, status: ipc::clause::ClauseCandidatesStatus::Ready {
+                        candidates: vec![
+                            ipc::clause::ClauseCandidate { surface: "東京に行く".into(), token: "full".into(), reading_start: ipc::clause::ReadingPosition(0), reading_end: ipc::clause::ReadingPosition(8) },
+                            ipc::clause::ClauseCandidate { surface: "東京".into(), token: "prefix".into(), reading_start: ipc::clause::ReadingPosition(0), reading_end: ipc::clause::ReadingPosition(5) },
+                        ],
+                    }})
+                }
+                _ => None,
+            }, 1, &identity, &work, vec![]).unwrap();
+            assert_eq!(choices.iter().map(Choice::text).collect::<Vec<_>>(), ["東京に行く", "東京"]);
+            let Choice::Ordinary { remaining, learning, .. } = &choices[1] else { panic!() };
+            assert_eq!(remaining, "にいく");
+            if stale { assert!(learning.is_none()); }
+            else {
+                let metadata = learning.as_ref().unwrap();
+                assert_eq!(metadata.reading, "とうきょう");
+                assert_eq!(metadata.token, "prefix");
+                assert_eq!(metadata.identity, identity);
+                assert!(matches!(&choices[0], Choice::Ordinary { learning: Some(meta), .. } if meta.token == "full"));
+            }
+        }
+    }
+
     #[test]
     fn mixed_candidates_follow_normal_order_and_keep_independent_projections() {
         let work = work();
@@ -431,6 +532,7 @@ mod tests {
                 _ => None,
             },
             1,
+            &ipc::client::EngineLearningIdentity { engine_epoch: "test".into(), learning_generation: 1 },
             &work,
             vec![plan],
         )
@@ -456,6 +558,7 @@ mod tests {
                 Some(response)
             },
             1,
+            &ipc::client::EngineLearningIdentity { engine_epoch: "test".into(), learning_generation: 1 },
             &work,
             vec![],
         );
@@ -472,6 +575,7 @@ mod tests {
                 _ => None,
             },
             1,
+            &ipc::client::EngineLearningIdentity { engine_epoch: "test".into(), learning_generation: 1 },
             &work,
             vec![plan],
         )

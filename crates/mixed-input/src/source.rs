@@ -17,6 +17,8 @@ use crate::position::{scalar_len, ReadingRange, SourceRange};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SourceStyle {
     Kana,
+    /// Kana keystrokes currently interpreted as Literal; explicit repair may resynthesize them.
+    LiteralKana,
     Direct,
 }
 

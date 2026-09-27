@@ -1043,7 +1043,7 @@ impl InputModule {
         };
         let units = projection.adoption_units();
         let reading_before = self.local_kana.reading().to_string();
-        let triples_before = self.effective_unit_triples();
+        let triples_before = self.effective_unit_signatures();
         let saved = self.local_kana.clone();
         self.local_kana.rebuild_units(&units);
         // 再構築の読みは Projection と一字一致していなければならない（採用は
@@ -1056,7 +1056,7 @@ impl InputModule {
             return false;
         }
         let changed = reading_before != self.local_kana.reading()
-            || triples_before != self.effective_unit_triples();
+            || triples_before != self.effective_unit_signatures();
         if changed {
             self.revision = revision;
         }
@@ -1095,9 +1095,23 @@ impl InputModule {
         true
     }
 
-    /// 現在の実効 unit 列（読み・journal 登録スタイル・元打鍵）。採用が source の
+    /// Literal の採用印は revision や表示キャッシュから独立に保持する。
+    pub(crate) fn widen_unprotected_digits(&self, text: &str) -> String {
+        let units = self.local_kana.effective_input_units();
+        // Converted surfaces have no scalar mapping to the composer journal.
+        // Preserve their width until a validated projection supplies that mapping.
+        if text != self.canonical_reading() && units.iter().any(|u| u.literal) {
+            return text.to_owned();
+        }
+        text.chars().enumerate().map(|(at, ch)| {
+            let protected = units.iter().any(|u| u.literal && u.start.0 <= at as u32 && (at as u32) < u.end.0);
+            if ch.is_ascii_digit() && !protected { char::from_u32(ch as u32 + 0xFEE0).unwrap() } else { ch }
+        }).collect()
+    }
+
+    /// 現在の実効 unit 列（読み・journal 登録スタイル・元打鍵・Literal 採用印）。採用が source の
     /// 意味を変えたかの判定に使う。
-    pub(crate) fn effective_unit_triples(&self) -> Vec<(String, bool, String)> {
+    pub(crate) fn effective_unit_signatures(&self) -> Vec<(String, bool, String, bool)> {
         self.local_kana
             .effective_input_units()
             .into_iter()
@@ -1110,7 +1124,7 @@ impl InputModule {
                     .skip(unit.start.0 as usize)
                     .take((unit.end.0 - unit.start.0) as usize)
                     .collect();
-                (reading, literal, unit.original)
+                (reading, literal, unit.original, unit.literal)
             })
             .collect()
     }
@@ -1284,6 +1298,85 @@ pub(crate) fn apply_presenter_candidate_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_adoption_advances_revision_even_when_direct_reading_is_unchanged() {
+        use mixed_input::{plan::{InterpretationPlan, SegmentKind}, projection::Projection};
+        let mut module = InputModule::default();
+        module.handle(InputEvent::Key(KeyEvent::Text { ch: '3', style: TextStyle::Direct, replay: ReplayMode::Delta, original: None }));
+        let before = module.reading_revision();
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build("3", &[(SegmentKind::Literal, "3".into())]).unwrap();
+        assert!(module.adopt_mixed_projection(&Projection::build(1, &source, &plan).unwrap()));
+        assert_eq!(module.reading_revision(), before + 1);
+        let source = module.composition_source();
+        assert!(module.adopt_mixed_projection(&Projection::build(2, &source, &plan).unwrap()));
+        assert_eq!(module.reading_revision(), before + 1);
+    }
+
+    #[test]
+    fn frozen_nonfirst_candidate_keeps_selection_and_suffix_across_rejection() {
+        for remaining in ["", "にいく"] {
+            let mut module = InputModule::default();
+            for ch in "toukyouniiku".chars() { module.handle(key(ch)); }
+            let mut request = prepare_candidate_commit(&mut module, vec!["とうきょう".into(), "東京".into()], 1);
+            for applied in [false, true] {
+                let output = module.handle(InputEvent::Engine(EngineResult::Commit {
+                    request, candidate: Some(1), resolved_text: "東京".into(),
+                    outcome: EngineCommitOutcome::Applied { text: "東京".into(), remaining: remaining.into() },
+                }));
+                let operation = output.immediate.unwrap();
+                assert!(matches!(&operation, ImmediateOperation::Commit { text, candidate: Some(1), remaining: Some(tail), .. }
+                    if text == "東京" && tail == remaining));
+                module.complete(&operation, applied);
+                if !applied {
+                    assert_eq!(module.canonical_reading(), "とうきょうにいく");
+                    let retry = module.candidate_commit(Some(1));
+                    request = match retry.background { Some(BackgroundIntent::Commit { request, text: Some(text), .. }) => {
+                        assert_eq!(text, "東京"); request
+                    }, other => panic!("{other:?}") };
+                }
+            }
+            assert_eq!(module.canonical_reading(), remaining);
+        }
+    }
+
+    #[test]
+    fn literal_kana_can_be_repaired_to_japanese_after_more_typing() {
+        use mixed_input::{plan::{InterpretationPlan, SegmentKind}, projection::Projection, position::SourceRange};
+        let mut module = InputModule::default();
+        for ch in "made".chars() { module.handle(key(ch)); }
+        let source = module.composition_source();
+        let literal = InterpretationPlan::build("made", &[(SegmentKind::Literal, "made".into())]).unwrap();
+        assert!(module.adopt_mixed_projection(&Projection::build(1, &source, &literal).unwrap()));
+        for ch in "desu".chars() { module.handle(key(ch)); }
+        let source = module.composition_source();
+        assert_eq!(source.source_text(), "madedesu");
+        let plan = InterpretationPlan::build("madedesu", &[(SegmentKind::Literal, "made".into()), (SegmentKind::Japanese, "desu".into())]).unwrap();
+        let repaired = mixed_input::selection::reinterpret(&source, &plan, SourceRange::new(0, 4), SegmentKind::Japanese).unwrap();
+        assert!(module.adopt_mixed_projection(&Projection::build(2, &source, &repaired).unwrap()));
+        assert_eq!(module.canonical_reading(), "までです");
+    }
+
+    #[test]
+    fn literal_digits_stay_protected_after_typing_cursor_edits_and_deletion() {
+        use mixed_input::{plan::{InterpretationPlan, SegmentKind}, projection::Projection};
+        let mut module = InputModule::default();
+        for ch in "Python3".chars() { module.handle(key(ch)); }
+        let source = module.composition_source();
+        let plan = InterpretationPlan::build("Python3", &[(SegmentKind::Literal, "Python3".into())]).unwrap();
+        assert!(module.adopt_mixed_projection(&Projection::build(1, &source, &plan).unwrap()));
+        for ch in "wo4".chars() { module.handle(key(ch)); }
+        assert_eq!(module.widen_unprotected_digits(module.canonical_reading()), "Python3を４");
+        module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.widen_unprotected_digits(module.canonical_reading()), "Python3を");
+        module.set_reading_cursor(ipc::clause::ReadingPosition(0));
+        module.handle(key('5'));
+        assert_eq!(module.widen_unprotected_digits(module.canonical_reading()), "５Python3を");
+        module.set_reading_cursor(ipc::clause::ReadingPosition(6));
+        module.handle(InputEvent::Key(KeyEvent::Delete));
+        assert_eq!(module.widen_unprotected_digits(module.canonical_reading()), "５Pytho3を");
+    }
 
     #[test]
     fn mixed_prefix_reconstructs_source_only_after_successful_commit() {

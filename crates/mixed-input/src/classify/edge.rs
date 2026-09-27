@@ -130,11 +130,8 @@ pub fn generate_edges(source: &CompositionSource, dictionary: &Dictionary) -> Ve
         }
     };
 
-    // 合法な source 境界（PR2 の Projection と同じ規則）。要素の境界は常に合法。
-    // 要素の内部は、保存済み読みと原文が一致する（= 内部で切っても対応が壊れない）
-    // 要素のときだけ合法。非1:1 の unit 内部（nn→ん 等）を切る Plan は
-    // Projection が SavedReadingNotSplittable で拒否するため、候補生成の時点で
-    // 同じ境界集合を使う（採用不能な候補を作らない）。
+    // Resynthesizable Kana can split inside an old unit (python + no splits nn).
+    // Stored nonidentity readings still require complete unit boundaries.
     let mut legal_boundary = vec![false; text.len() + 1];
     legal_boundary[0] = true;
     legal_boundary[text.len()] = true;
@@ -144,7 +141,9 @@ pub fn generate_edges(source: &CompositionSource, dictionary: &Dictionary) -> Ve
             element_layout.source.end.get(),
         );
         legal_boundary[end as usize] = true;
-        if element.source_text == element.reading {
+        if element.source_text == element.reading
+            || crate::projection::can_resynthesize(element)
+        {
             for at in start..end {
                 legal_boundary[at as usize] = true;
             }
@@ -458,6 +457,16 @@ mod tests {
         assert!(!edges
             .iter()
             .any(|e| e.kind == SegmentKind::Japanese && e.range.start.get() == 0));
+    }
+
+    #[test]
+    fn kana_nn_interiors_allow_resynthesis() {
+        let source = crate::classify::tune::source_from_str("pythonno");
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("python", DictLayer::Tech);
+        let edges = generate_edges(&source, &dictionary);
+        assert!(find(&edges, 0, 6, SegmentKind::Literal).is_some());
+        assert!(find(&edges, 6, 8, SegmentKind::Japanese).is_some());
     }
 
     #[test]

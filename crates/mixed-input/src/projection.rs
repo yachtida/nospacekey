@@ -86,7 +86,7 @@ pub struct Projection {
 
 /// 採用した Plan を composer（編集状態）へ反映するための unit（PR3）。
 /// kind が journal への反映方法を決める:
-/// - Literal: 原文 1 unit。journal へは**文字ごと**の Direct unit で登録する
+/// - Literal: 原文 1 unit。journal へは**文字ごと**に元スタイルと Literal 採用印を登録する
 ///   （1文字削除で境界をまたぐ unit 全体を落とし、残りの原入力対応を失わないため）。
 /// - Kana: Kana 打鍵の再合成 unit。journal へ Kana として登録。
 /// - Direct: 再合成を分断する境界（Direct 打鍵の保存読み）。journal へ Direct で登録し、
@@ -222,11 +222,8 @@ impl Projection {
                         };
                         match element.provenance {
                             Provenance::Typed {
-                                style: SourceStyle::Kana,
-                            } if resynthesizes_to_reading(
-                                &element.source_text,
-                                &element.reading,
-                            ) =>
+                                style: SourceStyle::Kana | SourceStyle::LiteralKana,
+                            } if can_resynthesize(element) =>
                             {
                                 // run には元打鍵（大小文字を含む）を積む。再合成は
                                 // push_kana_run が composer 入力（ASCII 小文字化）で
@@ -291,7 +288,7 @@ impl Projection {
                                     // 従う（Direct 境界の保存）。ResolvedKana は元打鍵
                                     // 不明として journal へ登録しない。
                                     provenance: match element.provenance {
-                                        Provenance::Typed { style: SourceStyle::Kana } => {
+                                        Provenance::Typed { style: SourceStyle::Kana | SourceStyle::LiteralKana } => {
                                             PieceProvenance::Inherited { direct: false }
                                         }
                                         Provenance::Typed { style: SourceStyle::Direct } => {
@@ -569,6 +566,14 @@ fn scalar_slice(text: &str, start: u32, stop: u32) -> String {
 /// （`roman_input` 参照）のときに限るため、読みの引き継ぎが composer 入力の再現と
 /// 一致する。composer 入力と読みが別文字になる新しい形状ができたら、composer
 /// 入力を要素に別に持たせる（replay_text 相当）必要がある。
+pub(crate) fn can_resynthesize(element: &crate::source::SourceElement) -> bool {
+    match element.provenance {
+        Provenance::Typed { style: SourceStyle::LiteralKana } => true,
+        Provenance::Typed { style: SourceStyle::Kana } => resynthesizes_to_reading(&element.source_text, &element.reading),
+        _ => false,
+    }
+}
+
 fn resynthesizes_to_reading(original: &str, reading: &str) -> bool {
     let resynthesized: String = roman::synthesize(&roman_input(original), false)
         .iter()

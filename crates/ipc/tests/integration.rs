@@ -71,6 +71,7 @@ fn snapshot_deadline_over_unique_pipe() {
         .stdout(Stdio::null()).stderr(Stdio::null()));
     let mut client = EngineClient::connect_to(&pipe, Duration::from_secs(5)).unwrap();
     let snapshot = Request::LiveSnapshot {
+        include_flat_candidates: false,
         composition: 1, revision: 1, configuration_generation: 1, connection_generation: 1,
         conversion_revision: 0, request_id: 1,
         segments: vec![ipc::protocol::SnapshotSegment { text: "あ".into(), style: Some("direct".into()) }],
@@ -110,6 +111,7 @@ fn clause_prefix_candidates_over_unique_pipe() {
     let session = ipc::client::verify_session_identity(
         client.request(&Request::StartSession).unwrap()).unwrap();
     let snapshot = client.request(&Request::LiveSnapshot {
+        include_flat_candidates: false,
         composition: 1, revision: 1, configuration_generation: 1, connection_generation: 1,
         conversion_revision: 0, request_id: 1,
         segments: vec![ipc::protocol::SnapshotSegment { text: "がぞうのように".into(), style: Some("direct".into()) }],
@@ -140,6 +142,62 @@ fn clause_prefix_candidates_over_unique_pipe() {
 
 #[test]
 #[ignore = "requires a built Swift engine"]
+fn mixed_menu_ordinary_candidate_receipts_survive_worker_session_end() {
+    use ipc::clause::*;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let engine = IsolatedEngine::stage();
+    let pipe = isolated_pipe("mixed-ordinary-receipt");
+    let _child = start_engine(Command::new(engine.exe()).arg(&pipe).arg("--persist")
+        .creation_flags(0x08000000).env("NOSPACEKEY_ZENZAI", "off")
+        .env("NOSPACEKEY_LEARNING", "1").env("NOSPACEKEY_MEMORY_DIR", engine.root.join("memory"))
+        .env("TEMP", &engine.root).env("TMP", &engine.root)
+        .stdout(Stdio::null()).stderr(Stdio::null()));
+    let mut worker = EngineClient::connect_to(&pipe, Duration::from_secs(5)).unwrap();
+    let (session, learning) = ipc::client::verify_session_metadata(worker.request(&Request::StartSession).unwrap()).unwrap();
+    let Response::SnapshotResult { baseline, clause_data, candidates: Some(texts), candidate_remaining: Some(remaining), .. } = worker.request(&Request::LiveSnapshot {
+        include_flat_candidates: true,
+        composition: 1, revision: 1, configuration_generation: 1, connection_generation: 1,
+        conversion_revision: 0, request_id: 1,
+        segments: vec![ipc::protocol::SnapshotSegment { text: "がぞうのように".into(), style: Some("direct".into()) }],
+        explicit: true, live_search_width: None, left_context: None,
+    }).unwrap() else { panic!("expected explicit snapshot"); };
+    let request = ClauseCandidatesRequest {
+        key: ClauseRequestKey { identity: SnapshotIdentity { composition: 1, revision: 1, configuration_generation: 1, connection_generation: 1 },
+            baseline, conversion_revision: clause_data.conversion_revision, clause_id: clause_data.clauses[0].id, request_id: 1 },
+        reading: clause_data.reading.clone(), reading_start: ReadingPosition(0), reading_end: ReadingPosition(7),
+        preceding_surfaces: vec![], include_prefix_candidates: true,
+    };
+    let candidates = clause_data.flat_candidates.as_ref().expect("snapshot carries its own flat candidate tokens");
+    request.validate_candidates(candidates).unwrap();
+    let selected = texts.iter().zip(&remaining).filter_map(|(surface, tail)| {
+        let consumed = clause_data.reading.strip_suffix(tail)?;
+        let candidate = candidates.iter().find(|candidate| candidate.surface == *surface && candidate.reading_end.0 == consumed.chars().count() as u32)?;
+        Some((candidate.clone(), consumed.to_string()))
+    }).collect::<Vec<_>>();
+    assert_eq!(selected.len(), texts.len(), "all ordinary snapshot choices have a matching learning token");
+    assert!(selected.iter().any(|(c, _)| c.reading_end.0 == 7));
+    assert!(selected.iter().any(|(c, _)| c.reading_end.0 < 7));
+    worker.request(&Request::EndSession { session }).unwrap();
+    drop(worker);
+    let mut outbox = EngineClient::connect_to(&pipe, Duration::from_secs(5)).unwrap();
+    for (index, (candidate, consumed)) in selected.iter().enumerate() {
+        let receipt = CommitReceipt {
+            commit_id: CommitId { client_instance: "550e8400-e29b-41d4-a716-446655440000".into(), sequence: index as u64 + 1 },
+            engine_epoch: learning.engine_epoch.clone(), learning_generation: learning.learning_generation,
+            reading: consumed.clone(), text: candidate.surface.clone(),
+            sentence_token: (candidate.reading_end.0 == 7).then(|| candidate.token.clone()),
+            intervals: vec![CommitInterval { reading_start: ReadingPosition(0), reading_end: candidate.reading_end,
+                surface: candidate.surface.clone(), learning: IntervalLearning::Candidate { token: candidate.token.clone(), explicitly_selected: true } }],
+        };
+        receipt.validate(|token, _| token == candidate.token).unwrap();
+        let response = outbox.request(&Request::CommitReceipt(receipt)).unwrap();
+        assert!(matches!(response, Response::CommitReceiptAck { status: ReceiptStatus::Applied, .. }), "{response:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires a built Swift engine"]
 fn live_search_width_over_unique_pipe() {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -158,6 +216,7 @@ fn live_search_width_over_unique_pipe() {
     for explicit in [false, true] {
         for (index, width) in [None, Some(10), Some(1)].into_iter().enumerate() {
             let result = client.request(&Request::LiveSnapshot {
+                include_flat_candidates: false,
                 composition: 1, revision: index as u64 + 1,
                 configuration_generation: 1, connection_generation: 1,
                 conversion_revision: 0, request_id: index as u64 + 1,

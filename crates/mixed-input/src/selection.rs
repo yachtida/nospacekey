@@ -15,9 +15,7 @@ pub fn reinterpret(
     if range.start >= range.end || range.end.get() > source.source_len() {
         return None;
     }
-    let current = Projection::build(0, source, plan).ok()?;
-    current.source_to_reading(range.start)?;
-    current.source_to_reading(range.end)?;
+    Projection::build(0, source, plan).ok()?;
     if kind == SegmentKind::Literal {
         source.original(range)?;
     }
@@ -111,7 +109,18 @@ mod tests {
         );
     }
     fn source_for_kyo() -> CompositionSource {
-        source("kyo")
+        CompositionSource::try_new(vec![SourceElement {
+            provenance: Provenance::Typed { style: SourceStyle::Direct },
+            source_text: "kyo".into(), reading: "きょ".into(),
+        }], 3).unwrap()
+    }
+
+    #[test]
+    fn repair_can_resynthesize_inside_the_original_nn_unit() {
+        let source = source("pythonno");
+        let plan = InterpretationPlan::build("pythonno", &[(SegmentKind::Japanese, "pythonno".into())]).unwrap();
+        let repaired = reinterpret(&source, &plan, SourceRange::new(0, 6), SegmentKind::Literal).unwrap();
+        assert_eq!(Projection::build(1, &source, &repaired).unwrap().reading(), "pythonの");
     }
 }
 

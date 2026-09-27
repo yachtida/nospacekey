@@ -15,8 +15,8 @@ fn wait(mut ready: impl FnMut() -> bool) -> bool {
     }
     false
 }
-fn open(host: &TsfHost) -> Result<(u32, String), String> {
-    for key in scenarios::typed("githubnotukaikata") {
+fn open_menu(host: &TsfHost, input: &str) -> Result<String, String> {
+    for key in scenarios::typed(input) {
         if !host.feed_key(key.0) {
             return Err("typing not eaten".into());
         }
@@ -35,6 +35,10 @@ fn open(host: &TsfHost) -> Result<(u32, String), String> {
             host.store.preedit()
         ));
     }
+    Ok(reading)
+}
+fn open(host: &TsfHost) -> Result<(u32, String), String> {
+    let reading = open_menu(host, "githubnotukaikata")?;
     let index = host
         .candidate_strings()
         .iter()
@@ -42,6 +46,43 @@ fn open(host: &TsfHost) -> Result<(u32, String), String> {
         .ok_or_else(|| format!("no github candidate: {:?}", host.candidate_strings()))?
         as u32;
     Ok((index, reading))
+}
+fn check_ordinary(host: &TsfHost) -> Result<(), String> {
+    for number_key in [false, true] {
+        host.store.reset();
+        open_menu(host, "nihongo")?;
+        let index = host.candidate_strings().iter().position(|s| s == "にほんご")
+            .ok_or_else(|| format!("no alternate ordinary candidate: {:?}", host.candidate_strings()))? as u32;
+        if index == 0 || index >= 9 { return Err("alternate ordinary fixture is not selectable".into()); }
+        if number_key {
+            host.feed_key(0x31 + index);
+        } else {
+            host.behavior_select(index);
+            let before = host.store.preedit();
+            host.store.reject_text.set(true);
+            host.behavior_select_and_finalize(index);
+            tsf_host::pump();
+            if !host.store.committed().is_empty() || host.store.preedit() != before
+                || host.candidate_strings().is_empty() {
+                return Err("rejected ordinary commit lost document or menu state".into());
+            }
+            host.store.reject_text.set(false);
+            host.behavior_select_and_finalize(index);
+        }
+        if !wait(|| !host.store.composing() && host.store.committed() == "にほんご") {
+            return Err(format!("ordinary choice was replaced: number={number_key} full={:?}", host.store.full()));
+        }
+    }
+    host.store.reset();
+    open_menu(host, "gazounoyouni")?;
+    let index = host.candidate_strings().iter().position(|s| s == "画像")
+        .ok_or_else(|| format!("no partial ordinary candidate: {:?}", host.candidate_strings()))? as u32;
+    host.behavior_select(index);
+    host.feed_key_with_shift(0x41);
+    if !wait(|| !host.store.composing() && host.store.committed() == "画像のように") {
+        return Err(format!("Shift settle lost the partial candidate suffix: {:?}", host.store.full()));
+    }
+    Ok(())
 }
 fn check(host: &TsfHost) -> Result<(), String> {
     let (index, reading) = open(host)?;
@@ -116,7 +157,7 @@ fn check(host: &TsfHost) -> Result<(), String> {
     if !wait(|| !host.store.composing() && host.store.committed() == expected) {
         return Err("continued input commit mismatch".into());
     }
-    Ok(())
+    check_ordinary(host)
 }
 pub fn run() -> i32 {
     if std::env::var("NOSPACEKEY_TEST_SANDBOX").as_deref() != Ok("1") {
@@ -139,6 +180,7 @@ pub fn run() -> i32 {
     settings.input_prediction_enabled = false;
     settings.zenzai.enabled = false;
     settings.learning.enabled = false;
+    settings.shift_latin.mode = "commit".into();
     if std::fs::write(path, settings.to_json()).is_err() {
         return 2;
     }

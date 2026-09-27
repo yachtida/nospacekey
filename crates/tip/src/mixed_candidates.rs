@@ -374,6 +374,23 @@ impl TextService_Impl {
         });
         self.show_mixed_menu(&ctx, selected);
     }
+    pub(crate) fn prepare_mixed_ordinary_receipt(&self, text: &str) -> Option<Box<dyn FnOnce()>> {
+        if !self.mixed_menu_current() { return None; }
+        let receipt = {
+            let controller = self.mixed_candidates.borrow();
+            let menu = controller.menu.as_ref()?;
+            let Choice::Ordinary { text: selected, learning: Some(learning), .. } = menu.choices.get(menu.selected?)? else { return None; };
+            if selected != text { return None; }
+            ordinary_receipt(learning, text, crate::receipt_outbox::next_commit_id()?)?
+        };
+        let mut outbox = self.receipt_outbox.borrow_mut();
+        if outbox.is_none() {
+            *outbox = crate::receipt_outbox::ReceiptOutbox::start(crate::engine_link::stable_pipe_name()).ok();
+        }
+        let outbox = outbox.as_ref()?.clone();
+        Some(Box::new(move || { outbox.text_applied(receipt, Instant::now()); }))
+    }
+
     fn mixed_menu_current(&self) -> bool {
         let current = self.mixed_identity(0);
         self.mixed_candidates
@@ -537,6 +554,10 @@ impl TextService_Impl {
         }
         true
     }
+    pub(crate) fn mixed_menu_open(&self) -> bool {
+        self.mixed_candidates.borrow().menu.is_some()
+    }
+
     pub(crate) fn commit_mixed_selection(&self, ctx: &ITfContext, index: usize) -> bool {
         if self.mixed_candidates.borrow().menu.is_none() {
             return false;
@@ -585,22 +606,16 @@ impl TextService_Impl {
                     self.mixed_candidates.borrow_mut().menu = None;
                 }
             }
-            Some(Choice::Ordinary { text, remaining }) => {
-                // Keep the frozen source and suffix until TSF actually consumes them.
-                // The flat snapshot path takes its remaining-reading slot before applying.
-                let menu = self.mixed_candidates.borrow_mut().menu.take();
+            Some(Choice::Ordinary { text, remaining, .. }) => {
                 let before = self.mixed_identity(0);
-                self.replace_module_candidates(&[text], 0);
-                self.explicit_snapshot_candidates_active.set(true);
-                *self.explicit_snapshot_candidate_remaining.borrow_mut() = vec![remaining];
-                if let Some((request, index, text)) = self.module_candidate_commit(Some(0)) {
-                    self.commit_candidate(ctx, request, index, &text);
+                if let Some((request, _, _)) = self.module_candidate_commit(Some(index)) {
+                    self.commit_frozen_candidate(ctx, request, index, &text, &remaining);
                 }
                 let current = self.mixed_identity(0);
-                if before.composition == current.composition && before.revision == current.revision
-                {
-                    self.mixed_candidates.borrow_mut().menu = menu;
+                if before.composition == current.composition && before.revision == current.revision {
                     self.show_mixed_menu(ctx, index);
+                } else {
+                    self.mixed_candidates.borrow_mut().menu = None;
                 }
             }
             None => {}
@@ -734,6 +749,9 @@ impl TextService_Impl {
         if vk == 0x08 || vk == 0x2E {
             return !self.cancel_mixed_menu(ctx, true);
         }
+        if keeps_menu_for_direct_settle(vk, shift, self.shift_latin_compose.get()) {
+            return false;
+        }
         if !matches!(
             vk,
             0x10 | 0x11 | 0x12 | 0x20 | 0x26 | 0x28 | 0x21 | 0x22 | 0x30..=0x39
@@ -839,7 +857,7 @@ fn trial_source(
             style: SourceStyle::Kana,
         } => false,
         Provenance::Typed {
-            style: SourceStyle::Direct,
+            style: SourceStyle::Direct | SourceStyle::LiteralKana,
         } => e.source.end.get() > prefix,
         _ => true,
     }) {
@@ -906,5 +924,51 @@ mod live_tests {
         assert_ne!(c.mode(1), settings::MixedInputMode::Off);
         assert_eq!(c.mode(2), settings::MixedInputMode::Off);
         assert_eq!(c.live.status, mixed_input::live::Status::Unresolved);
+    }
+}
+
+fn ordinary_receipt(learning: &crate::mixed_worker::OrdinaryLearning, text: &str,
+    commit_id: ipc::clause::CommitId) -> Option<ipc::clause::CommitReceipt> {
+    let receipt = ipc::clause::CommitReceipt {
+        commit_id, engine_epoch: learning.identity.engine_epoch.clone(),
+        learning_generation: learning.identity.learning_generation,
+        reading: learning.reading.clone(), text: text.into(),
+        sentence_token: learning.sentence.then(|| learning.token.clone()),
+        intervals: vec![ipc::clause::CommitInterval {
+            reading_start: ipc::clause::ReadingPosition(0),
+            reading_end: ipc::clause::ReadingPosition(learning.reading.chars().count() as u32),
+            surface: text.into(), learning: ipc::clause::IntervalLearning::Candidate {
+                token: learning.token.clone(), explicitly_selected: true,
+            },
+        }],
+    };
+    receipt.validate(|token, _| token == learning.token).ok()?;
+    Some(receipt)
+}
+
+fn keeps_menu_for_direct_settle(vk: u32, shift: bool, compose: bool) -> bool {
+    shift && !compose && matches!(vk, 0x41..=0x5A)
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+    #[test]
+    fn shift_direct_settle_retains_the_partial_candidate_menu() {
+        assert!(keeps_menu_for_direct_settle(0x41, true, false));
+        assert!(!keeps_menu_for_direct_settle(0x41, true, true));
+        assert!(!keeps_menu_for_direct_settle(0x41, false, false));
+        assert!(!keeps_menu_for_direct_settle(0x08, true, false));
+    }
+    #[test]
+    fn ordinary_prefix_receipt_learns_only_the_consumed_reading() {
+        let metadata = crate::mixed_worker::OrdinaryLearning {
+            identity: ipc::client::EngineLearningIdentity { engine_epoch: "epoch".into(), learning_generation: 2 },
+            reading: "とうきょう".into(), token: "tokyo".into(), sentence: false,
+        };
+        let receipt = ordinary_receipt(&metadata, "東京", ipc::clause::CommitId { client_instance: "test".into(), sequence: 1 }).unwrap();
+        assert_eq!(receipt.reading, "とうきょう");
+        assert_eq!(receipt.intervals[0].reading_end.0, 5);
+        assert!(matches!(&receipt.intervals[0].learning, ipc::clause::IntervalLearning::Candidate { token, explicitly_selected: true } if token == "tokyo"));
     }
 }

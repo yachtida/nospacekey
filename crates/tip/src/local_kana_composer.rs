@@ -442,7 +442,7 @@ impl LocalKanaComposer {
     }
 
     /// 混在 Plan 採用後の stable/journal の再構築（PR3）。unit 列の読みを stable へ
-    /// 載せ、journal は kind ごとに登録する（Literal=文字ごとの Direct、Kana=Kana、
+    /// 載せ、journal は kind ごとに登録する（Literal=文字ごとの元スタイル＋採用印、Kana=Kana、
     /// Direct=Direct、Unknown=登録なし=ResolvedKana 維持）。
     /// 未完・再開可能性は読み文字列の一致で推測せず、採用前の編集状態と unit の
     /// source 座標（採用前ソース上の対応範囲）で引き継ぐ:
@@ -553,17 +553,18 @@ impl LocalKanaComposer {
                     }
                 }
                 mixed_input::projection::AdoptionKind::Literal => {
-                    // journal へは stable の Literal と同じく文字ごとの Direct unit。
+                    // journal へは stable と同じく文字ごとの元スタイル＋Literal 採用印。
                     // 1文字削除（DeleteForward）が unit 全体を落として未編集文字の
                     // 原文字対応まで失わない。採用 Literal は削除で再開しない（封印）。
-                    for ch in original.chars() {
+                    for (offset, ch) in original.chars().enumerate() {
                         let text = ch.to_string();
                         self.journal.append(
                             ipc::clause::ReadingPosition(reading_at),
                             ipc::clause::ReadingPosition(reading_at + 1),
                             &text,
-                            InputStyle::Direct,
+                            context.source_style(base + offset as u32),
                         );
+                        self.journal.mark_literal();
                         reading_at += 1;
                     }
                 }
@@ -608,13 +609,17 @@ impl LocalKanaComposer {
         use mixed_input::projection::AdoptionKind;
         match unit.kind {
             AdoptionKind::Literal => {
-                // journal へは文字ごとの Direct unit。1文字削除が境界をまたぐ
+                // journal は元の打鍵スタイルを保持し、表示は Direct で凍結する。1文字削除が境界をまたぐ
                 // unit 全体を落とさない（残りの原入力対応を保つ）。採用 Literal は
                 // 削除で再開しない（封印）。
                 let (reading, _) = clip_stable_parts(unit, clip_to);
-                for ch in reading.chars() {
+                for (offset, ch) in reading.chars().enumerate() {
                     let text = ch.to_string();
-                    self.append_input_unit(&text, InputStyle::Direct, &text);
+                    self.append_stable(&text, InputStyle::Direct);
+                    let end = ipc::clause::ReadingPosition(self.stable.chars().count() as u32);
+                    self.journal.append(ipc::clause::ReadingPosition(end.0 - 1), end, &text,
+                        context.source_style(unit.source.start.get() + offset as u32));
+                    self.journal.mark_literal();
                 }
             }
             AdoptionKind::Kana | AdoptionKind::Direct => {
@@ -765,8 +770,16 @@ impl LocalKanaComposer {
         };
         let pending_aligned =
             (self.pending_originals.chars().count() as u32) == pending_scalar_len;
+        let source_styles = self.composition_source(0).layout().into_iter().map(|entry| {
+            let style = match entry.provenance {
+                mixed_input::source::Provenance::Typed { style: mixed_input::source::SourceStyle::Kana | mixed_input::source::SourceStyle::LiteralKana } => InputStyle::Kana,
+                _ => InputStyle::Direct,
+            };
+            (entry.source.start.get(), entry.source.end.get(), style)
+        }).collect();
         AdoptionContext {
             frozen_source_ranges,
+            source_styles,
             pending_source_start: pending_source.0,
             pending_source_end: pending_source.1,
             pending_nonempty: pending_scalar_len > 0 && pending_source.0 != u32::MAX,
@@ -1067,6 +1080,7 @@ struct AdoptionContext {
     /// 統合し、composition_source と同じ歩行で source へ写す。原文字不明
     /// （ResolvedKana・原文字空の pending）の範囲も含む（原文字不明と再開可能は独立）。
     frozen_source_ranges: Vec<(u32, u32)>,
+    source_styles: Vec<(u32, u32, InputStyle)>,
     /// 採用前 pending の source 範囲。`pending_nonempty` が false のときは空区間。
     pending_source_start: u32,
     pending_source_end: u32,
@@ -1077,6 +1091,11 @@ struct AdoptionContext {
 }
 
 impl AdoptionContext {
+    fn source_style(&self, at: u32) -> InputStyle {
+        self.source_styles.iter().find(|(start, end, _)| *start <= at && at < *end)
+            .map(|(_, _, style)| *style).unwrap_or(InputStyle::Direct)
+    }
+
     /// 採用 unit 列を採用前 pending の source 範囲 [ps, pe) で三方分割する。
     /// 戻り値:
     /// - stable_parts: (unit index, 末尾側 clip 位置)。stable へ載せる部分

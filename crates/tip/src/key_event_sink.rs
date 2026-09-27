@@ -23,7 +23,7 @@ use crate::input_module::{
 };
 use crate::input_state::{
     plan_live_enter, should_widen_digits, to_kana_reading_char,
-    to_zenkaku_digits, CommitPlan, InsertStyle, LiveEnterPlan,
+    CommitPlan, InsertStyle, LiveEnterPlan,
 };
 use crate::text_service::{
     tip_log, PendingEndKeySignature, PendingEndTestDecision, TextService_Impl,
@@ -2446,6 +2446,10 @@ impl TextService_Impl {
         };
         if let Some((request, index, text)) = cand_pick {
             self.commit_candidate(ctx, request, index, &text);
+            if self.mixed_menu_open() {
+                self.disarm_undo();
+                return false;
+            }
         }
         // 候補確定が部分確定だった場合・候補非表示の場合とも、composition が残っていれば
         // VK_RETURN の候補非表示枝と同一の「ライブ変換結果（無ければ読み）」で全確定する。
@@ -2757,7 +2761,7 @@ impl TextService_Impl {
             notation_fixed,
             source,
         ) {
-            to_zenkaku_digits(text)
+            self.state.borrow().widen_unprotected_digits(text)
         } else {
             text.to_string()
         }
@@ -2933,6 +2937,19 @@ impl TextService_Impl {
             snapshot_remaining.as_deref(),
             || self.engine_commit(index),
         );
+        self.apply_candidate_outcome(ctx, request, index, resolved_text, outcome);
+    }
+
+    pub(crate) fn commit_frozen_candidate(&self, ctx: &ITfContext, request: ModuleRequestId,
+        index: usize, text: &str, remaining: &str) {
+        self.disarm_debounce();
+        self.drop_engine();
+        self.apply_candidate_outcome(ctx, request, index, text,
+            crate::input_module::EngineCommitOutcome::Applied { text: text.into(), remaining: remaining.into() });
+    }
+
+    fn apply_candidate_outcome(&self, ctx: &ITfContext, request: ModuleRequestId,
+        index: usize, resolved_text: &str, outcome: crate::input_module::EngineCommitOutcome) {
         let output =
             self.state
                 .borrow_mut()

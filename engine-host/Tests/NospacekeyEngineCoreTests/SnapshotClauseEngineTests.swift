@@ -18,6 +18,21 @@ final class SnapshotClauseEngineTests: XCTestCase {
             end: UInt32(data.reading.unicodeScalars.count), text: text)
     }
 
+    func testExplicitSnapshotOwnsTokensForNonfirstAndPartialCandidates() throws {
+        let service = service()
+        service.snapshotCandidatesForTesting = [candidate("キョウハ", "今日は"), candidate("キョウハ", "今日わ"), candidate("キョウ", "今日")]
+        let result = service.snapshot([SnapshotSegment(text: "きょうは", style: "direct")], explicit: true, includeFlatCandidates: true)
+        let candidates = try XCTUnwrap(result.clauseData.flat_candidates)
+        XCTAssertEqual(candidates.map(\.surface), ["今日は", "今日わ", "今日"])
+        XCTAssertEqual(candidates.map(\.reading_end), [4, 4, 3])
+        XCTAssertEqual(Set(candidates.map(\.token)).count, 3)
+        XCTAssertEqual(try JSONDecoder().decode(SnapshotClauseData.self, from: JSONEncoder().encode(result.clauseData)), result.clauseData)
+        let ordinary = service.snapshot([SnapshotSegment(text: "きょうは", style: "direct")], explicit: true)
+        XCTAssertNil(ordinary.clauseData.flat_candidates)
+        let live = service.snapshot([SnapshotSegment(text: "きょうは", style: "direct")], explicit: false)
+        XCTAssertNil(live.clauseData.flat_candidates)
+    }
+
     func testPartialCandidateKeepsUnconsumedSuffixAsReading() throws {
         let data = service().snapshotClausesForTesting(reading: "きょうは", candidate: candidate("キョウ", "今日"))
         try validate(data, text: "今日は")
