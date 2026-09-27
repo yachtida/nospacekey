@@ -79,7 +79,7 @@ fn check_ordinary(host: &TsfHost) -> Result<(), String> {
         .ok_or_else(|| format!("no partial ordinary candidate: {:?}", host.candidate_strings()))? as u32;
     host.behavior_select(index);
     host.feed_key_with_shift(0x41);
-    if !wait(|| !host.store.composing() && host.store.committed() == "画像のように") {
+    if !wait(|| !host.store.composing() && host.store.committed() == "画像のようにA") {
         return Err(format!("Shift settle lost the partial candidate suffix: {:?}", host.store.full()));
     }
     Ok(())
