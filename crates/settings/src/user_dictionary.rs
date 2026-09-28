@@ -237,6 +237,61 @@ pub fn dict_path() -> Option<PathBuf> {
         })
 }
 
+/// 顔文字はエンジンが読む通常辞書とは別の保管庫に置く。
+pub fn kaomoji_path() -> Option<PathBuf> {
+    dict_path().map(|p| p.with_file_name("kaomoji_dictionary.json"))
+}
+
+/// 有効行だけで置換する。重複はファイル内の最初の行を残す。
+pub fn replace_imported(
+    rows: Vec<UserDictEntry>,
+    had_replacement: bool,
+) -> (Vec<UserDictEntry>, MergeReport) {
+    let mut entries = Vec::new();
+    let report = merge_imported(&mut entries, rows, had_replacement);
+    (entries, report)
+}
+
+/// 原本を置換する前に、復旧用のTSVを新規作成する。同秒の取込も上書きしない。
+pub fn backup_before_import(path: &Path, entries: &[UserDictEntry]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let tsv = to_google_tsv(entries);
+    // TSVでは表現できない既存データを黙って復旧用ファイルから落とさない。
+    if tsv.skipped_control != 0 {
+        return Err(std::io::Error::other(
+            "既存辞書にTSVで退避できない制御文字が含まれています",
+        ));
+    }
+    for n in 0u32.. {
+        let suffix = if n == 0 {
+            String::new()
+        } else {
+            format!(".{n}")
+        };
+        let dest = path.with_extension(format!("before-import.{secs}{suffix}.tsv"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+        {
+            Ok(mut file) => {
+                file.write_all(tsv.tsv.as_bytes())?;
+                file.sync_all()?;
+                return Ok(dest);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
 #[derive(Debug, PartialEq)]
 pub enum DictCorrupt {
     None,
@@ -717,6 +772,30 @@ fn has_control_char(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_uses_only_valid_file_rows_and_keeps_first_duplicate() {
+        let parsed = parse_tsv("にこ\t(^_^)\nニコ\t(^_^)\nなく\t(;_;)\nlatin\tbad\nあ\ta\u{0001}b\n".as_bytes());
+        let (entries, report) = replace_imported(parsed.rows, parsed.had_replacement);
+        assert_eq!(report.added, 2); assert_eq!(report.skipped_dup, 1); assert_eq!(report.skipped_invalid, 2);
+        assert_eq!(entries[0].ruby,"にこ");
+        let empty = parse_tsv(b"# empty dictionary\n");
+        assert!(replace_imported(empty.rows,false).0.is_empty());
+    }
+
+    #[test]
+    fn backups_are_restorable_and_never_overwrite_each_other() {
+        let path = std::env::temp_dir().join(format!("nsk-kaomoji-backup-{}.json",std::process::id()));
+        let entries = vec![UserDictEntry { ruby:"にこ".into(), word:"(^_^)".into(), pos:Some("名詞".into()) }];
+        save_to(&path,&entries).unwrap();
+        let first = backup_before_import(&path,&entries).unwrap();
+        let second = backup_before_import(&path,&[]).unwrap();
+        assert_ne!(first,second);
+        let parsed = parse_tsv(&std::fs::read(&first).unwrap());
+        assert_eq!(replace_imported(parsed.rows,parsed.had_replacement).0,entries);
+        assert_eq!(load_from(&path).unwrap().entries,entries);
+        std::fs::remove_file(first).unwrap(); std::fs::remove_file(second).unwrap(); std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn validate_accepts_kana_and_rejects_others() {

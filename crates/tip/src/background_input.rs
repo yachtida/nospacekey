@@ -1830,6 +1830,7 @@ mod tests {
 
     fn test_reload_config() -> Request {
         Request::ReloadConfig {
+            conversion_engine: None,
             llm_enabled: false,
             llm_api_key: String::new(),
             llm_endpoint: String::new(),

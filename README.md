@@ -26,8 +26,10 @@ Windows 11 向けの、ローカルで動く日本語 IME。
                  候補を変えたいときは Space
 ```
 
-長文入力では、先頭の文節を順次自動確定します。最後に残った入力は <kbd>Enter</kbd> で確定。
+既定のAzooKey方式では、長文入力中に先頭の文節を順次自動確定します。最後に残った入力は <kbd>Enter</kbd> で確定。
 ライブ変換をオフにして、Space で変換する使い方もできます。
+
+設定の「マルチエンジン」では、既定のAzooKeyに加え、Windowsの日本語変換機能を使うMicrosoft方式、両方式の候補を混ぜる方式を選べます。候補一覧・<kbd>Tab</kbd> の予測・ライブ変換に対応します。Microsoft方式の候補数や順位はMicrosoft IME本体と一致せず、文節の自動確定も使いません。詳しくは[beta版の変更点](https://github.com/yachtida/nospacekey/releases/tag/v1.7.0-beta.4)をご覧ください。
 
 ## 日本語は、必要なときだけ。
 

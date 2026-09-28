@@ -252,6 +252,7 @@ impl TextService_Impl {
         }
     }
     pub(crate) fn accept_input_predictions(&self, reply: crate::clause_worker::ClauseReply) {
+        if self.kaomoji_palette.borrow().owner.is_some() { return; }
         let Response::InputPredictionsResult { key, candidates } = reply.response else {
             return;
         };

@@ -756,6 +756,7 @@ fn candidates_event(event: &str, candidates: &[String]) -> String {
 pub enum PreservedAction {
     ToggleMode,
     Reconvert,
+    Kaomoji,
     None,
 }
 
@@ -765,6 +766,9 @@ pub fn classify_preserved_key(guid: &GUID) -> PreservedAction {
         GUID_PRESERVEDKEY_MODE_TOGGLE_HZ, GUID_PRESERVEDKEY_MODE_TOGGLE_US,
         GUID_PRESERVEDKEY_RECONVERT, GUID_PRESERVEDKEY_RECONVERT_US,
     };
+    if *guid == crate::globals::GUID_PRESERVEDKEY_KAOMOJI {
+        return PreservedAction::Kaomoji;
+    }
     if *guid == GUID_PRESERVEDKEY_MODE_TOGGLE
         || *guid == GUID_PRESERVEDKEY_MODE_TOGGLE_US
         || *guid == GUID_PRESERVEDKEY_MODE_TOGGLE_HZ
@@ -858,13 +862,24 @@ impl TextService_Impl {
         let ctx: ITfContext = match pic.ok() {
             Ok(c) => c.clone(),
             Err(_) => {
+                self.kaomoji_palette.borrow_mut().close();
                 self.invalidate_pending_end_test_reservation();
                 return Ok(FALSE);
             }
         };
         if self.is_password_context(&ctx) {
+            self.kaomoji_palette.borrow_mut().close();
             self.invalidate_pending_end_test_reservation();
             return Ok(FALSE);
+        }
+        self.retain_kaomoji_context(Some(&ctx));
+        if self.kaomoji_palette.borrow().owner.is_some() {
+            if crate::kaomoji_palette::claims(vk, cmd_modifier_down()) {
+                return Ok(TRUE);
+            }
+            if !is_pure_modifier_vk(vk) {
+                self.kaomoji_palette.borrow_mut().close();
+            }
         }
         let signature = match PendingEndKeySignature::from_context(
             &ctx,
@@ -964,6 +979,7 @@ impl TextService_Impl {
         let ctx: ITfContext = match pic.ok() {
             Ok(c) => c.clone(),
             Err(_) => {
+                self.kaomoji_palette.borrow_mut().close();
                 self.invalidate_pending_end_test_reservation();
                 return Ok(FALSE);
             }
@@ -973,7 +989,17 @@ impl TextService_Impl {
             if self.composition_end_pending.get() {
                 self.abandon_pending_composition_end("keydown_password_context");
             }
+            self.kaomoji_palette.borrow_mut().close();
             return Ok(FALSE);
+        }
+        self.retain_kaomoji_context(Some(&ctx));
+        if self.kaomoji_palette.borrow().owner.is_some() {
+            if crate::kaomoji_palette::claims(vk, cmd_modifier_down()) {
+                return self.handle_kaomoji_key(&ctx, vk, lparam);
+            }
+            if !is_pure_modifier_vk(vk) {
+                self.kaomoji_palette.borrow_mut().close();
+            }
         }
         let signature = match PendingEndKeySignature::from_context(
             &ctx,
@@ -2218,12 +2244,32 @@ impl TextService_Impl {
         if action != PreservedAction::None {
             if let Some(ctx) = &ctx {
                 if self.is_password_context(ctx) {
+                    self.kaomoji_palette.borrow_mut().close();
                     tip_log("ev=preservedkey skip=password");
                     return Ok(TRUE);
                 }
             }
         }
+        if action != PreservedAction::Kaomoji {
+            self.kaomoji_palette.borrow_mut().close();
+        }
         match action {
+            PreservedAction::Kaomoji => {
+                if self.kaomoji_palette.borrow().owner.is_some() {
+                    self.kaomoji_palette.borrow_mut().close();
+                    return Ok(TRUE);
+                }
+                if let Some(ctx) = &ctx {
+                    if !self.settle_before_mode_toggle(Some(ctx)) {
+                        return Ok(TRUE);
+                    }
+                    self.clear_input_predictions();
+                    let anchor = self.caret_point(ctx);
+                    let theme = self.appearance.borrow_mut().current_theme();
+                    self.kaomoji_palette.borrow_mut().open(ctx, anchor.x, anchor.y, theme);
+                }
+                Ok(TRUE)
+            }
             PreservedAction::ToggleMode => {
                 // spec §6.3: bare 0x1D を受理・配送するホストでは OnPreservedKey が composing 中も
                 // 先取りして NotationRotate が沈黙する。リゾルバと同じ優先順を preserved 経路にも
@@ -5002,4 +5048,47 @@ mod tests {
 
 
 
+}
+
+impl TextService_Impl {
+    pub(crate) fn retain_kaomoji_context(&self, ctx: Option<&ITfContext>) {
+        let owner = self.kaomoji_palette.borrow().owner.clone();
+        if let Some(owner) = owner {
+            if !ctx.is_some_and(|ctx| crate::text_service::com_identity_eq(&owner, ctx)) {
+                self.kaomoji_palette.borrow_mut().close();
+            }
+        }
+    }
+    fn handle_kaomoji_key(&self, ctx: &ITfContext, vk: u32, lp: LPARAM) -> Result<BOOL> {
+        let search = self.kaomoji_palette.borrow().search.clone();
+        match vk {
+            0x1B => self.kaomoji_palette.borrow_mut().close(),
+            0x0D => {
+                let word = search.borrow().word();
+                if let Some(word) = word {
+                    // Existing TSF edit session inserts at the selection and repairs the caret.
+                    // No learning or converter route participates in this insertion.
+                    if self.do_commit(ctx, &word) {
+                        self.kaomoji_palette.borrow_mut().close();
+                    } else {
+                        search.borrow_mut().insertion_failed();
+                    }
+                }
+            }
+            0x08 => search.borrow_mut().backspace(),
+            0x26 | 0x25 => search.borrow_mut().move_by(-1),
+            0x28 | 0x27 => search.borrow_mut().move_by(1),
+            0x21 => search.borrow_mut().move_by(-8),
+            0x22 => search.borrow_mut().move_by(8),
+            0x24 => search.borrow_mut().move_by(i32::MIN),
+            0x23 => search.borrow_mut().move_by(i32::MAX),
+            _ => {
+                if let Some(ch) = key_to_char(vk, lp) {
+                    search.borrow_mut().text(ch);
+                }
+            }
+        }
+        self.kaomoji_palette.borrow().repaint();
+        Ok(TRUE)
+    }
 }

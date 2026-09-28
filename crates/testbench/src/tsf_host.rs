@@ -684,6 +684,12 @@ impl TsfHost {
         self.feed_key_measured(vk).0
     }
 
+    /// Query whether an asynchronous candidate revision is ready without selecting it.
+    pub fn claims_key(&self, vk: u32) -> bool {
+        unsafe { self.ksm.TestKeyDown(WPARAM(vk as usize), LPARAM(0x0001_0001))
+            .unwrap_or(FALSE).as_bool() }
+    }
+
     /// Dispatch one VK without draining the STA queue. Callers can use this to model a
     /// host that delivers a physical burst before returning to its message loop.
     pub(crate) fn feed_key_no_pump(&self, vk: u32) -> bool {
@@ -750,6 +756,32 @@ impl TsfHost {
         crate::text_store::hlog(&format!(
             "=== feed_key_with_ctrl vk={vk:#x} eaten={eaten} restored"
         ));
+        eaten
+    }
+
+    /// Check the actual chord registration, then route through TSF's preserved-key API.
+    /// TestKeyDown/KeyDown alone do not simulate the OS preserved-key dispatcher.
+    pub fn open_kaomoji_palette(&self) -> bool {
+        use windows::Win32::UI::TextServices::{TF_MOD_CONTROL, TF_MOD_SHIFT, TF_PRESERVEDKEY};
+        let chord = TF_PRESERVEDKEY {
+            uVKey: 0x76,
+            uModifiers: TF_MOD_CONTROL | TF_MOD_SHIFT,
+        };
+        let eaten = unsafe {
+            let Ok(guid) = self.ksm.GetPreservedKey(&self._ctx, &chord) else {
+                return false;
+            };
+            let Ok(description) = self.ksm.GetPreservedKeyDescription(&guid) else {
+                return false;
+            };
+            if description.to_string() != "nospacekey kaomoji palette" {
+                return false;
+            }
+            self.ksm
+                .SimulatePreservedKey(&self._ctx, &guid)
+                .is_ok_and(|eaten| eaten.as_bool())
+        };
+        pump();
         eaten
     }
 

@@ -112,6 +112,8 @@ fn main() {
         "--engine-absence" => run_engine_absence_mode(args.get(2), args.get(3), args.get(4)),
         "--keymap-smoke" => run_keymap_smoke(),
         "--input-predictions" => input_prediction_acceptance::run(),
+        "--microsoft-engine" => input_prediction_acceptance::run_microsoft(),
+        "--hybrid-engine" => input_prediction_acceptance::run_hybrid(),
         "--diag" => tsf_host::diag(),
         other => {
             eprintln!("unknown mode: {other}");
@@ -1741,6 +1743,7 @@ fn run_keymap_smoke() -> i32 {
     let ok_convert_none = run_keymap_smoke_convert_none(&dir);
     let ok_reconvert_frees_convert = run_keymap_smoke_reconvert_frees_convert_key(&dir);
     let ok_rotate = run_keymap_smoke_notation_rotate(&dir);
+    let ok_kaomoji = run_keymap_smoke_kaomoji(&dir);
     let ok_live_off_enter = run_live_off_enter_commits_the_reading(&dir);
     let ok_live_off_space = run_live_off_space_still_converts(&dir);
     let ok_live_off_esc = run_live_off_esc_restores_the_reading(&dir);
@@ -1750,6 +1753,7 @@ fn run_keymap_smoke() -> i32 {
         && ok_convert_none
         && ok_reconvert_frees_convert
         && ok_rotate
+        && ok_kaomoji
         && ok_live_off_enter
         && ok_live_off_space
         && ok_live_off_esc
@@ -1758,7 +1762,7 @@ fn run_keymap_smoke() -> i32 {
         "keymap-smoke : {} (to_katakana_remap={ok_remap} convert_none={ok_convert_none} \
          reconvert_frees_convert_key={ok_reconvert_frees_convert} notation_rotate={ok_rotate} \
          live_off_enter={ok_live_off_enter} live_off_space={ok_live_off_space} \
-         live_off_esc={ok_live_off_esc} live_off_settle={ok_live_off_settle})",
+         live_off_esc={ok_live_off_esc} live_off_settle={ok_live_off_settle} kaomoji={ok_kaomoji})",
         if passed { "PASS" } else { "FAIL" }
     );
     if passed {
@@ -1768,6 +1772,74 @@ fn run_keymap_smoke() -> i32 {
     }
 }
 
+/// Production preserved-key routing, isolated search, selection insertion and mtime reload.
+fn run_keymap_smoke_kaomoji(dir: &std::path::Path) -> bool {
+    let path = dir.join("kaomoji_dictionary.json");
+    let entries = vec![
+        settings::user_dictionary::UserDictEntry {
+            ruby: "ニコ".into(),
+            word: "(^_^)".into(),
+            pos: None,
+        },
+        settings::user_dictionary::UserDictEntry {
+            ruby: "にこ".into(),
+            word: "🙂".into(),
+            pos: None,
+        },
+        settings::user_dictionary::UserDictEntry {
+            ruby: "なく".into(),
+            word: "(;_;)".into(),
+            pos: None,
+        },
+    ];
+    if std::fs::write(
+        dir.join("settings.json"),
+        r#"{"version":2,"live_conversion":{"enabled":false}}"#,
+    )
+    .is_err()
+        || settings::user_dictionary::save_to(&path, &entries).is_err()
+    {
+        return false;
+    }
+    let Ok(host) = tsf_host::TsfHost::start() else {
+        return false;
+    };
+    let _ = host.normalize_native_mode();
+    host.warm_up();
+    host.store.reset();
+    host.store.seed_committed("AB");
+    host.store.set_selection(1, 1);
+    let opened = host.open_kaomoji_palette();
+    for key in scenarios::typed("niko") {
+        let _ = host.feed_key(key.0);
+    }
+    let isolated = host.store.committed() == "AB" && host.store.preedit().is_empty();
+    let _ = host.feed_key(0x28);
+    let _ = host.feed_key(scenarios::ENTER.0);
+    let inserted = host.store.committed() == "A🙂B" && host.store.selection() == (3, 3);
+    let replacement = vec![settings::user_dictionary::UserDictEntry {
+        ruby: "にこ".into(),
+        word: "(T_T)".into(),
+        pos: None,
+    }];
+    let saved = settings::user_dictionary::save_to(&path, &replacement).is_ok();
+    host.store.set_selection(1, 3);
+    let reopened = host.open_kaomoji_palette();
+    for key in scenarios::typed("niko") {
+        let _ = host.feed_key(key.0);
+    }
+    let _ = host.feed_key(scenarios::ENTER.0);
+    let replaced = host.store.committed() == "A(T_T)B" && host.store.selection() == (6, 6);
+    let _ = host.open_kaomoji_palette();
+    for key in scenarios::typed("naku") {
+        let _ = host.feed_key(key.0);
+    }
+    let _ = host.feed_key(scenarios::ESC.0);
+    let cancelled = host.store.committed() == "A(T_T)B" && host.store.preedit().is_empty();
+    let passed = opened && isolated && inserted && saved && reopened && replaced && cancelled;
+    println!("keymap-smoke:kaomoji : {} (opened={opened} isolated={isolated} inserted={inserted} reloaded={replaced} cancelled={cancelled})",if passed {"PASS"} else {"FAIL"});
+    passed
+}
 /// サブ1: to_katakana を F7→F11 へリマップ。
 /// シナリオ: typed("nihongo") → F7(解放済み=表記変換しない) → F11(カタカナ表記変換)
 /// 自己証明（偽 PASS 防止）: ev=notation vk=0x7a を直接観測する（=F11 が実際に表記変換を

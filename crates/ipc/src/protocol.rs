@@ -65,6 +65,7 @@ pub enum Request {
     InputPredictions(crate::clause::ClauseCandidatesRequest),
     ConvertClauses(crate::clause::ConvertClausesRequest),
     CommitReceipt(crate::clause::CommitReceipt),
+    RecentMicrosoftSelections,
     /// 挿入文字の解釈。省略(None)=roman2kana(従来)。"direct"=リテラル挿入(Shift英語モード)。
     /// 必須フィールドにしないのは旧エンジン/旧TIPとの wire 互換のため(left_context と同じ
     /// Option+skip 規約 — None ならバイト一致)。
@@ -168,6 +169,8 @@ pub enum Request {
     /// 応答は Ok（反映済み）または Error（"reload busy ..." — warm-up/変換中でスキップ。
     /// 巡3 Z4: TIP は busy を上限付き遅延再送する。接続は維持）。
     ReloadConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversion_engine: Option<String>,
         llm_enabled: bool,
         llm_api_key: String,
         llm_endpoint: String,
@@ -274,6 +277,7 @@ pub struct MixedSpan {
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(tag = "result")]
 pub enum Response {
+    RecentMicrosoftSelections { entries: Vec<RecentMicrosoftSelection> },
     InputPredictionsResult { key: crate::clause::ClauseRequestKey, candidates: Vec<crate::clause::ClauseCandidate> },
     Pong,
     ClauseCandidatesResult {
@@ -423,6 +427,12 @@ pub enum Response {
     },
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct RecentMicrosoftSelection {
+    pub ruby: String,
+    pub word: String,
+}
+
 /// 混在変換応答の1区間。読み範囲は要求と同一（Japanese 変換で読みは変わらない）。
 /// `candidate_token` は Japanese 区間だけが持ち、確定 receipt の学習 token として
 /// 使う（Literal は None＝学習対象外）。省略時は None。
@@ -439,6 +449,17 @@ pub struct MixedSpanResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_microsoft_selections_roundtrip() {
+        let request = Request::RecentMicrosoftSelections;
+        assert_eq!(serde_json::to_string(&request).unwrap(), r#"{"method":"RecentMicrosoftSelections"}"#);
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&request).unwrap()).unwrap(), request);
+        let response = Response::RecentMicrosoftSelections {
+            entries: vec![RecentMicrosoftSelection { ruby: "こうほ".into(), word: "候補語".into() }],
+        };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&response).unwrap()).unwrap(), response);
+    }
 
     #[test]
     fn snapshot_flat_candidate_tokens_are_optional_and_roundtrip() {
@@ -873,6 +894,7 @@ mod tests {
     fn reload_config_request_roundtrips() {
         // UU-5: 設定 push リクエストの wire 形（method/params）と往復同一性を固定する。
         let r = Request::ReloadConfig {
+            conversion_engine: None,
             llm_enabled: true,
             llm_api_key: "sk-x".into(),
             llm_endpoint: "https://e".into(),
@@ -896,6 +918,7 @@ mod tests {
     fn reload_config_disabled_llm_roundtrips() {
         // LLM 無効時は空フィールドで送る（エンジンは非空チェックで disabled に落ちる＝H-1 と整合）。
         let r = Request::ReloadConfig {
+            conversion_engine: None,
             llm_enabled: false,
             llm_api_key: String::new(),
             llm_endpoint: String::new(),
@@ -1198,6 +1221,7 @@ mod tests {
     #[test]
     fn reload_config_carries_learning_enabled() {
         let r = Request::ReloadConfig {
+            conversion_engine: None,
             llm_enabled: false,
             llm_api_key: String::new(),
             llm_endpoint: String::new(),
@@ -1221,6 +1245,7 @@ mod tests {
     fn reload_config_inference_limit_none_omits_field() {
         // D6 env override 時/旧 TIP は None＝wire にフィールド自体が現れない（旧エンジン互換の既定形）。
         let r = Request::ReloadConfig {
+            conversion_engine: None,
             llm_enabled: false,
             llm_api_key: String::new(),
             llm_endpoint: String::new(),

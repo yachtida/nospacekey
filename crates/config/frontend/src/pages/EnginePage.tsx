@@ -143,11 +143,20 @@ export function EnginePage() {
   };
   return (
     <div className="page-stack">
-      <header className="page-heading"><h1>変換エンジン</h1><p>希望する方式、モデルの準備状況、実際に確認できた動作を分けて表示します。</p></header>
+      <header className="page-heading"><h1>マルチエンジン</h1><p>候補一覧、入力中の予測、ライブ変換に使うエンジンを選びます。</p></header>
       {failure && <StatusMessage tone="error">{failure}</StatusMessage>}
       {message && <StatusMessage tone="success">{message}</StatusMessage>}
       {operations.some((operation) => !["succeeded", "failed", "cancelled"].includes(operation.phase)) && <StatusMessage tone="warning">モデル処理: {operations.filter((operation) => !["succeeded", "failed", "cancelled"].includes(operation.phase)).map(operationLabel).join(" / ")}</StatusMessage>}
-      <SettingsGroup title="希望する変換方式">
+      <SettingsGroup title="変換エンジン">
+        <SettingRow id="conversion-engine" title="使用するエンジン" description="既定はAzooKeyです。入力方法やキー操作は共通です。" effect="入力先を開き直した後">
+          <SegmentedChoice label="使用するエンジン" value={values.conversionEngine} options={[{ value: "azookey", label: "AzooKey（既定）" }, { value: "microsoft", label: "Microsoft IME" }, { value: "hybrid", label: "両方を混ぜる" }]} onChange={(value) => save({ field: "conversion_engine", value })} />
+          <InlineError errors={errors} field="conversion_engine" />
+        </SettingRow>
+        {values.conversionEngine === "microsoft" && <p className="helper-text">Windowsの日本語変換・予測機能を使います。Microsoft IME本体とは候補の数や順序が異なります。全文単位で変換し、文節の自動確定は行いません。学習が有効なら、通常候補の明示選択を本アプリ内に学習します。Tab予測やMicrosoft IME本体へは学習しません。AzooKeyのGPU変換・辞書・学習は適用されません。Windowsの日本語言語機能が必要です。</p>}
+        {values.conversionEngine === "hybrid" && <p className="helper-text">AzooKeyとWindowsの候補を1件ずつ交互に表示します。重複する語はAzooKey側を残します。ライブ変換はAzooKey候補を優先します。学習が有効なら、Microsoft側の通常候補の明示選択を本アプリ内に学習します。Tab予測やMicrosoft IME本体へは学習しません。</p>}
+      </SettingsGroup>
+      {values.conversionEngine !== "microsoft" && <>
+      <SettingsGroup title="AzooKeyの変換方式">
         <SettingRow id="zenzai-enabled" title="変換方式" description="GPU変換を希望しても、モデルやGPUが利用できないときは標準変換へ安全に戻ります。" effect="次回のエンジン接続から">
           <SegmentedChoice label="変換方式" value={values.zenzaiEnabled ? "gpu" : "standard"} options={[{ value: "standard", label: "標準変換" }, { value: "gpu", label: "GPU変換" }]} onChange={(value) => save({ field: "zenzai_enabled", value: value === "gpu" })} />
         </SettingRow>
@@ -164,6 +173,7 @@ export function EnginePage() {
         <SettingRow id="zenzai-path" title="任意GGUFパス" description="空欄では管理領域または同梱モデルを自動検出します。絶対パスだけを保存できます。" effect="次回のエンジン接続から"><CommitField value={values.weightPath} label="GGUFパス" placeholder="C:\\…\\model.gguf" onCommit={(value) => save({ field: "weight_path", value })} /><InlineError errors={errors} field="weight_path" /></SettingRow>
         <SettingRow id="zenzai-limit" title="推論上限" description="1〜10。値が大きいほど推論回数が増えます。" effect="次回のエンジン接続から"><CommitField type="number" min={1} max={10} step={1} value={values.zenzaiInferenceLimit} label="推論上限" onCommit={(value) => save({ field: "zenzai_inference_limit", value: Number(value) })} /><InlineError errors={errors} field="zenzai_inference_limit" /></SettingRow>
       </div></details>
+      </>}
     </div>
   );
 }

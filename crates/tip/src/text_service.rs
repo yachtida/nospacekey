@@ -443,6 +443,7 @@ fn response_kind(response: &Response) -> &'static str {
         Response::ClauseCandidatesResult { .. } => "clause_candidates_result",
         Response::ConvertClausesResult { .. } => "convert_clauses_result",
         Response::CommitReceiptAck { .. } => "commit_receipt_ack",
+        Response::RecentMicrosoftSelections { .. } => "recent_microsoft_selections",
         Response::LlmResult { .. } => "llm_result",
         Response::ClauseView { .. } => "clause_view",
         Response::ZenzaiStatus { .. } => "zenzai_status",
@@ -505,6 +506,7 @@ fn build_reload_config(
         (String::new(), String::new(), String::new(), String::new())
     };
     Request::ReloadConfig {
+        conversion_engine: Some(s.conversion_engine.as_str().into()),
         llm_enabled: llm_on,
         llm_api_key,
         llm_endpoint,
@@ -1070,6 +1072,8 @@ pub struct TextService {
     /// （循環）になる。Deactivate で None にして循環を断ち切りリークを防ぐ。Deactivate が呼ばれない
     /// 経路（プロセス強制終了）はプロセスごと消えるのでリークにならない。
     pub(crate) langbar_on_toggle: crate::langbar::ModeToggleHandle,
+    /// 通常変換に関与しない、フォーカスを奪わない顔文字検索窓。
+    pub(crate) kaomoji_palette: RefCell<crate::kaomoji_palette::Palette>,
     /// SP5/US: モード切替時に あ/A をキャレット近傍へ一瞬出す HUD（Win11 では言語バーが出ない）。
     pub(crate) mode_hud: std::cell::RefCell<crate::mode_hud::ModeHud>,
     /// 読みモニタ: ライブ変換中の生読みをキャレット上側へ常時表示する窓（spec 2026-07-21）。
@@ -1323,6 +1327,7 @@ impl TextService {
             langbar_sink: Rc::new(RefCell::new(None)),
             langbar_item: RefCell::new(None),
             langbar_on_toggle: Rc::new(RefCell::new(None)),
+            kaomoji_palette: RefCell::new(crate::kaomoji_palette::Palette::default()),
             mode_hud: std::cell::RefCell::new(crate::mode_hud::ModeHud::empty()),
             reading_monitor: std::cell::RefCell::new(
                 crate::reading_monitor::ReadingMonitor::empty(),
@@ -1489,7 +1494,14 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             // 登録の成否は per-key でログに残す(実機で「無変換が効かない」「カスタムキーが
             // OS に拒否された(bare 0x1C の 0x80040506 前例)」を診断するため)。
             {
-                let regs = crate::keymap::build_preserved_regs(&self.keymap.get());
+                let mut regs = crate::keymap::build_preserved_regs(&self.keymap.get());
+                regs.push(crate::keymap::PreservedReg {
+                    guid: crate::globals::GUID_PRESERVEDKEY_KAOMOJI,
+                    vk: 0x76,
+                    modifiers: windows::Win32::UI::TextServices::TF_MOD_CONTROL
+                        | windows::Win32::UI::TextServices::TF_MOD_SHIFT,
+                    desc: "nospacekey kaomoji palette",
+                });
                 for r in &regs {
                     let pk = TF_PRESERVEDKEY {
                         uVKey: r.vk,
@@ -1980,6 +1992,7 @@ impl TextService_Impl {
         // ⚠この契約は --persist モード限定（oneShot は NamedPipeServer が onDisconnect を呼ばず
         // 学習 flush も走らない）。本 TIP の spawn は常に --persist（spawn_engine_hidden）なので
         // 現行経路では成立するが、oneShot を再有効化する改修はここを再考すること（レビュー I-1）。
+        self.kaomoji_palette.borrow_mut().close();
         self.thread_has_focus.set(false);
         self.configure_zenzai_status_monitor(false);
         self.drop_engine();
@@ -2093,6 +2106,7 @@ impl TextService_Impl {
         // （STATUS_FATAL_USER_CALLBACK_EXCEPTION, c000041d）でホストごと落ちる。
         // プロセスが健全な Deactivate 時点で破棄すれば、終了時は hwnd が null で no-op。
         self.candidate_ui.borrow_mut().destroy_window();
+        self.kaomoji_palette.borrow_mut().destroy();
         self.mode_hud.borrow_mut().destroy();
         self.reading_monitor.borrow_mut().destroy();
 
@@ -2326,6 +2340,7 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         // 巡4 T6: refresh_layout_sink_target の Advise/UnadviseSink コールアウト中に同期再入しうる
         // 入口 — 保護なし入口の panic は shim 越えで abort するため、他入口と同じ規律で包む。
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.retain_kaomoji_context(None);
             self.retain_input_prediction_context(None);
             self.password_ctx_key.set(0); // Spec2: context 切替で password キャッシュ無効化（ABA 対策・I-3）
 
@@ -2348,6 +2363,7 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         self.consume_started_composition();
         // 巡4 T6: OnPushContext と同じ規律。
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.retain_kaomoji_context(None);
             self.retain_input_prediction_context(None);
             self.password_ctx_key.set(0); // Spec2: context 切替で password キャッシュ無効化（ABA 対策・I-3）
 
@@ -2402,6 +2418,7 @@ impl TextService_Impl {
         let new_focus_ctx = new_focus
             .as_ref()
             .and_then(|doc| unsafe { doc.GetTop() }.ok());
+        self.retain_kaomoji_context(new_focus_ctx.as_ref());
         self.retain_input_prediction_context(new_focus_ctx.as_ref());
         self.preedit_apply.retain_context(new_focus_ctx.as_ref());
         // A host can end an already-written composition before this focus
@@ -2488,6 +2505,7 @@ impl ITfThreadFocusSink_Impl for TextService_Impl {
 
 impl TextService_Impl {
     fn on_kill_thread_focus_inner(&self) -> Result<()> {
+        self.kaomoji_palette.borrow_mut().close();
         self.thread_has_focus.set(false);
         self.disarm_zenzai_status_poll();
         self.zenzai_status_client.borrow_mut().take();
@@ -8052,6 +8070,7 @@ mod uu5_reload_config_tests {
         assert_eq!(
             req,
             Request::ReloadConfig {
+                conversion_engine: Some("azookey".into()),
                 llm_enabled: false,
                 llm_api_key: "".into(),
                 llm_endpoint: "".into(),
@@ -8064,6 +8083,17 @@ mod uu5_reload_config_tests {
                 zenzai_inference_limit: Some(1),
             }
         );
+    }
+
+    #[test]
+    fn microsoft_engine_selection_is_sent_on_reload() {
+        let mut settings = Settings::default();
+        settings.conversion_engine = settings::ConversionEngine::Microsoft;
+        match build_reload_config(&settings, None, |_| None) {
+            Request::ReloadConfig { conversion_engine, .. } =>
+                assert_eq!(conversion_engine.as_deref(), Some("microsoft")),
+            _ => unreachable!(),
+        }
     }
 
     #[test]

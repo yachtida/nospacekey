@@ -11,6 +11,17 @@ enum LearningStoreValidation {
     }
 
     static func validate(_ files: [String: Data]) throws {
+        if let data = files["microsoft-candidates.json"] {
+            struct MicrosoftCandidates: Decodable { let version: Int; let entries: [MicrosoftLearningStore.Entry] }
+            let decoded = try JSONDecoder().decode(MicrosoftCandidates.self, from: data)
+            guard decoded.version == 1, decoded.entries.count <= MicrosoftLearningStore.maxEntries,
+                  decoded.entries.allSatisfy({ entry in
+                      CorrectionStore.normalizedKey(entry.reading) == entry.reading &&
+                      entry.reading.unicodeScalars.count <= 64 &&
+                      !entry.surface.isEmpty && entry.surface.unicodeScalars.count <= 300
+                  }) else { throw Invalid.format }
+        }
+        if files.count == 1, files["microsoft-candidates.json"] != nil { return }
         guard let metadata = files["memory.memorymetadata"],
               let chars = files["memory.loudschars2"], let louds = files["memory.louds"] else { throw Invalid.format }
         let nodes = Int(try integer(metadata, 0, 4))
@@ -193,10 +204,19 @@ enum LearningMigration {
             // Never interpret that window as "no history" or select a different older store.
             let pause = directory.appendingPathComponent(".pause")
             if try learningPathMetadata(for: pause) != nil { throw LearningStoreValidation.Invalid.unavailable }
+            let microsoft = directory.appendingPathComponent("microsoft-candidates.json")
+            let microsoftItem = try learningPathMetadata(for: microsoft)
+            if let microsoftItem {
+                guard microsoftItem.isRegularFile, !microsoftItem.isReparsePoint else {
+                    throw LearningStoreValidation.Invalid.format
+                }
+            }
             guard let item = try learningPathMetadata(for: metadata) else {
                 if try learningPathMetadata(for: directory.appendingPathComponent("memory.memorymetadata.2")) != nil ||
                     learningPathMetadata(for: pause) != nil { throw LearningStoreValidation.Invalid.unavailable }
-                return nil
+                guard microsoftItem != nil else { return nil }
+                let modified = try manager.attributesOfItem(atPath: microsoft.path)[.modificationDate] as? Date ?? .distantPast
+                return Candidate(directory: directory, modified: modified)
             }
             guard item.isRegularFile, !item.isReparsePoint else { throw LearningStoreValidation.Invalid.format }
             let modified = try manager.attributesOfItem(atPath: metadata.path)[.modificationDate] as? Date ?? .distantPast
@@ -300,6 +320,17 @@ enum LearningMigration {
             guard !FileManager.default.fileExists(atPath: source.appendingPathComponent(".pause").path) else {
                 throw LearningStoreValidation.Invalid.unavailable
             }
+            let metadataURL = source.appendingPathComponent("memory.memorymetadata")
+            if try learningPathMetadata(for: metadataURL) == nil {
+                let microsoftLease = try LearningFileLease(source.appendingPathComponent("microsoft-candidates.json"))
+                let files = ["microsoft-candidates.json": try microsoftLease.read()]
+                guard !FileManager.default.fileExists(atPath: source.appendingPathComponent(".pause").path) else {
+                    throw LearningStoreValidation.Invalid.unavailable
+                }
+                do { try LearningStoreValidation.validate(files) }
+                catch { throw LearningStoreValidation.Invalid.format }
+                return files
+            }
             let metadataLease = try LearningFileLease(source.appendingPathComponent("memory.memorymetadata"))
             let metadata = try metadataLease.read()
             let nodes = Int(try LearningStoreValidation.integer(metadata, 0, 4))
@@ -308,6 +339,7 @@ enum LearningMigration {
             var files = ["memory.memorymetadata": metadata]
             var names = ["memory.louds", "memory.loudschars2"] + (0..<((nodes + 2047) / 2048)).map { "memory\($0).loudstxt3" }
             if FileManager.default.fileExists(atPath: source.appendingPathComponent("corrections.json").path) { names.append("corrections.json") }
+            if FileManager.default.fileExists(atPath: source.appendingPathComponent("microsoft-candidates.json").path) { names.append("microsoft-candidates.json") }
             for name in names {
                 let lease = try LearningFileLease(source.appendingPathComponent(name))
                 leases.append(lease)

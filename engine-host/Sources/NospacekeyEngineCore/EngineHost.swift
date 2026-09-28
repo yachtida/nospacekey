@@ -138,6 +138,8 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                 response = .convertClausesResult(service.convertClauses(request, admissionDeadline: deadline))
             case .commitReceipt(let receipt):
                 response = .commitReceiptAck(service.commitReceipt(receipt))
+            case .recentMicrosoftSelections:
+                response = .recentMicrosoftSelections(service.recentMicrosoftSelections())
             case .insert(let s, let t, let style):
                 response = service.insert(session: Int(s), text: t, style: style).map(Response.reading) ?? .error("no session")
             case .backspace(let s):
@@ -205,6 +207,9 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                 // UU-5: TIP が push した最新設定を、LLMConfig.resolve / ZenzaiConfig.resolve が読む
                 // env キーの「上書き集合」へ写す（reload が実プロセス env に重ねる — #2）。
                 var overrides: [String: String] = [:]
+                if let engine = p.conversion_engine {
+                    overrides["NOSPACEKEY_CONVERSION_ENGINE"] = engine.rawValue
+                }
                 overrides["NOSPACEKEY_ZENZAI"] = p.zenzai_enabled ? "on" : "off"
                 // 常時 put（空値も）: spawn 時に env へ積んだ旧 weight が reload の重ね書きで
                 // 残り続け、UI(weight_path 空 → per-user 表示)とエンジン(旧明示パス)が分岐する

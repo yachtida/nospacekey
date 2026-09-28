@@ -30,6 +30,7 @@ export type Appearance = {
 export type KeymapSettings = Record<string, string | null>;
 
 export type PublicSettings = {
+  conversionEngine: "azookey" | "microsoft" | "hybrid";
   zenzaiEnabled: boolean;
   weightPath: string;
   zenzaiInferenceLimit: number;
@@ -67,6 +68,7 @@ export type SettingsSnapshot = {
 export type FieldError = { field: string; message: string };
 
 export type SettingChange =
+  | { field: "conversion_engine"; value: PublicSettings["conversionEngine"] }
   | { field: "mixed_input"; value: "off" | "candidates" | "auto" }
   | { field: "default_direct" | "live_enabled" | "input_prediction_enabled" | "number_full_width" | "punctuation_full_width" | "symbol_full_width" | "reading_monitor_enabled" | "reading_monitor_accumulate" | "user_dictionary_enabled" | "learning_enabled" | "zenzai_enabled" | "update_include_beta"; value: boolean }
   | { field: "appearance_font_family" | "weight_path"; value: string }

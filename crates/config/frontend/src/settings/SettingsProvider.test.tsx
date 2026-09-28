@@ -17,7 +17,7 @@ const initial: SettingsSnapshot = {
   notices: [],
   values: {
     defaultDirect: false,
-    liveEnabled: true, mixedInput: "off",
+    conversionEngine: "azookey", liveEnabled: true, mixedInput: "off",
     zenzaiInferenceLimit: 3,
     appearance: { theme: "auto" },
     keymap: {},

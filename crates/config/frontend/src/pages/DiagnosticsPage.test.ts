@@ -3,7 +3,7 @@ import { resetChanges } from "./DiagnosticsPage";
 
 const defaults = {
   liveSearchWidth: 1,
-  defaultDirect: false, liveEnabled: true, mixedInput: "off", inputPredictionEnabled: true,
+  defaultDirect: false, conversionEngine: "azookey", liveEnabled: true, mixedInput: "off", inputPredictionEnabled: true,
   shiftLatinMode: "compose", numberFullWidth: true, punctuationFullWidth: true,
   symbolFullWidth: false, symbolFullWidthChars: ["!"],
   keymap: { mode_toggle: null, ephemeral: null, llm_convert: "Ctrl+Alt+L" },

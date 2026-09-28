@@ -76,6 +76,7 @@ enum Request: Decodable {
     case clauseCandidates(ClauseCandidatesRequest)
     case convertClauses(ConvertClausesRequest)
     case commitReceipt(CommitReceipt)
+    case recentMicrosoftSelections
     // style: "direct"=リテラル挿入(Shift英語モード)。nil=roman2kana(従来)。Rust 側は None の
     // ときキーを省略するので Optional デコードで旧 TIP 互換を保つ(left_context と同じ規約)。
     case insert(session: Int64, text: String, style: String?)
@@ -180,6 +181,7 @@ enum Request: Decodable {
     }
     /// UU-5: ReloadConfig の params。Rust `Request::ReloadConfig` のフィールドと一字一句一致させること。
     struct ReloadConfigParams: Decodable {
+        let conversion_engine: ConversionEngine?
         let llm_enabled: Bool
         let llm_api_key: String
         let llm_endpoint: String
@@ -207,6 +209,7 @@ enum Request: Decodable {
         case "ClauseCandidates": self = .clauseCandidates(try c.decode(ClauseCandidatesRequest.self, forKey: .params))
         case "ConvertClauses": self = .convertClauses(try c.decode(ConvertClausesRequest.self, forKey: .params))
         case "CommitReceipt": self = .commitReceipt(try c.decode(CommitReceipt.self, forKey: .params))
+        case "RecentMicrosoftSelections": self = .recentMicrosoftSelections
         case "Insert": let p = try c.decode(InsertParams.self, forKey: .params); self = .insert(session: p.session, text: p.text, style: p.style)
         case "Backspace": let p = try c.decode(SessionParams.self, forKey: .params); self = .backspace(session: p.session)
         // U9: Convert のみ left_context を持つ。Rust 側は None のときキーを省略するので、
@@ -278,12 +281,18 @@ struct InputPredictionsResult: Codable {
     let candidates: [ClauseCandidate]
 }
 
+struct RecentMicrosoftSelection: Codable, Equatable, Sendable {
+    let ruby: String
+    let word: String
+}
+
 enum Response: Encodable {
     case inputPredictionsResult(InputPredictionsResult)
     case pong
     case clauseCandidatesResult(ClauseCandidatesResult)
     case convertClausesResult(ConvertClausesResult)
     case commitReceiptAck(CommitReceiptAck)
+    case recentMicrosoftSelections([RecentMicrosoftSelection])
     // wire世代とEngineHost buildの完全一致だけをTIPが採用する。Rust `Response::Session` と対。
     case session(Int64, proto: UInt32?, boot: String?, engineEpoch: String, learningGeneration: UInt64, capabilities: [String]?)
     case reading(String)
@@ -329,7 +338,7 @@ enum Response: Encodable {
         case candidateRemaining = "candidate_remaining", baseline, autoCommit = "auto_commit"
         case engineEpoch = "engine_epoch", learningGeneration = "learning_generation"
         case capabilities, requestID = "request_id", sourceRevision = "source_revision"
-        case planID = "plan_id", spans
+        case planID = "plan_id", spans, entries
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: Keys.self)
@@ -347,6 +356,9 @@ enum Response: Encodable {
         case .commitReceiptAck(let response):
             try c.encode("CommitReceiptAck", forKey: .result)
             try response.encode(to: encoder)
+        case .recentMicrosoftSelections(let entries):
+            try c.encode("RecentMicrosoftSelections", forKey: .result)
+            try c.encode(entries, forKey: .entries)
         case .session(let s, let proto, let boot, let engineEpoch, let learningGeneration, let capabilities):
             try c.encode("Session", forKey: .result)
             try c.encode(s, forKey: .session)
@@ -453,6 +465,7 @@ extension Request {
         switch self {
         case .ping, .startSession, .liveSnapshot, .pollSnapshotEnhancement, .autoCommitReceipt,
              .inputPredictions, .clauseCandidates, .convertClauses, .commitReceipt,
+             .recentMicrosoftSelections,
              .reloadConfig, .clearLearning, .shutdown, .prepareMaintenance, .queryZenzaiStatus,
              .retryZenzai, .recordCorrection,
              .reloadDictionary:

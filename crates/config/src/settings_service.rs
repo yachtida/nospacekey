@@ -40,6 +40,7 @@ pub struct SettingsNotice {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicSettings {
+    pub conversion_engine: settings::ConversionEngine,
     pub zenzai_enabled: bool,
     pub weight_path: String,
     pub zenzai_inference_limit: u32,
@@ -70,6 +71,7 @@ impl From<&settings::Settings> for PublicSettings {
     fn from(settings: &settings::Settings) -> Self {
         let dto = logic::to_dto(settings);
         Self {
+            conversion_engine: settings.conversion_engine,
             zenzai_enabled: dto.zenzai_enabled,
             weight_path: dto.weight_path,
             zenzai_inference_limit: dto.zenzai_inference_limit,
@@ -119,6 +121,7 @@ pub struct KeyBindingChange {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "field", content = "value", rename_all = "snake_case")]
 pub enum SettingChange {
+    ConversionEngine(settings::ConversionEngine),
     DefaultDirect(bool),
     LiveEnabled(bool),
     MixedInput(settings::MixedInputMode),
@@ -465,6 +468,7 @@ fn apply_changes(
             SettingChange::UserDictionaryEnabled(value) => {
                 settings.user_dictionary.enabled = *value
             }
+            SettingChange::ConversionEngine(value) => settings.conversion_engine = *value,
             SettingChange::LearningEnabled(value) => settings.learning.enabled = *value,
             SettingChange::ZenzaiEnabled(value) => settings.zenzai.enabled = *value,
             SettingChange::WeightPath(value) => settings.zenzai.weight_path = value.clone(),
@@ -606,6 +610,19 @@ pub fn default_public_settings() -> PublicSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversion_engine_patch_is_typed_and_preserves_azookey_preferences() {
+        let original = settings::Settings::default();
+        let change: SettingChange = serde_json::from_str(
+            r#"{"field":"conversion_engine","value":"microsoft"}"#).unwrap();
+        let updated = apply_changes(original.clone(), &[change]).unwrap();
+        assert_eq!(PublicSettings::from(&updated).conversion_engine, settings::ConversionEngine::Microsoft);
+        assert_eq!(updated.zenzai.enabled, original.zenzai.enabled);
+        assert_eq!(updated.learning.enabled, original.learning.enabled);
+        assert!(serde_json::from_str::<SettingChange>(
+            r#"{"field":"conversion_engine","value":"unknown"}"#).is_err());
+    }
 
     #[test]
     fn snapshot_hashes_the_captured_bytes_and_numbers_each_observation() {

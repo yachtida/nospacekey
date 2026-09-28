@@ -592,11 +592,46 @@ pub fn dict_delete_logic(
     save_and_send(path, &loaded.entries, send)
 }
 
+#[cfg(test)]
 pub fn dict_import_logic(
     lock: &DictLock,
     path: &Path,
     send: &dyn Fn() -> EngineStatus,
     bytes: &[u8],
+) -> Result<ImportReportDto, DictCmdError> {
+    dict_import_checked(lock, path, send, bytes, None)
+}
+
+pub fn dict_import_snapshot(
+    lock: &DictLock,
+    path: &Path,
+) -> Result<(usize, Option<Vec<u8>>), DictCmdError> {
+    let _guard = lock.0.lock().unwrap();
+    let loaded = load_locked(path)?;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(DictCmdError::Unreadable),
+    };
+    Ok((loaded.entries.len(), bytes))
+}
+
+pub fn dict_import_if_unchanged_logic(
+    lock: &DictLock,
+    path: &Path,
+    send: &dyn Fn() -> EngineStatus,
+    bytes: &[u8],
+    snapshot: Option<&[u8]>,
+) -> Result<ImportReportDto, DictCmdError> {
+    dict_import_checked(lock, path, send, bytes, Some(snapshot))
+}
+
+fn dict_import_checked(
+    lock: &DictLock,
+    path: &Path,
+    send: &dyn Fn() -> EngineStatus,
+    bytes: &[u8],
+    snapshot: Option<Option<&[u8]>>,
 ) -> Result<ImportReportDto, DictCmdError> {
     // エンコーディング判別+パースは mutex の外(spec §5.3 — ダイアログ同様、重い処理で
     // 辞書タブ全体を無期限に無反応にしない)。
@@ -606,13 +641,27 @@ pub fn dict_import_logic(
         return Err(DictCmdError::InvalidEncoding);
     }
     let _guard = lock.0.lock().unwrap();
-    let mut loaded = load_locked(path)?;
-    let report = settings::user_dictionary::merge_imported(
-        &mut loaded.entries,
-        parsed.rows,
-        parsed.had_replacement,
-    );
-    settings::user_dictionary::save_to(path, &loaded.entries).map_err(|e| DictCmdError::Io {
+    if let Some(expected) = snapshot {
+        let current = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(DictCmdError::Unreadable),
+        };
+        if current.as_deref() != expected {
+            return Err(DictCmdError::Io {
+                message: "確認中に辞書が変更されました。もう一度取込してください。".into(),
+            });
+        }
+    }
+    let loaded = load_locked(path)?;
+    let (entries, report) =
+        settings::user_dictionary::replace_imported(parsed.rows, parsed.had_replacement);
+    settings::user_dictionary::backup_before_import(path, &loaded.entries).map_err(|e| {
+        DictCmdError::Io {
+            message: e.to_string(),
+        }
+    })?;
+    settings::user_dictionary::save_to(path, &entries).map_err(|e| DictCmdError::Io {
         message: e.to_string(),
     })?;
     Ok(ImportReportDto {
@@ -623,7 +672,6 @@ pub fn dict_import_logic(
         engine: send(),
     })
 }
-
 /// tsv は UTF-8 BOM 無しで書く(呼び出し元がファイルへ書き出す)。lock は `dict_list_logic`
 /// と同じ理由(`load_from` の隔離 rename)。
 pub fn dict_export_logic(
@@ -1139,6 +1187,37 @@ mod tests {
         assert!(matches!(result, Err(DictCmdError::InvalidEncoding)));
         assert_eq!(std::fs::read(&path).unwrap(), b"original bytes must survive");
         assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn replacement_import_backups_restore_and_concurrent_change_is_rejected() {
+        let path = temp_dict_path("replacement");
+        let lock = DictLock(std::sync::Mutex::new(()));
+        let original = vec![settings::user_dictionary::UserDictEntry {ruby:"にこ".into(),word:"(^_^)".into(),pos:Some("名詞".into())}];
+        settings::user_dictionary::save_to(&path,&original).unwrap();
+        let (count, snapshot) = dict_import_snapshot(&lock,&path).unwrap(); assert_eq!(count,1);
+        let report = dict_import_if_unchanged_logic(&lock,&path,&no_send,"なく\t(;_;)\nlatin\tbad".as_bytes(),snapshot.as_deref()).unwrap();
+        assert_eq!(report.added,1); assert_eq!(report.skipped_invalid,1);
+        assert_eq!(settings::user_dictionary::load_from(&path).unwrap().entries[0].word,"(;_;)");
+        assert!(dict_import_if_unchanged_logic(&lock,&path,&||panic!("must not send"),b"",snapshot.as_deref()).is_err());
+        let backup = std::fs::read_dir(path.parent().unwrap()).unwrap().filter_map(Result::ok).map(|e|e.path()).find(|p|p.extension().is_some_and(|e|e=="tsv")).unwrap();
+        let bytes = std::fs::read(&backup).unwrap();
+        dict_import_logic(&lock,&path,&no_send,&bytes).unwrap();
+        assert_eq!(settings::user_dictionary::load_from(&path).unwrap().entries,original);
+        dict_import_logic(&lock,&path,&no_send,b"# empty\n").unwrap();
+        assert!(settings::user_dictionary::load_from(&path).unwrap().entries.is_empty());
+        for file in std::fs::read_dir(path.parent().unwrap()).unwrap() { std::fs::remove_file(file.unwrap().path()).unwrap(); }
+    }
+
+    #[test]
+    fn failed_backup_keeps_dictionary_and_does_not_reload() {
+        let path = temp_dict_path("backup-failed");
+        let entries = vec![settings::user_dictionary::UserDictEntry {ruby:"あ".into(),word:"a\tb".into(),pos:None}];
+        settings::user_dictionary::save_to(&path,&entries).unwrap();
+        let result = dict_import_logic(&DictLock(std::sync::Mutex::new(())),&path,&||panic!("must not send"),b"");
+        assert!(result.is_err());
+        assert_eq!(settings::user_dictionary::load_from(&path).unwrap().entries,entries);
         std::fs::remove_file(path).unwrap();
     }
 

@@ -12,14 +12,30 @@ fn wait(mut predicate: impl FnMut() -> bool) -> bool {
     }
     false
 }
-fn type_reading(host: &TsfHost) -> bool {
-    crate::scenarios::typed("gazo")
+fn wait_preview(host: &TsfHost, completion: &str) -> bool {
+    // Stale candidates remain visible while the next revision is in flight.
+    wait(|| host.candidate_strings().iter().any(|c| c == completion) && host.claims_key(0x09))
+}
+fn type_reading(host: &TsfHost, engine: &str) -> bool {
+    crate::scenarios::typed(if engine != "azookey" { "sankou" } else { "gazo" })
         .into_iter()
         .all(|key| host.feed_key(key.0))
 }
-fn check_case(dir: &std::path::Path, live: bool, enabled: bool) -> Result<(), String> {
+fn resume_reading(host: &TsfHost, engine: &str) -> bool {
+    // A fresh Sandbox supplies homophones through the prediction API, without the
+    // host profile's extended completions. This checks UI interaction; extended
+    // predictions are separately required by the real-host IPC integration test.
+    // Replace the final roman key to exercise a fresh revision after dismissal.
+    (engine == "azookey" || host.feed_key(0x08)) && host.feed_key(0x55)
+}
+fn check_case(dir: &std::path::Path, live: bool, enabled: bool, engine: &str) -> Result<(), String> {
+    let reading = if engine != "azookey" { "さんこう" } else { "がぞ" };
+    let completion = if engine != "azookey" { "参考" } else { "画像" };
+    // After gazo -> gazou, "画像" is a whole conversion and is no longer a
+    // completion. Require a genuinely extended candidate from the new revision.
+    let resumed_completion = if engine != "azookey" { "参考" } else { "画像を" };
     std::fs::write(dir.join("settings.json"), serde_json::json!({
-        "version": 2, "live_conversion": {"enabled": live},
+        "version": 2, "conversion_engine": engine, "live_conversion": {"enabled": live},
         "input_prediction_enabled": enabled, "zenzai": {"enabled": false},
         "learning": {"enabled": false}, "feedback": {"enabled":true}, "keymap":{"feedback":"Ctrl+KeyJ"}
     }).to_string()).map_err(|e| e.to_string())?;
@@ -37,7 +53,7 @@ fn check_case(dir: &std::path::Path, live: bool, enabled: bool) -> Result<(), St
         }
     }
     eprintln!("prediction acceptance: typing");
-    if !type_reading(&host) {
+    if !type_reading(&host, engine) {
         return Err("reading keys not eaten".into());
     }
     if !enabled {
@@ -47,14 +63,14 @@ fn check_case(dir: &std::path::Path, live: bool, enabled: bool) -> Result<(), St
         }
         return Ok(());
     }
-    if !wait(|| host.candidate_strings().iter().any(|c| c == "画像")) {
+    if !wait_preview(&host, completion) {
         return Err(format!(
-            "missing 画像: {:?}, preedit={:?}",
+            "missing {completion}: {:?}, preedit={:?}",
             host.candidate_strings(),
             host.store.preedit()
         ));
     }
-    if !host.store.committed().is_empty() || (!live && host.store.preedit() != "がぞ") {
+    if !host.store.committed().is_empty() || (!live && host.store.preedit() != reading) {
         return Err("preview changed reading/committed text".into());
     }
     let before = host.store.preedit();
@@ -79,7 +95,7 @@ fn check_case(dir: &std::path::Path, live: bool, enabled: bool) -> Result<(), St
         ));
     }
     host.store.reset();
-    if !type_reading(&host) || !wait(|| host.candidate_strings().iter().any(|c| c == "画像")) {
+    if !type_reading(&host, engine) || !wait_preview(&host, completion) {
         return Err("second preview".into());
     }
     let before = host.store.preedit();
@@ -93,39 +109,39 @@ fn check_case(dir: &std::path::Path, live: bool, enabled: bool) -> Result<(), St
     if host.feed_key(0x09) {
         return Err("dismissed preview claimed Tab".into());
     }
-    if !host.feed_key(0x55) || !wait(|| !host.candidate_strings().is_empty()) {
+    if !resume_reading(&host, engine) || !wait_preview(&host, resumed_completion) {
         return Err("reading change did not reopen preview".into());
     }
     let choices = host.candidate_strings();
     let index = choices
         .iter()
-        .position(|c| c == "画像")
-        .ok_or("updated preview lacks 画像")?;
+        .position(|c| c == resumed_completion)
+        .ok_or("updated preview lacks completion")?;
     if !host.behavior_select_and_finalize(index as u32)
         || !wait(|| !host.store.composing())
-        || host.store.committed() != "画像"
+        || host.store.committed() != resumed_completion
     {
         return Err("click/Behavior completion commit".into());
     }
     host.store.reset();
-    if !type_reading(&host) || !wait(|| !host.candidate_strings().is_empty()) {
+    if !type_reading(&host, engine) || !wait_preview(&host, completion) {
         return Err("numeric preview".into());
     }
     if !host.feed_key(0x31)
         || !host.store.committed().is_empty()
         || !host.feed_key(0x08)
-        || !wait(|| host.candidate_strings().iter().any(|c| c == "画像"))
+        || !wait_preview(&host, completion)
     {
         return Err("unselected digit/Backspace changed or committed the reading".into());
     }
     if !host.feed_key(0x09)
         || !host.feed_key(0x08)
-        || host.store.preedit() != "がぞ"
+        || host.store.preedit() != reading
         || !host.store.committed().is_empty()
     {
         return Err("selected Backspace lost reading".into());
     }
-    if !host.feed_key(0x55) || !wait(|| !host.candidate_strings().is_empty()) {
+    if !resume_reading(&host, engine) || !wait_preview(&host, resumed_completion) {
         return Err("resume after selected Backspace".into());
     }
     let selected = host.candidate_strings()[0].clone();
@@ -137,7 +153,7 @@ fn check_case(dir: &std::path::Path, live: bool, enabled: bool) -> Result<(), St
         return Err("selected digit did not commit exactly one candidate".into());
     }
     host.store.reset();
-    if !type_reading(&host) || !wait(|| !host.candidate_strings().is_empty()) {
+    if !type_reading(&host, engine) || !wait_preview(&host, completion) {
         return Err("typing-resume preview".into());
     }
     let selected = host.candidate_strings()[0].clone();
@@ -156,17 +172,17 @@ fn check_case(dir: &std::path::Path, live: bool, enabled: bool) -> Result<(), St
         ));
     }
     host.store.reset();
-    if !type_reading(&host) || !wait(|| !host.candidate_strings().is_empty()) {
+    if !type_reading(&host, engine) || !wait_preview(&host, completion) {
         return Err("cancel preview".into());
     }
     if !host.feed_key(0x09)
         || !host.feed_key(0x1B)
-        || host.store.preedit() != "がぞ"
+        || host.store.preedit() != reading
         || !host.store.committed().is_empty()
     {
         return Err("selected Esc lost reading".into());
     }
-    if !host.feed_key(0x55) || !wait(|| !host.candidate_strings().is_empty()) {
+    if !resume_reading(&host, engine) || !wait_preview(&host, resumed_completion) {
         return Err("resume after selected Esc".into());
     }
     if live && !host.feed_key(0x09) {
@@ -187,7 +203,12 @@ fn check_case(dir: &std::path::Path, live: bool, enabled: bool) -> Result<(), St
     }
     Ok(())
 }
-pub fn run() -> i32 {
+pub fn run() -> i32 { run_engine("azookey") }
+
+pub fn run_microsoft() -> i32 { run_engine("microsoft") }
+pub fn run_hybrid() -> i32 { run_engine("hybrid") }
+
+fn run_engine(engine: &str) -> i32 {
     eprintln!("prediction acceptance: init");
     // Use only the disposable Sandbox's initially empty settings so the host's
     // configuration and its persist engine cannot affect this acceptance run.
@@ -212,9 +233,9 @@ pub fn run() -> i32 {
     };
     let mut passed = true;
     for (live, enabled) in [(false, true), (true, true), (false, false)] {
-        let result = check_case(&dir, live, enabled);
+        let result = check_case(&dir, live, enabled, engine);
         println!(
-            "input-predictions live={live} enabled={enabled} : {} {:?}",
+            "input-predictions engine={engine} live={live} enabled={enabled} : {} {:?}",
             if result.is_ok() { "PASS" } else { "FAIL" },
             result.as_ref().err()
         );

@@ -722,3 +722,93 @@ fn engine_build_dir() -> std::path::PathBuf {
         .expect("workspace root")
         .join(r"engine-host\.build\x86_64-unknown-windows-msvc\debug")
 }
+
+
+#[test]
+#[ignore = "requires the built engine and Windows Japanese language features"]
+fn microsoft_engine_snapshot_prediction_and_commit_over_unique_pipe() {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use ipc::clause::*;
+    let engine = IsolatedEngine::stage();
+    let pipe = isolated_pipe("windows-text");
+    let _child = start_engine(Command::new(engine.exe()).arg(&pipe)
+        .creation_flags(0x08000000).stdout(Stdio::null()).stderr(Stdio::null())
+        .env("NOSPACEKEY_CONVERSION_ENGINE", "azookey")
+        .env("NOSPACEKEY_ZENZAI", "off").env("NOSPACEKEY_LEARNING", "0")
+        .env("NOSPACEKEY_MEMORY_DIR", engine.root.join("memory")));
+    let mut client = EngineClient::connect_to(&pipe, Duration::from_secs(5)).unwrap();
+    let (epoch, generation) = match client.request(&Request::StartSession).unwrap() {
+        Response::Session { engine_epoch, learning_generation, .. } => (engine_epoch, learning_generation),
+        other => panic!("expected session: {other:?}"),
+    };
+    let reload = |engine: &str| Request::ReloadConfig {
+        conversion_engine: Some(engine.into()), llm_enabled: false,
+        llm_api_key: String::new(), llm_endpoint: String::new(), llm_model: String::new(),
+        llm_prompt: String::new(), llm_timeout_ms: 1000, zenzai_enabled: false,
+        zenzai_weight: String::new(), learning_enabled: false, zenzai_inference_limit: None,
+    };
+    assert!(matches!(client.request(&reload("microsoft")).unwrap(), Response::Ok));
+    for explicit in [false, true] {
+        let response = client.request(&Request::LiveSnapshot {
+            composition: 1, revision: 1, configuration_generation: 1, connection_generation: 1,
+            conversion_revision: 0, request_id: 1, explicit, include_flat_candidates: explicit,
+            segments: vec![ipc::protocol::SnapshotSegment { text: "にゅうりょく".into(), style: Some("direct".into()) }],
+            live_search_width: None, left_context: None,
+        }).unwrap();
+        match response {
+            Response::SnapshotResult { text, clause_data, candidates, auto_commit, .. } => {
+                assert_eq!(text, "入力");
+                clause_data.validate(&text).unwrap();
+                assert!(auto_commit.is_none());
+                assert!(clause_data.clauses[0].candidate_token.is_some());
+                if explicit { assert!(candidates.unwrap().iter().any(|c| c == "入力")); }
+            }
+            other => panic!("expected snapshot: {other:?}"),
+        }
+    }
+    let request = ClauseCandidatesRequest {
+        key: ClauseRequestKey { identity: SnapshotIdentity { composition: 2, revision: 1,
+            configuration_generation: 1, connection_generation: 1 }, baseline: 0,
+            conversion_revision: 0, clause_id: ClauseId(1), request_id: 2 },
+        reading: "にゅうりょく".into(), reading_start: ReadingPosition(0), reading_end: ReadingPosition(6),
+        preceding_surfaces: vec![], include_prefix_candidates: false,
+    };
+    let selected = match client.request(&Request::InputPredictions(request)).unwrap() {
+        Response::InputPredictionsResult { candidates, .. } => candidates.into_iter()
+            .find(|c| c.surface == "入力フォーム").expect("Windows completion"),
+        other => panic!("expected predictions: {other:?}"),
+    };
+    let receipt = CommitReceipt {
+        commit_id: CommitId { client_instance: "a1111111-1111-4111-8111-111111111111".into(), sequence: 1 },
+        engine_epoch: epoch, learning_generation: generation,
+        reading: "にゅうりょく".into(), text: selected.surface.clone(),
+        intervals: vec![CommitInterval { reading_start: ReadingPosition(0), reading_end: ReadingPosition(6),
+            surface: selected.surface, learning: IntervalLearning::Candidate {
+                token: selected.token.clone(), explicitly_selected: true } }], sentence_token: Some(selected.token),
+    };
+    assert!(matches!(client.request(&Request::CommitReceipt(receipt)).unwrap(),
+        Response::CommitReceiptAck { status: ReceiptStatus::Applied, .. }));
+    match client.request(&Request::RecentMicrosoftSelections).unwrap() {
+        Response::RecentMicrosoftSelections { entries } => {
+            assert!(entries.iter().any(|entry| entry.ruby == "にゅうりょく" && entry.word == "入力フォーム"));
+        }
+        other => panic!("expected recent Microsoft selections: {other:?}"),
+    }
+    assert!(matches!(client.request(&reload("hybrid")).unwrap(), Response::Ok));
+    let hybrid = client.request(&Request::LiveSnapshot {
+        composition: 3, revision: 1, configuration_generation: 1, connection_generation: 1,
+        conversion_revision: 0, request_id: 3, explicit: true, include_flat_candidates: true,
+        segments: vec![ipc::protocol::SnapshotSegment { text: "にゅうりょく".into(), style: Some("direct".into()) }],
+        live_search_width: None, left_context: None,
+    }).unwrap();
+    match hybrid {
+        Response::SnapshotResult { text, candidates: Some(candidates), clause_data, .. } => {
+            clause_data.validate(&text).unwrap();
+            assert!(candidates.iter().any(|candidate| candidate == "入力"));
+            assert_eq!(candidates.len(), candidates.iter().collect::<std::collections::HashSet<_>>().len());
+        }
+        other => panic!("expected hybrid snapshot: {other:?}"),
+    }
+    assert!(matches!(client.request(&reload("azookey")).unwrap(), Response::Ok));
+}

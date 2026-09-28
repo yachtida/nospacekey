@@ -15,6 +15,12 @@ let package = Package(
                  traits: ["Zenzai"]),
     ],
     targets: [
+        .target(
+            name: "NospacekeyWindowsText",
+            publicHeadersPath: "include",
+            cxxSettings: [.unsafeFlags(["-std=c++20"])],
+            linkerSettings: [.linkedLibrary("windowsapp", .when(platforms: [.windows]))]
+        ),
         // The product runtime seam is a C module because the patched llama ABI is
         // exported from the vendor DLL. Linker search order is kept ahead of the
         // upstream SwiftPM llama import so the Vulkan seam is the one used at run time.
@@ -40,6 +46,7 @@ let package = Package(
             name: "NospacekeyEngineCore",
             dependencies: [
                 "NospacekeyLlamaRuntimeAdapter",
+                "NospacekeyWindowsText",
                 .product(name: "KanaKanjiConverterModuleWithDefaultDictionary",
                          package: "AzooKeyKanaKanjiConverter"),
             ],
@@ -55,6 +62,7 @@ let package = Package(
             dependencies: [
                 "NospacekeyEngineCore",
                 "NospacekeyLlamaRuntimeAdapter",
+                "NospacekeyWindowsText",
                 .product(name: "KanaKanjiConverterModuleWithDefaultDictionary",
                          package: "AzooKeyKanaKanjiConverter"),
             ],

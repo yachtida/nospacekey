@@ -331,6 +331,9 @@ pub fn validate_binding(f: KeymapFunc, value: &str) -> Result<(), String> {
         return Ok(());
     }
     let c = parse_chord(value)?;
+    if c.vk == 0x76 && c.ctrl && c.shift && !c.alt {
+        return Err("Ctrl+Shift+F7 は顔文字・絵文字パレットの起動キーです".into());
+    }
     if c.alt && !f.alt_allowed() {
         return Err(
             "この機能に Alt は割り当てできません(キー入力経路に Alt 併用キーが届かないため)".into(),
@@ -365,6 +368,8 @@ pub fn resolve_binding(v: &Option<String>) -> Binding {
         None => Binding::Default,
         Some("none") => Binding::Disabled,
         Some(s) => parse_chord(s)
+            .ok()
+            .filter(|c| !(c.vk == 0x76 && c.ctrl && c.shift && !c.alt))
             .map(Binding::Chord)
             .unwrap_or(Binding::Default),
     }
@@ -503,6 +508,13 @@ pub fn find_conflicts_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn palette_chord_is_reserved_even_for_hand_edited_settings() {
+        assert!(validate_binding(KeymapFunc::ModeToggle, "Ctrl+Shift+F7").is_err());
+        assert_eq!(resolve_binding(&Some("Ctrl+Shift+F7".into())), Binding::Default);
+        assert!(validate_binding(KeymapFunc::ModeToggle, "Ctrl+F7").is_ok());
+    }
 
     #[test]
     fn key_names_map_to_vk_and_back() {

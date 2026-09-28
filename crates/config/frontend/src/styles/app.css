@@ -239,3 +239,5 @@ code { font-family: ui-monospace, "Cascadia Mono", monospace; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }
+
+.filter-bar [role="tab"][aria-selected="true"] { font-weight: 600; text-decoration: underline; text-underline-offset: 0.4em; }

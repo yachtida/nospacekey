@@ -4,13 +4,15 @@ import type { PublicSettings } from "../bridge/types";
 import { EnginePage } from "./EnginePage";
 
 const state = vi.hoisted(() => ({
-  values: { zenzaiEnabled: false, weightPath: "", zenzaiInferenceLimit: 3 } as PublicSettings,
+  values: { conversionEngine: "azookey", zenzaiEnabled: false, weightPath: "", zenzaiInferenceLimit: 3 } as PublicSettings,
   save: vi.fn(), acceptSnapshot: vi.fn(), errors: [],
 }));
 vi.mock("../settings/SettingsStore", () => ({ useSettings: () => state }));
 vi.mock("../bridge/tauri", () => ({ command: vi.fn(), errorMessage: String, onEvent: vi.fn(async () => () => {}) }));
 
 beforeEach(() => {
+  state.values.conversionEngine = "azookey";
+  state.save.mockReset();
   state.acceptSnapshot.mockReset();
   vi.mocked(command).mockReset().mockImplementation(async (name) => {
     if (name === "zenzai_model_status") return { installed: false, valid: false, path: "", source: "" };
@@ -100,4 +102,25 @@ it("shows timeout-only measurements without claiming a zero millisecond conversi
   expect(screen.queryByText("0 ms")).not.toBeInTheDocument();
   expect(screen.getByText("53 ms")).toBeInTheDocument();
   expect(screen.getByText("87 ms")).toBeInTheDocument();
+});
+
+
+it("saves the engine selection through the typed patch", async () => {
+  render(<EnginePage />);
+  fireEvent.click(screen.getByRole("radio", { name: "Microsoft IME" }));
+  expect(state.save).toHaveBeenCalledWith({ field: "conversion_engine", value: "microsoft" });
+});
+
+it("offers hybrid interleaving while keeping AzooKey as the default", async () => {
+  render(<EnginePage />);
+  expect(screen.getByRole("radio", {name: "AzooKey（既定）"})).toBeChecked();
+  fireEvent.click(screen.getByRole("radio", {name: "両方を混ぜる"}));
+  expect(state.save).toHaveBeenCalledWith({field: "conversion_engine", value: "hybrid"});
+});
+
+it("explains Microsoft candidate differences and hides inactive GPU controls", async () => {
+  state.values.conversionEngine = "microsoft";
+  render(<EnginePage />);
+  expect(screen.getByText(/Microsoft IME本体とは候補の数や順序が異なります/)).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "GPUを再試行" })).not.toBeInTheDocument();
 });

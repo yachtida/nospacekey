@@ -253,6 +253,7 @@ fn main() {
             update::download_and_install_update,
             update::cancel_update_download,
             commands::dict_list,
+            commands::dict_recent_microsoft,
             commands::dict_add,
             commands::dict_update,
             commands::dict_delete,

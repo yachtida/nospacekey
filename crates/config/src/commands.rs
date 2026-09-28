@@ -1787,6 +1787,7 @@ fn is_learning_file_name(name: &std::ffi::OsStr) -> bool {
     };
     name == ".pause"
         || name == "corrections.json"
+        || name == "microsoft-candidates.json"
         || name == "learningMemory.txt"
         || name.starts_with("memory")
 }
@@ -2328,34 +2329,79 @@ fn reload_sender(slock: &crate::logic::SettingsLock) -> impl Fn() -> EngineStatu
     }
 }
 
-fn dict_path_or_err() -> Result<std::path::PathBuf, DictCmdError> {
-    settings::user_dictionary::dict_path().ok_or_else(|| DictCmdError::Io {
+fn dict_path_or_err(kaomoji: bool) -> Result<std::path::PathBuf, DictCmdError> {
+    (if kaomoji {
+        settings::user_dictionary::kaomoji_path()
+    } else {
+        settings::user_dictionary::dict_path()
+    })
+    .ok_or_else(|| DictCmdError::Io {
         message: "LOCALAPPDATA が解決できません".into(),
     })
 }
 
 #[tauri::command(async)]
-pub fn dict_list(lock: tauri::State<DictLock>) -> Result<ListReport, DictCmdError> {
-    logic::dict_list_logic(&lock, &dict_path_or_err()?)
+pub fn dict_list(
+    lock: tauri::State<DictLock>,
+    kaomoji: Option<bool>,
+) -> Result<ListReport, DictCmdError> {
+    logic::dict_list_logic(&lock, &dict_path_or_err(kaomoji.unwrap_or(false))?)
+}
+
+#[tauri::command(async)]
+pub fn dict_recent_microsoft() -> Result<Vec<ipc::protocol::RecentMicrosoftSelection>, String> {
+    use std::time::Instant;
+    let pipe = ipc::client::stable_pipe_name();
+    let mut client = match ipc::client::EngineClient::connect_verified_to(
+        &pipe, DICT_CONNECT_TIMEOUT, Instant::now() + DICT_REQUEST_DEADLINE,
+    ) {
+        Ok(client) => client,
+        Err(ipc::client::EngineIdentityError::Mismatch { .. }) => {
+            return Err("エンジンのバージョンが異なります。入力先を開き直してください。".into());
+        }
+        Err(_) => return Ok(Vec::new()),
+    };
+    match client.request_within(&ipc::protocol::Request::RecentMicrosoftSelections,
+        Instant::now() + DICT_REQUEST_DEADLINE) {
+        Ok(ipc::protocol::Response::RecentMicrosoftSelections { entries }) => Ok(entries),
+        Ok(ipc::protocol::Response::Error { message }) => Err(message),
+        Ok(_) => Err("エンジンから予期しない応答がありました。".into()),
+        Err(error) => Err(format!("エンジンの応答を確認できませんでした: {error}")),
+    }
 }
 
 #[tauri::command(async)]
 pub fn dict_add(
+    kaomoji: Option<bool>,
     lock: tauri::State<DictLock>,
     slock: tauri::State<'_, crate::logic::SettingsLock>,
     ruby: String,
     word: String,
     pos: String,
 ) -> Result<MutationReport, DictCmdError> {
-    let path = dict_path_or_err()?;
+    let path = dict_path_or_err(kaomoji.unwrap_or(false))?;
     // 巡4 B3: State は Deref — &*slock でローカル参照を作り sender へ渡す
     // （読み〜送信の SettingsLock 保持は reload_sender 内で行う）。
     let slock = &*slock;
-    logic::dict_add_logic(&lock, &path, &reload_sender(slock), &ruby, &word, &pos)
+    logic::dict_add_logic(
+        &lock,
+        &path,
+        &|| {
+            if kaomoji.unwrap_or(false) {
+                EngineStatus::Absent
+            } else {
+                reload_sender(slock)()
+            }
+        },
+        &ruby,
+        &word,
+        &pos,
+    )
 }
 
 #[tauri::command(async)]
 pub fn dict_update(
+    kaomoji: Option<bool>,
     lock: tauri::State<DictLock>,
     slock: tauri::State<'_, crate::logic::SettingsLock>,
     old_ruby: String,
@@ -2364,12 +2410,18 @@ pub fn dict_update(
     word: String,
     pos: String,
 ) -> Result<MutationReport, DictCmdError> {
-    let path = dict_path_or_err()?;
+    let path = dict_path_or_err(kaomoji.unwrap_or(false))?;
     let slock = &*slock;
     logic::dict_update_logic(
         &lock,
         &path,
-        &reload_sender(slock),
+        &|| {
+            if kaomoji.unwrap_or(false) {
+                EngineStatus::Absent
+            } else {
+                reload_sender(slock)()
+            }
+        },
         &old_ruby,
         &old_word,
         &ruby,
@@ -2380,14 +2432,27 @@ pub fn dict_update(
 
 #[tauri::command(async)]
 pub fn dict_delete(
+    kaomoji: Option<bool>,
     lock: tauri::State<DictLock>,
     slock: tauri::State<'_, crate::logic::SettingsLock>,
     ruby: String,
     word: String,
 ) -> Result<MutationReport, DictCmdError> {
-    let path = dict_path_or_err()?;
+    let path = dict_path_or_err(kaomoji.unwrap_or(false))?;
     let slock = &*slock;
-    logic::dict_delete_logic(&lock, &path, &reload_sender(slock), &ruby, &word)
+    logic::dict_delete_logic(
+        &lock,
+        &path,
+        &|| {
+            if kaomoji.unwrap_or(false) {
+                EngineStatus::Absent
+            } else {
+                reload_sender(slock)()
+            }
+        },
+        &ruby,
+        &word,
+    )
 }
 
 /// TSV ファイルを選んでインポートする。ダイアログ表示・ファイル読み込みは mutex の外
@@ -2397,6 +2462,7 @@ pub fn dict_delete(
 /// （プラグインの JS API 側は常に set_parent するのと対照的）。
 #[tauri::command(async)]
 pub fn dict_import(
+    kaomoji: Option<bool>,
     app: tauri::AppHandle,
     window: tauri::Window,
     lock: tauri::State<DictLock>,
@@ -2418,15 +2484,43 @@ pub fn dict_import(
     let bytes = std::fs::read(&file_path).map_err(|e| DictCmdError::Io {
         message: e.to_string(),
     })?;
-    let path = dict_path_or_err()?;
+    let path = dict_path_or_err(kaomoji.unwrap_or(false))?;
+    let parsed = settings::user_dictionary::parse_tsv(&bytes);
+    if parsed.had_replacement {
+        return Err(DictCmdError::InvalidEncoding);
+    }
+    let (_, report) = settings::user_dictionary::replace_imported(parsed.rows, false);
+    let (before, snapshot) = logic::dict_import_snapshot(&lock, &path)?;
+    let confirmed = app.dialog().message(format!(
+        "現在 {} 件 → 取込後 {} 件（無効 {} 件を除外、重複 {} 件を除外）\n現在の辞書を置き換えます。取込前の内容は自動バックアップされます。",
+        before, report.added, report.skipped_invalid, report.skipped_dup
+    )).title("辞書を置換して取込").parent(&window)
+        .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancel).blocking_show();
+    if !confirmed {
+        return Ok(None);
+    }
     let slock = &*slock;
-    logic::dict_import_logic(&lock, &path, &reload_sender(slock), &bytes).map(Some)
+    logic::dict_import_if_unchanged_logic(
+        &lock,
+        &path,
+        &|| {
+            if kaomoji.unwrap_or(false) {
+                EngineStatus::Absent
+            } else {
+                reload_sender(slock)()
+            }
+        },
+        &bytes,
+        snapshot.as_deref(),
+    )
+    .map(Some)
 }
 
 /// TSV ファイルへエクスポートする。保存先ダイアログは mutex の外(spec §5.3)。
 /// キャンセルは `Ok(None)`。ピッカーのモーダル化は dict_import と同じ（巡3 Q6）。
 #[tauri::command(async)]
 pub fn dict_export(
+    kaomoji: Option<bool>,
     app: tauri::AppHandle,
     window: tauri::Window,
     lock: tauri::State<DictLock>,
@@ -2437,7 +2531,11 @@ pub fn dict_export(
         .file()
         .set_parent(&window)
         .add_filter("TSV", &["tsv"])
-        .set_file_name("user_dictionary.tsv")
+        .set_file_name(if kaomoji.unwrap_or(false) {
+            "kaomoji_dictionary.tsv"
+        } else {
+            "user_dictionary.tsv"
+        })
         .blocking_save_file()
     else {
         return Ok(None);
@@ -2445,14 +2543,13 @@ pub fn dict_export(
     let file_path = picked.into_path().map_err(|e| DictCmdError::Io {
         message: e.to_string(),
     })?;
-    let path = dict_path_or_err()?;
+    let path = dict_path_or_err(kaomoji.unwrap_or(false))?;
     let (tsv, report) = logic::dict_export_logic(&lock, &path)?;
     std::fs::write(&file_path, tsv.as_bytes()).map_err(|e| DictCmdError::Io {
         message: e.to_string(),
     })?;
     Ok(Some(report))
 }
-
 /// settings 適用成功後にフロントが fire-and-forget で呼ぶトグル反映(spec §4.2)。
 /// エントリ mutation(§4.1 の起動時 enqueue で救済される)と異なり、トグル適用は engine
 /// init〜pipe 作成の短い窓に落ちると次回まで無言で効かないため、接続失敗時のみ
@@ -2984,6 +3081,7 @@ mod tests {
                 learning_entry("memory.bin", LearningEntryKind::Regular),
                 learning_entry(".pause", LearningEntryKind::Regular),
                 learning_entry("corrections.json", LearningEntryKind::Regular),
+                learning_entry("microsoft-candidates.json", LearningEntryKind::Regular),
                 learning_entry("learningMemory.txt", LearningEntryKind::Regular),
                 learning_entry("foreign.json", LearningEntryKind::Regular),
             ]),
@@ -3008,6 +3106,7 @@ mod tests {
                 std::path::PathBuf::from("memory.bin"),
                 std::path::PathBuf::from(".pause"),
                 std::path::PathBuf::from("corrections.json"),
+                std::path::PathBuf::from("microsoft-candidates.json"),
                 std::path::PathBuf::from("learningMemory.txt"),
             ]
         );

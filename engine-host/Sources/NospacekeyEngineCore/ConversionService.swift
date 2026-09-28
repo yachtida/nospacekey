@@ -136,8 +136,12 @@ public final class ConversionService: @unchecked Sendable {
         let modelTop: String?
         var sentenceAction: SentenceAction? = nil
         var predictionReading: String? = nil
+        var microsoftOnly: Bool = false
     }
     private var clauseTokens: [String: ClauseTokenMaterial] = [:]
+    private var microsoftOnlySurfaces = Set<String>()
+    private var recentMicrosoftWords: [RecentMicrosoftSelection] = []
+    private static let windowsQueryBudgetSeconds: TimeInterval = 0.27
     private var nextClauseToken: UInt64 = 0
     private var receiptLedger = CommitReceiptLedger()
     var clauseClock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
@@ -215,6 +219,7 @@ public final class ConversionService: @unchecked Sendable {
         let explicit: Bool
         let reading: String
         let classic: ConversionResult
+        let microsoft: [Candidate]
         let snapshot: GPUWorkerCompositionSnapshot
         let leftContext: String?
         let inferenceLimit: Int
@@ -412,6 +417,8 @@ public final class ConversionService: @unchecked Sendable {
     /// UU-5: 常駐エンジンは起動後も `reload` で設定を差し替えられる（設定アプリの変更を反映）。
     /// `makeOptions` が convert ごとに読むため、`converterLock` 下で差し替えれば次回変換から効く
     /// （converter オブジェクト自体の再構築は不要＝Zenzai は options の weightURL で切替わる）。
+    private var conversionEngine: ConversionEngine
+    private let windowsTextProvider: WindowsTextProvider
     private var config: ZenzaiConfig
     /// Public status/configuration reads must not race reload's converterLock
     /// critical section, and status must remain independent of native work.
@@ -449,6 +456,9 @@ public final class ConversionService: @unchecked Sendable {
     /// 訂正昇格テーブル(spec 2026-07-30-correction-promotion)。読み書きとも converterLock 下
     /// (learning と同じ規律)。reload で learning.memoryDir が変わったら作り直す。
     private var corrections: CorrectionStore
+    /// Microsoft conversion selections are learned independently of AzooKey's vendor memory.
+    /// All access follows the converterLock discipline used by corrections.
+    private var microsoftLearning: MicrosoftLearningStore
     /// RecordCorrection(文字列しか運ばない)の記録可否照合用: 直近 32 読みの
     /// 「表層 → 記録可(isLearningTarget かつ全被覆)」+ その読みで直近に観測したモデル1位
     /// 表層の集合(昇格前の素の先頭。commit の cachedModelTop と同じ除外基準 — 昇格発火時の
@@ -624,6 +634,7 @@ public final class ConversionService: @unchecked Sendable {
          environment: [String: String] = [:],
          runtimeClient: ZenzaiRuntimeClient = NativeZenzaiRuntimeClient(),
          fileSystem: LearningFileSystem,
+         windowsTextProvider: WindowsTextProvider = .native,
          processRole: ProcessRole = .legacy,
          gpuWorkerSupervisor: GPUWorkerSupervisor? = nil,
          privateTemporaryDirectory: URL? = nil,
@@ -631,6 +642,8 @@ public final class ConversionService: @unchecked Sendable {
          learningPersistenceForTesting: (@Sendable (Candidate) -> Void)? = nil,
          learningClearStartedForTesting: (@Sendable () -> Void)? = nil,
          dictionaryRetryDelay: DispatchTimeInterval = .milliseconds(100)) {
+        self.conversionEngine = ConversionEngine.resolve(environment: environment)
+        self.windowsTextProvider = windowsTextProvider
         self.config = config
         self.processRole = processRole
         self.gpuWorkerSupervisor = gpuWorkerSupervisor
@@ -645,6 +658,8 @@ public final class ConversionService: @unchecked Sendable {
             zenzaiEnabled: config.weightURL != nil)
         self.learning = learning
         self.corrections = CorrectionStore(directory: learning.memoryDir)
+        self.microsoftLearning = MicrosoftLearningStore(directory:
+            learning.memoryDir ?? LearningSettings.resolveDir(environment: environment))
         self.llmClient = llmClient
         self.autoCommit = autoCommit
         self.autoCommitMaxReading = autoCommitMaxReading
@@ -663,7 +678,7 @@ public final class ConversionService: @unchecked Sendable {
     public var zenzaiEnabled: Bool {
         configurationLock.lock()
         defer { configurationLock.unlock() }
-        return config.weightURL != nil
+        return conversionEngine != .microsoft && config.weightURL != nil
     }
 
     /// Current engine state. The value is sanitized and contains no model path or input.
@@ -1118,12 +1133,16 @@ public final class ConversionService: @unchecked Sendable {
         overrides: [String: String],
         cpuMeetsLlamaBaseline: Bool = ZenzaiConfig.runtimeCPUMeetsLlamaBaseline
     ) -> Bool {
+        configurationLock.lock()
+        let nextEngine = overrides["NOSPACEKEY_CONVERSION_ENGINE"].flatMap(ConversionEngine.init(rawValue:)) ?? conversionEngine
+        configurationLock.unlock()
         var env = ProcessInfo.processInfo.environment
         for (k, v) in overrides { env[k] = v }
         let exeDir = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
             .deletingLastPathComponent()
         // cpuMeetsLlamaBaseline はテスト注入用（巡2 D3 — AVX2 非搭載機で resolve が候補探索
         // 前に nil へ短路し、reload 経由のテストが環境依存で失敗するのを防ぐ）。
+        if nextEngine == .microsoft { env["NOSPACEKEY_ZENZAI"] = "off" }
         let newZenzai = ZenzaiConfig.resolve(
             exeDir: exeDir, environment: env, cpuMeetsLlamaBaseline: cpuMeetsLlamaBaseline)
         let newLLM = LLMConfig.resolve(environment: env)
@@ -1167,6 +1186,7 @@ public final class ConversionService: @unchecked Sendable {
                     }
                 }
                 enqueueCorrectionPersistenceLocked()
+                enqueueMicrosoftPersistenceLocked()
             }
             // audit H2: Zenzai 有効→無効の切替時は一度だけフルリセットする。稼働中に bindConverter が
             // （切替スパイク排除のため）温存してきた classic 分岐の文脈（completedData 等）と zenz の
@@ -1192,7 +1212,11 @@ public final class ConversionService: @unchecked Sendable {
             // 訂正昇格テーブルは学習 directory と運命共同体: dir が変わったら flush して作り直す。
             if self.learningDirectory != newLearningDirectory {
                 enqueueCorrectionPersistenceLocked()
+                // A pending coalesced write may be replaced after the store swaps.
+                // Persist the old directory before releasing its in-memory entries.
+                microsoftLearning.flush()
                 corrections = CorrectionStore(directory: newLearningDirectory)
+                microsoftLearning = MicrosoftLearningStore(directory: newLearningDirectory)
             }
             // self.config の差し替え前に、旧 weightURL をキャプチャ（新規有効化判定で self.config が
             // 既に newZenzai に置き換わった後だと old==new で常に false になる — 行451 と同じパターン）。
@@ -1203,6 +1227,29 @@ public final class ConversionService: @unchecked Sendable {
                 pendingLearning.removeAll()
                 learningStateLock.unlock()
                 recentLearning.clear()
+            }
+            if nextEngine != conversionEngine {
+                stopCompositionLocked()
+                // Tokens belong to the provider that created them. Old receipts must not
+                // learn a Microsoft surface in AzooKey after an engine switch.
+                clauseTokens.removeAll()
+                microsoftOnlySurfaces.removeAll()
+                clauseBaselines.removeAll()
+                clauseCandidateReplies.removeAll()
+                clauseConversionReplies.removeAll()
+                snapshotAutoCommitStates.removeAll()
+                snapshotEnhancementLock.lock()
+                latestSnapshotEnhancement = nil
+                completedSnapshotEnhancement = nil
+                desiredSnapshotEnhancement = nil
+                snapshotEnhancementLock.unlock()
+                for id in Array(sessions.keys) {
+                    sessions[id]?.invalidateCandidateCache()
+                    sessions[id]?.liveState = nil
+                }
+                configurationLock.lock()
+                conversionEngine = nextEngine
+                configurationLock.unlock()
             }
             self.learning = newLearning
             self.learningDirectory = newLearningDirectory
@@ -1498,6 +1545,29 @@ public final class ConversionService: @unchecked Sendable {
     /// **converterLock 保持中に呼ぶこと**。
     private func requestCandidatesLocked(_ input: ComposingText,
                                          options: ConvertRequestOptions) -> ConversionResult {
+        if conversionEngine == .microsoft {
+            // ConversionResult has no public initializer in the vendor module. An empty,
+            // non-learning request supplies its container; all surfaces come from Windows.
+            var result = converter.requestCandidates(ComposingText(),
+                options: makeOptions(nBest: 1, forceClassic: true, noLearning: true))
+            result.mainResults = windowsCandidatesLocked(input, prediction: false)
+            microsoftOnlySurfaces = Set(result.mainResults.map(\.text))
+            result.firstClauseResults = []
+            return result
+        }
+        var result = requestAzookeyCandidatesLocked(input, options: options)
+        if conversionEngine == .hybrid && processRole != .gpuWorker {
+            let windows = windowsCandidatesLocked(input, prediction: false)
+            (result.mainResults, microsoftOnlySurfaces) = Self.interleaveAzookeyFirst(
+                result.mainResults, windows)
+        } else {
+            microsoftOnlySurfaces.removeAll()
+        }
+        return result
+    }
+
+    private func requestAzookeyCandidatesLocked(_ input: ComposingText,
+                                                 options: ConvertRequestOptions) -> ConversionResult {
         var effectiveOptions = options
         if processRole == .mainClassicOnly {
             // The main process never enters the vendor Zenzai path.  This is
@@ -1517,6 +1587,47 @@ public final class ConversionService: @unchecked Sendable {
         return result
     }
 
+    static func interleaveAzookeyFirst(_ azookey: [Candidate], _ microsoft: [Candidate])
+        -> ([Candidate], Set<String>) {
+        let azookeySurfaces = Set(azookey.map(\.text))
+        var seen = azookeySurfaces
+        let microsoftOnly = microsoft.filter { seen.insert($0.text).inserted }
+        var result: [Candidate] = []
+        result.reserveCapacity(min(256, azookey.count + microsoftOnly.count))
+        for index in 0..<max(azookey.count, microsoftOnly.count) {
+            if index < azookey.count { result.append(azookey[index]) }
+            if index < microsoftOnly.count { result.append(microsoftOnly[index]) }
+            if result.count >= 256 { break }
+        }
+        return (Array(result.prefix(256)), Set(microsoftOnly.map(\.text)))
+    }
+
+    private func windowsCandidatesLocked(_ input: ComposingText, prediction: Bool) -> [Candidate] {
+        let reading = input.convertTarget
+        guard !reading.isEmpty else { return [] }
+        var seen = Set<String>()
+        let learned = !prediction && learning.enabled ? microsoftLearning.surfaces(reading: reading) : []
+        let surfaces = (learned + windowsTextProvider.candidates(reading, prediction, 256))
+            .filter { !$0.isEmpty && $0.utf16.count <= 4096 && seen.insert($0).inserted }
+            .prefix(256)
+        // Windows may return hundreds of predictions per keystroke. Retain a bounded
+        // recent window instead of stopping all new candidates until the 60 s TTL.
+        // Evicted receipts remain safely rejected by the existing expired-token path.
+        let required = max(0, clauseTokens.count + surfaces.count + 1 - 4096)
+        if required > 0 {
+            let expired = clauseTokens.filter { !$0.value.candidate.isLearningTarget }
+                .sorted { $0.value.issuedAt < $1.value.issuedAt }.prefix(required)
+            for (token, _) in expired { clauseTokens.removeValue(forKey: token) }
+        }
+        return surfaces.map { surface in
+                Candidate(text: surface, value: 0, composingCount: .inputCount(input.input.count),
+                    lastMid: MIDData.一般.mid,
+                    data: [DicdataElement(word: surface, ruby: Self.toKatakana(reading),
+                        cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: 0)],
+                    isLearningTarget: false)
+            }
+    }
+
     /// Main-process conversion seam: generate the complete classic candidate
     /// pool first, then ask the isolated worker for GPU candidates.  Exact
     /// text matches reuse the classic objects; GPU-only candidates retain
@@ -1528,14 +1639,26 @@ public final class ConversionService: @unchecked Sendable {
         deadline: GPUWorkerDeadlineTier = .convert,
         overallDeadline: RequestDeadline? = nil
     ) -> ConversionResult {
+        if conversionEngine == .microsoft {
+            return requestCandidatesLocked(input, options: makeOptions(nBest: 1, forceClassic: true))
+        }
         let poolSize = max(10, nBest)
         let classicOptions = makeOptions(
             nBest: poolSize, leftSideContext: leftContext, forceClassic: true)
-        let classic = requestCandidatesLocked(input, options: classicOptions)
+        let classic = requestAzookeyCandidatesLocked(input, options: classicOptions)
+        let microsoft = conversionEngine == .hybrid
+            ? windowsCandidatesLocked(input, prediction: false) : []
+        func combined(_ azookey: ConversionResult) -> ConversionResult {
+            guard conversionEngine == .hybrid else { return azookey }
+            var result = azookey
+            (result.mainResults, microsoftOnlySurfaces) = Self.interleaveAzookeyFirst(
+                result.mainResults, microsoft)
+            return result
+        }
         guard processRole == .mainClassicOnly,
               let gpuWorkerSupervisor,
               !input.convertTarget.isEmpty else {
-            return classic
+            return combined(classic)
         }
         // 古典候補生成の後に残り予算を再確認する（§6.4: 要求全体の期限を区間数で
         // 積み増しせず、残り時間を下位へ渡す）。不足なら生成済みの古典結果を返し、
@@ -1543,7 +1666,7 @@ public final class ConversionService: @unchecked Sendable {
         var workerBudget = deadline.workerBudget
         if let overallDeadline {
             let remaining = overallDeadline.remainingSeconds
-            guard remaining >= deadline.workerBudget + 0.05 else { return classic }
+            guard remaining >= deadline.workerBudget + 0.05 else { return combined(classic) }
             workerBudget = min(workerBudget, remaining - 0.05)
         }
         let decision = gpuWorkerSupervisor.rerank(
@@ -1558,7 +1681,7 @@ public final class ConversionService: @unchecked Sendable {
             // Only the sanitized category is logged; no input/candidate text.
             engineLog("ev=zenzai_worker_fallback reason=\(failure.rawValue)\n")
         }
-        return decision.conversion
+        return combined(decision.conversion)
     }
 
     private func requestWarmUpCancellationIfConfigurationChanged(
@@ -1958,7 +2081,7 @@ public final class ConversionService: @unchecked Sendable {
     /// 呼び出し側が「昇格が起きた時だけ」表示差替え・ログを行う判定に、素通し配列との
     /// 内容比較(先頭非被覆時に誤発火する — 最終レビュー N1)を使わせないため。
     private func promoted(_ results: [Candidate], composing: ComposingText) -> [Candidate]? {
-        guard learning.enabled,
+        guard conversionEngine != .microsoft, learning.enabled,
               let surface = corrections.lookup(reading: composing.convertTarget) else { return nil }
         let targetCount = composing.convertTarget.count
         // 同名の非被覆候補を残すと候補窓に同文字列が2つ並び、後者の選択が意図しない
@@ -1994,7 +2117,7 @@ public final class ConversionService: @unchecked Sendable {
     public func recordCorrection(reading: String, surface: String) {
         converterLock.lock()
         defer { converterLock.unlock() }
-        guard learning.enabled else { return }
+        guard conversionEngine != .microsoft, learning.enabled else { return }
         // モデル1位表層は記録しない(modelTop 棄却)が、un-learn もしない — ここの照合基盤は
         // 共有 32 件マップで、別接続の同一読み変換がエントリを上書きし得る。stale 基準での
         // 削除は fail-destructive(棄却は再訂正で済むが削除は訂正の喪失)なので、un-learn は
@@ -2637,17 +2760,29 @@ public final class ConversionService: @unchecked Sendable {
         stopCompositionLocked()
         let nBest = explicit || liveSearchWidth == 10 ? 10 : 1
         let options = makeOptions(nBest: nBest, leftSideContext: leftContext, forceClassic: true)
-        var classic = requestCandidatesLocked(composing, options: options)
+        var classic = conversionEngine == .hybrid
+            ? requestAzookeyCandidatesLocked(composing, options: options)
+            : requestCandidatesLocked(composing, options: options)
         guard admissionDeadline?.expired != true else { return nil }
         if let snapshotCandidatesForTesting { classic.mainResults = snapshotCandidatesForTesting }
         let reading = composing.convertTarget
         let modelTop = classic.mainResults.first?.text
-        let ranked = recentLearning.rank(
-            mainResults: classic.mainResults, firstClauseResults: classic.firstClauseResults,
-            composing: composing)
-        classic.mainResults = ranked.main
-        classic.firstClauseResults = ranked.firstClause
-        let results = classic.mainResults
+        if conversionEngine != .microsoft {
+            let ranked = recentLearning.rank(
+                mainResults: classic.mainResults, firstClauseResults: classic.firstClauseResults,
+                composing: composing)
+            classic.mainResults = ranked.main
+            classic.firstClauseResults = ranked.firstClause
+        }
+        let microsoft = conversionEngine == .hybrid &&
+            (admissionDeadline?.remainingSeconds ?? .infinity) >= Self.windowsQueryBudgetSeconds
+            ? windowsCandidatesLocked(composing, prediction: false) : []
+        let results: [Candidate]
+        if conversionEngine == .hybrid {
+            (results, microsoftOnlySurfaces) = Self.interleaveAzookeyFirst(classic.mainResults, microsoft)
+        } else {
+            results = classic.mainResults
+        }
         guard nextClauseBaseline < UInt64.max else {
             let data = makeSnapshotClauseDataLocked(reading: reading, candidate: nil, key: enhancementKey)
             return (data.clauses.map(\.surface).joined(), reading, explicit ? [] : nil, explicit ? [] : nil, 0, nil, data)
@@ -2668,15 +2803,15 @@ public final class ConversionService: @unchecked Sendable {
                 lastMid: MIDData.一般.mid,
                 data: [DicdataElement(
                     ruby: Self.toKatakana(reading), cid: CIDData.一般名詞.cid,
-                    mid: MIDData.一般.mid, value: 0)])
-            let proposal = snapshotAutoCommitProposalLocked(
+                    mid: MIDData.一般.mid, value: 0)], isLearningTarget: conversionEngine != .microsoft)
+            let proposal = conversionEngine != .microsoft ? snapshotAutoCommitProposalLocked(
                 key: enhancementKey, connection: snapshotConnection,
                 composing: composing, candidate: liveCandidate,
-                firstClauseCandidates: classic.firstClauseResults, reading: reading)
+                firstClauseCandidates: classic.firstClauseResults, reading: reading) : nil
             if let enhancementKey {
                 enqueueSnapshotEnhancement(SnapshotEnhancementWork(
                     key: enhancementKey, baseline: baseline, explicit: false, reading: reading,
-                    classic: classic, snapshot: GPUWorkerCompositionSnapshot(composing),
+                    classic: classic, microsoft: microsoft, snapshot: GPUWorkerCompositionSnapshot(composing),
                     leftContext: leftContext, inferenceLimit: config.inferenceLimit))
             }
             let clauseReading = proposal?.remaining ?? reading
@@ -2694,7 +2829,7 @@ public final class ConversionService: @unchecked Sendable {
         if let enhancementKey {
             enqueueSnapshotEnhancement(SnapshotEnhancementWork(
                 key: enhancementKey, baseline: baseline, explicit: true, reading: reading,
-                classic: classic, snapshot: GPUWorkerCompositionSnapshot(composing),
+                classic: classic, microsoft: microsoft, snapshot: GPUWorkerCompositionSnapshot(composing),
                 leftContext: leftContext, inferenceLimit: config.inferenceLimit))
         }
         var data = makeSnapshotClauseDataLocked(reading: reading,
@@ -2730,32 +2865,56 @@ public final class ConversionService: @unchecked Sendable {
         defer { converterLock.unlock() }
         var input = ComposingText()
         input.insertAtCursorPosition(reading, inputStyle: .direct)
-        var options = makeOptions(nBest: 30, forceClassic: true, noLearning: true)
-        options.requireJapanesePrediction = true
-        options.needTypoCorrection = false
-        inputPredictionConverter.stopComposition()
-        let dictionary = inputPredictionConverter.requestCandidates(input, options: options).mainResults
+        var candidates: [Candidate]
+        if conversionEngine == .microsoft {
+            // The Windows API returns surfaces, not the extended reading. Keep the
+            // consumed prefix in the token and disable AzooKey learning for these items.
+            candidates = windowsCandidatesLocked(input, prediction: true)
+        } else {
+            var options = makeOptions(nBest: 30, forceClassic: true, noLearning: true)
+            options.requireJapanesePrediction = true
+            options.needTypoCorrection = false
+            inputPredictionConverter.stopComposition()
+            let dictionary = inputPredictionConverter.requestCandidates(input, options: options).mainResults
+            guard admissionDeadline?.expired != true else { return empty() }
+            let learned = learning.enabled ? recentLearning.predictions(reading: reading) : []
+            var seen = Set<String>()
+            candidates = (learned + dictionary).filter { candidate in
+                let fullReading = ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined())
+                // 全文変換(rubyが読みと一致)はSpace変換の管轄で、混ぜると先出しが「変換一覧」になる。
+                // MS IME式に、読みを延長する補完だけを予測として出す。読みが長いほど補完は枯渇し、候補0件で先出しは静かになる。
+                return !candidate.text.isEmpty && candidate.text != reading
+                    && fullReading.hasPrefix(reading) && fullReading.count > reading.count
+                    && seen.insert(candidate.text).inserted
+            }.prefix(9).map { $0 }
+        }
+        if conversionEngine == .hybrid {
+            // The native provider can use its full 250 ms timeout. Keep enough of
+            // the request budget for the response after AzooKey prediction finishes.
+            let windows = (admissionDeadline?.remainingSeconds ?? .infinity) >= Self.windowsQueryBudgetSeconds
+                ? windowsCandidatesLocked(input, prediction: true) : []
+            (candidates, microsoftOnlySurfaces) = Self.interleaveAzookeyFirst(candidates, windows)
+            candidates = Array(candidates.prefix(9))
+        } else if conversionEngine == .microsoft {
+            microsoftOnlySurfaces = Set(candidates.map(\.text))
+        } else {
+            microsoftOnlySurfaces.removeAll()
+        }
         guard admissionDeadline?.expired != true else { return empty() }
-        let learned = learning.enabled ? recentLearning.predictions(reading: reading) : []
-        var seen = Set<String>()
-        let candidates = (learned + dictionary).filter { candidate in
-            let fullReading = ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined())
-            // 全文変換(rubyが読みと一致)はSpace変換の管轄で、混ぜると先出しが「変換一覧」になる。
-            // MS IME式に、読みを延長する補完だけを予測として出す。読みが長いほど補完は枯渇し、候補0件で先出しは静かになる。
-            return !candidate.text.isEmpty && candidate.text != reading
-                && fullReading.hasPrefix(reading) && fullReading.count > reading.count
-                && seen.insert(candidate.text).inserted
-        }.prefix(9)
         let now = clauseClock()
         clauseTokens = clauseTokens.filter { now - $0.value.issuedAt < 60 }
         var result: [ClauseCandidate] = []
         for candidate in candidates {
             guard clauseTokens.count < 4096 else { break }
             let token = newClauseTokenLocked()
+            // TIP selection also carries this full-prefix token as sentence_token.
+            // A completion validates against the typed prefix, without sentence correction.
             clauseTokens[token] = ClauseTokenMaterial(candidate: candidate,
                 readingStart: 0, readingEnd: request.reading_end,
                 generation: currentLearningGeneration, issuedAt: now,
-                originalSurface: candidate.text, modelTop: nil, predictionReading: reading)
+                originalSurface: candidate.text, modelTop: nil,
+                sentenceAction: .unchanged, predictionReading: reading,
+                microsoftOnly: microsoftOnlySurfaces.contains(candidate.text) && !candidate.isLearningTarget)
             result.append(ClauseCandidate(surface: candidate.text, token: token,
                 reading_start: 0, reading_end: request.reading_end))
         }
@@ -2797,7 +2956,8 @@ public final class ConversionService: @unchecked Sendable {
                         clauses.append(WireClause(id: UInt64(index + 1), reading_start: cursor, reading_end: end,
                             state: .converted, surface: piece.text, candidate_token: token))
                         clauseTokens[token] = ClauseTokenMaterial(candidate: piece, readingStart: cursor, readingEnd: end,
-                            generation: generation, issuedAt: now, originalSurface: piece.text, modelTop: piece.text)
+                            generation: generation, issuedAt: now, originalSurface: piece.text, modelTop: piece.text,
+                            microsoftOnly: microsoftOnlySurfaces.contains(piece.text) && !piece.isLearningTarget)
                         cursor = end
                     }
                     if cursor < length { clauses.append(readingClause(cursor, UInt64(clauses.count + 1))) }
@@ -2848,7 +3008,8 @@ public final class ConversionService: @unchecked Sendable {
         let token = newClauseTokenLocked()
         clauseTokens[token] = ClauseTokenMaterial(candidate: candidate, readingStart: start, readingEnd: end,
             generation: generation, issuedAt: now, originalSurface: originalSurface, modelTop: modelTop,
-            sentenceAction: sentenceAction)
+            sentenceAction: sentenceAction,
+            microsoftOnly: microsoftOnlySurfaces.contains(candidate.text) && !candidate.isLearningTarget)
         return ClauseCandidate(surface: candidate.text, token: token, reading_start: start, reading_end: end)
     }
 
@@ -2936,10 +3097,28 @@ public final class ConversionService: @unchecked Sendable {
                 guard material.generation == receipt.learning_generation else { return .rejected(.staleLearningGeneration) }
                 guard material.sentenceAction != nil, material.readingStart == 0,
                       material.readingEnd == UInt32(receipt.reading.unicodeScalars.count),
-                      sameWireText(ClauseCoordinates.normalize(material.candidate.data.map(\.ruby).joined()), receipt.reading)
+                      sameWireText(material.predictionReading ?? ClauseCoordinates.normalize(material.candidate.data.map(\.ruby).joined()), receipt.reading)
                 else { return .rejected(.invalidToken) }
                 sentence = material
             }
+            var recordedMicrosoft = false
+            for (interval, material) in zip(receipt.intervals, materials) {
+                guard let material, material.microsoftOnly, material.predictionReading == nil,
+                      let ruby = ClauseCoordinates.slice(receipt.reading,
+                          start: interval.reading_start, end: interval.reading_end),
+                      !ruby.isEmpty, ruby.unicodeScalars.count <= 64,
+                      ruby.unicodeScalars.allSatisfy({ (0x3041...0x3096).contains($0.value) || $0.value == 0x30FC }),
+                      !interval.surface.isEmpty, interval.surface.unicodeScalars.count <= 300 else { continue }
+                let entry = RecentMicrosoftSelection(ruby: ruby, word: interval.surface)
+                recentMicrosoftWords.removeAll { $0 == entry }
+                recentMicrosoftWords.insert(entry, at: 0)
+                if recentMicrosoftWords.count > 20 { recentMicrosoftWords.removeLast() }
+                if learning.enabled, case .candidate(_, let explicit) = interval.learning, explicit {
+                    microsoftLearning.record(reading: ruby, surface: interval.surface)
+                    recordedMicrosoft = true
+                }
+            }
+            if recordedMicrosoft { enqueueMicrosoftPersistenceLocked() }
             guard learning.enabled else { return .applied }
             let options = makeOptions(nBest: 1, forceClassic: true)
             var run = 0
@@ -2973,6 +3152,12 @@ public final class ConversionService: @unchecked Sendable {
             if recorded { enqueueCorrectionPersistenceLocked() }
             return .applied
         }
+    }
+
+    func recentMicrosoftSelections() -> [RecentMicrosoftSelection] {
+        converterLock.lock()
+        defer { converterLock.unlock() }
+        return recentMicrosoftWords
     }
 
     func clauseCandidates(_ request: ClauseCandidatesRequest, admissionDeadline: RequestDeadline? = nil) -> ClauseCandidatesResult {
@@ -3307,7 +3492,29 @@ public final class ConversionService: @unchecked Sendable {
         }
     }
 
+    private func enqueueMicrosoftPersistenceLocked() {
+        let selectedStore = microsoftLearning
+        maintenance.submitLatest(label: "microsoft_learning") { [weak self] in
+            guard let self else { return }
+            self.learningPersistenceLock.lock()
+            defer { self.learningPersistenceLock.unlock() }
+            for _ in 0..<3 {
+                self.converterLock.lock()
+                let snapshot = selectedStore.persistenceSnapshot()
+                self.converterLock.unlock()
+                guard let snapshot else { return }
+                guard MicrosoftLearningStore.persist(snapshot) else { continue }
+                self.converterLock.lock()
+                selectedStore.acknowledgePersistence(snapshot)
+                self.converterLock.unlock()
+                return
+            }
+            throw MicrosoftPersistenceError.failed
+        }
+    }
+
     private enum CorrectionPersistenceError: Error { case failed }
+    private enum MicrosoftPersistenceError: Error { case failed }
     private enum DictionaryReloadError: Error { case failed }
 
     func pollSnapshotEnhancement(key: SnapshotEnhancementKey, baseline: UInt64)
@@ -3324,7 +3531,7 @@ public final class ConversionService: @unchecked Sendable {
     }
 
     private func enqueueSnapshotEnhancement(_ work: SnapshotEnhancementWork) {
-        guard processRole == .mainClassicOnly, zenzaiEnabled,
+        guard conversionEngine != .microsoft, processRole == .mainClassicOnly, zenzaiEnabled,
               gpuWorkerSupervisor != nil else { return }
         snapshotEnhancementLock.lock()
         latestSnapshotEnhancement = (work.key, work.baseline)
@@ -3376,9 +3583,18 @@ public final class ConversionService: @unchecked Sendable {
                                          of: work.classic.mainResults) else {
             return .unavailable
         }
-        let enhanced = decision.conversion.mainResults
+        let enhanced: [Candidate]
+        let microsoftOnly: Set<String>
+        if !work.microsoft.isEmpty {
+            (enhanced, microsoftOnly) = Self.interleaveAzookeyFirst(
+                decision.conversion.mainResults, work.microsoft)
+        } else {
+            enhanced = decision.conversion.mainResults
+            microsoftOnly = []
+        }
         let selected = Self.snapshotCandidate(enhanced, reading: work.reading)
         converterLock.lock()
+        microsoftOnlySurfaces = microsoftOnly
         let clauseData = makeSnapshotClauseDataLocked(reading: work.reading, candidate: selected, key: work.key)
         converterLock.unlock()
         let safeDisplay = clauseData.clauses.map(\.surface).joined()
@@ -3702,6 +3918,7 @@ public final class ConversionService: @unchecked Sendable {
         // classic converter as well would replay the same candidate into long-term memory.
         if processRole != .mainClassicOnly { flushLearningLocked() }
         corrections.flush()
+        microsoftLearning.flush()
     }
 
     /// 保留中の学習をディスクへフラッシュする。**converterLock 保持中に呼ぶこと**。
@@ -3756,7 +3973,7 @@ public final class ConversionService: @unchecked Sendable {
     /// `memory.backup` 等の foreign file を消すため、shard 以外は exact に限定する。
     static func isLearningArtifactName(_ name: String) -> Bool {
         switch name {
-        case ".pause", "corrections.json", "learningMemory.txt",
+        case ".pause", "corrections.json", "microsoft-candidates.json", "learningMemory.txt",
              "memory.louds", "memory.louds.2", "memory.loudschars2", "memory.loudschars2.2",
              "memory.memorymetadata", "memory.memorymetadata.2",
              "memory.loudstxt3", "memory.loudstxt3.2":
@@ -3881,6 +4098,7 @@ public final class ConversionService: @unchecked Sendable {
         // RAM の訂正テーブルは disk preflight が失敗しても消す（既存の false/error 契約）。
         // corrections.json 自体は下の allowlist preflight 後に seam 経由で削除する。
         corrections.clearMemory()
+        microsoftLearning.clearMemory()
         recentLearning.clear()
         snapshotAutoCommitStates.removeAll()
         appliedSnapshotAutoCommitReceipts.removeAll()

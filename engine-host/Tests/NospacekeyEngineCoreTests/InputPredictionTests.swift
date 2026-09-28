@@ -49,7 +49,7 @@ final class InputPredictionTests: XCTestCase {
                 engine_epoch: service.engineEpoch, learning_generation: service.currentLearningGeneration,
                 reading: reading, text: candidate.surface,
                 intervals: [.init(reading_start: 0, reading_end: 2, surface: candidate.surface,
-                    learning: .candidate(token: candidate.token, explicitlySelected: true))], sentence_token: nil)
+                    learning: .candidate(token: candidate.token, explicitlySelected: true))], sentence_token: candidate.token)
         }
         XCTAssertEqual(service.commitReceipt(receipt("がざ", sequence: 1)).outcome, .rejected(.invalidToken))
         let valid = receipt("がぞ", sequence: 2)

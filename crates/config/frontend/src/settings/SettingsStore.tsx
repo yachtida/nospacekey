@@ -52,6 +52,9 @@ function clone<T>(value: T): T {
 export function applyLocalChange(values: PublicSettings, change: SettingChange): PublicSettings {
   const next = clone(values);
   switch (change.field) {
+    case "conversion_engine":
+      next.conversionEngine = change.value;
+      break;
     case "default_direct":
       next.defaultDirect = Boolean(change.value);
       break;
@@ -152,6 +155,7 @@ function replay(snapshot: SettingsSnapshot, active: QueueItem | undefined, queue
 
 function changeValue(values: PublicSettings, change: SettingChange): unknown {
   switch (change.field) {
+    case "conversion_engine": return values.conversionEngine;
     case "default_direct": return values.defaultDirect;
     case "input_prediction_enabled": return values.inputPredictionEnabled;
     case "mixed_input": return values.mixedInput;

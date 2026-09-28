@@ -280,11 +280,27 @@ pub struct UpdateSettings {
     pub automatic_check_prompt_dismissed: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversionEngine {
+    #[default]
+    Azookey,
+    Microsoft,
+    Hybrid,
+}
+impl ConversionEngine {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Azookey => "azookey", Self::Microsoft => "microsoft", Self::Hybrid => "hybrid" }
+    }
+}
+
 const SETTINGS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub version: u32,
+    #[serde(default)]
+    pub conversion_engine: ConversionEngine,
     #[serde(default)]
     pub llm: LlmSettings,
     #[serde(default)]
@@ -340,6 +356,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             version: SETTINGS_SCHEMA_VERSION,
+            conversion_engine: ConversionEngine::default(),
             llm: Default::default(),
             zenzai: Default::default(),
             live_conversion: Default::default(),
@@ -1221,6 +1238,7 @@ pub fn resolve_env_map(
             out.push((k.to_string(), v));
         }
     };
+    put("NOSPACEKEY_CONVERSION_ENGINE", s.conversion_engine.as_str().into());
     if llm_effective_enabled(s) {
         if let Some(key) = api_key_plain {
             if !key.is_empty() {
@@ -1276,6 +1294,25 @@ pub fn resolve_env_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversion_engine_defaults_and_roundtrips_without_changing_other_settings() {
+        let old = Settings::from_json_str(r#"{"version":2}"#);
+        assert_eq!(old.conversion_engine, ConversionEngine::Azookey);
+        let mut selected = old;
+        selected.conversion_engine = ConversionEngine::Microsoft;
+        selected.live_conversion.enabled = false;
+        let restored = Settings::from_json_str(&selected.to_json());
+        assert_eq!(restored.conversion_engine, ConversionEngine::Microsoft);
+        assert!(!restored.live_conversion.enabled);
+        assert!(resolve_env_map(&restored, None, |_| None).contains(
+            &("NOSPACEKEY_CONVERSION_ENGINE".into(), "microsoft".into())));
+        selected.conversion_engine = ConversionEngine::Hybrid;
+        let hybrid = Settings::from_json_str(&selected.to_json());
+        assert_eq!(hybrid.conversion_engine, ConversionEngine::Hybrid);
+        assert!(resolve_env_map(&hybrid, None, |_| None).contains(
+            &("NOSPACEKEY_CONVERSION_ENGINE".into(), "hybrid".into())));
+    }
 
     #[test]
     fn snapshot_values_and_contents_come_from_the_same_read() {

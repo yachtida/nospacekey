@@ -51,6 +51,7 @@ mod llm_worker;
 pub mod local_kana_composer;
 mod mode_hud;
 mod popup;
+mod kaomoji_palette;
 mod panic_guard;
 mod power;
 #[allow(dead_code)]

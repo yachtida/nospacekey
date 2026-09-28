@@ -18,13 +18,14 @@ const PAGES: Array<{ id: PageId; label: string; short: string }> = [
   { id: "keys", label: "キー操作", short: "キー" },
   { id: "display", label: "候補・読みの表示", short: "表示" },
   { id: "dictionary", label: "辞書・学習", short: "辞書" },
-  { id: "engine", label: "変換エンジン", short: "エンジン" },
+  { id: "engine", label: "マルチエンジン", short: "エンジン" },
   { id: "updates", label: "更新", short: "更新" },
   { id: "diagnostics", label: "診断・詳細", short: "診断" },
 ];
 
 type SearchEntry = { page: PageId; target: string; title: string; description: string; terms: string };
 const SEARCH: SearchEntry[] = [
+  { page: "engine", target: "setting-conversion-engine", title: "変換エンジンの選択", description: "AzooKey / Microsoft IME", terms: "マルチエンジン Microsoft Windows IME azookey" },
   { page: "engine", target: "setting-conversion-latency", title: "変換速度の詳細", description: "処理時間と時間切れの統計", terms: "遅い 応答 タイムアウト 計測" },
   { page: "input", target: "setting-default-direct", title: "開始時モード", description: "ひらがな／半角英数", terms: "初期 アプリ" },
   { page: "input", target: "setting-mixed-input", title: "日本語・英字の混在入力", description: "OFF・候補のみ（試験）。自動は利用不可", terms: "英語 mixed github 試験" },

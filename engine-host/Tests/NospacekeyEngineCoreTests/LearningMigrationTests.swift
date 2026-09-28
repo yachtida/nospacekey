@@ -51,6 +51,46 @@ final class LearningMigrationTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: target.appendingPathComponent("memory0.loudstxt3").path))
     }
 
+    func testMicrosoftOnlyLearningSurvivesVersionInheritance() throws {
+        let base = try temporaryBase()
+        let source = base.appendingPathComponent("1.0.0")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let store = MicrosoftLearningStore(directory: source)
+        store.record(reading: "にゅうりょく", surface: "辞書にない語")
+        store.flush()
+
+        XCTAssertEqual(LearningMigration.inherit(base: base, version: "2.0.0"), .inherited)
+        let target = base.appendingPathComponent("2.0.0")
+        XCTAssertEqual(MicrosoftLearningStore(directory: target).surfaces(reading: "にゅうりょく"),
+            ["辞書にない語"])
+        XCTAssertEqual(MicrosoftLearningStore(directory: source).surfaces(reading: "にゅうりょく"),
+            ["辞書にない語"])
+    }
+
+    func testMicrosoftLearningMigratesAlongsideAzooKeyMemory() throws {
+        let base = try temporaryBase()
+        let source = base.appendingPathComponent("1.0.0")
+        _ = try seed(source)
+        let store = MicrosoftLearningStore(directory: source)
+        store.record(reading: "にゅうりょく", surface: "辞書にない語")
+        store.flush()
+
+        XCTAssertEqual(LearningMigration.inherit(base: base, version: "2.0.0"), .inherited)
+        XCTAssertEqual(MicrosoftLearningStore(directory: base.appendingPathComponent("2.0.0"))
+            .surfaces(reading: "にゅうりょく"), ["辞書にない語"])
+    }
+
+    func testMalformedMicrosoftOnlyHistoryIsRejected() throws {
+        let base = try temporaryBase()
+        let source = base.appendingPathComponent("1.0.0")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try Data("{broken".utf8).write(to: source.appendingPathComponent("microsoft-candidates.json"))
+
+        XCTAssertEqual(LearningMigration.inherit(base: base, version: "2.0.0"), .rejected)
+        XCTAssertTrue(FileManager.default.fileExists(atPath:
+            base.appendingPathComponent("2.0.0").appendingPathComponent(LearningMigration.marker).path))
+    }
+
     func testLegacyRootIsEligibleButExistingDestinationIsPreserved() throws {
         let base = try temporaryBase()
         _ = try seed(base)

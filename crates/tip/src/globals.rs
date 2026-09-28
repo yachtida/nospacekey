@@ -107,3 +107,5 @@ pub(crate) fn module_file_path() -> Option<String> {
         size *= 2;
     }
 }
+
+pub const GUID_PRESERVEDKEY_KAOMOJI: windows::core::GUID = windows::core::GUID::from_u128(0x4f975048_473d_4f72_988e_40eb7554dbde);

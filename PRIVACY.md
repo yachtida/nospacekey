@@ -11,6 +11,7 @@
 
 - かな漢字変換（古典変換・Zenzai ニューラル変換）は**全てローカルで実行**されます。
   ニューラル変換はローカル LLM（llama.cpp / Vulkan）を使います。外部LLM補正は製品設定では凍結中です。
+- マルチエンジンでMicrosoft方式を選んだ場合、Windowsの日本語変換・予測APIをこのPC上で呼び出します。入力内容を本ソフトウェアから外部APIへ送信しません。候補数や順位はMicrosoft IME本体と異なる場合があります。
 - 混在入力の判別もローカルで実行します。同梱モデル・辞書を使用し、追加ダウンロードや個人入力による判別器の学習は行いません。混在入力の診断は資産版・時間・候補数などのメタデータだけで、入力本文を含めません。
 - **自動アップデート確認は既定 OFF（opt-in）**です。設定でONにしたユーザーの更新確認タスクだけが
   GitHub Releases APIへHTTPSリクエストを送ります。更新確認は入力内容、変換履歴、辞書、学習データ、
@@ -26,6 +27,7 @@
 
 - 変換履歴からの学習データは `%LOCALAPPDATA%\nospacekey\memory`（ユーザー辞書は
   `%LOCALAPPDATA%\nospacekey\`）に**ローカル保存**され、外部送信されません。
+- 学習が有効なとき、Microsoft方式の通常変換候補を明示的に選ぶと、読みと語が `%LOCALAPPDATA%\nospacekey\memory\microsoft-candidates.json` に保存されます。<kbd>Tab</kbd> の予測候補や暗黙の確定は保存しません。Microsoft IME本体やAzooKeyの学習データには反映しません。「学習履歴を消去」でこの履歴も削除できます。
 - **パスワード／PIN入力欄では変換・学習を行いません。** パスワード欄（TSF の
   `IS_PASSWORD`、numeric/alphanumeric PIN scope /
   Chromium 系のパスワード専用コンテキスト）を検出すると直接入力モードに切り替わり、
