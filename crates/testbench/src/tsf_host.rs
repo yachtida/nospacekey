@@ -759,6 +759,19 @@ impl TsfHost {
         eaten
     }
 
+    pub fn feed_key_with_ctrl_shift(&self, vk: u32) -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState};
+        let mut saved = [0u8; 256];
+        if unsafe { GetKeyboardState(&mut saved) }.is_err() { return false; }
+        let mut pressed = saved;
+        pressed[0x10] |= 0x80;
+        pressed[0x11] |= 0x80;
+        if unsafe { SetKeyboardState(&pressed) }.is_err() { return false; }
+        let eaten = self.feed_key(vk);
+        let _ = unsafe { SetKeyboardState(&saved) };
+        eaten
+    }
+
     /// Check the actual chord registration, then route through TSF's preserved-key API.
     /// TestKeyDown/KeyDown alone do not simulate the OS preserved-key dispatcher.
     pub fn open_kaomoji_palette(&self) -> bool {

@@ -6,7 +6,8 @@
 //! （spec: docs/design/2026-07-21-reading-monitor-design.md）。
 //!
 //! 予測（input prediction）は従来候補窓の preview モードで流用表示していたが、本窓へ
-//! 統合した: 読み行を下段（=本文に近い位置）に固定し、候補欄はその上に広がる。入力を
+//! 統合した: 読み行をフッターに置き、候補を上から順位順に表示する。候補があれば
+//! 入力行の直下を優先し、画面下端では直上に反転する。入力を
 //! 再開してもパネルは閉じず、読み行だけ即時更新し、新しい応答が届けば候補欄の中身だけ
 //! 差し替える（閉じ→開きをしない）。読みが進んで古くなった候補（stale）は薄色で選択
 //! 対象外を示す（確定は identity 突合で拒否される）。選択モード（Tab）は従来どおり
@@ -49,17 +50,16 @@ const PAD_V_TOTAL: i32 = 12;
 /// （spec 2026-07-21 max-chars 方式B）。「作業領域の半分」の動的計算はモニタ照会を
 /// 増やすだけで、文字数指定+末尾優先で用が足りる（spec 却下案）。
 const MIN_TEXT_W: i32 = 24;
-/// キャレット上端と窓下端の間隔（dp）。
-const GAP: i32 = 6;
-/// パネルの予測候補は 3 行固定。エンジンは 9 件まで返すが、パネルは先頭 3 件の
-/// コンパクト表示に留め、全件は Tab で選択モードに入った後の候補窓で選ぶ。
-pub(crate) const PANEL_PREVIEW_ROWS: usize = 3;
+/// 入力行とパネルの間隔（dp）。
+const GAP: i32 = 2;
+/// 入力中は先頭5件を表示し、Tabで選択を始めると9件ずつ全候補をたどれる。
+pub(crate) const PANEL_PREVIEW_ROWS: usize = 5;
 /// 候補 1 行の高さ（dp）。候補窓の ROW_HEIGHT と同じ見た目。
 const ROW_H: i32 = 28;
 /// 読み行と候補欄の間の区切り帯（dp）。中央にヘアライン 1px を引く。
 const SEP_BAND: i32 = 7;
-/// 候補行のガター幅（dp）。1 行目だけ "Tab" を描く（候補窓の番号ガター 22dp に合わせる）。
-const GUTTER_W: i32 = 22;
+/// "Tab" と候補本文の間にも余白を確保する（番号だけのガターより広い）。
+const GUTTER_W: i32 = 30;
 /// パネル幅の下限（dp）。候補が読める最小幅（候補窓の MIN_W と同じ）—「未確定文字列の
 /// 表示幅を基本に、読み・候補が読める最小幅を確保する」の下限側。
 const MIN_PANEL_W: i32 = 160;
@@ -256,7 +256,7 @@ pub(crate) fn dim_text(text: crate::theme::Rgba, bg: crate::theme::Rgba) -> crat
 }
 
 /// 読み行帯の上端（クライアント座標、下辺からの帯 = パディング+フォント）。区切り線は
-/// この直上 SEP_BAND/2、候補行 i の下端は（区切り線位置 − i×ROW_H）。panel_window_size の
+/// この直上 SEP_BAND/2 に区切り線を置く。panel_window_size の
 /// 高さ式と対応させる帯計算の唯一の出所（paint_gdi / paint_d2d が共有）。
 pub(crate) fn reading_band_top(
     client_bottom: i32,
@@ -272,7 +272,7 @@ pub(crate) fn reading_band_top(
 }
 
 /// 候補欄の下端 y（クライアント座標、paint_gdi / paint_d2d の共有出所）。読み行がある
-/// ときは区切り線位置（候補第1行の下端 = 線の上端）、無いとき（ライブ変換 OFF + 候補欄
+/// ときは区切り線位置（最下段候補の下端 = 線の上端）、無いとき（ライブ変換 OFF + 候補欄
 /// のみ）は**下枠の直上** — 区切り帯は読み行との境界なので、無い形態でまで差し引くと
 /// 最上段の候補 top が負になり描画ループの `top < rc.top` で全行描かれない
 /// （panel_window_size が読み行なしで SEP_BAND を積まない高さ式と対応）。
@@ -286,6 +286,36 @@ pub(crate) fn candidate_rows_bottom(
         reading_band_top(client_bottom, true, font_px, dpi) - scale(SEP_BAND, dpi) / 2
     } else {
         client_bottom - BORDER
+    }
+}
+
+/// 表示順位は上下どちらに出す場合も上から下。Tab後の選択順と揃える。
+fn candidate_row_bounds(bottom: i32, rows: usize, index: usize, dpi: i32) -> (i32, i32) {
+    let row_h = scale(ROW_H, dpi);
+    let top = bottom - (rows - index) as i32 * row_h;
+    (top, top + row_h)
+}
+
+/// 予測は入力行の直下を優先し、収まらなければ直上へ。読みだけの小窓は従来の上側。
+fn panel_position(
+    anchor: CaretAnchor,
+    w: i32,
+    h: i32,
+    dpi: i32,
+    predictions: bool,
+    work: Option<RECT>,
+) -> (i32, i32) {
+    let gap = scale(GAP, dpi);
+    let top = anchor.caret_top.map(|y| y - gap);
+    let y = if predictions {
+        anchor.y + gap
+    } else {
+        top.map_or(anchor.y, |y| y - h)
+    };
+    match work {
+        Some(work) if predictions => popup::fit_below_or_flip_above(anchor.x, y, top, w, h, work),
+        Some(work) => popup::fit_to_work_area(anchor.x, y, w, h, work),
+        None => (anchor.x, y),
     }
 }
 
@@ -404,14 +434,11 @@ fn paint_gdi(hwnd: HWND) {
         let rows = state.candidates.len();
         let font_px = font_size_px(point_tenths, dpi).ceil() as i32;
         // 帯の割り出しは reading_band_top（panel_window_size と対応する唯一の出所）経由。
-        // 候補欄は読み行の上側に広がる（読み行の位置は候補の有無で動かない — 統合パネルの
-        // 視線固定要件）。候補行は candidate_rows_bottom（読み行あり=区切り線位置 / なし=
-        // 下枠直上）から上へ ROW_H 刻み。区切り線は読み行との境界なので読み行があるとき
-        // だけ描く。
+        // 読みはフッターに残し、候補はTab後と同じ上から順位順に配置する。
+        // 区切り線は読み行との境界にだけ描く。
         let reading_top = reading_band_top(rc.bottom, with_reading, font_px, dpi);
         if rows > 0 {
             let rows_bottom = candidate_rows_bottom(rc.bottom, with_reading, font_px, dpi);
-            let row_h = scale(ROW_H, dpi);
             if with_reading {
                 let line = CreateSolidBrush(COLORREF(colors.border.colorref()));
                 let _ = FillRect(
@@ -427,8 +454,7 @@ fn paint_gdi(hwnd: HWND) {
                 let _ = DeleteObject(line.into());
             }
             for (i, cand) in state.candidates.iter().enumerate() {
-                let bottom = rows_bottom - i as i32 * row_h;
-                let top = bottom - row_h;
+                let (top, bottom) = candidate_row_bounds(rows_bottom, rows, i, dpi);
                 if top < rc.top {
                     break;
                 }
@@ -585,13 +611,11 @@ unsafe fn paint_d2d(hwnd: HWND) {
     let pad = scale(PAD_H, dpi) as f32;
     let with_reading = !state.text.is_empty();
     let rows = state.candidates.len();
-    // 帯の割り出しは reading_band_top 経由（GDI パスと同一の出所）。候補欄は読み行の
-    // 上側に広がる — 読み行の位置は候補の有無で動かない（統合パネルの視線固定要件）。
+    // 読みはフッター、候補は上から順位順（GDIと共通の帯計算）。
     // 候補行の下端は candidate_rows_bottom（読み行なしは下枠直上）— GDI パスと共有の
     // 出所。区切り線は読み行との境界なので読み行があるときだけ描く。
     let reading_top = reading_band_top(rc.bottom, with_reading, font_px, dpi) as f32;
     if rows > 0 {
-        let row_h = scale(ROW_H, dpi) as f32;
         let rows_bottom = candidate_rows_bottom(rc.bottom, with_reading, font_px, dpi) as f32;
         let gutter_w = scale(GUTTER_W, dpi) as f32;
         if with_reading {
@@ -608,8 +632,8 @@ unsafe fn paint_d2d(hwnd: HWND) {
             }
         }
         for (i, cand) in state.candidates.iter().enumerate() {
-            let bottom = rows_bottom - i as f32 * row_h;
-            let top = bottom - row_h;
+            let (top, bottom) = candidate_row_bounds(rows_bottom as i32, rows, i, dpi);
+            let (top, bottom) = (top as f32, bottom as f32);
             if top < rc.top as f32 {
                 break;
             }
@@ -813,7 +837,7 @@ impl ReadingMonitor {
         }
     }
 
-    /// 読み `text` と予測候補 `candidates` を composition 先頭アンカーの上側に1窓で
+    /// 読み `text` と予測候補 `candidates` を composition 先頭アンカーに近い1窓で
     /// 表示/更新する（統合パネル）。表示条件の判定は呼び出し側（plan_panel が唯一の
     /// 真実源）。`anchor=None`（矩形取得失敗）は表示中なら前回位置保持・非表示なら
     /// 既定座標（plan_anchor）。`comp_width` は未確定文字列の表示幅の実測（物理px）で
@@ -959,32 +983,12 @@ impl ReadingMonitor {
             state.held_w = held_width(state.held_w, comp_changed, w)
                 .clamp(min_w, max_window_w(max_w, min_w, dpi));
             w = state.held_w;
-            // アンカー上側（caret_top の上に GAP 空けて）。caret_top 不明（無害位置劣化）は
-            // アンカー位置へそのまま（下側）— そのときは実キャレットも不明なので上下の
-            // 使い分けに意味がない。クランプは**アンカーモニタの作業領域**で行う
-            // （place_on_monitor だと配置点のモニタに跨いでしまい、縦積み混合DPIで
-            // 着地モニタとサイズDPIが不一致する — 巡1検証 G1。候補窓の
-            // place_on_monitor_flipped と同じ「アンカー点基準」に統一）。
+            // DPIも配置も入力行のモニタを基準にし、縦積みモニタへ飛ばさない。
             match target {
                 Target::Move(a) => {
-                    let (dx, dy) = match a.caret_top {
-                        Some(top) => (a.x, top - h - scale(GAP, dpi)),
-                        None => (a.x, a.y),
-                    };
-                    // クランプはアンカーモニタ（=窓を置く側）の作業領域で行う。fit_to_work_area は
-                    // 「窓が作業領域より広い」場合も (right-w).max(left) の二段クランプで
-                    // panic しない（i32::clamp の min>max panic を構造的に回避 — 巡2 A1。
-                    // popup.rs に幅超過テストあり。max_chars=100 等の合法設定で窓幅が
-                    // 作業領域幅を超えうるため、素の clamp は使えない）。
-                    match popup::work_area_at(a.x, a.caret_top.unwrap_or(a.y)) {
-                        Some(work) => {
-                            let (cx, cy) = popup::fit_to_work_area(dx, dy, w, h, work);
-                            popup::set_popup_pos(self.hwnd, Some((cx, cy)), w, h);
-                        }
-                        // モニタ情報が取れないときは配置希望点を素通し（候補窓の
-                        // place_on_monitor_flipped 失敗時と同じ劣化）。
-                        None => popup::set_popup_pos(self.hwnd, Some((dx, dy)), w, h),
-                    }
+                    let work = popup::work_area_at(a.x, a.caret_top.unwrap_or(a.y));
+                    let position = panel_position(a, w, h, dpi, rows > 0, work);
+                    popup::set_popup_pos(self.hwnd, Some(position), w, h);
                 }
                 Target::Hold => {
                     // 位置は前回のまま、サイズだけ追従（読みは伸縮する）。
@@ -1357,11 +1361,11 @@ mod tests {
         // 読み行なしの形態（ライブ変換 OFF + 候補欄）でも区切り帯を差し引くと最上段の
         // 候補 top が負になり、描画ループの `top < rc.top` で全行描かれない（96DPI・候補
         // 1件なら top=-1）。panel_window_size の高さ式と candidate_rows_bottom の対応で、
-        // 読み行あり/なし × 候補1〜3件 × 96/192DPI の全組合せで全候補行がクライアント
+        // 読み行あり/なし × 候補1〜5件 × 96/192DPI の全組合せで全候補行がクライアント
         // 領域内に収まることを固定する（描画ループと同一の判定で検証する）。
         for (dpi, font_px) in [(96, 14), (192, 28)] {
             for with_reading in [true, false] {
-                for rows in [1usize, 2, 3] {
+                for rows in 1..=PANEL_PREVIEW_ROWS {
                     let (_, h) = panel_window_size(
                         0,
                         if with_reading { 100 } else { 0 },
@@ -1372,11 +1376,12 @@ mod tests {
                         dpi,
                         max_text_w_px(34, font_px),
                     );
-                    let row_h = scale(ROW_H, dpi);
                     let rows_bottom = candidate_rows_bottom(h, with_reading, font_px, dpi);
                     for i in 0..rows {
-                        let bottom = rows_bottom - i as i32 * row_h;
-                        let top = bottom - row_h;
+                        let (top, bottom) = candidate_row_bounds(rows_bottom, rows, i, dpi);
+                        if i > 0 {
+                            assert_eq!(candidate_row_bounds(rows_bottom, rows, i - 1, dpi).1, top);
+                        }
                         assert!(
                             top >= 0,
                             "row {i} clipped: dpi={dpi} reading={with_reading} rows={rows} top={top}"
@@ -1385,6 +1390,22 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn prediction_panel_stays_next_to_input_and_flips_at_screen_bottom() {
+        for dpi in [96, 144, 192] {
+            let work = RECT { left: -1200, top: -800, right: 0, bottom: 0 };
+            let (_, h) = panel_window_size(0, 50, 100, true, 5, scale(14, dpi), dpi, 500);
+            let gap = scale(GAP, dpi);
+            let anchor = CaretAnchor { x: -800, y: -600, caret_top: Some(-620) };
+            assert_eq!(panel_position(anchor, 240, h, dpi, true, Some(work)), (-800, -600 + gap));
+            let low = CaretAnchor { x: -800, y: -20, caret_top: Some(-40) };
+            let (x, y) = panel_position(low, 240, h, dpi, true, Some(work));
+            assert_eq!((x, y + h), (-800, -40 - gap));
+            assert_eq!(panel_position(anchor, 240, 30, dpi, false, Some(work)), (-800, -620 - gap - 30));
+            assert_eq!(panel_position(anchor, 240, h, dpi, true, None), (-800, -600 + gap));
         }
     }
 

@@ -374,6 +374,7 @@ pub(crate) struct LiveSnapshotResult {
     pub(crate) candidate_remaining: Option<Vec<String>>,
     pub(crate) baseline: u64,
     pub(crate) enhancement: bool,
+    pub(crate) auto_commit_blocked: bool,
     pub(crate) auto_commit: Option<crate::input_module::AutoCommitProposal>,
 }
 
@@ -1299,6 +1300,7 @@ fn adopt_desired_snapshot_configuration(
 }
 
 struct EngineSnapshotTransport {
+    mixed_assets: Option<Result<mixed_input::assets::Bundle, mixed_input::assets::AssetError>>,
     learning_identity: Option<ipc::client::EngineLearningIdentity>,
     request_ids: Arc<AtomicU64>,
     pipe: String,
@@ -1356,6 +1358,7 @@ impl EngineSnapshotTransport {
         auto_commit_receipt_receiver: Receiver<Request>,
     ) -> Self {
         Self {
+            mixed_assets: None,
             learning_identity: None,
             request_ids: Arc::new(AtomicU64::new(0)),
             pipe,
@@ -1485,7 +1488,21 @@ impl SnapshotTransport for EngineSnapshotTransport {
                         (Some(candidates), Some(remaining))
                     }
                 };
+                let auto_commit_blocked = match (&snapshot.mixed_source, &auto_commit) {
+                    (Some(source), Some(proposal)) => {
+                        if source.reading_text() != format!("{}{}", proposal.consumed_reading, proposal.remaining)
+                            || proposal.text.is_empty() || proposal.consumed_reading.is_empty()
+                            || proposal.remaining != clause_data.reading {
+                            return None;
+                        }
+                        let assets = self.mixed_assets.get_or_insert_with(mixed_input::assets::Bundle::embedded);
+                        !assets.as_ref().is_ok_and(|bundle|
+                            crate::mixed_worker::ordinary_auto_commit_is_safe(source, &proposal.consumed_reading, bundle))
+                    }
+                    _ => false,
+                };
                 Some(LiveSnapshotResult {
+                    auto_commit_blocked,
                     learning_identity: self.learning_identity.clone(),
                     clause_data,
                     identity: SnapshotIdentity {
@@ -1523,6 +1540,7 @@ impl SnapshotTransport for EngineSnapshotTransport {
     }
 
     fn schedule_enhancement(&self, result: &LiveSnapshotResult) {
+        if result.auto_commit_blocked { return; }
         if let Some(publisher) = &self.enhancement_publisher {
             publisher.offer(result);
         }
@@ -1746,6 +1764,7 @@ fn decode_snapshot_enhancement(
                 baseline,
                 enhancement: true,
                 auto_commit: None,
+                auto_commit_blocked: false,
             })
         }
         Response::SnapshotEnhancement { .. } => SnapshotEnhancementPoll::Unavailable,
@@ -2351,6 +2370,7 @@ mod tests {
                     baseline: 1,
                     enhancement: false,
                     auto_commit: None,
+                    auto_commit_blocked: false,
                 })
         }
 
@@ -2405,6 +2425,7 @@ mod tests {
                 baseline: 1,
                 enhancement: false,
                 auto_commit: None,
+                auto_commit_blocked: false,
             })
         }
 
@@ -2457,6 +2478,7 @@ mod tests {
                 baseline: 42,
                 enhancement: false,
                 auto_commit: None,
+                auto_commit_blocked: false,
             })
         }
 
@@ -2496,6 +2518,7 @@ mod tests {
                 baseline,
                 enhancement: true,
                 auto_commit: None,
+                auto_commit_blocked: false,
             })
         }
     }
@@ -2534,6 +2557,7 @@ mod tests {
                 baseline,
                 enhancement: true,
                 auto_commit: None,
+                auto_commit_blocked: false,
             })
         }
     }
@@ -2570,6 +2594,7 @@ mod tests {
                     baseline,
                     enhancement: true,
                     auto_commit: None,
+                    auto_commit_blocked: false,
                 }),
             }
         }
@@ -2636,6 +2661,7 @@ mod tests {
                 baseline: 1,
                 enhancement: false,
                 auto_commit: None,
+                auto_commit_blocked: false,
             })
         }
 
@@ -2782,6 +2808,7 @@ mod tests {
                 baseline: 1,
                 enhancement: false,
                 auto_commit: None,
+                auto_commit_blocked: false,
             })
         }
 
@@ -2834,6 +2861,7 @@ mod tests {
                 baseline: 1,
                 enhancement: false,
                 auto_commit: None,
+                auto_commit_blocked: false,
             })
         }
 
@@ -2909,6 +2937,7 @@ mod tests {
                 baseline: 1,
                 enhancement: false,
                 auto_commit: None,
+                auto_commit_blocked: false,
             })
         }
 
@@ -2988,6 +3017,7 @@ mod tests {
                 baseline: 1,
                 enhancement: false,
                 auto_commit: None,
+                auto_commit_blocked: false,
             })
         }
 
@@ -3041,6 +3071,7 @@ mod tests {
                 baseline: 1,
                 enhancement: false,
                 auto_commit: None,
+                auto_commit_blocked: false,
             })
         }
 
@@ -3070,6 +3101,7 @@ mod tests {
             purpose: SnapshotPurpose::Live,
             segments: vec![segment("nihon")],
             live_search_width: 1,
+            mixed_source: None,
             left_context: None,
         }
     }
@@ -3604,7 +3636,7 @@ mod tests {
                     learning_identity: Some(ipc::client::EngineLearningIdentity { engine_epoch: "engine".into(), learning_generation: 1 }),
                     clause_data: ipc::clause::SnapshotClauseData::from_reading("gpu".into(), 0, 1),
                     identity, purpose, text: "gpu".into(), candidates: None, candidate_remaining: None,
-                    baseline, enhancement: true, auto_commit: None,
+                    baseline, enhancement: true, auto_commit: None, auto_commit_blocked: false,
                 })
             }
         }

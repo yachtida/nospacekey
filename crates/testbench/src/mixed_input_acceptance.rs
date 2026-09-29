@@ -47,13 +47,52 @@ fn open(host: &TsfHost) -> Result<(u32, String), String> {
         as u32;
     Ok((index, reading))
 }
+fn check_manual_repair(host: &TsfHost) -> Result<(), String> {
+    for converted in [false, true] {
+        host.store.reset();
+        for key in scenarios::typed("madewotukatteimasu") {
+            if !host.feed_key(key.0) { return Err("repair typing not eaten".into()); }
+        }
+        let reading = host.store.preedit();
+        if converted && (!host.feed_key(scenarios::SPACE.0)
+            || !wait(|| host.store.preedit() != reading)) {
+            return Err("ordinary clause conversion did not start".into());
+        }
+        if !host.feed_key_with_ctrl_shift(scenarios::SPACE.0)
+            || !wait(|| host.candidate_strings() == ["英字のまま", "日本語として解釈"]) {
+            return Err(format!("manual repair unavailable: converted={converted}"));
+        }
+        host.feed_key(scenarios::ESC.0);
+        if host.store.preedit() != reading || !host.store.committed().is_empty() {
+            return Err("repair cancel changed the input".into());
+        }
+        host.feed_key_with_ctrl_shift(scenarios::SPACE.0);
+        host.feed_key(0x24); // Home; select only 'made', retaining the Japanese suffix.
+        for _ in 0..4 { host.feed_key_with_shift(0x27); }
+        host.feed_key(scenarios::ENTER.0);
+        if !wait(|| host.store.preedit().starts_with("made")
+            && host.candidate_strings().iter().any(|s| s.starts_with("made"))) {
+            return Err(format!("manual Literal was not adopted: {:?}", host.store.preedit()));
+        }
+        let expected = host.store.preedit();
+        if expected == "madewotukatteimasu" || !expected.ends_with("います") {
+            return Err(format!("repair lost its Japanese suffix: {expected:?}"));
+        }
+        host.feed_key(scenarios::ENTER.0);
+        if !wait(|| !host.store.composing() && host.store.committed() == expected) {
+            return Err("repair commit mismatch".into());
+        }
+    }
+    Ok(())
+}
+
 fn check_ordinary(host: &TsfHost) -> Result<(), String> {
     for number_key in [false, true] {
         host.store.reset();
-        open_menu(host, "nihongo")?;
-        let index = host.candidate_strings().iter().position(|s| s == "にほんご")
-            .ok_or_else(|| format!("no alternate ordinary candidate: {:?}", host.candidate_strings()))? as u32;
-        if index == 0 || index >= 9 { return Err("alternate ordinary fixture is not selectable".into()); }
+        let (mixed_index, _) = open(host)?;
+        if mixed_index <= 1 { return Err("alternate ordinary choice missing before mixed alternatives".into()); }
+        let index = 1;
+        let expected = host.candidate_strings()[index as usize].clone();
         if number_key {
             host.feed_key(0x31 + index);
         } else {
@@ -69,17 +108,20 @@ fn check_ordinary(host: &TsfHost) -> Result<(), String> {
             host.store.reject_text.set(false);
             host.behavior_select_and_finalize(index);
         }
-        if !wait(|| !host.store.composing() && host.store.committed() == "にほんご") {
+        if !wait(|| !host.store.composing() && host.store.committed() == expected) {
             return Err(format!("ordinary choice was replaced: number={number_key} full={:?}", host.store.full()));
         }
     }
     host.store.reset();
-    open_menu(host, "gazounoyouni")?;
+    let reading = open_menu(host, "gazounoyounigithub")?;
+    let remaining = reading.strip_prefix("がぞう")
+        .ok_or_else(|| format!("unexpected partial candidate reading: {reading:?}"))?;
+    let expected = format!("画像{remaining}A");
     let index = host.candidate_strings().iter().position(|s| s == "画像")
         .ok_or_else(|| format!("no partial ordinary candidate: {:?}", host.candidate_strings()))? as u32;
     host.behavior_select(index);
     host.feed_key_with_shift(0x41);
-    if !wait(|| !host.store.composing() && host.store.committed() == "画像のようにA") {
+    if !wait(|| !host.store.composing() && host.store.committed() == expected) {
         return Err(format!("Shift settle lost the partial candidate suffix: {:?}", host.store.full()));
     }
     Ok(())
@@ -157,7 +199,8 @@ fn check(host: &TsfHost) -> Result<(), String> {
     if !wait(|| !host.store.composing() && host.store.committed() == expected) {
         return Err("continued input commit mismatch".into());
     }
-    check_ordinary(host)
+    check_ordinary(host)?;
+    check_manual_repair(host)
 }
 pub fn run() -> i32 {
     if std::env::var("NOSPACEKEY_TEST_SANDBOX").as_deref() != Ok("1") {

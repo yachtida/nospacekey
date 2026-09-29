@@ -18,6 +18,28 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+/// Check only on the snapshot worker, and only when the engine proposes a commit.
+/// Space's lower-ranked alternatives must not disable ordinary Japanese typing.
+pub(crate) fn ordinary_auto_commit_is_safe(
+    source: &CompositionSource,
+    consumed_reading: &str,
+    bundle: &mixed_input::assets::Bundle,
+) -> bool {
+    if consumed_reading.is_empty()
+        || !source.reading_text().starts_with(consumed_reading)
+        || source.source_len() > mixed_input::classify::MAX_ANALYZE_SCALARS
+    {
+        return false;
+    }
+    let reading_end = consumed_reading.chars().count() as u32;
+    let Some(source_end) = source.layout().iter()
+        .find(|element| element.reading.end.get() == reading_end)
+        .map(|element| element.source.end.get()) else { return false; };
+    classify(source, &bundle.model, &bundle.dictionary).first().is_some_and(|best|
+        !best.plan.spans.iter().any(|span|
+            span.kind == SegmentKind::Literal && span.range.start.get() < source_end))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
     pub composition: u64,
@@ -198,6 +220,9 @@ fn calculate(
             .cloned()
             .collect()
     };
+    if plans.is_empty() {
+        return Some((vec![], fence));
+    }
     let mut client = EngineClient::connect_to(
         pipe,
         Duration::from_millis(100).min(work.deadline.saturating_duration_since(Instant::now())),
@@ -394,6 +419,47 @@ fn collect_choices(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mixed_auto_commit_keeps_unselected_english_and_source_units_editable() {
+        use mixed_input::classify::tune::source_from_str;
+        let bundle = mixed_input::assets::Bundle::embedded().unwrap();
+        let mixed = source_from_str("githubnotukaikatawosetsumeisurunodenagaibunshouwoutimasu");
+        assert!(!ordinary_auto_commit_is_safe(&mixed, "ぎて", &bundle));
+        assert!(!ordinary_auto_commit_is_safe(&mixed, "ぎ", &bundle));
+        assert!(!ordinary_auto_commit_is_safe(&mixed, "ぎてゅb", &bundle));
+        let japanese = source_from_str("kyouhaiitenkinodenagaibunshouwoutimasu");
+        assert!(ordinary_auto_commit_is_safe(&japanese, "きょうは", &bundle));
+        assert!(!ordinary_auto_commit_is_safe(&japanese, "き", &bundle));
+        let mut composer = crate::local_kana_composer::LocalKanaComposer::default();
+        for ch in "kyouhaiitenkinanodenagaibunshouwoutitsuduketeimasu".chars() {
+            composer.push(ch, crate::local_kana_composer::InputStyle::Kana);
+        }
+        let japanese = composer.composition_source(1);
+        assert!(ordinary_auto_commit_is_safe(&japanese, "きょうはいい", &bundle),
+            "{:?}", classify(&japanese, &bundle.model, &bundle.dictionary).first());
+        let too_long = source_from_str(&"a".repeat(257));
+        assert!(!ordinary_auto_commit_is_safe(&too_long, "あ", &bundle));
+    }
+
+    #[test]
+    fn ordinary_japanese_space_keeps_clause_conversion_and_github_still_offers_mixed() {
+        let bundle = mixed_input::assets::Bundle::embedded().unwrap();
+        for text in ["kyouhaiitenkidesu", "nihongo", "watashihagakkouheikimasu"] {
+            let source = mixed_input::classify::tune::source_from_str(text);
+            let plans = classify(&source, &bundle.model, &bundle.dictionary);
+            assert!(mixed_input::selection::mixed_candidate_plans(&plans).next().is_none(),
+                "lower-ranked Literal alternatives must not replace Japanese clauses: {text}");
+            let mut request = work();
+            request.source = source;
+            let (choices, _) = calculate("unused-no-engine-needed", &request, &bundle.model, &bundle.dictionary).unwrap();
+            assert!(choices.is_empty(), "the STA must enter its ordinary clause path");
+        }
+        for text in ["githubnotukaikata", "gazounoyounigithub"] {
+            let source = mixed_input::classify::tune::source_from_str(text);
+            let plans = classify(&source, &bundle.model, &bundle.dictionary);
+            assert!(mixed_input::selection::mixed_candidate_plans(&plans).next().is_some(), "{text}");
+        }
+    }
     fn work() -> Work {
         Work {
             identity: Identity {

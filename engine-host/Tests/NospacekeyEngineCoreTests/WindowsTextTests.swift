@@ -78,6 +78,88 @@ final class WindowsTextTests: XCTestCase {
             .contains("予測追加"))
     }
 
+    func testHybridKeepsDictionaryClauseBoundariesInLiveAndExplicitConversion() throws {
+        let reading = "きょうはいいてんきです"
+        for explicit in [false, true] {
+            for width in [1, 10] {
+                let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+                    learning: .disabled, environment: ["NOSPACEKEY_CONVERSION_ENGINE": "hybrid"],
+                    fileSystem: .live, windowsTextProvider: .init { _, _, _ in ["Windows全文候補"] })
+                let result = service.snapshot([.init(text: reading, style: "direct")],
+                    explicit: explicit, liveSearchWidth: width)
+                try ClauseCoordinates.validate(reading: reading, clauses: result.clauseData.clauses,
+                    start: 0, end: UInt32(reading.unicodeScalars.count), text: result.text)
+                XCTAssertGreaterThan(result.clauseData.clauses.count, 1)
+                XCTAssertNotEqual(result.text, reading)
+                XCTAssertTrue(result.clauseData.clauses.allSatisfy { $0.candidate_token != nil })
+            }
+        }
+    }
+
+    func testHybridLongLiveInputProposesAutoCommitWithoutSpace() throws {
+        for width in [1, 10] {
+            let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+                learning: .disabled, environment: ["NOSPACEKEY_CONVERSION_ENGINE": "hybrid"],
+                fileSystem: .live, windowsTextProvider: .init { _, _, _ in
+                    XCTFail("ordinary hybrid live conversion must not wait for Windows alternatives")
+                    return []
+                })
+            var reading = ""
+            var committed = false
+            for (offset, ch) in "きょうはいいてんきなのでながいぶんしょうをうちつづけています".enumerated() {
+                reading.append(ch)
+                let key = ConversionService.SnapshotEnhancementKey(composition: 1,
+                    revision: UInt64(offset + 1), configurationGeneration: 1, connectionGeneration: 1)
+                let result = service.snapshot([.init(text: reading, style: "direct")],
+                    explicit: false, enhancementKey: key, snapshotConnection: 1, liveSearchWidth: width)
+                if let proposal = result.autoCommit {
+                    XCTAssertEqual(proposal.consumedReading + proposal.remaining, reading)
+                    XCTAssertFalse(proposal.text.isEmpty)
+                    XCTAssertFalse(proposal.remaining.isEmpty)
+                    XCTAssertTrue(service.applySnapshotAutoCommitReceipt(connection: 1,
+                        key: key, proposal: proposal.proposal))
+                    committed = true
+                    break
+                }
+            }
+            XCTAssertTrue(committed, "long live input must commit a prefix before Space, width=\(width)")
+        }
+    }
+
+    func testHybridAutoCommitContinuesAfterRomanInputIsReseededAsKana() throws {
+        let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+            learning: .disabled, environment: ["NOSPACEKEY_CONVERSION_ENGINE": "hybrid"],
+            fileSystem: .live, windowsTextProvider: .init { _, _, _ in [] })
+        let roman = "kyouhaiitenkinanodenagaibunshouwoutitsuduketeimasu"
+        let key = ConversionService.SnapshotEnhancementKey(composition: 1, revision: 1,
+            configurationGeneration: 1, connectionGeneration: 1)
+        let initial = service.snapshot([.init(text: roman, style: nil)], explicit: false,
+            enhancementKey: key, snapshotConnection: 1, liveSearchWidth: 10)
+        let first = try XCTUnwrap(initial.autoCommit)
+        XCTAssertTrue(service.applySnapshotAutoCommitReceipt(connection: 1, key: key, proposal: first.proposal))
+        var reading = first.remaining
+        var commits = 0
+        for (offset, ch) in "きょうはいいてんきなのでながいぶんしょうをうちつづけています".enumerated() {
+            reading.append(ch)
+            let nextKey = ConversionService.SnapshotEnhancementKey(composition: 1, revision: UInt64(offset + 2),
+                configurationGeneration: 1, connectionGeneration: 1)
+            let result = service.snapshot([.init(text: reading, style: "direct")], explicit: false,
+                leftContext: first.text, enhancementKey: nextKey, snapshotConnection: 1, liveSearchWidth: 10)
+            if let proposal = result.autoCommit {
+                let retryKey = ConversionService.SnapshotEnhancementKey(composition: 1, revision: nextKey.revision,
+                    configurationGeneration: 1, connectionGeneration: 1, requestID: UInt64(offset + 100))
+                let retry = service.snapshot([.init(text: reading, style: "direct")], explicit: false,
+                    leftContext: first.text, enhancementKey: retryKey, snapshotConnection: 1, liveSearchWidth: 10)
+                XCTAssertEqual(retry.autoCommit?.proposal, proposal.proposal,
+                    "A debounce/prediction retry of the same reading must retain its pending prefix")
+                XCTAssertTrue(service.applySnapshotAutoCommitReceipt(connection: 1, key: retryKey, proposal: proposal.proposal))
+                reading = proposal.remaining
+                commits += 1
+            }
+        }
+        XCTAssertGreaterThan(commits, 0)
+    }
+
     func testSelectedMicrosoftOnlyWordBecomesReviewableWithoutAutomaticLearning() throws {
         let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
             learning: .init(enabled: false, memoryDir: nil),
@@ -121,6 +203,8 @@ final class WindowsTextTests: XCTestCase {
         XCTAssertEqual(restored.snapshot(segments, explicit: false).text, "辞書にない語")
         XCTAssertTrue(restored.inputPredictions(request("にゅうりょく")).candidates.isEmpty,
             "A learned conversion must never become a Tab prediction")
+        XCTAssertEqual(restored.inputPredictions(request("にゅう")).candidates.first?.surface, "辞書にない語",
+            "A verified learned full reading can complete a shorter prefix before native predictions")
         XCTAssertTrue(restored.clearLearning())
         XCTAssertFalse(FileManager.default.fileExists(atPath:
             dir.appendingPathComponent("microsoft-candidates.json").path))
@@ -272,6 +356,161 @@ final class WindowsTextTests: XCTestCase {
         }
     }
 
+    func testHybridLiveNeverRequestsUnusedMicrosoftAlternatives() {
+        let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+            learning: .disabled, environment: ["NOSPACEKEY_CONVERSION_ENGINE": "hybrid"],
+            fileSystem: .live, windowsTextProvider: .init { _, _, _ in
+                XCTFail("Hybrid live must not query Windows")
+                return []
+            })
+        XCTAssertFalse(service.snapshot([.init(text: "にほんご", style: "direct")], explicit: false).text.isEmpty)
+    }
+
+    func testHybridPredictionPrefersLearningThenMicrosoftThenDictionary() throws {
+        let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+            learning: .init(enabled: true, memoryDir: nil),
+            environment: ["NOSPACEKEY_CONVERSION_ENGINE": "hybrid"], fileSystem: .live,
+            windowsTextProvider: .init { _, _, limit in
+                XCTAssertEqual(limit, 64)
+                return ["Microsoft先頭", "Microsoft次点", "Microsoft先頭"]
+            }, learningPersistenceForTesting: { _ in })
+        let first = service.inputPredictions(request("がぞ"))
+        XCTAssertEqual(Array(first.candidates.prefix(2).map(\.surface)), ["Microsoft先頭", "Microsoft次点"])
+        let learned = try XCTUnwrap(first.candidates.first { $0.surface == "画像" })
+        XCTAssertEqual(service.commitReceipt(receipt(service, candidate: learned,
+            reading: "がぞ", explicit: true, prediction: true)).outcome, .applied)
+        let ranked = service.inputPredictions(request("がぞ")).candidates.map(\.surface)
+        XCTAssertEqual(Array(ranked.prefix(3)), ["画像", "Microsoft先頭", "Microsoft次点"])
+        XCTAssertEqual(ranked.filter { $0 == "Microsoft先頭" }.count, 1)
+        XCTAssertTrue(service.clearLearning())
+        XCTAssertEqual(service.inputPredictions(request("がぞ")).candidates.first?.surface, "Microsoft先頭")
+    }
+
+    func testHybridPredictionPagesRetainBothSourcesAndTheirLearningRules() throws {
+        let native = (0..<12).map { "Microsoft\($0)" }
+        let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+            learning: .init(enabled: true, memoryDir: nil),
+            environment: ["NOSPACEKEY_CONVERSION_ENGINE": "hybrid"], fileSystem: .live,
+            windowsTextProvider: .init { _, _, _ in native + [native[0]] },
+            learningPersistenceForTesting: { _ in })
+        let predictions = service.inputPredictions(request("さんこう")).candidates
+        XCTAssertEqual(Array(predictions.prefix(native.count).map(\.surface)), native)
+        XCTAssertGreaterThan(predictions.count, native.count)
+        XCTAssertLessThanOrEqual(predictions.count, 64)
+        XCTAssertEqual(Set(predictions.map(\.surface)).count, predictions.count)
+        XCTAssertEqual(Set(predictions.map(\.token)).count, predictions.count)
+        XCTAssertTrue(predictions.allSatisfy { $0.reading_start == 0 && $0.reading_end == 4 })
+        let windows = try XCTUnwrap(predictions.first { $0.surface == native[9] })
+        let windowsReceipt = receipt(service, candidate: windows, reading: "さんこう",
+            explicit: true, prediction: true)
+        XCTAssertEqual(service.commitReceipt(windowsReceipt).outcome, .applied)
+        XCTAssertEqual(service.commitReceipt(windowsReceipt).outcome, .alreadyProcessed)
+        service.flushMaintenanceForTesting()
+        XCTAssertEqual(service.recentLearningCountForTesting, 0)
+        let dictionary = try XCTUnwrap(predictions.first { $0.surface == "参考" })
+        XCTAssertEqual(service.commitReceipt(receipt(service, candidate: dictionary, reading: "さんこう",
+            explicit: true, sequence: 2, prediction: true)).outcome, .applied)
+        service.flushMaintenanceForTesting()
+        XCTAssertEqual(service.recentLearningCountForTesting, 1)
+    }
+
+    func testHybridPredictionCapsLargeNativeListAndDeduplicatesDictionary() {
+        let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+            learning: .disabled, environment: ["NOSPACEKEY_CONVERSION_ENGINE": "hybrid"],
+            fileSystem: .live, windowsTextProvider: .init { _, _, limit in
+                XCTAssertEqual(limit, 64)
+                return (0..<80).map { "Microsoft\($0)" }
+            })
+        XCTAssertEqual(service.inputPredictions(request("さんこう")).candidates.map(\.surface),
+            (0..<64).map { "Microsoft\($0)" })
+        let duplicates = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+            learning: .disabled, environment: ["NOSPACEKEY_CONVERSION_ENGINE": "hybrid"],
+            fileSystem: .live, windowsTextProvider: .init { _, _, _ in ["参考", "参考"] })
+        let values = duplicates.inputPredictions(request("さんこう")).candidates.map(\.surface)
+        XCTAssertEqual(values.first, "参考")
+        XCTAssertEqual(values.filter { $0 == "参考" }.count, 1)
+        XCTAssertGreaterThan(values.count, 9)
+    }
+
+    func testLearnedPredictionsContinuePastTheFirstPageInBothDictionaryModes() throws {
+        let dir = try makeLearningDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dictionary = dir.appendingPathComponent("user.json")
+        let entries = (0..<12).map { ["ruby": "やちだ", "word": "学習候補\($0)", "pos": "名詞"] }
+        try JSONSerialization.data(withJSONObject: entries).write(to: dictionary)
+        for engine in ["azookey", "hybrid"] {
+            let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+                learning: .init(enabled: true, memoryDir: nil),
+                environment: ["NOSPACEKEY_CONVERSION_ENGINE": engine], fileSystem: .live,
+                windowsTextProvider: .init { _, _, _ in [] }, learningPersistenceForTesting: { _ in })
+            service.loadUserDictionary(from: dictionary)
+            let offered = service.inputPredictions(request("やちだ")).candidates
+                .filter { $0.surface.hasPrefix("学習候補") }
+            XCTAssertEqual(offered.count, 12, engine)
+            for (index, candidate) in offered.enumerated() {
+                XCTAssertEqual(service.commitReceipt(receipt(service, candidate: candidate, reading: "やちだ",
+                    explicit: true, sequence: UInt64(index + 1), prediction: true)).outcome, .applied)
+            }
+            service.flushMaintenanceForTesting()
+            let exact = service.inputPredictions(request("やちだ")).candidates.map(\.surface)
+            XCTAssertEqual(Array(exact.prefix(offered.count)), offered.reversed().map(\.surface), engine)
+            let learned = service.inputPredictions(request("やち")).candidates.map(\.surface)
+            XCTAssertEqual(Array(learned.prefix(offered.count)), offered.reversed().map(\.surface), engine)
+        }
+    }
+
+    func testStoredMicrosoftCompletionsUseTheEngineBudgetWithoutAzooKeyLearning() throws {
+        let dir = try makeLearningDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MicrosoftLearningStore(directory: dir)
+        for index in 0..<80 { store.record(reading: "やちだ", surface: "Microsoft学習\(index)") }
+        store.flush()
+        for (engine, limit) in [("hybrid", 64), ("microsoft", 80)] {
+            let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+                learning: .init(enabled: true, memoryDir: dir),
+                environment: ["NOSPACEKEY_CONVERSION_ENGINE": engine], fileSystem: .live,
+                windowsTextProvider: .init { _, _, _ in [] })
+            let predictions = service.inputPredictions(request("やち")).candidates
+            XCTAssertEqual(predictions.map(\.surface),
+                (0..<80).reversed().prefix(limit).map { "Microsoft学習\($0)" }, engine)
+            let last = try XCTUnwrap(predictions.last)
+            XCTAssertEqual(service.commitReceipt(receipt(service, candidate: last, reading: "やち",
+                explicit: true, prediction: true)).outcome, .applied)
+            service.flushMaintenanceForTesting()
+            XCTAssertEqual(service.recentLearningCountForTesting, 0)
+            XCTAssertFalse(service.inputPredictions(request("やちだ")).candidates
+                .contains { $0.surface.hasPrefix("Microsoft学習") })
+        }
+    }
+
+    func testHybridPredictionFallsBackToDictionaryWhenMicrosoftUnavailable() {
+        let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+            learning: .disabled, environment: ["NOSPACEKEY_CONVERSION_ENGINE": "hybrid"],
+            fileSystem: .live, windowsTextProvider: .init { _, _, _ in [] })
+        XCTAssertTrue(service.inputPredictions(request("がぞ")).candidates.contains { $0.surface == "画像" })
+    }
+
+    func testEngineSwitchDuringWindowsPredictionDiscardsOldProviderResult() throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let service = service(.init { _, _, _ in
+            entered.signal()
+            _ = release.wait(timeout: .now() + 3)
+            return ["OldWindowsProvider"]
+        })
+        let query = request("がぞ")
+        Thread.detachNewThread {
+            XCTAssertTrue(service.inputPredictions(query).candidates.isEmpty)
+            finished.signal()
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        XCTAssertTrue(service.reload(overrides: ["NOSPACEKEY_CONVERSION_ENGINE": "azookey",
+            "NOSPACEKEY_ZENZAI": "off", "NOSPACEKEY_LEARNING": "0"]))
+        release.signal()
+        XCTAssertEqual(finished.wait(timeout: .now() + 3), .success)
+    }
+
     func testUnavailableProviderReadingReceiptDoesNotEnterAzooKeyLearning() throws {
         let service = service(.init { _, _, _ in [] })
         let live = service.snapshot([.init(text: "にゅうりょく", style: "direct")], explicit: false)
@@ -293,5 +532,19 @@ final class WindowsTextTests: XCTestCase {
         XCTAssertTrue(WindowsTextProvider.native.candidates("にゅうりょく", false, 256).contains("入力"))
         XCTAssertTrue(WindowsTextProvider.native.candidates("にゅうりょく", true, 256).contains("入力フォーム"))
         XCTAssertTrue(WindowsTextProvider.native.candidates("きょうはいいてんきです", false, 256).contains("今日はいい天気です"))
+    }
+
+    func testNativeWindowsProviderSurvivesConcurrentRepeatedQueries() throws {
+        guard ProcessInfo.processInfo.environment["NOSPACEKEY_TEST_WINDOWS_TEXT"] == "1" else {
+            throw XCTSkip("Opt-in Windows Japanese language API integration")
+        }
+        DispatchQueue.concurrentPerform(iterations: 12) { index in
+            let prediction = index % 2 == 0
+            let values = WindowsTextProvider.native.candidates("にゅうりょく", prediction, 9)
+            XCTAssertFalse(values.isEmpty)
+            XCTAssertEqual(Set(values).count, values.count)
+            XCTAssertLessThanOrEqual(values.count, 9)
+            if !prediction { XCTAssertTrue(values.contains("入力")) }
+        }
     }
 }

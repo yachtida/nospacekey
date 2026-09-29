@@ -124,13 +124,16 @@ mod tests {
     }
 }
 
-/// The candidate UI retains the normal interpretation and appends at most two Mixed plans.
+/// Keep ordinary clause conversion when Japanese is the best interpretation.
+/// Otherwise the candidate UI retains the normal interpretation and adds at most two Mixed plans.
 pub fn mixed_candidate_plans(
     results: &[crate::classify::ScoredPlan],
 ) -> impl Iterator<Item = &InterpretationPlan> {
+    let offer_mixed = results.first().is_some_and(|best|
+        best.plan.spans.iter().any(|span| span.kind == SegmentKind::Literal));
     results
         .iter()
-        .filter(|p| p.plan.spans.iter().any(|s| s.kind == SegmentKind::Literal))
+        .filter(move |p| offer_mixed && p.plan.spans.iter().any(|s| s.kind == SegmentKind::Literal))
         .take(2)
         .map(|p| &p.plan)
 }

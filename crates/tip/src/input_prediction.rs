@@ -23,6 +23,7 @@ pub(crate) struct InputPredictions {
     pending: Option<(ClauseCandidatesRequest, Instant)>,
     owner: Option<ITfContext>,
     requested: Option<SnapshotIdentity>,
+    retried: Option<SnapshotIdentity>,
     dismissed: Option<SnapshotIdentity>,
     ready: Option<Ready>,
     pub selecting: bool,
@@ -86,12 +87,20 @@ impl InputPredictions {
             .as_ref()
             .is_some_and(|(_, deadline)| now >= *deadline)
         {
-            return self
-                .pending
-                .take()
-                .is_some_and(|(request, _)| request.key.identity != current);
+            let (request, _) = self.pending.take().unwrap();
+            return request.key.identity != current || self.retry(current);
         }
         false
+    }
+    // A cold provider or a busy engine may lose the first 400 ms window. Retry
+    // once per identity; empty dictionaries and disconnected hosts must settle.
+    fn retry(&mut self, identity: SnapshotIdentity) -> bool {
+        if self.retried == Some(identity) || self.dismissed == Some(identity) || self.selecting {
+            return false;
+        }
+        self.retried = Some(identity);
+        self.requested = None;
+        true
     }
     fn accepts(
         &self,
@@ -239,6 +248,9 @@ impl TextService_Impl {
             state.pending = Some((request, deadline));
             drop(state);
             self.arm_clause_poll();
+        } else if state.retry(identity) {
+            drop(state);
+            self.arm_debounce();
         }
     }
     pub(crate) fn expire_input_predictions(&self) {
@@ -298,10 +310,14 @@ impl TextService_Impl {
             return;
         }
         if candidates.is_empty() {
+            if self.input_predictions.borrow_mut().retry(identity) {
+                self.arm_debounce();
+                return;
+            }
             // 最新の検索が本当に 0 件: 旧候補を明示的に取り下げる（黙って放置すると読みと
             // 無関係な候補が表示に残る）。パネルは候補欄だけ畳み、読み行は維持する。この
             // 経路は accepts 通過後＝応答が fresh なことが確定済み。同 identity の再要求は
-            // requested 抑止で起きないため、取り下げたまま安定する。
+            // 1回の再試行後は requested 抑止で止まり、取り下げたまま安定する。
             let had_candidates = self.input_predictions.borrow_mut().withdraw();
             if had_candidates {
                 // 内部データ（ready）と外部公開（UIElement）は別々に畳む。publish_preview で
@@ -612,10 +628,12 @@ mod tests {
         ));
         assert!(!state.pending());
         state.pending = Some((request.clone(), now));
-        assert!(
-            !state.expire(now, identity),
-            "unchanged reading must not retry indefinitely"
-        );
+        state.requested = Some(identity);
+        assert!(state.expire(now, identity), "one recovery attempt for the same reading");
+        assert_eq!(state.requested, None);
+        state.requested = Some(identity);
+        state.pending = Some((request.clone(), now));
+        assert!(!state.expire(now, identity), "unchanged reading must not retry indefinitely");
         assert!(!state.pending());
         state.dismissed = Some(identity);
         assert!(!state.accepts(&request, identity, "がぞ"));
@@ -631,6 +649,25 @@ mod tests {
             reading_start: ReadingPosition(0),
             reading_end: ReadingPosition(3),
         }
+    }
+
+    #[test]
+    fn prediction_retry_is_bounded_and_respects_dismissal_and_selection() {
+        let identity = SnapshotIdentity {
+            composition: 1, revision: 2, configuration_generation: 3, connection_generation: 4,
+        };
+        let mut state = InputPredictions { requested: Some(identity), ..Default::default() };
+        assert!(state.retry(identity));
+        assert!(!state.retry(identity));
+        let next = SnapshotIdentity { revision: 3, ..identity };
+        state.dismissed = Some(next);
+        assert!(!state.retry(next));
+        state.dismissed = None;
+        state.selecting = true;
+        assert!(!state.retry(next));
+        state.selecting = false;
+        assert!(state.retry(next));
+        assert!(!state.retry(next));
     }
 
     fn ready_request(identity: SnapshotIdentity) -> ClauseCandidatesRequest {
@@ -670,9 +707,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        // パネルは先頭 3 件のコンパクト表示（全件は Tab 後の候補窓で選ぶ）。
+        // パネルは先頭 5 件のコンパクト表示（全件は Tab 後の候補窓で選ぶ）。
         let fresh_rows = state.panel_candidates(identity);
-        assert_eq!(fresh_rows.len(), PANEL_PREVIEW_ROWS);
+        assert_eq!(fresh_rows.len(), 5);
+        assert_eq!(fresh_rows[4].text, "ほ4");
+        assert_eq!(state.ready.as_ref().unwrap().candidates.len(), 9);
         assert_eq!(fresh_rows[0].text, "ほ0");
         // 最新（identity 一致）なら stale は付かない。
         assert!(!fresh_rows.iter().any(|row| row.stale));

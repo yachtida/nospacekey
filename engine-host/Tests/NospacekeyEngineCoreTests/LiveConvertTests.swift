@@ -334,11 +334,26 @@ final class LiveConvertTests: XCTestCase {
             return XCTFail("representative live input must produce a proposal")
         }
         XCTAssertFalse(proposal.text.isEmpty)
+        let retriedKey = ConversionService.SnapshotEnhancementKey(
+            composition: proposalKey.composition, revision: proposalKey.revision,
+            configurationGeneration: proposalKey.configurationGeneration,
+            connectionGeneration: proposalKey.connectionGeneration, requestID: 2)
+        let retried = svc.snapshot(
+            [SnapshotSegment(text: raw, style: nil)], explicit: false,
+            enhancementKey: retriedKey, snapshotConnection: 1)
+        XCTAssertEqual(retried.autoCommit?.proposal, proposal.proposal,
+                       "a newer request for the same reading must retain the unreceipted prefix")
+        XCTAssertEqual(retried.autoCommit?.consumedReading, proposal.consumedReading)
+        XCTAssertEqual(retried.clauseData.reading, proposal.remaining)
         XCTAssertTrue(svc.applySnapshotAutoCommitReceipt(
-            connection: 1, key: proposalKey, proposal: proposal.proposal))
+            connection: 1, key: retriedKey, proposal: proposal.proposal))
         XCTAssertTrue(svc.applySnapshotAutoCommitReceipt(
             connection: 1, key: proposalKey, proposal: proposal.proposal),
             "a retried receipt is acknowledged idempotently")
+        let acknowledged = svc.snapshot(
+            [SnapshotSegment(text: raw, style: nil)], explicit: false,
+            enhancementKey: retriedKey, snapshotConnection: 1)
+        XCTAssertNil(acknowledged.autoCommit, "an acknowledged prefix must not be proposed again")
     }
 
     func testNewerRevisionSupersedesAnUnreceiptedSnapshotAutoCommitProposal() {

@@ -52,6 +52,12 @@ impl Controller {
     pub fn pending(&self) -> bool {
         self.pending.is_some()
     }
+    fn blocks_ordinary_auto_commit(&mut self, composition: u64) -> bool {
+        // Merely offering mixed candidates does not own the ordinary Japanese
+        // composition. Dropping a prefix proposal also drops its live display.
+        self.mode(composition) == settings::MixedInputMode::Auto
+            || self.locked || self.pending.is_some() || self.menu.is_some()
+    }
     fn mode(&mut self, composition: u64) -> settings::MixedInputMode {
         if self.composition != Some(composition) {
             self.composition = Some(composition);
@@ -73,6 +79,35 @@ impl Controller {
     }
 }
 impl TextService_Impl {
+    pub(crate) fn mixed_repair_available(&self) -> bool {
+        self.mixed_mode_active() && !self.is_direct_mode() && !self.state.borrow().latin_mode()
+            && !self.state.borrow().awaiting_llm() && !self.reconverting.get()
+            && self.pending_commit.borrow().is_none() && !self.composition_end_pending.get()
+            && self.conversion_queue.borrow().front().is_none()
+            && !self.conversion_queue.borrow().owner_lost && !self.conversion_queue.borrow().commit_failed
+    }
+
+    pub(crate) fn begin_manual_mixed_repair(&self, ctx: &ITfContext) {
+        if !self.mixed_repair_available() { return; }
+        if self.mixed_menu_current() {
+            self.begin_mixed_repair(ctx);
+            return;
+        }
+        let source = self.state.borrow().composition_source();
+        let saved = self.state.borrow().snapshot_composer();
+        let Some(menu) = manual_repair_menu(self.mixed_identity(0), source, saved) else { return; };
+        self.disarm_debounce();
+        self.cancel_explicit_snapshot_wait();
+        self.conversion_queue.borrow_mut().resolved();
+        self.state.borrow_mut().invalidate_live_snapshot();
+        self.clear_clause_nav();
+        let mut controller = self.mixed_candidates.borrow_mut();
+        controller.live.lock();
+        controller.menu = Some(menu);
+        drop(controller);
+        self.show_mixed_menu(ctx, 0);
+    }
+
     pub(crate) fn mixed_mode_active(&self) -> bool {
         let state = self.state.borrow();
         state.composing
@@ -88,6 +123,11 @@ impl TextService_Impl {
         state.composing
             && controller.composition == Some(state.composition_id())
             && controller.locked
+    }
+    pub(crate) fn mixed_blocks_ordinary_auto_commit(&self) -> bool {
+        let state = self.state.borrow();
+        state.composing && self.mixed_candidates.borrow_mut()
+            .blocks_ordinary_auto_commit(state.composition_id())
     }
     fn mixed_identity(&self, request: u64) -> Identity {
         let state = self.state.borrow();
@@ -339,7 +379,7 @@ impl TextService_Impl {
             }
             return;
         }
-        if choices.is_empty() {
+        if !choices.iter().any(|choice| matches!(choice, Choice::Mixed { .. })) {
             self.begin_explicit_snapshot_wait();
             if self.local_converting() {
                 self.render_local_edit(&ctx);
@@ -828,6 +868,15 @@ impl TextService_Impl {
     }
 }
 
+fn manual_repair_menu(identity: Identity, source: CompositionSource, saved: LocalKanaComposer) -> Option<Menu> {
+    let text = source.source_text();
+    let repair_plan = InterpretationPlan::build(&text, &[(SegmentKind::Japanese, text.clone())]).ok()?;
+    Some(Menu {
+        identity, revision: identity.revision, repair: Some((0, source.source_len())),
+        source, saved, choices: vec![], selected: None, repair_plan,
+    })
+}
+
 fn ordinary_live_fallback(controller: &Controller) -> bool {
     controller.live.status == mixed_input::live::Status::Unresolved
         && controller.live.accepted.is_none()
@@ -876,6 +925,47 @@ fn trial_source(
 #[cfg(test)]
 mod live_tests {
     use super::*;
+    #[test]
+    fn manual_mixed_repair_is_available_when_japanese_wins_classification() {
+        let mut composer = LocalKanaComposer::default();
+        for ch in "madewotukatteimasu".chars() {
+            composer.push(ch, crate::local_kana_composer::InputStyle::Kana);
+        }
+        let source = composer.composition_source(1);
+        let bundle = mixed_input::assets::Bundle::embedded().unwrap();
+        let scored = mixed_input::classify::classify(&source, &bundle.model, &bundle.dictionary);
+        assert!(mixed_input::selection::mixed_candidate_plans(&scored).next().is_none());
+        let menu = manual_repair_menu(Identity {
+            composition: 1, revision: 1, configuration: 1, connection: 1, request: 0,
+        }, source, composer).unwrap();
+        assert_eq!(menu.repair, Some((0, 18)));
+        let repaired = mixed_input::selection::reinterpret(&menu.source, &menu.repair_plan,
+            SourceRange::new(0, 4), SegmentKind::Literal).unwrap();
+        let projection = mixed_input::projection::Projection::build(1, &menu.source, &repaired).unwrap();
+        assert_eq!(projection.reading(), "madeをつかっています");
+        assert_eq!(menu.saved.reading(), "までをつかっています");
+    }
+
+    #[test]
+    fn candidate_setting_does_not_block_ordinary_auto_commit_but_mixed_ownership_does() {
+        let mut c = Controller::default();
+        c.configured = settings::MixedInputMode::Candidates;
+        assert!(!c.blocks_ordinary_auto_commit(1));
+        c.locked = true;
+        assert!(c.blocks_ordinary_auto_commit(1), "adopted Literal must not be consumed");
+        assert!(!c.blocks_ordinary_auto_commit(2), "the next composition is ordinary again");
+        c.pending = Some(Pending {
+            identity: Identity { composition: 2, revision: 1, configuration: 1, connection: 1, request: 1 },
+            source: mixed_input::classify::tune::source_from_str("made"),
+            saved: LocalKanaComposer::default(), deadline: Instant::now(), forced: false, live: false,
+        });
+        assert!(c.blocks_ordinary_auto_commit(2), "Space owns the pending interpretation");
+        c.clear();
+        assert!(!c.blocks_ordinary_auto_commit(2));
+        c.configured = settings::MixedInputMode::Auto;
+        assert_eq!(c.blocks_ordinary_auto_commit(3), cfg!(feature = "mixed-input-live-trial"),
+            "the experimental auto mode keeps its prefix-commit guard");
+    }
     #[test]
     fn abstention_uses_normal_live_but_never_reinterprets_an_adopted_or_locked_plan() {
         let mut c = Controller::default();

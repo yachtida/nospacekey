@@ -256,6 +256,9 @@ public final class ConversionService: @unchecked Sendable {
     private let recentLearning = RecentLearningOverlay()
     // Never imports or reads legacy learning memory. Its only dynamic entries are user dictionaries.
     private let inputPredictionConverter = KanaKanjiConverter.withDefaultDictionary()
+    // This bundled dictionary is immutable. Its initializer reads/parses the whole
+    // file, so share it instead of repeating that work for every input request.
+    private static let defaultTextReplacer = TextReplacer.withDefaultEmojiDictionary()
     private let learningStateLock = NSLock()
     // Serializes actual vendor writes with settings generation changes. Reload
     // uses try(), preserving its existing busy/retry contract during disk I/O.
@@ -1602,14 +1605,15 @@ public final class ConversionService: @unchecked Sendable {
         return (Array(result.prefix(256)), Set(microsoftOnly.map(\.text)))
     }
 
-    private func windowsCandidatesLocked(_ input: ComposingText, prediction: Bool) -> [Candidate] {
+    private func windowsCandidatesLocked(_ input: ComposingText, prediction: Bool,
+                                        nativeSurfaces: [String]? = nil, limit: Int = 256) -> [Candidate] {
         let reading = input.convertTarget
         guard !reading.isEmpty else { return [] }
         var seen = Set<String>()
         let learned = !prediction && learning.enabled ? microsoftLearning.surfaces(reading: reading) : []
-        let surfaces = (learned + windowsTextProvider.candidates(reading, prediction, 256))
+        let surfaces = (learned + (nativeSurfaces ?? windowsTextProvider.candidates(reading, prediction, limit)))
             .filter { !$0.isEmpty && $0.utf16.count <= 4096 && seen.insert($0).inserted }
-            .prefix(256)
+            .prefix(limit)
         // Windows may return hundreds of predictions per keystroke. Retain a bounded
         // recent window instead of stopping all new candidates until the 60 s TTL.
         // Evicted receipts remain safely rejected by the existing expired-token path.
@@ -2774,7 +2778,9 @@ public final class ConversionService: @unchecked Sendable {
             classic.mainResults = ranked.main
             classic.firstClauseResults = ranked.firstClause
         }
-        let microsoft = conversionEngine == .hybrid &&
+        // Hybrid live display uses AzooKey's top candidate. Fetch Windows alternatives
+        // only for explicit conversion; unused alternatives used to stall every keystroke.
+        let microsoft = conversionEngine == .hybrid && explicit &&
             (admissionDeadline?.remainingSeconds ?? .infinity) >= Self.windowsQueryBudgetSeconds
             ? windowsCandidatesLocked(composing, prediction: false) : []
         let results: [Candidate]
@@ -2861,48 +2867,85 @@ public final class ConversionService: @unchecked Sendable {
               request.preceding_surfaces.isEmpty,
               reading.unicodeScalars.allSatisfy({ (0x3041...0x3096).contains($0.value) || $0.value == 0x30FC }),
               (try? request.validate()) != nil else { return empty() }
+        // Native prediction does not use the mutable AzooKey converter. Never hold
+        // converterLock during its wait: live snapshots/receipts must remain available.
+        configurationLock.lock()
+        let engine = conversionEngine
+        configurationLock.unlock()
+        // 表示ページの9件と取得上限は独立。併用でも後続ページまで候補を保持する。
+        let limit = engine == .microsoft ? 256 : 64
+        let windows = engine != .azookey &&
+            (admissionDeadline?.remainingSeconds ?? .infinity) >= Self.windowsQueryBudgetSeconds
+            ? windowsTextProvider.candidates(reading, true, limit) : []
         guard RequestDeadline.acquire(converterLock, before: admissionDeadline) else { return empty() }
         defer { converterLock.unlock() }
+        guard engine == conversionEngine else { return empty() }
         var input = ComposingText()
         input.insertAtCursorPosition(reading, inputStyle: .direct)
-        var candidates: [Candidate]
-        if conversionEngine == .microsoft {
-            // The Windows API returns surfaces, not the extended reading. Keep the
-            // consumed prefix in the token and disable AzooKey learning for these items.
-            candidates = windowsCandidatesLocked(input, prediction: true)
-        } else {
+        var seen = Set<String>()
+        func matchingPredictions(_ values: [Candidate]) -> [Candidate] {
+            values.filter { candidate in
+                let fullReading = ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined())
+                return !candidate.text.isEmpty && candidate.text != reading
+                    && fullReading.hasPrefix(reading)
+                    && seen.insert(candidate.text).inserted
+            }
+        }
+        var candidates = engine != .microsoft && learning.enabled
+            ? Array(matchingPredictions(recentLearning.predictions(reading: reading)).prefix(limit)) : []
+        if engine != .azookey {
+            if learning.enabled {
+                candidates += microsoftLearning.predictions(reading: reading, limit: limit).compactMap { entry in
+                    guard seen.insert(entry.surface).inserted else { return nil }
+                    return Candidate(text: entry.surface, value: 0, composingCount: .inputCount(input.input.count),
+                        lastMid: MIDData.一般.mid,
+                        data: [DicdataElement(word: entry.surface, ruby: Self.toKatakana(entry.reading),
+                            cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: 0)], isLearningTarget: false)
+                }
+            }
+            let native = windowsCandidatesLocked(input, prediction: true, nativeSurfaces: windows, limit: limit)
+            candidates += native.filter { seen.insert($0.text).inserted }
+        }
+        // Learned predictions, then Microsoft order, then the AzooKey dictionary.
+        // Skip dictionary work only when the complete result budget is already filled.
+        if engine != .microsoft && candidates.count < limit && admissionDeadline?.expired != true {
             var options = makeOptions(nBest: 30, forceClassic: true, noLearning: true)
             options.requireJapanesePrediction = true
             options.needTypoCorrection = false
             inputPredictionConverter.stopComposition()
             let dictionary = inputPredictionConverter.requestCandidates(input, options: options).mainResults
             guard admissionDeadline?.expired != true else { return empty() }
-            let learned = learning.enabled ? recentLearning.predictions(reading: reading) : []
-            var seen = Set<String>()
-            candidates = (learned + dictionary).filter { candidate in
+            let bestExact = dictionary.first {
+                ClauseCoordinates.normalize($0.data.map(\.ruby).joined()) == reading
+            }?.text
+            // 長い読みを無理に分割した別解（入力虫、北海道煮派など）で予測欄を埋めない。
+            // 完全一致は最上位の全文候補と辞書の単語を残す。実際に確定した履歴はこの制限の外。
+            let dictionaryPredictions = dictionary.filter { candidate in
+                let ruby = ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined())
+                return ruby != reading || candidate.data.count == 1 || candidate.text == bestExact
+            }
+            // 読みの一致候補も残す（例: にゅうりょく → 入力）。読みを途中までしか
+            // 消費しない候補や誤読み候補は出さない。
+            candidates += dictionaryPredictions.filter { candidate in
                 let fullReading = ClauseCoordinates.normalize(candidate.data.map(\.ruby).joined())
-                // 全文変換(rubyが読みと一致)はSpace変換の管轄で、混ぜると先出しが「変換一覧」になる。
-                // MS IME式に、読みを延長する補完だけを予測として出す。読みが長いほど補完は枯渇し、候補0件で先出しは静かになる。
                 return !candidate.text.isEmpty && candidate.text != reading
-                    && fullReading.hasPrefix(reading) && fullReading.count > reading.count
+                    && fullReading.hasPrefix(reading)
                     && seen.insert(candidate.text).inserted
-            }.prefix(9).map { $0 }
+            }
         }
-        if conversionEngine == .hybrid {
-            // The native provider can use its full 250 ms timeout. Keep enough of
-            // the request budget for the response after AzooKey prediction finishes.
-            let windows = (admissionDeadline?.remainingSeconds ?? .infinity) >= Self.windowsQueryBudgetSeconds
-                ? windowsCandidatesLocked(input, prediction: true) : []
-            (candidates, microsoftOnlySurfaces) = Self.interleaveAzookeyFirst(candidates, windows)
-            candidates = Array(candidates.prefix(9))
-        } else if conversionEngine == .microsoft {
-            microsoftOnlySurfaces = Set(candidates.map(\.text))
-        } else {
-            microsoftOnlySurfaces.removeAll()
-        }
+        candidates = Array(candidates.prefix(limit))
+        microsoftOnlySurfaces = Set(candidates.filter { !$0.isLearningTarget }.map(\.text))
         guard admissionDeadline?.expired != true else { return empty() }
         let now = clauseClock()
         clauseTokens = clauseTokens.filter { now - $0.value.issuedAt < 60 }
+        let required = max(0, clauseTokens.count + candidates.count - 4096)
+        if required > 0 {
+            // Preserve conversion/commit receipts; retire the oldest prediction
+            // previews before a sustained typing session fills the token table.
+            let oldest = clauseTokens.filter { $0.value.predictionReading != nil }
+                .sorted { $0.value.issuedAt < $1.value.issuedAt }.prefix(required)
+            for (token, _) in oldest { clauseTokens.removeValue(forKey: token) }
+        }
         var result: [ClauseCandidate] = []
         for candidate in candidates {
             guard clauseTokens.count < 4096 else { break }
@@ -3352,7 +3395,13 @@ public final class ConversionService: @unchecked Sendable {
         var state = snapshotAutoCommitStates[stream] ?? SnapshotAutoCommitState()
         if let last = state.lastRevision, key.revision < last { return nil }
         if let pending = state.pending {
-            if pending.key == key { return pending.value }
+            // Debounce/prediction retries may issue a new request ID for the same reading.
+            // Keep the unreceipted prefix while the reading and conversion remain valid.
+            if pending.key.sameReadingIdentity(as: key),
+               pending.key.conversionRevision == key.conversionRevision,
+               pending.value.consumedReading + pending.value.remaining == reading {
+                return pending.value
+            }
             if key.revision <= pending.key.revision { return nil }
             state.pending = nil
         }
@@ -4296,7 +4345,7 @@ public final class ConversionService: @unchecked Sendable {
             learningType: (learning.enabled && !noLearning) ? .inputAndOutput : .nothing,
             memoryDirectoryURL: learning.memoryDir ?? workDir,
             sharedContainerURL: workDir,
-            textReplacer: .withDefaultEmojiDictionary(),
+            textReplacer: Self.defaultTextReplacer,
             specialCandidateProviders: nil,
             zenzaiMode: zenzai,
             metadata: .init(versionString: "NospacekeyEngineHost")

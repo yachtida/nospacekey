@@ -15,6 +15,34 @@ private final class ReplyBox: @unchecked Sendable {
 }
 
 final class EngineHostHandlerTests: XCTestCase {
+    func testBlockedWindowsPredictionDoesNotBlockHybridLiveSnapshot() throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+            learning: .disabled, environment: ["NOSPACEKEY_CONVERSION_ENGINE": "hybrid"],
+            fileSystem: .live, windowsTextProvider: .init { _, prediction, _ in
+                if prediction {
+                    entered.signal()
+                    _ = release.wait(timeout: .now() + 3)
+                }
+                return ["Windows予測"]
+            })
+        let handler = makeEngineHandler(service: service, serviceLock: NSLock())
+        let prediction = Data(#"{"method":"InputPredictions","params":{"key":{"identity":{"composition":1,"revision":1,"configuration_generation":1,"connection_generation":1},"baseline":0,"conversion_revision":0,"clause_id":1,"request_id":1},"reading":"がぞ","reading_start":0,"reading_end":2,"preceding_surfaces":[]}}"#.utf8)
+        Thread.detachNewThread {
+            _ = handler(1, prediction)
+            finished.signal()
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        // The provider remains blocked until after the live reply. A serialized
+        // handler would exhaust the live deadline and return Error instead.
+        let live = handler(2, try snapshotRequest())
+        release.signal()
+        XCTAssertEqual(resultTag(live), "SnapshotResult")
+        XCTAssertEqual(finished.wait(timeout: .now() + 3), .success)
+    }
+
     private func snapshotRequest(deadline: UInt64? = nil) throws -> Data {
         var wire: [String: Any] = ["method": "LiveSnapshot", "params": [
             "composition": 1, "revision": 1, "configuration_generation": 1,

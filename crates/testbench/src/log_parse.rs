@@ -3,6 +3,7 @@
 #[derive(Debug, Clone)]
 pub enum Ev {
     Activate,
+    LiveSnapshotApplied,
     ReceiptAcknowledged,
     ReceiptTokenExpired,
     ReceiptStaleLearningGeneration,
@@ -166,6 +167,7 @@ fn list_value(body: &str) -> Option<&str> {
 /// 1 行から ev を取り出す（自 PID 前提で呼ぶ）。
 fn parse_one(body: &str) -> Option<Ev> {
     let body = body.trim();
+    if body == "ev=live_snapshot_applied" { return Some(Ev::LiveSnapshotApplied); }
     if body == "ev=conversion_owner_lost pending_input=true cancel=escape" { return Some(Ev::ConversionOwnerLost); }
     if body == "ev=reconvert_correction_ack" { return Some(Ev::ReconvertCorrectionAcknowledged); }
     if body == "ev=receipt_delivery_notice reason=Rejected(Expired)" { return Some(Ev::ReceiptTokenExpired); }

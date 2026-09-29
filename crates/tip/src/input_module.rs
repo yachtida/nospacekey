@@ -42,6 +42,7 @@ pub struct CompositionSnapshot {
     pub segments: Vec<InputSegment>,
     pub left_context: Option<String>,
     pub live_search_width: u32,
+    pub mixed_source: Option<mixed_input::source::CompositionSource>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -300,6 +301,7 @@ impl InputModule {
                 identity,
                 purpose: SnapshotPurpose::Live,
                 live_search_width: 1,
+                mixed_source: None,
                 segments: self.replay_segments(),
                 left_context,
             },
@@ -329,6 +331,7 @@ impl InputModule {
                 identity,
                 purpose: SnapshotPurpose::Explicit,
                 live_search_width: 1,
+                mixed_source: None,
                 segments: self.replay_segments(),
                 left_context,
             },

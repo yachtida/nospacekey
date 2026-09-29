@@ -848,6 +848,12 @@ impl TextService_Impl {
         crate::keymap::resolve_action(&self.keymap.get(), &ai)
     }
 
+    fn mixed_repair_requested(&self, vk: u32, action: crate::keymap::KeyAction) -> bool {
+        let (ctrl, shift, alt) = mods_now();
+        crate::keymap::mixed_repair_shortcut(&self.keymap.get(), vk, ctrl, shift, alt, action)
+            && self.mixed_repair_available()
+    }
+
     fn on_test_key_down_impl(
         &self,
         pic: Ref<'_, ITfContext>,
@@ -937,7 +943,7 @@ impl TextService_Impl {
             let queue = self.conversion_queue.borrow();
             queue_recovery_claims(vk, cmd_modifier_down(), queue.owner_lost, queue.commit_failed, queue.has_commit())
         };
-        let handled = self.input_prediction_claims(vk, action, cmd_modifier_down() || shift_down()) || recovery || ((self.local_converting() || self.explicit_snapshot_pending.get()) && !cmd_modifier_down() && matches!(vk, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_HOME | VK_END | VK_DELETE)) || will_handle_awaiting(
+        let handled = self.mixed_repair_requested(vk, action) || self.input_prediction_claims(vk, action, cmd_modifier_down() || shift_down()) || recovery || ((self.local_converting() || self.explicit_snapshot_pending.get()) && !cmd_modifier_down() && matches!(vk, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_HOME | VK_END | VK_DELETE)) || will_handle_awaiting(
             vk,
             composing,
             showing,
@@ -1042,6 +1048,7 @@ impl TextService_Impl {
         // Ctrl 併用チョード）だけはこのゲートを通す（実処理へ進ませる — carve-out invariant）。
         if cmd_modifier_down()
             && action == crate::keymap::KeyAction::None
+            && !self.mixed_repair_requested(vk, action)
             && !pending_test_reserved
             && !pending_at_entry
         {
@@ -1191,6 +1198,10 @@ impl TextService_Impl {
             return Ok(FALSE);
         }
 
+        if self.mixed_repair_requested(vk, action) {
+            self.begin_manual_mixed_repair(&ctx);
+            return Ok(TRUE);
+        }
         if self.handle_mixed_key(&ctx, vk, shift_down(), cmd_modifier_down()) { return Ok(TRUE); }
         if self.handle_input_prediction_key(&ctx, vk, action, cmd_modifier_down() || shift_down()) { return Ok(TRUE); }
         if self.handle_conversion_wait_key(&ctx, vk, lparam, action) { return Ok(TRUE); }

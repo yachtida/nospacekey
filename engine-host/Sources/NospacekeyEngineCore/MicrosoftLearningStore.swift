@@ -43,6 +43,14 @@ final class MicrosoftLearningStore: @unchecked Sendable {
         return Array(entries.lazy.filter { $0.reading == key }.prefix(16).map(\.surface))
     }
 
+    func predictions(reading: String, limit: Int) -> [Entry] {
+        guard let key = Self.validReading(reading) else { return [] }
+        loadIfNeeded()
+        // These pairs came from explicit full-reading receipts. Never treat an
+        // exact conversion as a completion or fabricate the reading of a Windows prediction.
+        return Array(entries.lazy.filter { $0.reading.hasPrefix(key) && $0.reading != key }.prefix(limit))
+    }
+
     func clearMemory() {
         entries = []
         loaded = true

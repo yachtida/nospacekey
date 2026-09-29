@@ -4423,6 +4423,9 @@ impl TextService_Impl {
             return;
         };
         snapshot.live_search_width = self.live_search_width.get();
+        if self.mixed_mode_active() {
+            snapshot.mixed_source = Some(self.state.borrow().composition_source());
+        }
         if self.background_input.try_live_snapshot(snapshot) {
             self.arm_live_result_poll();
         } else {
@@ -4745,7 +4748,7 @@ impl TextService_Impl {
         {
             self.snapshot_configuration_pending.set(false);
         }
-        while let Some(result) = self.background_input.try_result() {
+        while let Some(mut result) = self.background_input.try_result() {
             if !snapshot_result_is_current(
                 result.identity,
                 self.acknowledged_configuration_generation.get(),
@@ -4791,26 +4794,26 @@ impl TextService_Impl {
             {
                 continue;
             }
-            if result.auto_commit.is_some() && self.mixed_mode_active() { continue; }
             if let Some(proposal) = result.auto_commit.clone() {
-                let output =
-                    self.state
-                        .borrow_mut()
-                        .handle(crate::input_module::InputEvent::Engine(
-                            crate::input_module::EngineResult::LiveAutoCommitProposal(proposal),
-                        ));
-                let Some(operation @ crate::input_module::ImmediateOperation::Commit { .. }) =
-                    output.immediate
-                else {
-                    continue;
-                };
-                let Some(context) = self.current_context.borrow().clone() else {
-                    self.state.borrow_mut().complete(&operation, false);
-                    continue;
-                };
-                self.apply_auto_commit_proposal(&context, operation, &result.text);
-                self.finish_live_result_wait();
-                return;
+                if result.auto_commit_blocked {
+                    if self.mixed_blocks_ordinary_auto_commit() { continue; }
+                    // The engine has not consumed this prefix without a receipt. Keep
+                    // its whole display editable, with the original source still owned by TIP.
+                    result.text = format!("{}{}", proposal.text, result.text);
+                } else {
+                    let Some(operation @ crate::input_module::ImmediateOperation::Commit { .. }) =
+                        self.prepare_live_auto_commit(proposal)
+                    else {
+                        continue;
+                    };
+                    let Some(context) = self.current_context.borrow().clone() else {
+                        self.state.borrow_mut().complete(&operation, false);
+                        continue;
+                    };
+                    self.apply_auto_commit_proposal(&context, operation, &result.text);
+                    self.finish_live_result_wait();
+                    return;
+                }
             }
             let mut accepted_candidate_remaining = None;
             let engine_result = match result.purpose {
@@ -4960,6 +4963,14 @@ impl TextService_Impl {
     /// preeditの本文適用を返す。装飾修復待ちでも本文適用済みならtrue。
     pub(crate) fn run_preedit(&self, ctx: &ITfContext, text: &str) -> bool {
         self.run_preedit_with_target(ctx, text, None)
+    }
+
+    fn prepare_live_auto_commit(&self, proposal: crate::input_module::AutoCommitProposal)
+        -> Option<crate::input_module::ImmediateOperation> {
+        if self.mixed_blocks_ordinary_auto_commit() { return None; }
+        self.state.borrow_mut().handle(crate::input_module::InputEvent::Engine(
+            crate::input_module::EngineResult::LiveAutoCommitProposal(proposal),
+        )).immediate
     }
 
     /// Edit session 内の `StartComposition` が実際に成功した後だけ、新しい composition
@@ -8828,6 +8839,40 @@ mod deactivate_preflight_tests {
         assert_eq!(&*service.live_text.borrow(), "にほんご");
         service.apply_live_preedit("日本語", None, || true);
         assert_eq!(&*service.live_text.borrow(), "日本語");
+    }
+
+    #[test]
+    fn mixed_candidate_setting_keeps_ordinary_live_auto_commit_and_remaining_source() {
+        use crate::input_module::{AutoCommitProposal, BackgroundIntent, InputEvent,
+            KeyEvent, ReplayMode, TextStyle};
+        for mode in [settings::MixedInputMode::Off, settings::MixedInputMode::Candidates] {
+            let service = super::TextService::new().into_outer();
+            service.mixed_candidates.borrow_mut().configured = mode;
+            for attempt in 1..=2 {
+                for ch in "きょうはいいてんきなのでながいぶんしょうをうちつづけています".chars() {
+                    service.state.borrow_mut().handle(InputEvent::Key(KeyEvent::Text {
+                        ch, style: TextStyle::Kana, replay: ReplayMode::Full, original: None,
+                    }));
+                }
+                let reading = service.state.borrow().canonical_reading().to_owned();
+                let consumed: String = reading.chars().take(4).collect();
+                let remaining: String = reading.chars().skip(4).collect();
+                let BackgroundIntent::LiveSnapshot { snapshot } = service.state.borrow_mut()
+                    .live_snapshot(1, 4, None).unwrap() else { unreachable!() };
+                let proposal = AutoCommitProposal { proposal: attempt, identity: snapshot.identity,
+                    text: "今日は".into(), consumed_reading: consumed, remaining: remaining.clone() };
+                let operation = service.prepare_live_auto_commit(proposal.clone())
+                    .expect("enabling mixed candidates must not discard ordinary live conversion");
+                service.state.borrow_mut().complete(&operation, false);
+                assert_eq!(service.state.borrow().canonical_reading(), reading);
+                assert!(service.state.borrow_mut().take_auto_commit_receipt().is_none());
+                let operation = service.prepare_live_auto_commit(proposal).unwrap();
+                service.state.borrow_mut().complete(&operation, true);
+                assert_eq!(service.state.borrow().canonical_reading(), remaining);
+                assert_eq!(service.state.borrow().composition_source().reading_text(), remaining);
+                assert!(service.state.borrow_mut().take_auto_commit_receipt().is_some());
+            }
+        }
     }
 
     #[test]

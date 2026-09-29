@@ -57,7 +57,7 @@ export function InputPage() {
           <Switch checked={values.liveEnabled} onChange={(value) => save({ field: "live_enabled", value })} label="ライブ変換" />
         </SettingRow>
         <SettingRow id="mixed-input" title="日本語・英字の混在入力"
-          description="候補に英字を残す解釈を追加する試験機能です。精度は評価中のため、確定前に候補を確認してください。自動モードは利用できません。"
+          description="候補に英字を残す解釈を追加する試験機能です。入力中・変換中にCtrl+Shift+Spaceで区間を修正できます（他のキー割り当てが優先）。精度は評価中のため、確定前に候補を確認してください。自動モードは利用できません。"
           effect="入力先を開き直した後">
           <SegmentedChoice
             label="日本語・英字の混在入力"

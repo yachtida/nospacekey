@@ -154,19 +154,26 @@ pub fn run() -> i32 {
     host.warm_up();
     host.store.reset();
 
+    let passed = check_host(&host, true);
+    let _ = std::fs::remove_dir_all(&base);
+    if passed { 0 } else { 1 }
+}
+
+pub(crate) fn check_host(host: &TsfHost, live: bool) -> bool {
     let mut eaten = true;
     for key in scenarios::typed("kyouhaiitenkidesu") { eaten &= host.feed_key(key.0); }
     let kana = "きょうはいいてんきです";
     let mut settled = String::new();
-    for _ in 0..5 {
-        host.settle_debounce();
-        settled = host.store.preedit();
-        if !settled.is_empty() && settled != kana { break; }
+    if live {
+        for _ in 0..5 {
+            host.settle_debounce();
+            settled = host.store.preedit();
+            if !settled.is_empty() && settled != kana { break; }
+        }
     }
-    if settled.is_empty() || settled == kana {
+    if live && (settled.is_empty() || settled == kana) {
         println!("live-clause-display : ERROR (live snapshot did not apply; settled={settled:?})");
-        let _ = std::fs::remove_dir_all(&base);
-        return 2;
+        return false;
     }
 
     let pid = std::process::id();
@@ -175,10 +182,11 @@ pub fn run() -> i32 {
     let presented = wait_until(|| read_events(pid).iter().skip(events)
         .any(|event| matches!(event, Ev::ClausePresented { ready: false, .. })));
     let passed = check("space-presents-clause-view", eaten && presented, host.store.preedit());
-    let passed = check("first-space-preserves-live-text", host.store.preedit() == settled,
+    if !live { settled = host.store.preedit(); }
+    let passed = check("first-space-preserves-live-text", !live || host.store.preedit() == settled,
         (&settled, &host.store.preedit())) && passed;
 
-    let labels = probe_preedit_attributes(&host);
+    let labels = probe_preedit_attributes(host);
     let target_run = first_target_run(&labels);
     let mut passed = check("first-space-targets-first-clause",
         labels.first().is_some_and(|l| l == "target") && target_run.is_some_and(|(_, end)| end < labels.len()),
@@ -219,7 +227,7 @@ pub fn run() -> i32 {
     eaten &= host.feed_key(scenarios::RIGHT.0);
     let moved = wait_until(|| read_events(pid).iter().skip(events)
         .any(|event| matches!(event, Ev::ClausePresented { .. })));
-    let labels_after = probe_preedit_attributes(&host);
+    let labels_after = probe_preedit_attributes(host);
     let moved_run = first_target_run(&labels_after);
     passed = check("clause-nav-moves-target",
         eaten && moved
@@ -235,6 +243,5 @@ pub fn run() -> i32 {
         (writes_before_nav, host.store.text_writes.get(), &body_before_nav)) && passed;
 
     let _ = host.feed_key(scenarios::ESC.0);
-    let _ = std::fs::remove_dir_all(&base);
-    if passed { 0 } else { 1 }
+    passed
 }

@@ -22,12 +22,51 @@ final class InputPredictionTests: XCTestCase {
         XCTAssertEqual(service.recentLearningCountForTesting, 0)
     }
 
-    func testWholeConversionCandidatesAreExcludedFromPredictions() throws {
+    func testExactReadingCandidatesRemainAlongsideCompletions() throws {
         let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
             learning: .init(enabled: false, memoryDir: nil))
         let result = service.inputPredictions(request("きょう"))
-        // 「今日」は「きょう」を丸ごと消費する全文変換で、Space変換の管轄。先出し予測には混ぜない。
-        XCTAssertFalse(result.candidates.contains { $0.surface == "今日" }, "\(result.candidates)")
+        XCTAssertTrue(result.candidates.contains { $0.surface == "今日" }, "\(result.candidates)")
+    }
+
+    func testReferenceReadingsIncludeExactMatchesAndStayDistinct() {
+        let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+            learning: .init(enabled: false, memoryDir: nil))
+        for (reading, expected) in [("にゅうりょく", "入力"), ("にゅうりょくちゅう", "入力中"),
+                                    ("さんこう", "参考"), ("ほっかいどうには", "北海道には")] {
+            let values = service.inputPredictions(request(reading)).candidates.map(\.surface)
+            XCTAssertTrue(values.contains(expected), "\(reading): \(values)")
+            XCTAssertEqual(values.count, Set(values).count)
+            XCTAssertLessThanOrEqual(values.count, 64)
+            if reading == "にゅうりょくちゅう" {
+                XCTAssertFalse(values.contains("入力虫"))
+            }
+            if reading == "ほっかいどうには" {
+                XCTAssertFalse(values.contains("北海道煮派"))
+            }
+            if reading == "さんこう" {
+                XCTAssertGreaterThan(values.count, 9)
+            }
+            print("input-prediction \(reading): \(values.count) \(values)")
+        }
+    }
+
+    func testCandidatesContinueBeyondNineAndKeepABoundedTotal() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let service = ConversionService(config: .init(weightURL: nil, inferenceLimit: 1),
+            learning: .init(enabled: false, memoryDir: nil))
+        let dictionary = dir.appendingPathComponent("user.json")
+        for count in [24, 80] {
+            let entries = (0..<count).map { ["ruby": "やちだ", "word": "候補\($0)", "pos": "名詞"] }
+            try JSONSerialization.data(withJSONObject: entries).write(to: dictionary)
+            service.loadUserDictionary(from: dictionary)
+            let result = service.inputPredictions(request("やちだ")).candidates
+            XCTAssertEqual(result.filter { $0.surface.hasPrefix("候補") }.count, min(count, 64))
+            XCTAssertEqual(Set(result.map(\.token)).count, result.count)
+            XCTAssertTrue(result.allSatisfy { $0.reading_start == 0 && $0.reading_end == 3 })
+        }
     }
 
     func testPredictionReceiptLearnsFullReadingOnceAndChecksConsumedReading() throws {
@@ -58,6 +97,7 @@ final class InputPredictionTests: XCTestCase {
         service.flushMaintenanceForTesting()
         XCTAssertEqual(learned.values, ["ガゾウ"])
         XCTAssertEqual(service.inputPredictions(request("が" )).candidates.first?.surface, "画像")
+        XCTAssertEqual(service.inputPredictions(request("がぞう")).candidates.first?.surface, "画像")
         XCTAssertTrue(service.clearLearning())
         XCTAssertEqual(service.recentLearningCountForTesting, 0)
     }

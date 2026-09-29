@@ -23,6 +23,25 @@ pub fn normalize_vk(vk: u32) -> u32 {
     }
 }
 
+/// An explicit trial repair command; configured shortcuts keep precedence.
+pub(crate) fn mixed_repair_shortcut(
+    km: &Keymap, vk: u32, ctrl: bool, shift: bool, alt: bool, action: KeyAction,
+) -> bool {
+    if vk != 0x20 || !ctrl || !shift || alt || action != KeyAction::None {
+        return false;
+    }
+    // Preserved shortcuts and inactive bindings may not appear in resolve_action.
+    let globals = [km.mode_toggle, km.reconvert].map(|binding| match binding {
+        Binding::Chord(chord) => Some(chord),
+        _ => None,
+    });
+    !globals.into_iter()
+        .chain([km.ephemeral, km.commit_undo, km.llm, km.notation_rotate])
+        .chain(km.notations)
+        .chain(km.convert)
+        .any(|chord| chord_hits(chord, vk, ctrl, shift, alt))
+}
+
 /// NotationRotate の遷移(spec §4.1)。現在表記から「次」を導出する。
 /// Why not 独立カウンタ: F6-F10 との併用で表示と巡回位置がズレる。表示中の表記
 /// (notation_fixed)を唯一の状態にすれば、どの経路で表記が変わっても次の一手が表示と整合する。
@@ -321,6 +340,26 @@ pub fn build_preserved_regs(km: &Keymap) -> Vec<PreservedReg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_repair_requires_its_exact_chord_and_yields_to_configured_actions() {
+        let km = Keymap::default();
+        assert!(mixed_repair_shortcut(&km, 0x20, true, true, false, KeyAction::None));
+        for (vk, ctrl, shift, alt) in [(0x20, false, true, false), (0x20, true, false, false),
+            (0x20, true, true, true), (0x41, true, true, false)] {
+            assert!(!mixed_repair_shortcut(&km, vk, ctrl, shift, alt, KeyAction::None));
+        }
+        assert!(!mixed_repair_shortcut(&km, 0x20, true, true, false, KeyAction::Convert));
+        assert!(!mixed_repair_shortcut(&km, 0x20, true, true, false, KeyAction::ModeToggle));
+        for field in ["mode_toggle", "reconvert", "ephemeral", "commit_undo", "llm_convert",
+            "to_hiragana", "to_katakana", "to_hankaku_kana", "to_zenkaku_eisu",
+            "to_hankaku_eisu", "notation_rotate", "convert"] {
+            let mut settings = settings::Settings::default();
+            settings.keymap = serde_json::from_value(serde_json::json!({field: "Ctrl+Shift+Space"})).unwrap();
+            let km = Keymap::from_settings(&settings);
+            assert!(!mixed_repair_shortcut(&km, 0x20, true, true, false, KeyAction::None), "{field}");
+        }
+    }
 
     #[test]
     fn default_keymap_matches_current_hardcoded_behavior() {

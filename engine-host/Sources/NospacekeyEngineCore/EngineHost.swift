@@ -14,7 +14,8 @@ func encodeResponse(_ response: Response) -> Data {
 
 /// リクエスト1件（connId, フレーム body）を処理して応答フレーム body を返すハンドラを構築する。
 /// runEngineHost から分離した唯一の理由はテスト可能化（パイプ無しで request/response を検証する）。
-/// serviceLock で ConversionService への全アクセスを直列化する規律は従来どおり。
+/// 可変セッション操作は serviceLock で直列化する。予測の外部待機は分離し、
+/// 候補合成・トークン発行は ConversionService 内の converterLock で保護する。
 func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Sendable (Int, Data) -> (reply: Data, exitAfterReply: Bool) {
     return { connId, body in
         let receivedAt = GetTickCount64()
@@ -94,6 +95,21 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
             return (encodeResponse(response), false)
         }
 
+        // Prediction owns its converter lock and releases it while Windows is working.
+        // Holding serviceLock here would still serialize live snapshots behind that wait.
+        if case .inputPredictions(let request) = req {
+            guard RequestDeadline.acquire(serviceLock, before: deadline) else {
+                return (encodeResponse(.error("request expired before execution")), false)
+            }
+            let shuttingDown = service.isMaintenanceShutdownPending
+            serviceLock.unlock()
+            guard !shuttingDown else {
+                return (encodeResponse(.error("maintenance shutdown in progress")), false)
+            }
+            return (encodeResponse(.inputPredictionsResult(
+                service.inputPredictions(request, admissionDeadline: deadline))), false)
+        }
+
         // All operations below can change the visible conversion context.
         guard RequestDeadline.acquire(serviceLock, before: deadline) else {
             return (encodeResponse(.error("request expired before execution")), false)
@@ -130,8 +146,8 @@ func makeEngineHandler(service: ConversionService, serviceLock: NSLock) -> @Send
                     boot: BuildInfo.version, engineEpoch: service.engineEpoch,
                     learningGeneration: service.currentLearningGeneration,
                     capabilities: ["mixed_input_v1"])
-            case .inputPredictions(let request):
-                response = .inputPredictionsResult(service.inputPredictions(request, admissionDeadline: deadline))
+            case .inputPredictions:
+                response = .error("input prediction routing error")
             case .clauseCandidates(let request):
                 response = .clauseCandidatesResult(service.clauseCandidates(request, admissionDeadline: deadline))
             case .convertClauses(let request):

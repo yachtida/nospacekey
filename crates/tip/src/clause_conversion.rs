@@ -2207,6 +2207,29 @@ mod tests {
         assert!(!m.accept_candidates(b.key, ready(&b, &["古"]), now));
     }
     #[test]
+    fn prediction_navigation_crosses_pages_and_preserves_commit_token_and_reading() {
+        let identity = model().identity;
+        let candidates: Vec<_> = (0..23).map(|i| ClauseCandidate {
+            surface: format!("入力候補{i}"), token: format!("prediction-{i}"),
+            reading_start: ReadingPosition(0), reading_end: ReadingPosition(6),
+        }).collect();
+        let mut m = ClauseConversion::from_predictions(identity, "にゅうりょく".into(), candidates, 0).unwrap();
+        for i in 0..23 {
+            let (page, selected) = m.page().unwrap();
+            assert_eq!(selected, i % 9);
+            assert_eq!(page.len(), if i < 18 { 9 } else { 5 });
+            assert_eq!(m.text(), format!("入力候補{i}"));
+            assert_eq!(page[selected].token, format!("prediction-{i}"));
+            assert_eq!(m.reading, "にゅうりょく");
+            assert!(m.advance_candidate(1));
+        }
+        assert_eq!(m.text(), "入力候補0");
+        assert!(m.advance_candidate(-1));
+        assert_eq!(m.text(), "入力候補22");
+        assert_eq!(m.page().unwrap().1, 4);
+    }
+
+    #[test]
     fn pages_have_nine_entries_without_truncating_candidate_list() {
         let mut m = model();
         let now = Instant::now();
