@@ -133,6 +133,15 @@ impl TextService_Impl {
             .as_ref()
             .is_some_and(|m| matches!(m.window, CandidateWindow::Loading(_)))
     }
+    /// 文節変換の候補窓（Loading/Ready）が開いているか。この間 `showing` は立たない
+    /// （render_local_clauses が表示前に false へ戻す）ため、候補UIの可視を前提にした
+    /// 判定（統合パネルとの排他など）は showing とこの旗の和集合を見る。
+    pub(crate) fn local_clause_window_open(&self) -> bool {
+        self.local_clauses
+            .borrow()
+            .as_ref()
+            .is_some_and(|m| !matches!(m.window, CandidateWindow::Closed))
+    }
     pub(crate) fn render_local_clauses(&self, context: &ITfContext) -> bool {
         let composition_generation = self.composition_generation.get();
         let material = self.local_clauses.borrow().as_ref().map(|m| {

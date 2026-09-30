@@ -1253,7 +1253,7 @@ impl TextService_Impl {
                     self.render_local_edit(&ctx);
                     return Ok(TRUE);
                 }
-                VK_1..=VK_9 if !shift_down() && self.local_clauses.borrow().as_ref().is_some_and(|m| !matches!(m.window, crate::clause_conversion::CandidateWindow::Closed)) => {
+                VK_1..=VK_9 if !shift_down() && self.local_clause_window_open() => {
                     let selected = {
                         let mut state = self.local_clauses.borrow_mut();
                         let model = state.as_mut().unwrap();

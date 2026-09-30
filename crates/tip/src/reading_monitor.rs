@@ -105,6 +105,16 @@ pub(crate) fn plan_panel(
     }
 }
 
+/// plan_panel へ渡す `candidate_visible`（候補UIが見た目を持っているか）の組立。
+/// `showing` はモジュール候補（明示候補・再変換・混在メニュー）の旗で、文節変換
+/// （Space/Tab）の候補窓は local_clauses 側で開き、表示中も showing=false のまま
+/// （render_local_clauses が表示前に false へ戻す）。showing だけを渡すと変換候補の
+/// 表示中も blocked が解けてパネルが再表示・候補窓へ重なる（beta.6 実機報告:
+/// 下側表示では Tab表示が候補を覆い、上側表示では最下段の候補が読み行帯に隠れる）。
+pub(crate) fn candidate_ui_visible(showing: bool, clause_window_open: bool) -> bool {
+    showing || clause_window_open
+}
+
 impl PanelPlan {
     /// plan を**表示データへ反映**する（読み行 OFF=空文字、候補欄 OFF=空配列）。
     /// 通常更新とレイアウト追従の共通組立（text_service::panel_sync_data 経由の唯一の適用箇所）。
@@ -1303,6 +1313,20 @@ mod tests {
         assert!(no_reading_setting.candidate_rows);
         // 候補窓表示中は予測候補があっても隠れる（候補窓に集中する — ユーザ確認済み決定）。
         assert!(!p(true, true, true, true, true).candidate_rows);
+    }
+
+    #[test]
+    fn clause_candidate_window_blocks_the_panel_while_showing_is_false() {
+        // beta.6 実機報告の回帰: Space 変換（と Tab 選択）で文節候補窓が開いている間は
+        // showing が立たない。showing だけを candidate_visible にすると変換候補の表示中に
+        // パネルが出続け、下側表示では候補が Tab表示に覆われ、上側表示では最下段
+        // （9番目）の候補が読み行帯に隠れて見えなくなる。
+        assert!(candidate_ui_visible(false, true));
+        assert!(candidate_ui_visible(true, false));
+        assert!(!candidate_ui_visible(false, false));
+        // 文節窓が開いている間は showing 相当に扱われ、plan_panel の両行が隠れる。
+        let plan = plan_panel(true, true, true, true, candidate_ui_visible(false, true));
+        assert!(!plan.reading_row && !plan.candidate_rows);
     }
 
     #[test]

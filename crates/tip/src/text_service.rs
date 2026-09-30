@@ -5865,12 +5865,19 @@ impl TextService_Impl {
         if host_drawing {
             return None;
         }
+        // candidate_visible は showing（モジュール候補・再変換・混在メニュー）と文節変換窓
+        // （Space/Tab。表示中も showing=false — local_clause_window_open の注記）の和集合。
+        // showing だけだと変換候補の表示中にパネルが再表示されて候補窓へ重なる。
+        let candidate_visible = crate::reading_monitor::candidate_ui_visible(
+            self.showing.get(),
+            self.local_clause_window_open(),
+        );
         let plan = crate::reading_monitor::plan_panel(
             self.reading_monitor_enabled.get(),
             !candidates.is_empty(),
             self.state.borrow().composing,
             self.live_enabled.get(),
-            self.showing.get(),
+            candidate_visible,
         );
         let (reading, candidates) = plan.filter_display(self.monitor_reading_text(), candidates);
         Some((identity.composition, reading, candidates))
