@@ -1,0 +1,324 @@
+{
+  "status": "normative-design-fixtures-not-executed-product-tests",
+  "normalization": [
+    {
+      "id": "empty",
+      "input": "",
+      "normalized": "",
+      "boundaries": [
+        0
+      ],
+      "utf16": 0
+    },
+    {
+      "id": "small-kana",
+      "input": "キョウ",
+      "normalized": "きょう",
+      "boundaries": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "utf16": 3
+    },
+    {
+      "id": "dakuten",
+      "input": "が",
+      "normalized": "が",
+      "boundaries": [
+        0,
+        2
+      ],
+      "utf16": 2
+    },
+    {
+      "id": "precomposed",
+      "input": "ガ",
+      "normalized": "が",
+      "boundaries": [
+        0,
+        1
+      ],
+      "utf16": 1
+    },
+    {
+      "id": "supplementary",
+      "input": "𠮷あ",
+      "normalized": "𠮷あ",
+      "boundaries": [
+        0,
+        1,
+        2
+      ],
+      "utf16": 3
+    },
+    {
+      "id": "half-kana",
+      "input": "ｶﾞ",
+      "normalized": "ｶﾞ",
+      "boundaries": [
+        0,
+        1,
+        2
+      ],
+      "utf16": 2
+    },
+    {
+      "id": "small-n-long",
+      "input": "ッンー",
+      "normalized": "っんー",
+      "boundaries": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "utf16": 3
+    }
+  ],
+  "local_transitions": [
+    {
+      "id": "bs-surface-only",
+      "initial": {
+        "reading": "てんき",
+        "surface": "天気",
+        "mode": "Converting",
+        "origin": "Candidate"
+      },
+      "action": "Backspace",
+      "expected": {
+        "reading": "てんき",
+        "surface": "天",
+        "mode": "Converting",
+        "origin": "LocalSurface",
+        "candidate_token": null,
+        "receipt_emitted": false
+      }
+    },
+    {
+      "id": "bs-empty-clause",
+      "initial": {
+        "reading": "てんき",
+        "surface": "天",
+        "mode": "Converting",
+        "origin": "LocalSurface"
+      },
+      "action": "Backspace",
+      "expected": {
+        "reading": "",
+        "surface": "",
+        "clauses": [],
+        "composition_ended": true,
+        "receipt_emitted": false
+      }
+    },
+    {
+      "id": "bs-commit",
+      "initial": {
+        "reading": "てんき",
+        "surface": "天",
+        "mode": "Converting",
+        "origin": "LocalSurface"
+      },
+      "action": "Enter",
+      "expected": {
+        "text": "天",
+        "learning": {
+          "kind": "None",
+          "reason": "Invalidated"
+        }
+      }
+    },
+    {
+      "id": "bs-reselect",
+      "initial": {
+        "reading": "てんき",
+        "surface": "天",
+        "mode": "Converting",
+        "origin": "LocalSurface"
+      },
+      "actions": [
+        "Space",
+        "SelectCandidate(天気)"
+      ],
+      "expected": {
+        "reading": "てんき",
+        "surface": "天気",
+        "origin": "Candidate"
+      }
+    },
+    {
+      "id": "f7-f6-target",
+      "initial": {
+        "reading": "きょう",
+        "surface": "きょう",
+        "mode": "Editing"
+      },
+      "actions": [
+        "F7",
+        "F6"
+      ],
+      "expected_steps": [
+        {
+          "surface": "キョウ",
+          "mode": "Converting",
+          "origin": "LocalSurface"
+        },
+        {
+          "surface": "きょう",
+          "mode": "Converting",
+          "origin": "Reading"
+        }
+      ]
+    },
+    {
+      "id": "f10-case-cycle",
+      "initial": {
+        "reading": "にほん",
+        "journal": "nihon",
+        "journal_aligned": true,
+        "mode": "Editing"
+      },
+      "actions": [
+        "F10",
+        "F10",
+        "F10",
+        "F10"
+      ],
+      "expected_surfaces": [
+        "nihon",
+        "NIHON",
+        "Nihon",
+        "nihon"
+      ]
+    },
+    {
+      "id": "f10-no-alignment",
+      "initial": {
+        "reading": "き",
+        "journal": "kyo",
+        "journal_aligned": false,
+        "mode": "Converting"
+      },
+      "action": "F10",
+      "expected": {
+        "surface": "き",
+        "origin": "LocalSurface",
+        "learning": false
+      }
+    },
+    {
+      "id": "boundary-await-space",
+      "initial": {
+        "mode": "Converting",
+        "reading": "きょうは",
+        "boundaries": [
+          0,
+          3,
+          4
+        ]
+      },
+      "actions": [
+        "ResizeRight",
+        "Wait(5000)"
+      ],
+      "expected": {
+        "boundaries": [
+          0,
+          4
+        ],
+        "surface": "きょうは",
+        "wait": "None",
+        "requests_sent": 0
+      }
+    },
+    {
+      "id": "nonlearning-token",
+      "intervals": [
+        {
+          "token": "a",
+          "is_learning_target": true
+        },
+        {
+          "token": "b",
+          "is_learning_target": false
+        },
+        {
+          "token": "c",
+          "is_learning_target": true
+        }
+      ],
+      "expected": {
+        "learning_runs": [
+          [
+            "a"
+          ],
+          [
+            "c"
+          ]
+        ],
+        "learn_b": false,
+        "learn_bigram_ac": false
+      }
+    },
+    {
+      "id": "learning-generation-refresh",
+      "actions": [
+        "ClearLearning",
+        "StartSession(new_generation)",
+        "InvalidateOldTokens",
+        "AcquireNewCandidate",
+        "Commit"
+      ],
+      "expected": {
+        "old_receipts_rewritten": false,
+        "new_candidate_learning": true
+      }
+    },
+    {
+      "id": "editing-delete-end",
+      "initial": {
+        "reading": "かな",
+        "cursor": 2,
+        "mode": "Editing"
+      },
+      "action": "Delete",
+      "expected": {
+        "reading": "かな",
+        "cursor": 2
+      }
+    },
+    {
+      "id": "converting-delete",
+      "initial": {
+        "reading": "かな",
+        "surface": "仮名",
+        "mode": "Converting"
+      },
+      "action": "Delete",
+      "expected": {
+        "surface": "仮名",
+        "receipt_emitted": false
+      }
+    }
+  ],
+  "display_backspace": [
+    {
+      "surface": "天気",
+      "after_bs": "天"
+    },
+    {
+      "surface": "が",
+      "after_bs": ""
+    },
+    {
+      "surface": "𠮷",
+      "after_bs": ""
+    },
+    {
+      "surface": "あ👩‍💻",
+      "after_bs": "あ"
+    }
+  ]
+}
