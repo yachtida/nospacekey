@@ -4501,6 +4501,9 @@ mod tests {
 
     #[test]
     fn failed_auto_commit_receipt_invalidates_before_same_epoch_snapshot_conversion() {
+        // These waits check event ordering, not a latency budget. Hosted VMs
+        // may deschedule the worker longer than 100 ms while other tests run.
+        let event_timeout = Duration::from_secs(2);
         let (sender, receiver) = sync_channel(2);
         let statuses = Arc::new(ArrayQueue::new(SNAPSHOT_STATUS_CAPACITY));
         let results = Arc::new(ArrayQueue::new(1));
@@ -4563,7 +4566,7 @@ mod tests {
 
         offer_configuration(&sender, &desired, &desired_generation, 31, Request::Ping);
         assert_eq!(
-            statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
+            statuses.recv_timeout(event_timeout).unwrap(),
             SnapshotStatus::Configured {
                 learning_identity: None,
                 configuration_generation: 31,
@@ -4572,7 +4575,7 @@ mod tests {
         );
         sender.send(SnapshotCommand::WorkAvailable).unwrap();
         first_drain_started_rx
-            .recv_timeout(Duration::from_millis(100))
+            .recv_timeout(event_timeout)
             .unwrap();
         pending_receipt.store(true, Ordering::Release);
         assert!(offer_test_snapshot(
@@ -4583,21 +4586,21 @@ mod tests {
         ));
         first_drain_release_tx.send(()).unwrap();
         assert_eq!(
-            statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
+            statuses.recv_timeout(event_timeout).unwrap(),
             SnapshotStatus::Invalidated {
                 configuration_generation: 31,
                 connection_epoch: 2,
             }
         );
         assert_eq!(
-            statuses.recv_timeout(Duration::from_millis(100)).unwrap(),
+            statuses.recv_timeout(event_timeout).unwrap(),
             SnapshotStatus::Configured {
                 learning_identity: None,
                 configuration_generation: 31,
                 connection_epoch: 2,
             }
         );
-        let replayed = results.recv_timeout(Duration::from_millis(100)).unwrap();
+        let replayed = results.recv_timeout(event_timeout).unwrap();
         assert_eq!(replayed.identity.revision, 1);
         assert_eq!(replayed.identity.connection_generation, 2);
         assert!(offer_test_snapshot(
@@ -4608,7 +4611,7 @@ mod tests {
         ));
         assert_eq!(
             results
-                .recv_timeout(Duration::from_millis(100))
+                .recv_timeout(event_timeout)
                 .unwrap()
                 .identity
                 .revision,
