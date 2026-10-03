@@ -4,7 +4,7 @@ import test from 'node:test';
 import {
   assertReleaseAvailable, encodeReleaseReservation, expectedReleaseReservation, readReleaseReservation,
   reservationFilename, reservationRef, ReservationPendingError,
-  validateReleaseReservation, validateReleaseVersion,
+  validateReleaseReservation, validateReleaseVersion, validateReleasePush,
 } from '../release-identity.mjs';
 
 const version = '1.7.0-beta.8';
@@ -12,7 +12,7 @@ const context = {
   serverUrl: 'https://github.com', repository: 'yachtida/nospacekey',
   repositoryId: '1307686551', runId: '37112350751', runAttempt: '1',
   commit: '5f7df7ec14d65721b811fb8df65e701c7e11277a',
-  ref: `refs/heads/release-build/v${version}`, eventName: 'push', token: 'offline-only-token',
+  ref: `refs/tags/v${version}`, eventName: 'push', token: 'offline-only-token',
 };
 const receiptCommit = 'a'.repeat(40);
 const differentCommit = 'b'.repeat(40);
@@ -53,6 +53,8 @@ function fixture() {
     state.calls.push(route);
     if (state.routes.has(route)) return state.routes.get(route)(state);
     if (route === '') return json(state.repo);
+    if (route === `/git/ref/tags/v${version}`) return json({ ref: `refs/tags/v${version}`, object: { type: 'commit', sha: context.commit } });
+    if (route === `/releases/tags/v${version}`) return json({}, 404);
     if (route === refRoute) return json(state.ref);
     if (route === `/git/commits/${receiptCommit}`) return json(state.commit);
     if (route === compareRoute) return json(state.comparison);
@@ -76,7 +78,7 @@ test('valid receipt admits its single owner with immutable commit and blob ident
     ...expectedReleaseReservation(context, version),
     reservation_ref: reservationRef(version), reservation_commit: receiptCommit, receipt_blob: state.blob.sha,
   });
-  assert.deepEqual(state.calls, ['', refRoute, `/git/commits/${receiptCommit}`, compareRoute, `/git/blobs/${state.blob.sha}`, refRoute]);
+  assert.deepEqual(state.calls, ['', `/git/ref/tags/v${version}`, `/releases/tags/v${version}`, '', refRoute, `/git/commits/${receiptCommit}`, compareRoute, `/git/blobs/${state.blob.sha}`, refRoute, '', `/git/ref/tags/v${version}`, `/releases/tags/v${version}`]);
 });
 
 test('same receipt can be read again only with the exact pinned commit', async () => {
@@ -87,10 +89,10 @@ test('same receipt can be read again only with the exact pinned commit', async (
 });
 
 test('version format rejects aliases, leading zeros, overflow, CI identities, and metadata', () => {
-  for (const valid of ['0.0.0-beta.1', version, '65535.65535.65535-beta.12345678901234567890']) {
+  for (const valid of ['1.7.0', '0.0.0-beta.1', version, '65535.65535.65535-beta.12345678901234567890']) {
     assert.equal(validateReleaseVersion(valid), valid);
   }
-  for (const invalid of [undefined, null, 1, '', '1.7.0', '1.7.0-beta.0', 'v1.7.0-beta.8', '1.7.0-beta.08', '01.7.0-beta.8',
+  for (const invalid of [undefined, null, 1, '', '1.7.0-rc.1', '1.7.0-beta.0', 'v1.7.0-beta.8', '1.7.0-beta.08', '01.7.0-beta.8',
     '65536.0.0-beta.1', '1.7.0-beta.8+meta', '1.7.0-beta.8.ci.gha.1.2.1', '1.7.0-Beta.8',
     '1.7.0-beta.8\n', '1.7.0-beta.-1', `1.7.0-beta.${'1'.repeat(130)}`]) {
     assert.throws(() => validateReleaseVersion(invalid));
@@ -104,11 +106,11 @@ test('release version length uses the same 80-character install identity ceiling
   assert.throws(() => validateReleaseVersion(accepted + '1'), /too long/);
 });
 
-test('context requires GitHub.com, exact repository and push on exact request branch', async () => {
+test('context requires GitHub.com, exact repository and push on exact release tag', async () => {
   for (const change of [
     { serverUrl: 'https://github.enterprise.example' }, { repository: 'another/nospacekey' },
     { repository: 'Yachtida/nospacekey' }, { eventName: 'workflow_dispatch' }, { eventName: 'pull_request' },
-    { eventName: undefined }, { ref: 'refs/heads/beta' }, { ref: `refs/tags/v${version}` },
+    { eventName: undefined }, { ref: 'refs/heads/beta' }, { ref: `refs/heads/release-build/v${version}` },
     { ref: 'refs/heads/release-build/v1.7.0-beta.9' },
   ]) {
     const state = fixture();
@@ -315,29 +317,32 @@ test('HTTP errors omit token and arbitrary response content', async () => {
 });
 
 
-test('availability requires authenticated repository identity and exact missing tag and Release', async () => {
+test('admission requires an exact lightweight source tag and no Release', async () => {
   const state = fixture();
-  state.routes.set(`/git/ref/tags/v${version}`, () => json({}, 404));
-  state.routes.set(`/releases/tags/v${version}`, () => json({}, 404));
   assert.deepEqual(await assertReleaseAvailable(state.context, version), { version, tag: `v${version}`, available: true });
   assert.deepEqual(state.calls, ['', `/git/ref/tags/v${version}`, `/releases/tags/v${version}`]);
+  for (const tag of [
+    { ref: `refs/tags/v${version}`, object: { type: 'commit', sha: differentCommit } },
+    { ref: `refs/tags/v${version}`, object: { type: 'tag', sha: context.commit } },
+    { ref: 'refs/tags/wrong', object: { type: 'commit', sha: context.commit } },
+  ]) {
+    state.routes.set(`/git/ref/tags/v${version}`, () => json(tag));
+    await assert.rejects(assertReleaseAvailable(state.context, version), /mismatch/);
+  }
 });
 
-test('any existing tag or Release blocks admission, including a same-source tag', async () => {
-  for (const existingRoute of [`/git/ref/tags/v${version}`, `/releases/tags/v${version}`]) {
-    const state = fixture();
-    state.routes.set(`/git/ref/tags/v${version}`, () => json({}, 404));
-    state.routes.set(`/releases/tags/v${version}`, () => json({}, 404));
-    state.routes.set(existingRoute, () => json({ object: { sha: context.commit }, tag_name: `v${version}` }));
-    await assert.rejects(assertReleaseAvailable(state.context, version), /already in use/);
-  }
+test('an existing Release and a missing tag both block admission', async () => {
+  const state = fixture();
+  state.routes.set(`/releases/tags/v${version}`, () => json({ tag_name: `v${version}` }));
+  await assert.rejects(assertReleaseAvailable(state.context, version), /already in use/);
+  state.routes.set(`/git/ref/tags/v${version}`, () => json({}, 404));
+  await assert.rejects(assertReleaseAvailable(state.context, version), /HTTP 404/);
 });
 
 test('availability does not interpret permission, redirect, rate-limit or server errors as absence', async () => {
   for (const route of [`/git/ref/tags/v${version}`, `/releases/tags/v${version}`]) {
     for (const status of [301, 302, 401, 403, 409, 422, 429, 500]) {
       const state = fixture();
-      state.routes.set(`/git/ref/tags/v${version}`, () => json({}, 404));
       state.routes.set(route, () => json({}, status));
       await assert.rejects(assertReleaseAvailable(state.context, version), new RegExp(`HTTP ${status}`));
     }
@@ -359,4 +364,37 @@ test('HTTP 200 null, arrays or scalar JSON never masquerade as HTTP 404 availabi
     state.routes.set(`/git/ref/tags/v${version}`, () => json(value));
     await assert.rejects(assertReleaseAvailable(state.context, version), /GitHub response must be an object/);
   }
+});
+
+
+test('only creation push events for the exact tag and commit are admitted', () => {
+  const event = { created: true, deleted: false, forced: false, ref: context.ref, after: context.commit };
+  validateReleasePush(context, event);
+  for (const change of [
+    { created: false }, { deleted: true }, { forced: true }, { created: undefined },
+    { deleted: undefined }, { forced: undefined }, { ref: 'refs/heads/beta' }, { after: differentCommit },
+  ]) assert.throws(() => validateReleasePush(context, { ...event, ...change }));
+  for (const change of [{ eventName: 'pull_request' }, { eventName: 'workflow_dispatch' }, { ref: 'refs/heads/beta' }]) {
+    assert.throws(() => validateReleasePush({ ...context, ...change }, event));
+  }
+});
+
+test('tag deletion or retargeting during receipt validation fails closed', async () => {
+  for (const moved of [true, false]) {
+    const state = fixture();
+    let reads = 0;
+    state.routes.set(`/git/ref/tags/v${version}`, () => {
+      reads++;
+      return reads === 1 ? json({ ref: context.ref, object: { type: 'commit', sha: context.commit } }) :
+        moved ? json({ ref: context.ref, object: { type: 'commit', sha: differentCommit } }) : json({}, 404);
+    });
+    await assert.rejects(readReleaseReservation(state.context, version), /mismatch|HTTP 404/);
+  }
+});
+
+test('a later tag run cannot claim a receipt belonging to a previous branch build', async () => {
+  const state = fixture();
+  const previous = { ...expectedReleaseReservation(context, version), run_id: '37121425797' };
+  state.setText(encodeReleaseReservation(previous, { ...context, runId: previous.run_id }, version));
+  await assert.rejects(readReleaseReservation(state.context, version), /run_id/);
 });

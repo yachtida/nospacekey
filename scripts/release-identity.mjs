@@ -1,6 +1,7 @@
 // Read-only release admission. A separately authorized actor creates the receipt
 // branch; Actions has contents:read and this module never sends a mutation.
 // Node 22+ built-ins only. context.fetch is injectable for offline tests.
+import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
@@ -38,8 +39,8 @@ function exactKeys(actual, expected, label) {
 }
 export function validateReleaseVersion(version) {
   requireValue(typeof version === 'string', 'Release version is required');
-  const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-beta\.([1-9][0-9]*)$/.exec(version);
-  requireValue(match && match.slice(1, 4).every(value => BigInt(value) <= 65535n), 'Release version must be exactly Windows-compatible core-beta.N');
+  const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-beta\.([1-9][0-9]*))?$/.exec(version);
+  requireValue(match && match.slice(1, 4).every(value => BigInt(value) <= 65535n), 'Release version must be exactly Windows-compatible core or core-beta.N');
   requireValue(version.length <= 80, 'Release version is too long');
   return version;
 }
@@ -47,8 +48,8 @@ export function expectedReleaseReservation(context, version) {
   validateReleaseVersion(version);
   requireValue(context.serverUrl === 'https://github.com', 'Release requires GitHub.com');
   requireValue(context.repository === repository, `Release requires ${repository}`);
-  requireValue(context.ref === `refs/heads/release-build/v${version}` && context.eventName === 'push',
-    'Release requires a push to its exact release-build/v<version> request branch');
+  requireValue(context.ref === `refs/tags/v${version}` && context.eventName === 'push',
+    'Release requires a push to its exact v<version> release tag');
   return {
     reservation_schema: 1,
     version,
@@ -108,17 +109,33 @@ async function validateRepository(api, expected) {
     'Remote repository identity mismatch');
 }
 
-// This is a fail-closed availability check, never an atomic reservation. The
-// separately created, create-only reservation branch remains the uniqueness lock.
+// A tag is not the uniqueness lock: the create-only receipt still binds exactly
+// one source/run/attempt. Require a lightweight tag so its ref SHA is the source
+// SHA, and recheck it at every build/verification boundary. Never mutate GitHub.
 export async function assertReleaseAvailable(context, version) {
   const expected = expectedReleaseReservation(context, version);
   const api = client(context);
   await validateRepository(api, expected);
-  for (const route of [`/git/ref/tags/v${version}`, `/releases/tags/v${version}`]) {
-    const existing = await api.get(route, { absent: true });
-    requireValue(existing === null, `Release version is already in use: v${version}`);
-  }
+  const tag = await api.get(`/git/ref/tags/v${version}`);
+  exact(tag, { ref: `refs/tags/v${version}` }, 'Release tag');
+  exact(tag.object, { type: 'commit', sha: expected.source_commit }, 'Release tag object');
+  const release = await api.get(`/releases/tags/v${version}`, { absent: true });
+  requireValue(release === null, `Release version is already in use: v${version}`);
   return { version, tag: `v${version}`, available: true };
+}
+
+export function validateReleasePush(context, event) {
+  requireValue(context.eventName === 'push' && context.ref?.startsWith('refs/tags/v'), 'Release requires tag push');
+  object(event, 'Push event');
+  requireValue(event.created === true && event.deleted === false && event.forced === false,
+    'Release requires a new tag; deleted, updated or forced tags are rejected');
+  requireValue(event.ref === context.ref && event.after === context.commit, 'Push event ref or source commit differs');
+}
+
+export function validateReleasePushFromEnvironment(context) {
+  requireValue(typeof process.env.GITHUB_EVENT_PATH === 'string' && process.env.GITHUB_EVENT_PATH.length > 0,
+    'Release requires GITHUB_EVENT_PATH');
+  validateReleasePush(context, JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')));
 }
 
 function decodeBlob(blob, blobSha) {
@@ -146,7 +163,9 @@ export async function readReleaseReservation(context, version, {
   const expected = expectedReleaseReservation(context, version);
   if (reservationCommitSha !== undefined) sha(reservationCommitSha, 'Pinned reservation commit');
   requireValue(Number.isInteger(waitSeconds) && waitSeconds >= 0 && waitSeconds <= 600, 'Reservation wait must be 0..600 whole seconds');
-  const api = client(fetch === undefined ? context : { ...context, fetch });
+  const readContext = fetch === undefined ? context : { ...context, fetch };
+  const api = client(readContext);
+  await assertReleaseAvailable(readContext, version);
   await validateRepository(api, expected);
   const refName = reservationRef(version);
   const refRoute = `/git/ref/${refName.slice('refs/'.length)}`;
@@ -193,6 +212,7 @@ export async function readReleaseReservation(context, version, {
   const finalRef = await api.get(refRoute);
   exact(finalRef, { ref: refName }, 'Reservation ref');
   exact(finalRef.object, { type: 'commit', sha: receiptCommit }, 'Reservation ref');
+  await assertReleaseAvailable(readContext, version);
   return { ...expected, reservation_ref: refName, reservation_commit: receiptCommit, receipt_blob: blobSha };
 }
 
@@ -212,6 +232,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   try {
     const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
     const context = contextFromEnvironment(root);
+    validateReleasePushFromEnvironment(context);
     const [command, version, pin, wait, ...extra] = process.argv.slice(2);
     requireValue(command === 'read' && version && extra.length === 0, 'Expected read <version> [<reservation-commit-sha>|-] [<wait-seconds>]');
     requireValue(wait === undefined || /^(0|[1-9][0-9]*)$/.test(wait), 'Wait seconds must be canonical decimal');
