@@ -48,6 +48,7 @@
   pwsh -File scripts\run-gate.ps1 -Sandbox                         # immune to user input
   pwsh -File scripts\run-gate.ps1 -Sandbox -DistributionDir dist # signed payload gate
   pwsh -File scripts\run-gate.ps1 -Sandbox -DistributionDir dist `
+    -TestbenchArgs '--item32' -PredictionModelDir experiments\inline-prediction\.models\product-test
 #>
 #Requires -Version 7.3
 [CmdletBinding()]
@@ -81,13 +82,15 @@ param(
     # Previous signed distribution used only by --pair-coexistence. The guest
     # keeps this TIP loaded while registering and starting DistributionDir.
     [string]$PreviousDistributionDir = '',
-    # Use the current Store CLI when the legacy WindowsSandbox.exe launcher fails.
-    [switch]$SandboxCli
+    # Pinned model pair for --item32. It is mapped read-only beside the signed
+    # product tree so model bytes cannot weaken the distribution manifest gate.
+    [string]$PredictionModelDir = ''
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'test-lib.ps1')
 . (Join-Path $PSScriptRoot 'zenzai-runtime-manifest.ps1')
 . (Join-Path $PSScriptRoot 'swift-toolchain.ps1')
+. (Join-Path $PSScriptRoot 'prediction-runtime-contract.ps1')
 . (Join-Path $PSScriptRoot 'release-lib.ps1')
 
 # The first invocation immediately hands control to the same-integrity
@@ -335,7 +338,7 @@ function Invoke-SandboxGate {
         [string]$OutFile = '',
         [string]$DistributionDir = '',
         [string]$PreviousDistributionDir = '',
-        [switch]$SandboxCli
+        [string]$PredictionModelDir = ''
     )
     $wsbExe = Join-Path $env:WINDIR 'System32\WindowsSandbox.exe'
     if (-not (Test-Path $wsbExe)) {
@@ -359,6 +362,8 @@ function Invoke-SandboxGate {
             exit 2
         }
     }
+    $manualInlineApps = $TestbenchArgs.Count -gt 0 -and
+        $TestbenchArgs[0] -eq '--manual-inline-apps'
     $pairCoexistence = $TestbenchArgs.Count -eq 1 -and
         $TestbenchArgs[0] -eq '--pair-coexistence'
     $versionCleanup = $TestbenchArgs.Count -eq 1 -and
@@ -481,6 +486,64 @@ function Invoke-SandboxGate {
     }
     $Testbench = $testbenchSource
 
+    # Manual Phase-1 acceptance runs real host applications inside the disposable
+    # guest. Only these fixed installation candidates are admitted and every
+    # mapped tree is read-only; arbitrary caller-provided executable paths are
+    # deliberately unsupported.
+    $manualAppMappings = @()
+    if ($manualInlineApps) {
+        $manualAppSpecs = @(
+            @{ Name = 'Edge'; Guest = 'C:\Users\WDAGUtilityAccount\Desktop\manual-edge';
+               Candidates = @(
+                   'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+                   'C:\Program Files\Microsoft\Edge\Application\msedge.exe') },
+            @{ Name = 'VS Code'; Guest = 'C:\Users\WDAGUtilityAccount\Desktop\manual-vscode';
+               Candidates = @(
+                   (Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Code\Code.exe'),
+                   'C:\Program Files\Microsoft VS Code\Code.exe') },
+            @{ Name = 'Word'; Guest = 'C:\Users\WDAGUtilityAccount\Desktop\manual-word';
+               Candidates = @(
+                   'C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE',
+                   'C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE') }
+        )
+        foreach ($spec in $manualAppSpecs) {
+            $candidate = @($spec.Candidates | Where-Object {
+                Test-Path -LiteralPath $_ -PathType Leaf
+            } | Select-Object -First 1)
+            if ($candidate.Count -eq 0) {
+                Write-Warn "manual acceptance app unavailable on host: $($spec.Name)"
+                continue
+            }
+            try {
+                $validatedExe = Get-SandboxValidatedPath -Path $candidate[0] `
+                    -Label "manual acceptance $($spec.Name)"
+                $hostFolder = [IO.Path]::GetFullPath((Split-Path -Parent $validatedExe))
+                if ($spec.Name -eq 'Word') {
+                    # Click-to-Run Office keeps this mandatory DLL as an absolute reparse
+                    # link into its installed virtualization runtime. A mapped Office16
+                    # folder therefore cannot be a runnable Word installation in a clean
+                    # Sandbox. Treat it as the spec's explicit Word-unavailable case.
+                    $wordVirtualizationDll = Join-Path $hostFolder 'AppvIsvSubsystems64.dll'
+                    $wordDependency = Get-Item -LiteralPath $wordVirtualizationDll `
+                        -Force -ErrorAction SilentlyContinue
+                    if ($null -eq $wordDependency -or
+                        ($wordDependency.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                        Write-Warn 'Word Click-to-Run cannot be mapped into Windows Sandbox; acceptance is pending'
+                        continue
+                    }
+                }
+                $manualAppMappings += [pscustomobject]@{
+                    Name = $spec.Name
+                    HostFolder = $hostFolder
+                    GuestFolder = $spec.Guest
+                }
+                Write-Ok "manual acceptance app mapped read-only: $($spec.Name)"
+            } catch {
+                Write-Warn "manual acceptance app rejected: $($spec.Name) ($($_.Exception.Message))"
+            }
+        }
+    }
+
     $distributionRoot = $null
     $previousDistributionRoot = $null
     $useSignedDistribution = -not [string]::IsNullOrWhiteSpace($DistributionDir)
@@ -492,6 +555,9 @@ function Invoke-SandboxGate {
                 throw "distribution is not a directory: $DistributionDir"
             }
             Assert-ZenzaiVulkanRuntimeBundle -RuntimeDirectory $distributionRoot | Out-Null
+            Assert-PredictionRuntimeBundle `
+                -RuntimeDirectory (Join-Path $distributionRoot 'prediction-runtime') `
+                -AllowAdditionalRuntimeFiles | Out-Null
             if (Test-SandboxPathWithinRoot -Root $distributionRoot -Candidate $testbenchSource) {
                 throw 'testbench path is inside the signed distribution root'
             }
@@ -543,6 +609,9 @@ function Invoke-SandboxGate {
                 throw 'previous and current distribution roots must be different'
             }
             Assert-ZenzaiVulkanRuntimeBundle -RuntimeDirectory $previousDistributionRoot | Out-Null
+            Assert-PredictionRuntimeBundle `
+                -RuntimeDirectory (Join-Path $previousDistributionRoot 'prediction-runtime') `
+                -AllowAdditionalRuntimeFiles | Out-Null
             $currentTipVersion = (Get-Item -LiteralPath `
                 (Join-Path $distributionRoot 'nospacekey_tip.dll') `
                 -ErrorAction Stop).VersionInfo.ProductVersion
@@ -564,6 +633,68 @@ function Invoke-SandboxGate {
     } elseif (-not [string]::IsNullOrWhiteSpace($PreviousDistributionDir)) {
         Write-FailMsg '-PreviousDistributionDir is valid only with --pair-coexistence.'
         exit 2
+    }
+
+    $predictionModelRoot = $null
+    $predictionModelPins = New-Object 'System.Collections.Generic.List[IDisposable]'
+    if (-not [string]::IsNullOrWhiteSpace($PredictionModelDir)) {
+        try {
+            $validatedModelDir = Get-SandboxValidatedPath -Path $PredictionModelDir `
+                -Label 'prediction model'
+            $predictionModelRoot = [IO.Path]::GetFullPath(
+                (Resolve-Path -LiteralPath $validatedModelDir -ErrorAction Stop).Path)
+            if (-not (Test-Path -LiteralPath $predictionModelRoot -PathType Container)) {
+                throw "prediction model is not a directory: $PredictionModelDir"
+            }
+            $artifacts = @(
+                @{ Name = 'llm-jp-3-150m-q8_0-c060ca9.gguf'; Length = 164257184;
+                   Hash = '191F2FDF41A6F64F00EC6B4FCC39EC6164BB13B41D3609AC8F5B2B6149A23A6D' },
+                @{ Name = 'tokenizer.json'; Length = 6416433;
+                   Hash = '955DC1FA623FAB38CC92A3F4EE172423AE6D73201C4207569BFDF5626BC733F0' }
+            )
+            Initialize-ValidationGateNative
+            foreach ($artifact in $artifacts) {
+                $path = Get-SandboxValidatedPath `
+                    -Path (Join-Path $predictionModelRoot $artifact.Name) `
+                    -Label "prediction artifact $($artifact.Name)"
+                $stream = [NospacekeyValidationNative]::OpenPinnedReadFile(
+                    $path, $predictionModelRoot)
+                $predictionModelPins.Add($stream)
+                if ($stream.Length -ne $artifact.Length) {
+                    throw "prediction artifact size mismatch: $($artifact.Name)"
+                }
+                $sha = [Security.Cryptography.SHA256]::Create()
+                try {
+                    $hash = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '')
+                } finally { $sha.Dispose() }
+                $stream.Position = 0
+                if ($hash -ne $artifact.Hash) {
+                    throw "prediction artifact hash mismatch: $($artifact.Name)"
+                }
+            }
+            $receiptPath = Get-SandboxValidatedPath `
+                -Path (Join-Path $predictionModelRoot 'VERIFIED') -Label 'prediction receipt'
+            $expectedReceipt = "schema=1`n" +
+                "model_sha256=191f2fdf41a6f64f00ec6b4fcc39ec6164bb13b41d3609ac8f5b2b6149a23a6d`n" +
+                "tokenizer_sha256=955dc1fa623fab38cc92a3f4ee172423ae6d73201c4207569bfdf5626bc733f0`n"
+            $receiptStream = [NospacekeyValidationNative]::OpenPinnedReadFile(
+                $receiptPath, $predictionModelRoot)
+            $predictionModelPins.Add($receiptStream)
+            $receiptReader = [IO.StreamReader]::new(
+                $receiptStream, [Text.Encoding]::UTF8, $true, 1024, $true)
+            try { $actualReceipt = $receiptReader.ReadToEnd() }
+            finally { $receiptReader.Dispose() }
+            $receiptStream.Position = 0
+            if ($actualReceipt -ne $expectedReceipt) {
+                throw 'prediction receipt mismatch'
+            }
+            Write-Ok "validated and write-pinned prediction model mapping: $predictionModelRoot"
+        } catch {
+            foreach ($pin in $predictionModelPins) { $pin.Dispose() }
+            $predictionModelPins.Clear()
+            Write-FailMsg "invalid prediction model directory: $PredictionModelDir ($($_.Exception.Message))"
+            exit 2
+        }
     }
 
     # ---- stage artifacts (mirrors stage-dist.ps1 §1-4c: the sandbox image is a
@@ -673,6 +804,45 @@ function Invoke-SandboxGate {
             if ($dll) { Copy-Item -LiteralPath $dll.FullName -Destination $binDir -Force; Write-Ok "staged $vc (VC++ redist)" }
             else { Write-Warn "$vc not found (PEs may fail with 0xC0000135 in the sandbox). Install the VC++ redist / VS C++ workload." }
         }
+        if (-not [string]::IsNullOrWhiteSpace($PredictionModelDir)) {
+            # item32 runs through the unsigned build-tree gate so the disposable
+            # guest may disable Smart App Control. Stage the independent pinned
+            # llama-server beside the engine; it is not part of the legacy Zenzai
+            # DLL closure copied above.
+            $predictionRuntime = Join-Path $repoRoot 'engine-host\prediction-runtime'
+            if (-not (Test-Path -LiteralPath $predictionRuntime -PathType Container)) {
+                $predictionRuntime = Join-Path $repoRoot `
+                    'experiments\inline-prediction\.tools\product-runtime'
+            }
+            $predictionContract = Get-PredictionRuntimeContract
+            try {
+                $runtimeRoot = Get-SandboxValidatedPath -Path $predictionRuntime `
+                    -Label 'prediction runtime'
+                Assert-PredictionRuntimeBundle -RuntimeDirectory $runtimeRoot | Out-Null
+                $runtimeDestination = Join-Path $binDir 'prediction-runtime'
+                New-Item -ItemType Directory -Path $runtimeDestination -Force | Out-Null
+                foreach ($name in $predictionContract.RequiredFiles) {
+                    $source = Get-SandboxValidatedPath -Path (Join-Path $runtimeRoot $name) `
+                        -Label "prediction runtime $name"
+                    Copy-Item -LiteralPath $source -Destination $runtimeDestination `
+                        -Force -ErrorAction Stop
+                }
+                foreach ($vc in @('vcomp140.dll', 'vcruntime140.dll',
+                    'vcruntime140_1.dll', 'msvcp140.dll')) {
+                    $dll = Find-VcRedistDll -Name $vc
+                    if (-not $dll) { throw "prediction runtime dependency missing: $vc" }
+                    Copy-Item -LiteralPath $dll.FullName -Destination $runtimeDestination `
+                        -Force -ErrorAction Stop
+                }
+                Assert-PredictionRuntimeBundle `
+                    -RuntimeDirectory $runtimeDestination `
+                    -AllowAdditionalRuntimeFiles | Out-Null
+                Write-Ok "staged pinned inline-prediction Vulkan runtime ($($predictionContract.Revision))"
+            } catch {
+                Write-FailMsg "inline-prediction runtime staging failed: $($_.Exception.Message)"
+                exit 2
+            }
+        }
         if (Test-Path -LiteralPath $modelsDir) {
             New-Item -ItemType Directory -Force (Join-Path $binDir 'models') | Out-Null
             Copy-Item -Path (Join-Path $modelsDir '*.gguf') -Destination (Join-Path $binDir 'models') -Force -ErrorAction SilentlyContinue
@@ -722,6 +892,10 @@ function Invoke-SandboxGate {
         $innerCommand += " -PreviousBinDir `"$guestPreviousBin`""
     }
     Write-Warn 'Sandbox gate: disabling guest Smart App Control for this disposable session (unsigned dev tree or dev-signed distribution)'
+    $guestPredictionModel = "$desk\prediction-model"
+    if ($predictionModelRoot) {
+        $innerCommand += " -PredictionModelDir `"$guestPredictionModel`""
+    }
     $guestExit = "$desk\results\exitcode.txt"
     $guestExitTemp = "$guestExit.tmp"
     $guestInnerExit = "$desk\results\inner-exitcode.txt"
@@ -760,6 +934,10 @@ function Invoke-SandboxGate {
     # XML-escape host paths and the deliberately simple LogonCommand.
     $escBin   = [System.Security.SecurityElement]::Escape($binDir)
     $escRes   = [System.Security.SecurityElement]::Escape($resDir)
+    $escPredictionModel = if ($predictionModelRoot) {
+        [System.Security.SecurityElement]::Escape($predictionModelRoot)
+    } else { '' }
+    $escGuestPredictionModel = [System.Security.SecurityElement]::Escape($guestPredictionModel)
     $escLogon = [System.Security.SecurityElement]::Escape($logon)
     $wsbPath = Join-Path $root 'gate.wsb'
     $mappedFolders = @(
@@ -771,6 +949,16 @@ function Invoke-SandboxGate {
         $escGuestPreviousBin = [System.Security.SecurityElement]::Escape($guestPreviousBin)
         $mappedFolders += "    <MappedFolder><HostFolder>$escPreviousBin</HostFolder>" +
             "<SandboxFolder>$escGuestPreviousBin</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>"
+    }
+    if ($predictionModelRoot) {
+        $mappedFolders += "    <MappedFolder><HostFolder>$escPredictionModel</HostFolder>" +
+            "<SandboxFolder>$escGuestPredictionModel</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>"
+    }
+    foreach ($app in $manualAppMappings) {
+        $escAppHost = [System.Security.SecurityElement]::Escape($app.HostFolder)
+        $escAppGuest = [System.Security.SecurityElement]::Escape($app.GuestFolder)
+        $mappedFolders += "    <MappedFolder><HostFolder>$escAppHost</HostFolder>" +
+            "<SandboxFolder>$escAppGuest</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>"
     }
     @(
         '<Configuration>',
@@ -811,21 +999,7 @@ function Invoke-SandboxGate {
         throw "fresh run-owned result path unexpectedly exists: $sandboxExit"
     }
     Write-Step "launching Windows Sandbox (results: $resDir)"
-    if ($SandboxCli) {
-        $cli = Get-Command wsb.exe -ErrorAction Stop
-        $sandboxId = [Guid]::NewGuid().ToString()
-        $startResult = & $cli.Source start --id $sandboxId --config ([IO.File]::ReadAllText($wsbPath)) --raw
-        $startExit = $LASTEXITCODE
-        $startResult | Set-Content -LiteralPath (Join-Path $root 'sandbox-cli-start.json') -Encoding utf8
-        if ($startExit -ne 0) {
-            Write-FailMsg "Sandbox CLI start failed ($startExit); session id $sandboxId"
-            exit 2
-        }
-        Write-Step "connecting Sandbox CLI session $sandboxId"
-        $p = Start-Process -FilePath $cli.Source -ArgumentList @('connect', '--id', $sandboxId, '--raw') -WindowStyle Hidden -PassThru
-    } else {
-        $p = Start-Process -FilePath $wsbExe -ArgumentList "`"$wsbPath`"" -PassThru
-    }
+    $p = Start-Process -FilePath $wsbExe -ArgumentList "`"$wsbPath`"" -PassThru
 
     # Completion signal = exitcode.txt appearing WITH CONTENT in the writable map
     # (the outer watchdog publishes it LAST). Boot budget: sandbox cold start can take
@@ -935,17 +1109,34 @@ if (-not [string]::IsNullOrWhiteSpace($DistributionDir) -and -not $Sandbox) {
     Write-FailMsg '-DistributionDir is only valid with -Sandbox (the signed payload gate).'
     exit 2
 }
-if ($SandboxCli -and -not $Sandbox) {
-    Write-FailMsg '-SandboxCli is only valid with -Sandbox.'
-    exit 2
-}
 if (-not [string]::IsNullOrWhiteSpace($PreviousDistributionDir) -and -not $Sandbox) {
     Write-FailMsg '-PreviousDistributionDir is only valid with -Sandbox.'
     exit 2
 }
+if (-not [string]::IsNullOrWhiteSpace($PredictionModelDir) -and -not $Sandbox) {
+    Write-FailMsg '-PredictionModelDir is only valid with -Sandbox.'
+    exit 2
+}
+$isItem32 = $TestbenchArgs.Count -gt 0 -and $TestbenchArgs[0] -eq '--item32'
+$isManualInlineApps = $TestbenchArgs.Count -gt 0 -and
+    $TestbenchArgs[0] -eq '--manual-inline-apps'
 $TimeoutSec = Resolve-SandboxTimeoutSec -RequestedTimeoutSec $TimeoutSec `
     -Sandbox:$Sandbox -TestbenchArgs $TestbenchArgs `
     -TimeoutExplicit:$PSBoundParameters.ContainsKey('TimeoutSec')
+if ($Sandbox -and $isItem32 -and [string]::IsNullOrWhiteSpace($PredictionModelDir)) {
+    Write-FailMsg 'Sandbox --item32 requires -PredictionModelDir.'
+    exit 2
+}
+if (-not $Sandbox -and $isManualInlineApps) {
+    Write-FailMsg '--manual-inline-apps is only valid with -Sandbox.'
+    exit 2
+}
+if ($Sandbox -and $isManualInlineApps -and
+    [string]::IsNullOrWhiteSpace($PredictionModelDir)) {
+    Write-FailMsg 'Sandbox --manual-inline-apps requires -PredictionModelDir.'
+    exit 2
+}
+
 $run = New-RunOwnedDirectory -Root (Join-Path $env:TEMP 'nospacekey-gate')
 $outDir = $run.Path
 $outFile = Join-Path $outDir 'gate.out'
@@ -956,7 +1147,8 @@ if ($Sandbox) {
     # エンジン kill も不要（sandbox は使い捨てで、常にクリーンな登録から始まる）。
     try {
         Invoke-SandboxGate -Testbench $Testbench -DistributionDir $DistributionDir `
-            -PreviousDistributionDir $PreviousDistributionDir -SandboxCli:$SandboxCli `
+            -PreviousDistributionDir $PreviousDistributionDir `
+            -PredictionModelDir $PredictionModelDir `
             -TestbenchArgs $TestbenchArgs `
             -TimeoutSec $TimeoutSec -OutFile $outFile
     } catch {

@@ -2491,12 +2491,12 @@ function Get-GateSummary {
 }
 
 function Test-ScenarioIdSet {
-    <#--scenarios の stdout が、全シナリオ ID (1..52 から削除済み 12/16/30/41 を除く) を一度ずつ含むか検証する。#>
+    <#--scenarios の stdout が、全シナリオ ID (1..52 から削除済み 12/16/30 を除く) を一度ずつ含むか検証する。#>
     param(
         [Parameter(Mandatory)]$Summary,
         [int]$First = 1,
         [int]$Last = 52,
-        [int[]]$Excluded = @(12, 16, 30, 41)
+        [int[]]$Excluded = @(12, 16, 30)
     )
     $ids = @($Summary.ScenarioIds)
     $expected = @($First..$Last | Where-Object { $_ -notin $Excluded })

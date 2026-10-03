@@ -51,6 +51,7 @@ param(
     [string]$TestbenchArgs = '--scenarios',
     [int]$TimeoutSec = 240,
     [switch]$DisableApplicationControlForDevelopment,
+    [string]$PredictionModelDir = '',
     [string]$PreviousBinDir = ''
 )
 $ErrorActionPreference = 'Continue'
@@ -274,10 +275,10 @@ function Get-NormalizedGateExit([int]$RawExit, $Counts) {
 }
 
 function Test-ExactScenarioIds($Ids) {
-    # Retired scenario IDs (12, 16, 30, 41) were removed from the canonical set.
-    $retired = @(12, 16, 30, 41)
+    # Retired scenario IDs (12, 16, 30) were removed from the canonical set.
+    $retired = @(12, 16, 30)
     $idsArray = @($Ids)
-    if ($idsArray.Count -ne 48) { return $false }
+    if ($idsArray.Count -ne 49) { return $false }
     $seen = New-Object 'bool[]' 53
     foreach ($id in $idsArray) {
         $n = [int]$id
@@ -293,7 +294,15 @@ function Test-IsScenarioArgs($ArgsList) {
     return $items.Count -gt 0 -and $items[0] -eq '--scenarios'
 }
 
+function Test-IsItem32Args($ArgsList) {
+    $items = @($ArgsList)
+    return $items.Count -gt 0 -and $items[0] -eq '--item32'
+}
 
+function Test-IsManualInlineAppsArgs($ArgsList) {
+    $items = @($ArgsList)
+    return $items.Count -gt 0 -and $items[0] -eq '--manual-inline-apps'
+}
 
 function Reset-SandboxCleanupTrace([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return }
@@ -1178,6 +1187,19 @@ try {
     $targs = @($TestbenchArgs -split '\s+' | Where-Object { $_ })
     $pairCoexistence = $targs.Count -eq 1 -and $targs[0] -eq '--pair-coexistence'
     $versionCleanup = $targs.Count -eq 1 -and $targs[0] -eq '--version-cleanup'
+    if ((Test-IsItem32Args $targs) -or (Test-IsManualInlineAppsArgs $targs)) {
+        if ([string]::IsNullOrWhiteSpace($PredictionModelDir)) {
+            throw 'inline-prediction gate requires the read-only prediction model mapping'
+        }
+        foreach ($required in @(
+            'llm-jp-3-150m-q8_0-c060ca9.gguf', 'tokenizer.json', 'VERIFIED')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $PredictionModelDir $required) -PathType Leaf)) {
+                throw "inline-prediction artifact missing: $required"
+            }
+        }
+        $env:NOSPACEKEY_PREDICTION_MODEL_DIR = $PredictionModelDir
+        Log 'inline-prediction model mapping accepted'
+    }
 
     if ($versionCleanup) {
         $cleanupFixtureRoot = New-SandboxCleanupFixtureRoot
@@ -1637,7 +1659,6 @@ public static class CleanupTipLoader {
     }
 
     # 3) run the gate (SAFE SPAWN - see the header contract).
-    $env:NOSPACEKEY_TEST_SANDBOX = '1'
     if (-not (Test-Path -LiteralPath $testbench -PathType Leaf)) {
         throw "testbench not found: $testbench"
     }
@@ -1743,7 +1764,7 @@ public static class CleanupTipLoader {
     Log ("gate.out rows: parsed={0} failed={1}" -f $rowCounts.Parsed, $rowCounts.Failed)
     $gateExit = Get-NormalizedGateExit -RawExit $gateExit -Counts $rowCounts
     if ((Test-IsScenarioArgs $targs) -and -not (Test-ExactScenarioIds $rowCounts.ScenarioIds)) {
-        Log "scenario ID evidence does not match the canonical set"
+        Log "scenario ID evidence is not exactly 1..51"
         $gateExit = 2
     }
     Log "normalized exit=$gateExit"

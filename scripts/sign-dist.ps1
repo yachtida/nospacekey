@@ -54,6 +54,7 @@ function Fail([string]$t)       { Write-Host "   [FAIL] $t" -ForegroundColor Red
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'release-lib.ps1')
 . (Join-Path $PSScriptRoot 'zenzai-runtime-manifest.ps1')
+. (Join-Path $PSScriptRoot 'prediction-runtime-contract.ps1')
 
 # Resolve the dist dir relative to the repo root unless an absolute path is given.
 if ([System.IO.Path]::IsPathRooted($DistDir)) {
@@ -138,8 +139,10 @@ $OwnPes = @(
     Join-Path $Dist 'NospacekeyEngineHost.exe'
     Join-Path $Dist 'NospacekeyConfig.exe'
     Join-Path $Dist 'NospacekeyUpdateChecker.exe'
+    Join-Path $Dist 'prediction-runtime\llama-server.exe'
 )
 # Bundled llama/ggml DLLs (NOT the ~32 Swift runtime DLLs). Match recursively because the
+# independent prediction runtime lives in its own directory.
 $LlamaDlls = @(Get-ChildItem -Path $Dist -Filter '*.dll' -File -Recurse -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -like 'llama*.dll' -or $_.Name -like 'ggml*.dll' -or $_.Name -eq 'mtmd.dll' } |
     Select-Object -ExpandProperty FullName)
@@ -172,6 +175,10 @@ if (-not $SetupExe) {
         # manifest alone is not an accepted provenance source.
         Assert-ZenzaiVulkanRuntimeBundle -RuntimeDirectory $Dist | Out-Null
         Write-Ok 'Vulkan Zenzai provenance receipt and manifest verified before payload signing'
+        Assert-PredictionRuntimeBundle `
+            -RuntimeDirectory (Join-Path $Dist 'prediction-runtime') `
+            -AllowAdditionalRuntimeFiles | Out-Null
+        Write-Ok 'inline-prediction Vulkan runtime closure verified before payload signing'
     } catch {
         Fail "unsigned Vulkan Zenzai runtime manifest verification failed: $($_.Exception.Message)"
     }
@@ -202,6 +209,10 @@ if (-not $SetupExe) {
         Write-ZenzaiVulkanRuntimeManifest -RuntimeDirectory $Dist -Signed | Out-Null
         Assert-ZenzaiVulkanRuntimeBundle -RuntimeDirectory $Dist | Out-Null
         Write-Ok 'Vulkan Zenzai manifest refreshed after payload signing (receipt retained)'
+        Assert-PredictionRuntimeBundle `
+            -RuntimeDirectory (Join-Path $Dist 'prediction-runtime') `
+            -AllowAdditionalRuntimeFiles | Out-Null
+        Write-Ok 'signed inline-prediction Vulkan runtime closure retained'
         $workspaceVersion = ([regex]::Match(
             (Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'Cargo.toml')),
             '(?m)^version = "([^"]+)"\r?$')).Groups[1].Value

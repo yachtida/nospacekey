@@ -137,7 +137,7 @@ Zenzai を利用できない環境では、通常のかな漢字変換で動作�
 
 `master`・`main`・`beta` への push で、[Windows build and verification](https://github.com/yachtida/nospacekey/actions/workflows/windows.yml) が実行されます。Pull Request と Actions の「Run workflow」からも実行できます。
 
-実行結果の **Artifacts → `nospacekey-windows-x64-<実行番号>-<試行番号>`** をダウンロードして展開すると、インストーラ、`SHA256SUMS.txt`、ソースのコミットを記録した `BUILD-INFO.json` が入っています。成果物の保存期間は30日です。これは開発用証明書で署名したテスト用ビルドで、SmartScreen の警告が出る場合があります。GitHub Releases の公開や自動更新への配信は行いません。
+実行結果の **Artifacts → `nospacekey-windows-x64-<実行番号>-<試行番号>`** をダウンロードして展開すると、インストーラ、`SHA256SUMS.txt`、ソースのコミットを記録した `BUILD-INFO.json` が入っています。成果物の保存期間は30日です。同じ製品バージョンへの上書きを避けるため、CI内でのみバージョンに実行番号・試行番号・コミットを付けます（例：`1.6.0-ci.16.1.abcdef12`）。リポジトリの製品バージョンは変更しません。これは開発用証明書で署名したテスト用ビルドで、SmartScreen の警告が出る場合があります。GitHub Releases の公開や自動更新への配信は行いません。
 
 CI は設定UI・Rust・Swift・実エンジンとのIPCを検証します。続いて別のクリーンな Windows VM に同じインストーラを入れ、配布ファイルのハッシュ、IME登録、キー操作・変換シナリオ、アンインストールを確認します。後段の検証結果は `verify-install` ジョブと `windows-verification-report` に残ります。ビルド成果物があるだけでは検証成功を意味しません。
 

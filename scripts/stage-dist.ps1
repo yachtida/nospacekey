@@ -14,6 +14,7 @@
     *.resources\ (3 dirs: dictionary, EfficientNGram tokenizer, swift-transformers Hub)
     <Swift runtime DLLs>                     <- %LOCALAPPDATA%\Programs\Swift\Runtimes\<newest-semver>\usr\bin
     llama.dll, ggml*.dll + receipt/manifest <- engine-host\vendor\llama\vulkan
+    prediction-runtime\llama-server.exe + DLLs <- pinned upstream llama.cpp
     models\README.txt                        <- Zenzai opt-in note (GGUF user-supplied)
     LICENSE, THIRD-PARTY-NOTICES.md          <- repo root
 
@@ -33,6 +34,7 @@ $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'swift-toolchain.ps1')
 . (Join-Path $PSScriptRoot 'zenzai-runtime-manifest.ps1')
+. (Join-Path $PSScriptRoot 'prediction-runtime-contract.ps1')
 . (Join-Path $PSScriptRoot 'release-lib.ps1')
 
 $RepoRoot   = Split-Path -Parent $PSScriptRoot
@@ -45,6 +47,8 @@ $ZenzaiRuntimeManifestName = (Get-ZenzaiVulkanRuntimeContract).ManifestName
 $ZenzaiRuntimeReceiptName = (Get-ZenzaiVulkanRuntimeContract).ReceiptName
 $ZenzaiBuildAttestationPath = Get-ZenzaiVulkanBuildAttestationPath `
     -BuildDirectory (Join-Path $RepoRoot '.llama-build\build-vulkan-dl')
+$PredictionRuntime = Join-Path $EngineHost 'prediction-runtime'
+$PredictionRuntimeContract = Get-PredictionRuntimeContract
 # newest semver Swift runtime with a complete swiftCore.dll leaf (same pick as
 # with-dev-env.ps1 / find-swift.ps1; do NOT pin a version, or staging would
 # mismatch the toolchain the build actually used).
@@ -154,11 +158,20 @@ if ($Rebuild) {
     if (-not (Test-Path -LiteralPath $relEngine -PathType Leaf)) {
         Die "swift build succeeded but did not produce the engine executable: $relEngine"
     }
+    Step 'build pinned inline-prediction runtime'
+    & (Join-Path $PSScriptRoot 'build-prediction-runtime.ps1') -OutputDir $PredictionRuntime
+    if ($LASTEXITCODE -ne 0) { Die "build-prediction-runtime exit $LASTEXITCODE" }
     Step 'build pinned Vulkan Zenzai runtime'
     & (Join-Path $PSScriptRoot 'build-llama.ps1') -Vulkan
     if ($LASTEXITCODE -ne 0) { Die "build-llama -Vulkan exit $LASTEXITCODE" }
 }
 
+if (-not (Test-Path -LiteralPath $PredictionRuntime -PathType Container)) {
+    $evaluatedRuntime = Join-Path $RepoRoot 'experiments\inline-prediction\.tools\product-runtime'
+    if (Test-Path -LiteralPath $evaluatedRuntime -PathType Container) {
+        $PredictionRuntime = $evaluatedRuntime
+    }
+}
 
 # Recreate dist\ clean. An explicit destination is an isolated audit output and
 # must not already exist; the default dist\ path keeps its historical rebuild
@@ -169,6 +182,7 @@ if ($UsingExplicitDestination -and (Test-Path -LiteralPath $Dist)) {
 if (Test-Path -LiteralPath $Dist) { Remove-Item -LiteralPath $Dist -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $Dist 'models') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $Dist 'prediction-runtime') | Out-Null
 
 function Copy-Required([string]$src, [string]$destName) {
     if (-not (Test-Path $src)) { Die "missing build artifact: $src (run with -Rebuild)" }
@@ -231,6 +245,19 @@ $receiptSource = $zenzaiRuntime.ReceiptPath
 Copy-Item -LiteralPath $receiptSource -Destination (Join-Path $Dist $ZenzaiRuntimeReceiptName) -Force
 Ok "staged exact Vulkan Zenzai runtime ($($llamaDlls.Count) DLLs + receipt + manifest)"
 
+# 4a) Independent llama-server runtime for inline prediction. Fail closed: unlike the optional
+# model, these binaries are part of the application and must exactly match the evaluated revision.
+try {
+    Assert-PredictionRuntimeBundle -RuntimeDirectory $PredictionRuntime | Out-Null
+} catch {
+    Die "inline-prediction Vulkan runtime is incomplete or invalid at ${PredictionRuntime}: $($_.Exception.Message)"
+}
+foreach ($name in $PredictionRuntimeContract.RequiredFiles) {
+    $source = Join-Path $PredictionRuntime $name
+    Copy-Item -LiteralPath $source -Destination (Join-Path $Dist 'prediction-runtime') -Force
+}
+Ok "staged pinned inline-prediction Vulkan runtime ($($PredictionRuntimeContract.Revision))"
+
 # 4b) VC++ OpenMP runtime (vcomp140.dll). ggml-cpu.dll STATICALLY imports it and it is NOT in
 #     the Swift runtime folder, so a clean PC without the VC++ redist lacks it -> NospacekeyEngineHost.exe
 #     fails to start (STATUS_DLL_NOT_FOUND) -> ALL conversion dies (not just Zenzai). App-local
@@ -250,6 +277,22 @@ Stage-VCRedistDll 'vcruntime140.dll'   'the Rust TIP DLL + engine need the MSVC 
 Stage-VCRedistDll 'vcruntime140_1.dll' 'the Rust TIP DLL + engine need the MSVC C runtime (SEH helper).'
 Stage-VCRedistDll 'msvcp140.dll'       'the Rust TIP DLL + engine need the MSVC C++ runtime.'
 
+# llama-server.exe is launched from a subdirectory. Windows resolves app-local dependencies from
+# that executable's directory, so clean machines without the VC++ Redistributable need the same
+# runtime DLLs beside the server as well as beside the first-party executables in dist root.
+foreach ($name in @('vcomp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
+    Copy-Item -LiteralPath (Join-Path $Dist $name) `
+        -Destination (Join-Path $Dist 'prediction-runtime') -Force
+}
+Ok 'staged VC++ runtime beside inline-prediction server'
+try {
+    Assert-PredictionRuntimeBundle `
+        -RuntimeDirectory (Join-Path $Dist 'prediction-runtime') `
+        -AllowAdditionalRuntimeFiles | Out-Null
+} catch {
+    Die "staged inline-prediction Vulkan runtime failed closure verification: $($_.Exception.Message)"
+}
+
 # 5) models\ opt-in note (GGUF is user-supplied, CC-BY-SA-4.0, not bundled).
 $modelsNote = @'
 Place the Zenzai neural model here to enable neural conversion:
@@ -263,14 +306,7 @@ download and place it yourself. Without it, nospacekey uses classic (LOUDS) conv
 Set-Content -Path (Join-Path $Dist 'models\README.txt') -Value $modelsNote -Encoding ascii
 Ok 'staged models\README.txt'
 
-# 6) Embedded mixed-input audit metadata and license docs.
-# Stable branches before mixed-input do not ship this crate. A branch that
-# declares it must supply both notices.
-$hasMixedInput = (Get-Content -Raw (Join-Path $RepoRoot 'Cargo.toml')) -match '"crates/mixed-input"'
-if ($hasMixedInput) {
-    Copy-Required (Join-Path $RepoRoot 'crates\mixed-input\data\manifest.toml') 'mixed-input-manifest.toml'
-    Copy-Required (Join-Path $RepoRoot 'crates\mixed-input\data\README.md') 'MIXED-INPUT-NOTICE.md'
-}
+# 6) license docs.
 foreach ($lic in @('LICENSE', 'THIRD-PARTY-NOTICES.md')) {
     $src = Join-Path $RepoRoot $lic
     if (Test-Path $src) { Copy-Item $src (Join-Path $Dist $lic) -Force; Ok "staged $lic" }
@@ -290,6 +326,10 @@ $required = @(
     (Join-Path $Dist 'models\README.txt'),
     (Join-Path $Dist $ZenzaiRuntimeReceiptName),
     (Join-Path $Dist $ZenzaiRuntimeManifestName),
+    (Join-Path $Dist 'prediction-runtime\llama-server.exe'),
+    (Join-Path $Dist 'prediction-runtime\ggml-vulkan.dll'),
+    (Join-Path $Dist 'prediction-runtime\REVISION'),
+    (Join-Path $Dist 'prediction-runtime\BUILD-RECEIPT.txt'),
     # VC++ runtime DLLs the PEs statically import (NOT guaranteed on a clean PC).
     # vcomp140 = ggml-cpu OpenMP; vcruntime140 + vcruntime140_1 + msvcp140 = MSVC CRT for the Rust DLL + engine.
     (Join-Path $Dist 'vcomp140.dll'),
@@ -297,9 +337,6 @@ $required = @(
     (Join-Path $Dist 'vcruntime140_1.dll'),
     (Join-Path $Dist 'msvcp140.dll')
 )
-if ($hasMixedInput) {
-    $required += (Join-Path $Dist 'mixed-input-manifest.toml'), (Join-Path $Dist 'MIXED-INPUT-NOTICE.md')
-}
 foreach ($r in $Resources) { $required += (Join-Path $Dist $r) }
 $required += @($llamaDlls | ForEach-Object { Join-Path $Dist $_.Name })
 $missing = $required | Where-Object { -not (Test-Path $_) }

@@ -41,9 +41,9 @@ rustup toolchain install 1.96.0 --profile minimal --no-self-update
 $swift = Get-Installer 'swift-6.3.2.exe' 'https://download.swift.org/swift-6.3.2-release/windows10/swift-6.3.2-RELEASE/swift-6.3.2-RELEASE-windows10.exe'
 Install-Tool $swift @('/quiet', '/norestart', '/log', (Join-Path $downloads 'swift-install.log'))
 
-$vulkan = Get-Installer 'VulkanSDK-1.3.296.0.exe' 'https://sdk.lunarg.com/sdk/download/1.3.296.0/windows/VulkanSDK-1.3.296.0-Installer.exe'
-Install-Tool $vulkan @('--root', 'C:\VulkanSDK\1.3.296.0', '--accept-licenses', '--default-answer', '--confirm-command', 'install')
-$sdk = 'C:\VulkanSDK\1.3.296.0'
+$vulkan = Get-Installer 'VulkanSDK-1.4.363.0.exe' 'https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/vulkan-sdk.exe'
+Install-Tool $vulkan @('--root', 'C:\VulkanSDK\1.4.363.0', '--accept-licenses', '--default-answer', '--confirm-command', 'install')
+$sdk = 'C:\VulkanSDK\1.4.363.0'
 foreach ($file in @('Include\vulkan\vulkan.h', 'Lib\vulkan-1.lib', 'Bin\glslc.exe')) {
     if (-not (Test-Path (Join-Path $sdk $file))) { throw "Vulkan SDK is missing $file" }
 }

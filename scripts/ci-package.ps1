@@ -39,6 +39,7 @@ $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash
 New-Sha256SumsLine $hash "$stem.exe" | Set-Content (Join-Path $download 'SHA256SUMS.txt') -Encoding ascii
 $build = [ordered]@{
     version = $version
+    source_version = $env:NOSPACEKEY_CI_BASE_VERSION
     commit = $sha
     ref = $env:GITHUB_REF
     run_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"

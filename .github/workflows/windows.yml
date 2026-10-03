@@ -26,6 +26,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: 1.96.0
       CARGO_TERM_COLOR: always
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -36,31 +37,53 @@ jobs:
           cache: npm
           cache-dependency-path: crates/config/frontend/package-lock.json
       - name: Cache toolchain installers
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: installer-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .ci-downloads
           key: windows-2022-installers-${{ hashFiles('scripts/ci-setup.ps1') }}
       - name: Install Windows build tools
         run: ./scripts/ci-setup.ps1
+      - name: Save toolchain installers
+        if: steps.installer-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .ci-downloads
+          key: ${{ steps.installer-cache.outputs.cache-primary-key }}
       - name: Cache Vulkan runtime build
         id: runtime-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             .llama-build
             engine-host/vendor/llama/vulkan
-          key: windows-2022-vulkan-${{ env.ImageVersion }}-${{ hashFiles('scripts/build-llama.ps1', 'scripts/zenzai-runtime-manifest.ps1', 'scripts/ci-setup.ps1', 'patches/*.patch') }}
+            engine-host/prediction-runtime
+          key: windows-2022-vulkan-${{ env.ImageVersion }}-${{ hashFiles('scripts/build-llama.ps1', 'scripts/zenzai-runtime-manifest.ps1', 'scripts/ci-setup.ps1', 'scripts/build-prediction-runtime.ps1', 'scripts/prediction-runtime-contract.ps1', 'patches/*.patch') }}
       - name: Build Vulkan runtime
         if: steps.runtime-cache.outputs.cache-hit != 'true'
         run: |
           & ./scripts/with-dev-env.ps1 @('pwsh', '-NoProfile', '-File', 'scripts/build-llama.ps1', '-Vulkan')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/with-dev-env.ps1 @('pwsh', '-NoProfile', '-File', 'scripts/build-prediction-runtime.ps1', '-SourceDir', '.llama-build/prediction-source')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Save Vulkan runtime build
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .llama-build
+            engine-host/vendor/llama/vulkan
+            engine-host/prediction-runtime
+          key: ${{ steps.runtime-cache.outputs.cache-primary-key }}
+      - name: Assign an installable CI version
+        run: ./scripts/ci-version.ps1
       - name: Build and test settings UI
         run: |
           ./scripts/build-config-ui.ps1
           npm --prefix crates/config/frontend test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test Rust workspace
+        timeout-minutes: 15
         run: |
           & ./scripts/with-dev-env.ps1 @('cargo', 'test', '--locked', '--workspace')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -74,6 +97,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } finally { Pop-Location }
       - name: Test Swift engine
+        timeout-minutes: 20
         run: |
           Push-Location engine-host
           try {
@@ -81,6 +105,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } finally { Pop-Location }
       - name: Stage runtime and test real IPC
+        timeout-minutes: 10
         run: |
           ./scripts/stage-dist.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

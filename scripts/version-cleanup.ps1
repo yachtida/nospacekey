@@ -667,10 +667,8 @@ function Get-AllowedAceSignatures($Dacl) {
 }
 
 function Test-ExactTaskArtifactAcl($Acl, [string[]]$AcceptedSddls) {
-    $descriptor = if ($Acl -is [Security.AccessControl.RawSecurityDescriptor]) { $Acl } else {
-        $binary = $Acl.GetSecurityDescriptorBinaryForm()
-        [Security.AccessControl.RawSecurityDescriptor]::new($binary, 0)
-    }
+    $binary = $Acl.GetSecurityDescriptorBinaryForm()
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($binary, 0)
     $requiredControl = [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent -bor
         [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected
     if (($descriptor.ControlFlags -band $requiredControl) -ne $requiredControl -or
@@ -3710,8 +3708,10 @@ if ($FixtureValidateTaskArtifactAclSddl) {
         if (-not $TestFixture -or
             [string]::IsNullOrWhiteSpace($FixtureTaskGateAclSddl) -or
             [string]::IsNullOrWhiteSpace($FixtureTaskJournalAclSddl)) { exit 2 }
-        $gateAcl = [Security.AccessControl.RawSecurityDescriptor]::new($FixtureTaskGateAclSddl)
-        $journalAcl = [Security.AccessControl.RawSecurityDescriptor]::new($FixtureTaskJournalAclSddl)
+        $gateAcl = [Security.AccessControl.FileSecurity]::new()
+        $gateAcl.SetSecurityDescriptorSddlForm($FixtureTaskGateAclSddl)
+        $journalAcl = [Security.AccessControl.DirectorySecurity]::new()
+        $journalAcl.SetSecurityDescriptorSddlForm($FixtureTaskJournalAclSddl)
         if (Test-TaskTransactionArtifactAclObjects $gateAcl $journalAcl) { exit 0 }
     } catch { }
     exit 2
