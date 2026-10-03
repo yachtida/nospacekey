@@ -1,0 +1,23 @@
+# name	artifact	verdict	sddl
+generic gate	gate	accept	O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)
+stored gate	gate	accept	O:BAG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)
+reordered gate	gate	accept	O:BAG:SYD:PAI(A;;FR;;;BU)(A;;FA;;;BA)(A;;FA;;;SY)
+numeric gate	gate	accept	O:S-1-5-32-544G:S-1-5-18D:P(A;;0x1f01ff;;;SY)(A;;FA;;;BA)(A;;0x120089;;;BU)
+generic journal	journal	accept	O:BAG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;BU)
+stored journal	journal	accept	O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;FR;;;BU)(A;OICIIO;GR;;;BU)
+reordered journal	journal	accept	O:BAG:SYD:PAI(A;OICIIO;GR;;;BU)(A;;FR;;;BU)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)
+wrong owner	gate	reject	O:BUG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)
+wrong group	gate	reject	O:BAG:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)
+unprotected	gate	reject	O:BAG:SYD:AI(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)
+null dacl	gate	reject	O:BAG:SYD:PNO_ACCESS_CONTROL
+empty dacl	gate	reject	O:BAG:SYD:P
+users write	gate	reject	O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGW;;;BU)
+extra principal	gate	reject	O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)(A;;FR;;;WD)
+duplicate ace	gate	reject	O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)(A;;GR;;;BU)
+deny ace	gate	reject	O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(D;;GR;;;BU)
+inherited ace	gate	reject	O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;ID;GR;;;BU)
+missing admin	gate	reject	O:BAG:SYD:P(A;;FA;;;SY)(A;;GR;;;BU)
+inherit write	journal	reject	O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;FR;;;BU)(A;OICIIO;GRGW;;;BU)
+missing inheritance	journal	reject	O:BAG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;FR;;;BU)
+unexpected inherit flag	journal	reject	O:BAG:SYD:P(A;OICINP;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;BU)
+callback ace	gate	reject	O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(XA;;GR;;;BU)

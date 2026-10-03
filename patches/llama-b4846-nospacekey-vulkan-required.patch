@@ -1,0 +1,652 @@
+diff --git a/ggml/src/ggml-backend-reg.cpp b/ggml/src/ggml-backend-reg.cpp
+index d0d68be..21ca645 100644
+--- a/ggml/src/ggml-backend-reg.cpp
++++ b/ggml/src/ggml-backend-reg.cpp
+@@ -101,7 +101,13 @@ static dl_handle * dl_load_library(const fs::path & path) {
+     DWORD old_mode = SetErrorMode(SEM_FAILCRITICALERRORS);
+     SetErrorMode(old_mode | SEM_FAILCRITICALERRORS);
+ 
+-    HMODULE handle = LoadLibraryW(path.wstring().c_str());
++    HMODULE handle;
++    if (path.is_absolute()) {
++        handle = LoadLibraryExW(path.wstring().c_str(), nullptr,
++                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
++    } else {
++        handle = LoadLibraryW(path.wstring().c_str());
++    }
+ 
+     SetErrorMode(old_mode);
+ 
+@@ -559,6 +565,11 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
+     bool silent = false;
+ #endif
+ 
++    if (dir_path != nullptr) {
++        ggml_backend_load_best("vulkan", silent, dir_path);
++        ggml_backend_load_best("cpu", silent, dir_path);
++        return;
++    }
+     ggml_backend_load_best("blas", silent, dir_path);
+     ggml_backend_load_best("cann", silent, dir_path);
+     ggml_backend_load_best("cuda", silent, dir_path);
+@@ -573,7 +584,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
+     ggml_backend_load_best("cpu", silent, dir_path);
+     // check the environment variable GGML_BACKEND_PATH to load an out-of-tree backend
+     const char * backend_path = std::getenv("GGML_BACKEND_PATH");
+-    if (backend_path) {
++    if (dir_path == nullptr && backend_path) {
+         ggml_backend_load(backend_path);
+     }
+ }
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index e1b02e4..373dd5a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -10,6 +10,8 @@ add_library(llama
+             ../include/llama.h
+             llama.cpp
+             llama-adapter.cpp
++            llama-nospacekey-runtime.cpp
++            llama-nospacekey-runtime.h
+             llama-arch.cpp
+             llama-batch.cpp
+             llama-chat.cpp
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 1da4eae..b030687 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1,5 +1,7 @@
+ #include "llama-model.h"
+ 
++#include "llama-nospacekey-runtime.h"
++
+ #include "llama-impl.h"
+ #include "llama-mmap.h"
+ #include "llama-model-loader.h"
+@@ -1478,6 +1478,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+             if (ml.use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+                 auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                 buft = ggml_backend_dev_buffer_type(cpu_dev);
+             }
++            if ((info.layer == LLM_TENSOR_LAYER_REPEATING || info.layer == LLM_TENSOR_LAYER_OUTPUT) &&
++                !nsk_llama_runtime::gpu_weight_buffer_allowed(buft)) {
++                throw std::runtime_error("GPU-required model tensor fallback");
++            }
+
+             if (buft != buft_list->front().second) {
+@@ -3810,6 +3816,8 @@ struct llama_model_params llama_model_default_params() {
+     result.n_gpu_layers = 999;
+ #endif
+ 
++    nsk_llama_runtime::apply_model_defaults(result);
++
+     return result;
+ }
+ 
+diff --git a/src/llama-nospacekey-runtime.cpp b/src/llama-nospacekey-runtime.cpp
+new file mode 100644
+index 0000000..722d56c
+--- /dev/null
++++ b/src/llama-nospacekey-runtime.cpp
+@@ -0,0 +1,393 @@
++#include "llama-nospacekey-runtime.h"
++
++#include "ggml-backend.h"
++
++#include <cctype>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <limits>
++#include <mutex>
++#include <string>
++
++namespace {
++
++namespace fs = std::filesystem;
++
++constexpr uint32_t kStateUnconfigured = NSK_LLAMA_RUNTIME_STATE_UNCONFIGURED;
++constexpr uint32_t kStateGpuActive = NSK_LLAMA_RUNTIME_STATE_GPU_ACTIVE;
++constexpr uint32_t kStateFailed = NSK_LLAMA_RUNTIME_STATE_FAILED;
++
++constexpr uint32_t kFailureNone = NSK_LLAMA_RUNTIME_FAILURE_NONE;
++constexpr uint32_t kFailureInvalidRuntimeDirectory = NSK_LLAMA_RUNTIME_FAILURE_INVALID_RUNTIME_DIRECTORY;
++constexpr uint32_t kFailureBackendPathRejected = NSK_LLAMA_RUNTIME_FAILURE_BACKEND_PATH_REJECTED;
++constexpr uint32_t kFailureBackendUnavailable = NSK_LLAMA_RUNTIME_FAILURE_BACKEND_UNAVAILABLE;
++constexpr uint32_t kFailureGpuUnavailable = NSK_LLAMA_RUNTIME_FAILURE_GPU_UNAVAILABLE;
++constexpr uint32_t kFailureModelLoad = NSK_LLAMA_RUNTIME_FAILURE_MODEL_LOAD;
++constexpr uint32_t kFailureContextLoad = NSK_LLAMA_RUNTIME_FAILURE_CONTEXT_LOAD;
++constexpr uint32_t kFailureDecode = NSK_LLAMA_RUNTIME_FAILURE_DECODE;
++
++constexpr int32_t kMaxGpuLayers = (std::numeric_limits<int32_t>::max)();
++constexpr size_t kBackendCapacity = NSK_LLAMA_RUNTIME_BACKEND_CAPACITY;
++constexpr size_t kDeviceCapacity = NSK_LLAMA_RUNTIME_DEVICE_CAPACITY;
++
++struct runtime_state {
++    std::mutex mutex;
++    uint32_t state = kStateUnconfigured;
++    uint32_t failure = kFailureNone;
++    uint64_t generation = 0;
++    uint64_t model_load_attempts = 0;
++    uint64_t context_init_attempts = 0;
++    uint64_t decode_attempts = 0;
++    bool registry_owned = false;
++    bool registry_load_started = false;
++    std::string runtime_directory;
++    char backend[kBackendCapacity] = {};
++    char device[kDeviceCapacity] = {};
++};
++
++runtime_state & state() {
++    static runtime_state value;
++    return value;
++}
++
++bool is_backend(const ggml_backend_reg_t reg, const char * expected) {
++    if (reg == nullptr) {
++        return false;
++    }
++    const char * name = ggml_backend_reg_name(reg);
++    if (name == nullptr) {
++        return false;
++    }
++    std::string normalized(name);
++    for (char & character : normalized) {
++        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
++    }
++    return normalized == expected;
++}
++
++bool is_vulkan(const ggml_backend_reg_t reg) {
++    return is_backend(reg, "vulkan");
++}
++
++bool is_cpu(const ggml_backend_reg_t reg) {
++    return is_backend(reg, "cpu");
++}
++
++void clear_identity(runtime_state & current) {
++    std::memset(current.backend, 0, sizeof(current.backend));
++    std::memset(current.device, 0, sizeof(current.device));
++}
++
++void copy_identity(char * destination, size_t capacity, const char * source) {
++    std::memset(destination, 0, capacity);
++    if (source == nullptr || capacity == 0) {
++        return;
++    }
++    size_t written = 0;
++    for (; source[written] != '\0' && written + 1 < capacity; ++written) {
++        const unsigned char value = static_cast<unsigned char>(source[written]);
++        destination[written] = (value < 0x20 || value == '/' || value == '\\' || value == ':')
++            ? ' '
++            : static_cast<char>(value);
++    }
++    destination[written] = '\0';
++}
++
++void snapshot_unlocked(const runtime_state & current, struct nsk_llama_runtime_status * out_status) {
++    if (out_status == nullptr) {
++        return;
++    }
++    std::memset(out_status, 0, sizeof(*out_status));
++    out_status->abi_version = NSK_LLAMA_RUNTIME_ABI_VERSION;
++    out_status->struct_size = static_cast<uint32_t>(sizeof(*out_status));
++    out_status->state = current.state;
++    out_status->failure = current.failure;
++    out_status->generation = current.generation;
++    out_status->model_load_attempts = current.model_load_attempts;
++    out_status->context_init_attempts = current.context_init_attempts;
++    out_status->decode_attempts = current.decode_attempts;
++    std::memcpy(out_status->backend, current.backend, sizeof(current.backend));
++    std::memcpy(out_status->device, current.device, sizeof(current.device));
++}
++
++void latch_unlocked(runtime_state & current, uint32_t failure) {
++    if (current.state != kStateGpuActive) {
++        return;
++    }
++    current.state = kStateFailed;
++    current.failure = failure;
++    clear_identity(current);
++}
++
++bool gpu_available_unlocked() {
++    for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
++        const ggml_backend_dev_t device = ggml_backend_dev_get(index);
++        if (device == nullptr || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
++            continue;
++        }
++        if (is_vulkan(ggml_backend_dev_backend_reg(device))) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool is_failed(const runtime_state & current) {
++    return current.state == kStateFailed;
++}
++
++}
++
++namespace nsk_llama_runtime {
++
++void apply_model_defaults(struct llama_model_params & params) {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++    if (current.state == kStateGpuActive) {
++        params.n_gpu_layers = kMaxGpuLayers;
++    }
++}
++
++void apply_context_defaults(struct llama_context_params & params) {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++    if (current.state == kStateGpuActive) {
++        params.offload_kqv = true;
++    }
++}
++
++bool before_model_load(struct llama_model_params & params) {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++    if (current.state == kStateUnconfigured) {
++        return true;
++    }
++    if (is_failed(current)) {
++        return false;
++    }
++    if (!gpu_available_unlocked()) {
++        latch_unlocked(current, kFailureGpuUnavailable);
++        return false;
++    }
++    params.n_gpu_layers = kMaxGpuLayers;
++    ++current.model_load_attempts;
++    return true;
++}
++
++bool gpu_required() {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++    return current.state == kStateGpuActive;
++}
++
++bool gpu_weight_buffer_allowed(ggml_backend_buffer_type_t buft) {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++    if (current.state != kStateGpuActive) {
++        return true;
++    }
++    const ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
++    return device != nullptr &&
++        ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
++        is_vulkan(ggml_backend_dev_backend_reg(device));
++}
++
++void model_load_failed() {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++    latch_unlocked(current, kFailureModelLoad);
++}
++
++bool before_context_init(const struct llama_model * model) {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++    if (current.state == kStateUnconfigured) {
++        return true;
++    }
++    if (is_failed(current)) {
++        return false;
++    }
++    if (model == nullptr) {
++        latch_unlocked(current, kFailureContextLoad);
++        return false;
++    }
++    if (!gpu_available_unlocked()) {
++        latch_unlocked(current, kFailureGpuUnavailable);
++        return false;
++    }
++    ++current.context_init_attempts;
++    return true;
++}
++
++bool before_decode() {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++    if (current.state == kStateUnconfigured) {
++        return true;
++    }
++    if (is_failed(current)) {
++        return false;
++    }
++    ++current.decode_attempts;
++    return true;
++}
++
++void context_load_failed() {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++    latch_unlocked(current, kFailureContextLoad);
++}
++
++void decode_failed() {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++    latch_unlocked(current, kFailureDecode);
++}
++
++context_attempt::context_attempt()
++    : active_([&]() {
++        auto & current = state();
++        std::lock_guard<std::mutex> lock(current.mutex);
++        return current.state == kStateGpuActive;
++    }()) {
++}
++
++context_attempt::~context_attempt() {
++    if (active_ && !succeeded_) {
++        context_load_failed();
++    }
++}
++
++void context_attempt::succeed() {
++    succeeded_ = true;
++}
++
++}
++
++extern "C" LLAMA_API int32_t nsk_llama_runtime_configure(
++        const char * trusted_runtime_directory,
++        uint32_t explicit_retry,
++        struct nsk_llama_runtime_status * out_status) {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++
++    if ((current.state == kStateFailed || current.state == kStateGpuActive) && explicit_retry == 0) {
++        snapshot_unlocked(current, out_status);
++        return current.state == kStateGpuActive ? INT32_C(0) : INT32_C(-1);
++    }
++
++    ++current.generation;
++    current.state = kStateFailed;
++    current.failure = kFailureInvalidRuntimeDirectory;
++    clear_identity(current);
++
++    if (trusted_runtime_directory == nullptr || trusted_runtime_directory[0] == '\0') {
++        snapshot_unlocked(current, out_status);
++        return INT32_C(-1);
++    }
++
++    fs::path input_path;
++    fs::path canonical_path;
++    try {
++        input_path = fs::u8path(trusted_runtime_directory);
++        if (!input_path.is_absolute()) {
++            snapshot_unlocked(current, out_status);
++            return INT32_C(-1);
++        }
++        std::error_code error;
++        canonical_path = fs::canonical(input_path, error);
++        if (error || !fs::is_directory(canonical_path, error) || error) {
++            snapshot_unlocked(current, out_status);
++            return INT32_C(-1);
++        }
++    } catch (...) {
++        snapshot_unlocked(current, out_status);
++        return INT32_C(-1);
++    }
++
++    if (std::getenv("GGML_BACKEND_PATH") != nullptr) {
++        current.failure = kFailureBackendPathRejected;
++        snapshot_unlocked(current, out_status);
++        return INT32_C(-1);
++    }
++
++    const std::string canonical_utf8 = canonical_path.u8string();
++    std::error_code artifact_error;
++    const bool has_vulkan_artifact = fs::is_regular_file(canonical_path / "ggml-vulkan.dll", artifact_error) && !artifact_error;
++    artifact_error.clear();
++    const bool has_cpu_artifact = fs::is_regular_file(canonical_path / "ggml-cpu.dll", artifact_error) && !artifact_error;
++    if (!has_vulkan_artifact || !has_cpu_artifact) {
++        current.failure = kFailureBackendUnavailable;
++        snapshot_unlocked(current, out_status);
++        return INT32_C(-1);
++    }
++
++    const bool existing_vulkan = ggml_backend_reg_by_name("VULKAN") != nullptr;
++    const bool existing_cpu = ggml_backend_reg_by_name("CPU") != nullptr;
++    if ((existing_vulkan || existing_cpu) && !current.registry_owned && !current.registry_load_started) {
++        current.failure = kFailureBackendUnavailable;
++        snapshot_unlocked(current, out_status);
++        return INT32_C(-1);
++    }
++    if (current.registry_load_started && current.runtime_directory != canonical_utf8) {
++        current.failure = kFailureBackendUnavailable;
++        snapshot_unlocked(current, out_status);
++        return INT32_C(-1);
++    }
++    ggml_backend_reg_t vulkan = ggml_backend_reg_by_name("VULKAN");
++    ggml_backend_reg_t cpu = ggml_backend_reg_by_name("CPU");
++    const std::string vulkan_path = (canonical_path / "ggml-vulkan.dll").u8string();
++    const std::string cpu_path = (canonical_path / "ggml-cpu.dll").u8string();
++    if (vulkan == nullptr) {
++        vulkan = ggml_backend_load(vulkan_path.c_str());
++        if (vulkan != nullptr) {
++            current.registry_load_started = true;
++            current.runtime_directory = canonical_utf8;
++        }
++    }
++    if (cpu == nullptr) {
++        cpu = ggml_backend_load(cpu_path.c_str());
++        if (cpu != nullptr) {
++            current.registry_load_started = true;
++            current.runtime_directory = canonical_utf8;
++        }
++    }
++
++    if (!is_vulkan(vulkan) || !is_cpu(cpu)) {
++        current.failure = kFailureBackendUnavailable;
++        snapshot_unlocked(current, out_status);
++        return INT32_C(-1);
++    }
++    current.registry_owned = true;
++
++    ggml_backend_dev_t selected = nullptr;
++    for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
++        const ggml_backend_dev_t device = ggml_backend_dev_get(index);
++        if (device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
++            is_vulkan(ggml_backend_dev_backend_reg(device))) {
++            selected = device;
++            break;
++        }
++    }
++    if (selected == nullptr) {
++        current.failure = kFailureGpuUnavailable;
++        snapshot_unlocked(current, out_status);
++        return INT32_C(-1);
++    }
++
++    current.state = kStateGpuActive;
++    current.failure = kFailureNone;
++    copy_identity(current.backend, sizeof(current.backend), ggml_backend_reg_name(vulkan));
++    copy_identity(current.device, sizeof(current.device), ggml_backend_dev_description(selected));
++    snapshot_unlocked(current, out_status);
++    return INT32_C(0);
++}
++
++extern "C" LLAMA_API int32_t nsk_llama_runtime_status(struct nsk_llama_runtime_status * out_status) {
++    auto & current = state();
++    std::lock_guard<std::mutex> lock(current.mutex);
++    snapshot_unlocked(current, out_status);
++    return out_status == nullptr ? INT32_C(-1) : INT32_C(0);
++}
+diff --git a/src/llama-nospacekey-runtime.h b/src/llama-nospacekey-runtime.h
+new file mode 100644
+index 0000000..871cc06
+--- /dev/null
++++ b/src/llama-nospacekey-runtime.h
+@@ -0,0 +1,71 @@
++#ifndef LLAMA_NOSPACEKEY_RUNTIME_H
++#define LLAMA_NOSPACEKEY_RUNTIME_H
++
++#include "llama.h"
++
++#include <cstdint>
++
++/* Keep this mirror local to the pinned source so the DLL has no repository include dependency. */
++#define NSK_LLAMA_RUNTIME_ABI_VERSION UINT32_C(1)
++#define NSK_LLAMA_RUNTIME_STATE_UNCONFIGURED UINT32_C(0)
++#define NSK_LLAMA_RUNTIME_STATE_GPU_ACTIVE UINT32_C(1)
++#define NSK_LLAMA_RUNTIME_STATE_FAILED UINT32_C(2)
++#define NSK_LLAMA_RUNTIME_FAILURE_NONE UINT32_C(0)
++#define NSK_LLAMA_RUNTIME_FAILURE_INVALID_RUNTIME_DIRECTORY UINT32_C(1)
++#define NSK_LLAMA_RUNTIME_FAILURE_BACKEND_PATH_REJECTED UINT32_C(2)
++#define NSK_LLAMA_RUNTIME_FAILURE_BACKEND_UNAVAILABLE UINT32_C(3)
++#define NSK_LLAMA_RUNTIME_FAILURE_GPU_UNAVAILABLE UINT32_C(4)
++#define NSK_LLAMA_RUNTIME_FAILURE_MODEL_LOAD UINT32_C(5)
++#define NSK_LLAMA_RUNTIME_FAILURE_CONTEXT_LOAD UINT32_C(6)
++#define NSK_LLAMA_RUNTIME_FAILURE_DECODE UINT32_C(7)
++#define NSK_LLAMA_RUNTIME_BACKEND_CAPACITY UINT32_C(32)
++#define NSK_LLAMA_RUNTIME_DEVICE_CAPACITY UINT32_C(128)
++
++struct nsk_llama_runtime_status {
++    uint32_t abi_version;
++    uint32_t struct_size;
++    uint32_t state;
++    uint32_t failure;
++    uint64_t generation;
++    uint64_t model_load_attempts;
++    uint64_t context_init_attempts;
++    uint64_t decode_attempts;
++    char backend[NSK_LLAMA_RUNTIME_BACKEND_CAPACITY];
++    char device[NSK_LLAMA_RUNTIME_DEVICE_CAPACITY];
++};
++
++namespace nsk_llama_runtime {
++
++void apply_model_defaults(struct llama_model_params & params);
++void apply_context_defaults(struct llama_context_params & params);
++bool before_model_load(struct llama_model_params & params);
++bool gpu_required();
++bool gpu_weight_buffer_allowed(ggml_backend_buffer_type_t buft);
++void model_load_failed();
++bool before_context_init(const struct llama_model * model);
++bool before_decode();
++void context_load_failed();
++void decode_failed();
++
++class context_attempt {
++public:
++    context_attempt();
++    ~context_attempt();
++
++    void succeed();
++
++private:
++    bool active_ = false;
++    bool succeeded_ = false;
++};
++
++}
++
++extern "C" LLAMA_API int32_t nsk_llama_runtime_configure(
++    const char * trusted_runtime_directory,
++    uint32_t explicit_retry,
++    struct nsk_llama_runtime_status * out_status);
++
++extern "C" LLAMA_API int32_t nsk_llama_runtime_status(struct nsk_llama_runtime_status * out_status);
++
++#endif
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 607f278..b117000 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-impl.h"
++#include "llama-nospacekey-runtime.h"
+ 
+ #include "llama-chat.h"
+ #include "llama-mmap.h"
+@@ -9363,6 +9364,7 @@ struct llama_context_params llama_context_default_params() {
+         /*.abort_callback_data         =*/ nullptr,
+     };
+ 
++    nsk_llama_runtime::apply_context_defaults(result);
+     return result;
+ }
+ 
+@@ -9525,28 +9527,48 @@ struct llama_model * llama_load_model_from_file(
+ struct llama_model * llama_model_load_from_file(
+         const char * path_model,
+         struct llama_model_params params) {
++    if (!nsk_llama_runtime::before_model_load(params)) {
++        return nullptr;
++    }
+     std::vector<std::string> splits = {};
+-    return llama_model_load_from_file_impl(path_model, splits, params);
++    struct llama_model * model = llama_model_load_from_file_impl(path_model, splits, params);
++    if (model == nullptr) {
++        nsk_llama_runtime::model_load_failed();
++    }
++    return model;
+ }
+ 
+ struct llama_model * llama_model_load_from_splits(
+         const char ** paths,
+         size_t n_paths,
+         struct llama_model_params params) {
++    if (!nsk_llama_runtime::before_model_load(params)) {
++        return nullptr;
++    }
+     std::vector<std::string> splits;
+     if (n_paths == 0) {
+         LLAMA_LOG_ERROR("%s: list of splits is empty\n", __func__);
++        nsk_llama_runtime::model_load_failed();
+         return nullptr;
+     }
+     for (size_t i = 0; i < n_paths; ++i) {
+         splits.push_back(paths[i]);
+     }
+-    return llama_model_load_from_file_impl(splits.front(), splits, params);
++    struct llama_model * model = llama_model_load_from_file_impl(splits.front(), splits, params);
++    if (model == nullptr) {
++        nsk_llama_runtime::model_load_failed();
++    }
++    return model;
+ }
+ 
+ struct llama_context * llama_init_from_model(
+                  struct llama_model * model,
+         struct llama_context_params   params) {
++    nsk_llama_runtime::apply_context_defaults(params);
++    if (!nsk_llama_runtime::before_context_init(model)) {
++        return nullptr;
++    }
++    nsk_llama_runtime::context_attempt context_attempt;
+ 
+     if (!model) {
+         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
+@@ -9892,6 +9914,7 @@ struct llama_context * llama_init_from_model(
+         }
+     }
+ 
++    context_attempt.succeed();
+     return ctx;
+ }
+ 
+@@ -9990,9 +10013,13 @@ int32_t llama_encode(
+ int32_t llama_decode(
+         struct llama_context * ctx,
+           struct llama_batch   batch) {
++    if (!nsk_llama_runtime::before_decode()) {
++        return -1;
++    }
+     const int ret = llama_decode_impl(*ctx, batch);
+     if (ret != 0) {
+         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
++        nsk_llama_runtime::decode_failed();
+     }
+ 
+     return ret;

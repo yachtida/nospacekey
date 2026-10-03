@@ -426,6 +426,10 @@ fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
 }
 
 fn engine_build_dir() -> std::path::PathBuf {
+    // CI validates the staged release engine rather than a developer debug build.
+    if let Some(path) = std::env::var_os("NOSPACEKEY_TEST_ENGINE_DIR") {
+        return std::path::PathBuf::from(path);
+    }
     // CARGO_MANIFEST_DIR = <workspace>/crates/ipc
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
