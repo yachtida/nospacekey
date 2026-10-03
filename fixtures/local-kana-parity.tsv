@@ -1,0 +1,28 @@
+# AzooKeyKanaKanjiConverter revision 80b8204f1cdfb364bb2ed355cf52c7ebb2519a0c
+# name<TAB>operations (K=roman2kana, D=direct, B=surface backspace)<TAB>reading after each event, separated by |.
+completed_roman	K:nihongo	n|に|にh|にほ|にほn|にほんg|にほんご
+unfinished_consonant	K:k	k
+unfinished_digraph	K:ky	k|ky
+unfinished_n	K:n	n
+concrete_nn	K:nn	n|ん
+nni_pinned_surface_and_backspace	K:nni,B	n|ん|んい|ん
+konni_pinned_surface_and_backspace	K:konni,B	k|こ|こn|こん|こんい|こん
+nny_resolves_nn_before_next_input	K:nny	n|ん|んy
+nna_after_resolved_nn	K:nna	n|ん|んあ
+backspace_resolved_nn	D:X,K:nn,B	X|Xn|Xん|X
+incomplete_ny	K:ny	n|ny
+sokuon	K:gakkou	g|が|がk|がっk|がっこ|がっこう
+small_kana	K:xya	x|xy|ゃ
+punctuation	K:n。	n|ん。
+direct_segment	K:kyou,D:A	k|ky|きょ|きょう|きょうA
+backspace_sha_then_next	K:sha,B,K:a	s|sh|しゃ|し|しあ
+backspace_kaki_then_next	K:kaki,B,K:o	k|か|かk|かき|か|かお
+backspace_incomplete_ky_then_a	K:ky,B,K:a	k|ky|k|か
+backspace_incomplete_sh_then_a	K:sh,B,K:a	s|sh|s|さ
+backspace_incomplete_xy_then_a	K:xy,B,K:a	x|xy|x|ぁ
+backspace_incomplete_ky_then_o	K:ky,B,K:o	k|ky|k|こ
+# backspace_incomplete_ny_then_a は意図的に共有から外している — TIP は MS IME 準拠で
+# BS 後の n を再結合させる(n|ny|n|な)、エンジン(AzooKey)は n を凍結する(n|ny|n|nあ)。
+# エンジン側の挙動は LocalKanaParityFixtureTests、TIP 側は local_kana_composer の単体テストで固定。
+# 方針: docs/design/2026-09-01-alive-n-after-backspace-msime.md
+backspace_direct_grapheme	D:xe,D:́,B	x|xe|xé|x

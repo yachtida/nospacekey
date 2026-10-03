@@ -133,6 +133,18 @@ Zenzai を利用できない環境では、通常のかな漢字変換で動作�
 
 ## 不具合報告・開発について
 
+### push ごとの Windows ビルド
+
+`master`・`main`・`beta` への push で、[Windows build and verification](https://github.com/yachtida/nospacekey/actions/workflows/windows.yml) が実行されます。Pull Request と Actions の「Run workflow」からも実行できます。
+
+実行結果の **Artifacts → `nospacekey-windows-x64-<実行番号>-<試行番号>`** をダウンロードして展開すると、インストーラ、`SHA256SUMS.txt`、ソースのコミットを記録した `BUILD-INFO.json` が入っています。成果物の保存期間は30日です。これは開発用証明書で署名したテスト用ビルドで、SmartScreen の警告が出る場合があります。GitHub Releases の公開や自動更新への配信は行いません。
+
+CI は設定UI・Rust・Swift・実エンジンとのIPCを検証します。続いて別のクリーンな Windows VM に同じインストーラを入れ、配布ファイルのハッシュ、IME登録、キー操作・変換シナリオ、アンインストールを確認します。後段の検証結果は `verify-install` ジョブと `windows-verification-report` に残ります。ビルド成果物があるだけでは検証成功を意味しません。
+
+物理GPUでの推論、JISキーボードの実打鍵、Wordでの操作、旧版からの更新はこのCIの対象外です。GPUがない環境でもVulkan対応バイナリをビルドし、通常のかな漢字変換を検証します。
+
+ビルドに必要なスクリプト・llama.cppパッチ・共有テストデータはこのリポジトリに含まれ、非公開リポジトリや開発者PCへのアクセスは不要です。
+
 不具合や機能の提案は [Issues](https://github.com/yachtida/nospacekey/issues) へ。Windows のバージョン、nospacekey のバージョン、入力先アプリ、再現手順があると調査の助けになります。入力例に個人情報や機密情報を含めないでください。
 
 現在、Pull Request は受け付けていません。脆弱性の報告方法は [SECURITY.md](SECURITY.md) をご覧ください。
