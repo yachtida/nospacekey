@@ -8,6 +8,10 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 }
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
+# Validate the original build identity, including verification-only reruns, before
+# trusting a filename, certificate, or installer supplied by the downloaded bundle.
+& node (Join-Path $PSScriptRoot 'ci-identity.mjs') verify-download | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Downloaded build identity verification failed' }
 $reports = Join-Path $root 'artifacts/reports'
 New-Item -ItemType Directory -Force $reports | Out-Null
 $download = Join-Path $root 'artifacts/download'
@@ -130,6 +134,9 @@ try {
     }
     [ordered]@{
         commit = $info.commit; installer_sha256 = $info.sha256
+        version = $info.version; build_run_id = $info.run_id; build_run_attempt = $info.run_attempt
+        reservation_commit = $info.reservation_commit
+        verification_run_attempt = $env:GITHUB_RUN_ATTEMPT
         runner_os = (Get-CimInstance Win32_OperatingSystem).Caption
         checks = $results.ToArray()
         not_tested = @('Physical GPU inference', 'Physical JIS keyboard', 'Word interaction', 'Upgrade from a previous version')
