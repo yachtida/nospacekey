@@ -53,7 +53,7 @@ function Close-InstalledApplications {
         catch { if (-not $process.HasExited) { throw } }
         if (-not $process.WaitForExit(10000)) { throw 'Installed IME host did not exit' }
     }
-    $closed.ToArray() | ConvertTo-Json -Depth 3 |
+    ConvertTo-Json -InputObject @($closed.ToArray()) -Depth 3 |
         Set-Content (Join-Path $reports 'closed-applications.json') -Encoding utf8
 }
 
@@ -89,6 +89,7 @@ try {
     $env:PATH = "$installed;$env:PATH"
     $env:NOSPACEKEY_ZENZAI = 'off'
     $env:NOSPACEKEY_LEARNING = '0'
+    $env:NOSPACEKEY_TEST_ENGINE_DIR = $installed
     $testbench = Join-Path $inputs 'testbench.exe'
     foreach ($scenario in @('--keymap-smoke', '--scenarios')) {
         Write-Host "Running TSF $scenario"

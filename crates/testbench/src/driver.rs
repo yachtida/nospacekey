@@ -156,7 +156,16 @@ pub fn run_item8(host: &TsfHost, threshold_ms: u128) -> Item8Result {
             host.store.composing(), host.store.preedit(), host.store.committed(), host.store.full()) };
     }
     // A historical spawn can already be dead, or the TIP may reuse an existing host.
-    let connected = match EngineClient::connect_to(&stable_pipe_name(), Duration::from_secs(3)) {
+    // Installed-artifact tests keep the harness outside the product directory.
+    // Authenticate against that exact engine instead of the harness's sibling.
+    let connection = match std::env::var_os("NOSPACEKEY_TEST_ENGINE_DIR") {
+        Some(directory) => EngineClient::connect_to_engine_at(
+            &stable_pipe_name(), Duration::from_secs(3),
+            &std::path::PathBuf::from(directory).join("NospacekeyEngineHost.exe"),
+        ),
+        None => EngineClient::connect_to(&stable_pipe_name(), Duration::from_secs(3)),
+    };
+    let connected = match connection {
         Ok(client) => client,
         Err(error) => return Item8Result { passed: false, detail: format!("engine connection before termination: {error}") },
     };
