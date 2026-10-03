@@ -6,6 +6,8 @@ import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { expectedReleaseReservation, validateReleasePushFromEnvironment } from './release-identity.mjs';
+
 const identityFile = '.ci-build-identity.json';
 const startedFile = '.ci-package-started.json';
 const completedFile = '.ci-package-complete.json';
@@ -66,16 +68,7 @@ export function makeIdentity(sourceVersion, context) {
 
 export function makeReleaseIdentity(sourceVersion, context, reservation) {
   const ordinary = makeIdentity(sourceVersion, context); // Validate the shared fields.
-  if (!/^[0-9]+\.[0-9]+\.[0-9]+-beta\.[1-9][0-9]*$/.test(sourceVersion) ||
-      context.repository !== 'yachtida/nospacekey' || context.eventName !== 'push' ||
-      context.ref !== `refs/heads/release-build/v${sourceVersion}`) {
-    throw new Error('Release identity requires an exact beta release-build branch push');
-  }
-  const required = {
-    reservation_schema: 1, version: sourceVersion, repository: context.repository,
-    repository_id: context.repositoryId, source_commit: context.commit,
-    run_id: context.runId, run_attempt: context.runAttempt,
-  };
+  const required = expectedReleaseReservation(context, sourceVersion);
   if (!reservation) throw new Error('A release version requires a remote reservation');
   assertIdentity(reservation, required);
   if (!/^[0-9a-f]{40}$/.test(reservation.reservation_commit ?? '') ||
@@ -94,7 +87,7 @@ export function makeReleaseIdentity(sourceVersion, context, reservation) {
 }
 
 function assignedIdentity(sourceVersion, context, reservation) {
-  if (context.ref?.startsWith('refs/heads/release-build/')) {
+  if (context.ref?.startsWith('refs/tags/')) {
     return makeReleaseIdentity(sourceVersion, context, reservation);
   }
   if (reservation) throw new Error('Release reservation supplied to an ordinary CI build');
@@ -202,7 +195,7 @@ export function contextFromEnvironment(root) {
   if (process.env.GITHUB_ACTIONS !== 'true') throw new Error('CI identity requires GitHub Actions');
   const commit = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   if (commit !== process.env.GITHUB_SHA) throw new Error('Checkout HEAD differs from GITHUB_SHA');
-  return {
+  const context = {
     serverUrl: process.env.GITHUB_SERVER_URL,
     repository: process.env.GITHUB_REPOSITORY,
     repositoryId: process.env.GITHUB_REPOSITORY_ID,
@@ -212,6 +205,8 @@ export function contextFromEnvironment(root) {
     eventName: process.env.GITHUB_EVENT_NAME,
     commit,
   };
+  if (context.ref?.startsWith('refs/tags/')) validateReleasePushFromEnvironment(context);
+  return context;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -220,7 +215,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const context = contextFromEnvironment(root);
     const command = process.argv[2];
     let reservation;
-    if (context.ref?.startsWith('refs/heads/release-build/')) {
+    if (context.ref?.startsWith('refs/tags/')) {
       const { readReleaseReservation, assertReleaseAvailable } = await import('./release-identity.mjs');
       const saved = command === 'allocate' ? null : readJson(root,
         command === 'verify-download' ? 'artifacts/download/BUILD-INFO.json' : identityFile);
