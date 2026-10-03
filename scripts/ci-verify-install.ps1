@@ -20,6 +20,7 @@ $results = [Collections.Generic.List[object]]::new()
 $failure = $null
 
 function Invoke-InstallerProcess([string]$Path, [string[]]$Arguments, [int]$TimeoutSeconds = 300) {
+    Write-Host "Running $(Split-Path -Leaf $Path)"
     $start = [Diagnostics.ProcessStartInfo]::new($Path)
     $start.UseShellExecute = $false
     foreach ($arg in $Arguments) { [void]$start.ArgumentList.Add($arg) }
@@ -29,6 +30,31 @@ function Invoke-InstallerProcess([string]$Path, [string[]]$Arguments, [int]$Time
         throw "Process timed out: $Path"
     }
     if ($process.ExitCode -ne 0) { throw "Process failed: $Path (exit $($process.ExitCode))" }
+}
+
+function Close-InstalledApplications {
+    # Emulate closing apps before uninstall. Only processes that actually loaded
+    # this exact installed payload are touched, inside the disposable VM guard.
+    $prefix = $installed.TrimEnd('\') + '\'
+    $closed = [Collections.Generic.List[object]]::new()
+    foreach ($process in Get-Process) {
+        try {
+            $loaded = @($process.Modules | Where-Object {
+                $_.FileName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+            })
+        } catch { continue } # The uninstaller still verifies that no lease remains.
+        if ($loaded.Count -eq 0) { continue }
+        if ($process.Id -eq $PID -or $process.ProcessName -like 'Runner.*') {
+            throw "CI runner itself holds the installed runtime: $($process.ProcessName)"
+        }
+        $closed.Add([ordered]@{ pid = $process.Id; name = $process.ProcessName })
+        Write-Host "Closing installed IME host: $($process.ProcessName) ($($process.Id))"
+        try { Stop-Process -Id $process.Id -Force -ErrorAction Stop }
+        catch { if (-not $process.HasExited) { throw } }
+        if (-not $process.WaitForExit(10000)) { throw 'Installed IME host did not exit' }
+    }
+    $closed.ToArray() | ConvertTo-Json -Depth 3 |
+        Set-Content (Join-Path $reports 'closed-applications.json') -Encoding utf8
 }
 
 try {
@@ -56,6 +82,7 @@ try {
     $registered = (Get-Item 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{B4B39227-EFF2-41DA-B357-0C3170A57875}\InprocServer32').GetValue('')
     if ([IO.Path]::GetFullPath($registered) -ine (Join-Path $installed 'nospacekey_tip.dll')) { throw 'COM registration does not point to the installed artifact' }
     $results.Add([ordered]@{ check = 'installed TIP registration'; status = 'pass' })
+    Write-Host "Installed payload and TIP registration verified ($(@($manifest.Files).Count) files)"
 
     # Keep the test program outside the product tree. DLL search uses the exact
     # installed payload; no Swift SDK or locally built engine is installed here.
@@ -64,7 +91,11 @@ try {
     $env:NOSPACEKEY_LEARNING = '0'
     $testbench = Join-Path $inputs 'testbench.exe'
     foreach ($scenario in @('--keymap-smoke', '--scenarios')) {
-        & ./scripts/run-gate.ps1 -Testbench $testbench -TestbenchArgs $scenario -TimeoutSec 240
+        Write-Host "Running TSF $scenario"
+        # The full suite makes dozens of real TSF hosts and can exceed four
+        # minutes on hosted VMs while still making steady progress.
+        $timeout = if ($scenario -eq '--scenarios') { 600 } else { 240 }
+        & ./scripts/run-gate.ps1 -Testbench $testbench -TestbenchArgs $scenario -TimeoutSec $timeout
         $code = $LASTEXITCODE
         $status = if ($code -eq 0) { 'pass' } elseif ($code -eq 2) { 'unavailable' } else { 'fail' }
         $results.Add([ordered]@{ check = "TSF $scenario"; status = $status; exit_code = $code })
@@ -72,6 +103,7 @@ try {
     }
 } catch {
     $failure = $_
+    Write-Host "Verification failed: $($_.Exception.Message)"
     $results.Add([ordered]@{ check = 'verification'; status = 'fail'; detail = $_.Exception.Message })
 } finally {
     # Keep all test evidence even when registration, input or cleanup fails.
@@ -86,6 +118,7 @@ try {
         try {
             $config = Join-Path $installed 'NospacekeyConfig.exe'
             if (Test-Path $config) { Invoke-InstallerProcess $config @('--stop-engine') 30 }
+            Close-InstalledApplications
             Invoke-InstallerProcess $uninstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$reports/uninstall.log")
             if (Test-Path 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{B4B39227-EFF2-41DA-B357-0C3170A57875}\InprocServer32') { throw 'TIP registration remains after uninstall' }
             if (Test-Path $installed) { throw 'Installed version remains after uninstall (possibly pending reboot)' }
