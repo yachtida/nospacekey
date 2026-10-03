@@ -133,15 +133,17 @@ Zenzai を利用できない環境では、通常のかな漢字変換で動作�
 
 ## 不具合報告・開発について
 
-### push ごとの Windows ビルド
+### 通常チェックとタグによる配布用ビルド
 
-`master`・`main`・`beta` への push で、[Windows build and verification](https://github.com/yachtida/nospacekey/actions/workflows/windows.yml) が実行されます。Pull Request と Actions の「Run workflow」からも実行できます。
+`master`・`main`・`beta` への push、Pull Request、Actions の「Run workflow」では、版宣言の整合性、採番・予約の単体テスト、設定UIの静的チェックと単体テストを実行します。
 
-実行結果の **Artifacts → `nospacekey-windows-x64-<run ID>-<試行番号>`** をダウンロードして展開すると、インストーラ、`SHA256SUMS.txt`、ソースのコミットを記録した `BUILD-INFO.json` が入っています。成果物の保存期間は30日です。同じ製品バージョンへの上書きを避けるため、CI内でのみバージョンにリポジトリID・run ID・試行番号を付けます（例：`1.6.0-ci.gha.1307686551.37112350751.1`）。リポジトリの製品バージョンは変更しません。これは開発用証明書で署名したテスト用ビルドで、SmartScreen の警告が出る場合があります。GitHub Releases の公開や自動更新への配信は行いません。
+配布用の [Windows build and verification](https://github.com/yachtida/nospacekey/actions/workflows/windows.yml) は、ソースの製品版と厳密に一致する軽量タグ `v<version>` の新規pushでだけ実行します。対応する版は安定版 `1.7.0` またはベータ版 `1.7.0-beta.9` の形式です。注釈付きタグ、タグの更新・削除・force push、PRや手動workflow実行では製品ビルドを行いません。
 
-CI は設定UI・Rust・Swift・実エンジンとのIPCを検証します。続いて別のクリーンな Windows VM に同じインストーラを入れ、配布ファイルのハッシュ、IME登録、キー操作・変換シナリオ、IMEを使うアプリを閉じた後のアンインストールを確認します。後段の検証結果は `verify-install` ジョブと `windows-verification-report-<run ID>-<試行番号>` に残ります。検証ジョブだけを再実行する場合も、元のビルド成果物を再使用します。ビルド成果物があるだけでは検証成功を意味しません。
+タグだけでは再実行の重複を防げないため、操作者がcreate-onlyの予約receiptを作り、ソースcommit・リポジトリID・run ID・attemptを固定します。予約を検証できた1回だけ、CI接尾辞のない製品版でビルド・署名します。操作順序と失敗時の扱いは[採番と配布物の同一性](docs/build-version-identity.md)を参照してください。Actionsの権限は `contents: read` で、Releaseの公開や添付はユーザーが手動で行います。
 
-別workflowや再実行でも内部版番号が重ならないようにし、同じ版での再包装・再署名と成果物の上書きを拒否します。検証だけの再実行では、元の版と署名済み成果物を使います。[採番と配布物の同一性](docs/build-version-identity.md)に詳細を記載しています。
+実行結果の **Artifacts → `nospacekey-windows-x64-<run ID>-<試行番号>`** に、開発用証明書で署名したインストーラ、`SHA256SUMS.txt`、`BUILD-INFO.json` が入ります。保存期間は30日で、SmartScreenの警告が出る場合があります。
+
+CIは設定UI・Rust・Swift・実エンジンとのIPCを検証します。続いて別のクリーンなWindows VMに同じ署名済みインストーラを入れ、配布ファイルのハッシュ、IME登録、キー操作・変換シナリオ、使用アプリを閉じた後のアンインストールを確認します。結果は `verify-install` ジョブと `windows-verification-report-<run ID>-<試行番号>` に残ります。検証成功後だけ `nospacekey-release-ready-<run ID>-<試行番号>` に同じexeと手動公開用bundleを用意します。検証のみの再実行では元のartifact ID・元のattempt・同じ署名済みファイルを再使用します。製品ビルドの再実行は既存予約により拒否します。
 
 物理GPUでの推論、JISキーボードの実打鍵、Wordでの操作、旧版からの更新はこのCIの対象外です。GPUがない環境でもVulkan対応バイナリをビルドし、通常のかな漢字変換を検証します。
 

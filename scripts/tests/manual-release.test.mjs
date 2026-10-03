@@ -7,16 +7,18 @@ import { allocateIdentity, beginPackage, finishPackage } from '../ci-identity.mj
 import { prepareManualRelease, validateVerification } from '../prepare-manual-release.mjs';
 
 const version = '1.7.0-beta.8';
-const context = {
+const globalContext = {
   serverUrl: 'https://github.com', repository: 'yachtida/nospacekey', repositoryId: '1307686551',
   runId: '37112350751', runAttempt: '1', commit: 'a'.repeat(40),
-  ref: `refs/heads/release-build/v${version}`, eventName: 'push',
+  ref: `refs/tags/v${version}`, eventName: 'push',
 };
-const reservation = {
-  reservation_schema: 1, version, repository: context.repository, repository_id: context.repositoryId,
-  run_id: context.runId, run_attempt: context.runAttempt, source_commit: context.commit,
+const globalReservation = {
+  reservation_schema: 1, version, repository: globalContext.repository, repository_id: globalContext.repositoryId,
+  run_id: globalContext.runId, run_attempt: globalContext.runAttempt, source_commit: globalContext.commit,
   reservation_commit: 'b'.repeat(40),
 };
+const context = globalContext;
+const reservation = globalReservation;
 const notes = `# nospacekey v${version}\n\n開発用証明書。SmartScreenの警告が出る場合があります。\n`;
 
 function write(root, filename, bytes) {
@@ -24,7 +26,10 @@ function write(root, filename, bytes) {
   fs.writeFileSync(path.join(root, filename), bytes);
 }
 
-function fixture(t) {
+function fixture(t, productVersion = version) {
+  const version = productVersion;
+  const context = { ...globalContext, ref: `refs/tags/v${version}` };
+  const reservation = { ...globalReservation, version };
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nospacekey-manual-release-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   write(root, 'Cargo.toml', `[workspace.package]\nversion = "${version}"\n`);
@@ -51,14 +56,17 @@ function fixture(t) {
     not_tested: ['Physical GPU inference', 'Physical JIS keyboard', 'Word interaction', 'Upgrade from a previous version'],
   };
   write(root, 'artifacts/reports/verification.json', JSON.stringify(report));
-  return { root, build, report };
+  return { root, build, report, context, reservation };
 }
 
 test('handoff copies only the same signed bytes and clearly identifies the exact target', t => {
   const { root, build } = fixture(t);
   const manifest = prepareManualRelease(root, context, reservation, notes);
   assert.equal(manifest.target_commit, context.commit);
-  assert.equal(manifest.target_branch, 'release-build/v1.7.0-beta.8');
+  assert.equal(manifest.target_ref, 'refs/tags/v1.7.0-beta.8');
+  const instructions = fs.readFileSync(path.join(root, 'artifacts/release-ready/MANUAL-RELEASE.md'), 'utf8');
+  assert.match(instructions, /既存タグ/);
+  assert.doesNotMatch(instructions, /release-build\//);
   assert.equal(manifest.tag, 'v1.7.0-beta.8');
   assert.equal(manifest.prerelease, true);
   assert.equal(manifest.make_latest, false);
@@ -121,4 +129,13 @@ test('Windows CRLF release notes pass exact heading validation unchanged', t => 
   const windowsNotes = notes.replaceAll('\n', '\r\n');
   prepareManualRelease(root, context, reservation, windowsNotes);
   assert.equal(fs.readFileSync(path.join(root, 'artifacts/release-ready/RELEASE-NOTES.md'), 'utf8'), windowsNotes);
+});
+
+
+test('stable handoff selects the existing tag and is not a prerelease', t => {
+  const { root, context, reservation } = fixture(t, '1.7.0');
+  const manifest = prepareManualRelease(root, context, reservation, notes.replaceAll(version, '1.7.0'));
+  assert.equal(manifest.prerelease, false);
+  assert.equal(manifest.target_ref, 'refs/tags/v1.7.0');
+  assert.equal(manifest.make_latest, false);
 });

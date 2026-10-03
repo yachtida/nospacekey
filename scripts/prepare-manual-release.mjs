@@ -54,8 +54,8 @@ export function prepareManualRelease(root, context, reservation, notes) {
     version: build.version,
     tag: build.release_tag,
     target_commit: build.commit,
-    target_branch: `release-build/v${build.version}`,
-    prerelease: true,
+    target_ref: `refs/tags/${build.release_tag}`,
+    prerelease: build.version.includes('-'),
     make_latest: false,
     installer: build.installer,
     installer_sha256: build.sha256,
@@ -73,11 +73,11 @@ export function prepareManualRelease(root, context, reservation, notes) {
     `この配布物のWindowsインストール・入力・変換・削除検証は成功しています。\n` +
     `署名後に検証したexeを、そのままコピーしました。再ビルドや再署名はしていません。\n\n` +
     `1. ブラウザで https://github.com/yachtida/nospacekey/releases の新規Release作成画面を開きます\n` +
-    `2. 新規タグは ${build.release_tag}、Targetは release-build/v${build.version} を選びます\n` +
-    `   Targetのcommitが ${build.commit} であることを確認します\n` +
+    `2. 既存タグ ${build.release_tag} を選びます（新規作成や付け替えはしません）\n` +
+    `   タグのcommitが ${build.commit} であることを確認します\n` +
     `3. タイトルは nospacekey ${build.release_tag}、説明には RELEASE-NOTES.md の本文を使います\n` +
     `4. 公開添付は ${build.installer} と SHA256SUMS.txt の2点です\n` +
-    `5. プレリリースに設定し、最新の安定版としての指定はオフにします\n` +
+    `5. プレリリース設定は ${manifest.prerelease}、最新の安定版としての指定はオフにします\n` +
     `6. タグ・Target・添付・説明を確認して公開します。既存の同名Releaseや添付の置換はしません\n\n` +
     `installer SHA-256: ${build.sha256}\n` +
     `検証run: ${build.run_url}\n\n` +

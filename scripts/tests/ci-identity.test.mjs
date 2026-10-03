@@ -21,7 +21,7 @@ const thumbprint = 'A'.repeat(40);
 
 function releaseInputs() {
   const version = '1.7.0-beta.8';
-  const owner = { ...context, eventName: 'push', ref: `refs/heads/release-build/v${version}` };
+  const owner = { ...context, eventName: 'push', ref: `refs/tags/v${version}` };
   const reservation = {
     reservation_schema: 1, version, repository: owner.repository,
     repository_id: owner.repositoryId, source_commit: owner.commit,
@@ -285,4 +285,64 @@ test('workflow preserves artifact IDs, immutable upload, and least privileges', 
   assert.match(workflow, /artifact-ids: \$\{\{ needs\.build\.outputs\.verification_id \}\}/);
   assert.match(workflow, /nospacekey-windows-x64-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/);
   assert.equal((workflow.match(/overwrite: false/g) ?? []).length, 4);
+});
+
+
+test('stable release identity uses the exact source version and receipt', () => {
+  const { owner, reservation } = releaseInputs();
+  const version = '1.7.0';
+  const context = { ...owner, ref: `refs/tags/v${version}` };
+  const identity = makeReleaseIdentity(version, context, { ...reservation, version });
+  assert.equal(identity.version, version);
+  assert.equal(identity.mode, 'release');
+  assert.throws(() => makeReleaseIdentity('1.7.1', context, { ...reservation, version }), /exact/);
+});
+
+test('workflow build gate accepts only creation push of release tags in the public repo', () => {
+  const workflow = fs.readFileSync(fileURLToPath(new URL('../../.github/workflows/windows.yml', import.meta.url)), 'utf8');
+  const condition = /name: Build installer and test\n    needs: checks\n    if: (.+)/.exec(workflow)[1];
+  const evaluate = new Function('github', 'startsWith', `return (${condition})`);
+  const startsWith = (value, prefix) => value.startsWith(prefix);
+  const accepted = { repository: 'yachtida/nospacekey', event_name: 'push', ref: 'refs/tags/v1.7.0-beta.9',
+    event: { created: true, deleted: false, forced: false } };
+  assert.equal(evaluate(accepted, startsWith), true);
+  assert.equal(evaluate({ ...accepted, ref: 'refs/tags/v1.7.0' }, startsWith), true);
+  for (const change of [
+    { event_name: 'pull_request' }, { event_name: 'workflow_dispatch' }, { repository: 'someone/fork' },
+    { ref: 'refs/heads/master' }, { ref: 'refs/heads/beta' }, { ref: 'refs/heads/release-build/v1.7.0-beta.9' },
+    { ref: 'refs/tags/other' }, { event: { ...accepted.event, created: false } },
+    { event: { ...accepted.event, deleted: true } }, { event: { ...accepted.event, forced: true } },
+  ]) assert.equal(evaluate({ ...accepted, ...change }, startsWith), false);
+  assert.match(workflow, /branches: \[master, main, beta\]\n    tags: \['v\*'\]/);
+  assert.doesNotMatch(workflow, /release-build\/|pull_request_target/);
+  assert(workflow.indexOf('Assign an installable build version') < workflow.indexOf('Install Windows build tools'));
+});
+
+
+test('tag environment requires the original creation event and exact checkout commit', t => {
+  const root = fixture(t);
+  execFileSync('git', ['init', '-q', root]);
+  execFileSync('git', ['-C', root, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+    'commit', '-q', '--allow-empty', '-m', 'fixture']);
+  const commit = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const eventFile = path.join(root, 'push-event.json');
+  const ref = 'refs/tags/v1.7.0-beta.9';
+  const code = `import { contextFromEnvironment } from ${JSON.stringify(moduleUrl)}; console.log(contextFromEnvironment(${JSON.stringify(root)}).commit);`;
+  const env = { ...process.env, GITHUB_ACTIONS: 'true', GITHUB_SHA: commit, GITHUB_REF: ref,
+    GITHUB_EVENT_NAME: 'push', GITHUB_EVENT_PATH: eventFile };
+  const run = change => execFileSync(process.execPath, ['--input-type=module', '-e', code], {
+    env: { ...env, ...change }, encoding: 'utf8', stdio: 'pipe',
+  });
+  const event = { ref, after: commit, created: true, deleted: false, forced: false };
+  write(root, 'push-event.json', JSON.stringify(event));
+  assert.equal(run({}).trim(), commit);
+  // A verification-only rerun keeps this same original event.
+  assert.equal(run({ GITHUB_RUN_ATTEMPT: '2' }).trim(), commit);
+  assert.throws(() => run({ GITHUB_EVENT_PATH: '' }), /GITHUB_EVENT_PATH/);
+  assert.throws(() => run({ GITHUB_EVENT_NAME: 'workflow_dispatch' }), /tag push/);
+  for (const change of [{ created: false }, { forced: true }, { deleted: true }, { after: '0'.repeat(40) },
+    { ref: 'refs/tags/v1.7.0-beta.10' }]) {
+    write(root, 'push-event.json', JSON.stringify({ ...event, ...change }));
+    assert.throws(() => run({}));
+  }
 });
