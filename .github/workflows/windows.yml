@@ -37,7 +37,7 @@ jobs:
           cache: npm
           cache-dependency-path: crates/config/frontend/package-lock.json
       - name: Test identities, release admission and duplicate protection
-        run: node --test scripts/tests/*.test.mjs
+        run: node scripts/test-ci-event-environments.mjs
       - name: Check product version declarations
         shell: pwsh
         run: ./scripts/sync-version.ps1 -Check
@@ -70,7 +70,7 @@ jobs:
           cache: npm
           cache-dependency-path: crates/config/frontend/package-lock.json
       - name: Test build identity and duplicate protection
-        run: node --test scripts/tests/ci-identity.test.mjs scripts/tests/release-identity.test.mjs scripts/tests/manual-release.test.mjs
+        run: node scripts/test-ci-event-environments.mjs
       - name: Check source product version declarations
         run: ./scripts/sync-version.ps1 -Check
       - name: Assign an installable build version
