@@ -26,3 +26,8 @@
 # GitHub Actions local build products and toolchain downloads.
 /.ci-downloads/
 /artifacts/
+
+# Create-only, ephemeral CI build/packaging identity receipts (never cached).
+/.ci-build-identity.json
+/.ci-package-started.json
+/.ci-package-complete.json

@@ -2,7 +2,7 @@ name: Windows build and verification
 
 on:
   push:
-    branches: [master, main, beta]
+    branches: [master, main, beta, 'release-build/**']
   pull_request:
     branches: [master, main, beta]
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: windows-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/heads/release-build/') }}
 
 defaults:
   run:
@@ -39,6 +39,8 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: crates/config/frontend/package-lock.json
+      - name: Test build identity and duplicate protection
+        run: node --test scripts/tests/ci-identity.test.mjs scripts/tests/release-identity.test.mjs scripts/tests/manual-release.test.mjs
       - name: Cache toolchain installers
         id: installer-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -84,7 +86,9 @@ jobs:
           key: windows-2022-rust-1.96-swift-6.3.2-${{ hashFiles('Cargo.lock', 'engine-host/Package.resolved') }}-${{ github.sha }}
           restore-keys: |
             windows-2022-rust-1.96-swift-6.3.2-${{ hashFiles('Cargo.lock', 'engine-host/Package.resolved') }}-
-      - name: Assign an installable CI version
+      - name: Assign an installable build version
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./scripts/ci-version.ps1
       - name: Build and test settings UI
         run: |
@@ -131,28 +135,32 @@ jobs:
           & ./scripts/with-dev-env.ps1 @('cargo', 'test', '--locked', '-p', 'ipc', '--test', 'integration', 'tip_like', '--', '--ignored', '--nocapture')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package development-signed installer
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./scripts/ci-package.ps1
       - name: Upload installer for download
         id: installer
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: nospacekey-windows-x64-${{ github.run_number }}-${{ github.run_attempt }}
+          name: nospacekey-windows-x64-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/download/
           if-no-files-found: error
           retention-days: 30
+          overwrite: false
       - name: Upload installation test inputs
         id: verification
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: windows-verification-inputs-${{ github.run_attempt }}
+          name: windows-verification-inputs-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/verification/
           if-no-files-found: error
           retention-days: 30
+          overwrite: false
       - name: Upload build diagnostics
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: windows-build-diagnostics-${{ github.run_attempt }}
+          name: windows-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             .ci-downloads/*.log*
             artifacts/reports/
@@ -168,6 +176,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ needs.build.outputs.installer_id }}
@@ -179,12 +190,30 @@ jobs:
           merge-multiple: true
           path: artifacts/verification
       - name: Install, verify payload hashes and run TSF scenarios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./scripts/ci-verify-install.ps1
       - name: Upload installation and input test report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: windows-verification-report-${{ github.run_attempt }}
+          name: windows-verification-report-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/reports/
           if-no-files-found: error
           retention-days: 30
+          overwrite: false
+
+      - name: Prepare verified manual release files
+        if: startsWith(github.ref, 'refs/heads/release-build/')
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/prepare-manual-release.mjs
+      - name: Upload verified manual release files
+        if: startsWith(github.ref, 'refs/heads/release-build/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nospacekey-release-ready-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/release-ready/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
