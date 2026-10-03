@@ -1,0 +1,878 @@
+{
+  "status": "normative-proto11",
+  "protocol": 11,
+  "notes": [
+    "Positive fixtures assume matching issuance ledger and token catalog. Each is an independent decoding case, not chronological traffic.",
+    "reject-semantic must decode first, then fail domain validation. traces test valid messages against local state.",
+    "P4a must load this exact JSON file in Rust and Swift; parsing here is not cross-language validation."
+  ],
+  "token_catalog": [
+    {
+      "token": "candidate-a",
+      "reading_start": 0,
+      "reading_end": 3,
+      "surface": "今日"
+    },
+    {
+      "token": "candidate-c",
+      "reading_start": 4,
+      "reading_end": 7,
+      "surface": "天気"
+    }
+  ],
+  "examples": [
+    {
+      "id": "session",
+      "expect": "accept",
+      "wire": {
+        "result": "Session",
+        "session": 1,
+        "proto": 11,
+        "boot": "fixture-build",
+        "engine_epoch": "11111111-1111-4111-8111-111111111111",
+        "learning_generation": 6
+      }
+    },
+    {
+      "id": "initial",
+      "expect": "accept",
+      "wire": {
+        "method": "LiveSnapshot",
+        "params": {
+          "composition": 7,
+          "revision": 12,
+          "configuration_generation": 2,
+          "connection_generation": 3,
+          "segments": [
+            {
+              "text": "きょうはてんき",
+              "style": "direct"
+            }
+          ],
+          "explicit": true,
+          "conversion_revision": 5,
+          "request_id": 90
+        }
+      }
+    },
+    {
+      "id": "snapshot-mixed",
+      "expect": "accept",
+      "wire": {
+        "result": "SnapshotResult",
+        "composition": 7,
+        "revision": 12,
+        "configuration_generation": 2,
+        "connection_generation": 3,
+        "baseline": 41,
+        "conversion_revision": 5,
+        "request_id": 90,
+        "reading": "きょうはてんき",
+        "text": "今日は天気",
+        "clauses": [
+          {
+            "id": 1,
+            "reading_start": 0,
+            "reading_end": 3,
+            "state": "Converted",
+            "surface": "今日",
+            "candidate_token": "candidate-a"
+          },
+          {
+            "id": 2,
+            "reading_start": 3,
+            "reading_end": 4,
+            "state": "Reading",
+            "surface": "は",
+            "candidate_token": null
+          },
+          {
+            "id": 3,
+            "reading_start": 4,
+            "reading_end": 7,
+            "state": "Converted",
+            "surface": "天気",
+            "candidate_token": "candidate-c"
+          }
+        ],
+        "sentence_token": null
+      }
+    },
+    {
+      "id": "poll-enhancement",
+      "expect": "accept",
+      "wire": {
+        "method": "PollSnapshotEnhancement",
+        "params": {
+          "composition": 7,
+          "revision": 12,
+          "configuration_generation": 2,
+          "connection_generation": 3,
+          "baseline": 41,
+          "conversion_revision": 5,
+          "request_id": 90
+        }
+      }
+    },
+    {
+      "id": "SnapshotEnhancementPending",
+      "expect": "accept",
+      "wire": {
+        "result": "SnapshotEnhancementPending",
+        "composition": 7,
+        "revision": 12,
+        "configuration_generation": 2,
+        "connection_generation": 3,
+        "baseline": 41,
+        "conversion_revision": 5,
+        "request_id": 90
+      }
+    },
+    {
+      "id": "SnapshotEnhancementUnavailable",
+      "expect": "accept",
+      "wire": {
+        "result": "SnapshotEnhancementUnavailable",
+        "composition": 7,
+        "revision": 12,
+        "configuration_generation": 2,
+        "connection_generation": 3,
+        "baseline": 41,
+        "conversion_revision": 5,
+        "request_id": 90
+      }
+    },
+    {
+      "id": "enhancement",
+      "expect": "accept",
+      "wire": {
+        "result": "SnapshotEnhancement",
+        "composition": 7,
+        "revision": 12,
+        "configuration_generation": 2,
+        "connection_generation": 3,
+        "baseline": 41,
+        "conversion_revision": 5,
+        "request_id": 90,
+        "reading": "きょうはてんき",
+        "text": "今日は天気",
+        "clauses": [
+          {
+            "id": 1,
+            "reading_start": 0,
+            "reading_end": 3,
+            "state": "Converted",
+            "surface": "今日",
+            "candidate_token": "candidate-a"
+          },
+          {
+            "id": 2,
+            "reading_start": 3,
+            "reading_end": 4,
+            "state": "Reading",
+            "surface": "は",
+            "candidate_token": null
+          },
+          {
+            "id": 3,
+            "reading_start": 4,
+            "reading_end": 7,
+            "state": "Converted",
+            "surface": "天気",
+            "candidate_token": "candidate-c"
+          }
+        ],
+        "sentence_token": null
+      }
+    },
+    {
+      "id": "candidates-request",
+      "expect": "accept",
+      "wire": {
+        "method": "ClauseCandidates",
+        "params": {
+          "key": {
+            "identity": {
+              "composition": 7,
+              "revision": 12,
+              "configuration_generation": 2,
+              "connection_generation": 3
+            },
+            "baseline": 41,
+            "conversion_revision": 5,
+            "clause_id": 1,
+            "request_id": 100
+          },
+          "reading": "きょうはてんき",
+          "reading_start": 0,
+          "reading_end": 3,
+          "preceding_surfaces": []
+        }
+      }
+    },
+    {
+      "id": "candidates-Pending",
+      "expect": "accept",
+      "wire": {
+        "result": "ClauseCandidatesResult",
+        "key": {
+          "identity": {
+            "composition": 7,
+            "revision": 12,
+            "configuration_generation": 2,
+            "connection_generation": 3
+          },
+          "baseline": 41,
+          "conversion_revision": 5,
+          "clause_id": 1,
+          "request_id": 100
+        },
+        "status": "Pending"
+      }
+    },
+    {
+      "id": "candidates-Ready",
+      "expect": "accept",
+      "wire": {
+        "result": "ClauseCandidatesResult",
+        "key": {
+          "identity": {
+            "composition": 7,
+            "revision": 12,
+            "configuration_generation": 2,
+            "connection_generation": 3
+          },
+          "baseline": 41,
+          "conversion_revision": 5,
+          "clause_id": 1,
+          "request_id": 100
+        },
+        "status": "Ready",
+        "candidates": [
+          {
+            "surface": "今日",
+            "token": "candidate-a",
+            "reading_start": 0,
+            "reading_end": 3
+          },
+          {
+            "surface": "京",
+            "token": "candidate-alt",
+            "reading_start": 0,
+            "reading_end": 3
+          }
+        ]
+      }
+    },
+    {
+      "id": "candidates-Unavailable",
+      "expect": "accept",
+      "wire": {
+        "result": "ClauseCandidatesResult",
+        "key": {
+          "identity": {
+            "composition": 7,
+            "revision": 12,
+            "configuration_generation": 2,
+            "connection_generation": 3
+          },
+          "baseline": 41,
+          "conversion_revision": 5,
+          "clause_id": 1,
+          "request_id": 100
+        },
+        "status": "Unavailable",
+        "reason": "NoCandidates"
+      }
+    },
+    {
+      "id": "boundary-request",
+      "expect": "accept",
+      "wire": {
+        "method": "ConvertClauses",
+        "params": {
+          "key": {
+            "identity": {
+              "composition": 7,
+              "revision": 12,
+              "configuration_generation": 2,
+              "connection_generation": 3
+            },
+            "baseline": 41,
+            "conversion_revision": 6,
+            "clause_id": 4,
+            "request_id": 101
+          },
+          "reading": "きょうはてんき",
+          "clauses": [
+            {
+              "id": 4,
+              "reading_start": 0,
+              "reading_end": 4
+            }
+          ],
+          "preceding_surfaces": []
+        }
+      }
+    },
+    {
+      "id": "boundary-Pending",
+      "expect": "accept",
+      "wire": {
+        "result": "ConvertClausesResult",
+        "key": {
+          "identity": {
+            "composition": 7,
+            "revision": 12,
+            "configuration_generation": 2,
+            "connection_generation": 3
+          },
+          "baseline": 41,
+          "conversion_revision": 6,
+          "clause_id": 4,
+          "request_id": 101
+        },
+        "status": "Pending"
+      }
+    },
+    {
+      "id": "boundary-Ready",
+      "expect": "accept",
+      "wire": {
+        "result": "ConvertClausesResult",
+        "key": {
+          "identity": {
+            "composition": 7,
+            "revision": 12,
+            "configuration_generation": 2,
+            "connection_generation": 3
+          },
+          "baseline": 41,
+          "conversion_revision": 6,
+          "clause_id": 4,
+          "request_id": 101
+        },
+        "status": "Ready",
+        "clauses": [
+          {
+            "id": 4,
+            "reading_start": 0,
+            "reading_end": 4,
+            "state": "Converted",
+            "surface": "今日は",
+            "candidate_token": "candidate-new"
+          }
+        ]
+      }
+    },
+    {
+      "id": "boundary-Unavailable",
+      "expect": "accept",
+      "wire": {
+        "result": "ConvertClausesResult",
+        "key": {
+          "identity": {
+            "composition": 7,
+            "revision": 12,
+            "configuration_generation": 2,
+            "connection_generation": 3
+          },
+          "baseline": 41,
+          "conversion_revision": 6,
+          "clause_id": 4,
+          "request_id": 101
+        },
+        "status": "Unavailable",
+        "reason": "NoCandidates"
+      }
+    },
+    {
+      "id": "commit-mixed",
+      "expect": "accept",
+      "wire": {
+        "method": "CommitReceipt",
+        "params": {
+          "commit_id": {
+            "client_instance": "22222222-2222-4222-8222-222222222222",
+            "sequence": 9
+          },
+          "engine_epoch": "11111111-1111-4111-8111-111111111111",
+          "learning_generation": 6,
+          "reading": "きょうはてんき",
+          "text": "今日は天気",
+          "intervals": [
+            {
+              "reading_start": 0,
+              "reading_end": 3,
+              "surface": "今日",
+              "learning": {
+                "kind": "Candidate",
+                "token": "candidate-a",
+                "explicitly_selected": false
+              }
+            },
+            {
+              "reading_start": 3,
+              "reading_end": 4,
+              "surface": "は",
+              "learning": {
+                "kind": "None",
+                "reason": "Reading"
+              }
+            },
+            {
+              "reading_start": 4,
+              "reading_end": 7,
+              "surface": "天気",
+              "learning": {
+                "kind": "Candidate",
+                "token": "candidate-c",
+                "explicitly_selected": true
+              }
+            }
+          ],
+          "sentence_token": null
+        }
+      }
+    },
+    {
+      "id": "receipt-Applied",
+      "expect": "accept",
+      "wire": {
+        "result": "CommitReceiptAck",
+        "commit_id": {
+          "client_instance": "22222222-2222-4222-8222-222222222222",
+          "sequence": 9
+        },
+        "status": "Applied"
+      }
+    },
+    {
+      "id": "receipt-AlreadyProcessed",
+      "expect": "accept",
+      "wire": {
+        "result": "CommitReceiptAck",
+        "commit_id": {
+          "client_instance": "22222222-2222-4222-8222-222222222222",
+          "sequence": 9
+        },
+        "status": "AlreadyProcessed"
+      }
+    },
+    {
+      "id": "receipt-Rejected",
+      "expect": "accept",
+      "wire": {
+        "result": "CommitReceiptAck",
+        "commit_id": {
+          "client_instance": "22222222-2222-4222-8222-222222222222",
+          "sequence": 9
+        },
+        "status": "Rejected",
+        "reason": "Expired"
+      }
+    },
+    {
+      "id": "u64-max",
+      "expect": "accept",
+      "wire": {
+        "method": "ClauseCandidates",
+        "params": {
+          "key": {
+            "identity": {
+              "composition": 7,
+              "revision": 12,
+              "configuration_generation": 2,
+              "connection_generation": 3
+            },
+            "baseline": 41,
+            "conversion_revision": 5,
+            "clause_id": 1,
+            "request_id": 18446744073709551615
+          },
+          "reading": "きょうはてんき",
+          "reading_start": 0,
+          "reading_end": 3,
+          "preceding_surfaces": []
+        }
+      },
+      "reason": "serialization-only; isolated maximum counter case, not a successor to request 100"
+    },
+    {
+      "id": "overlap",
+      "expect": "reject-semantic",
+      "wire": {
+        "result": "SnapshotResult",
+        "composition": 7,
+        "revision": 12,
+        "configuration_generation": 2,
+        "connection_generation": 3,
+        "baseline": 41,
+        "conversion_revision": 5,
+        "request_id": 90,
+        "reading": "きょうはてんき",
+        "text": "今日は天気",
+        "clauses": [
+          {
+            "id": 1,
+            "reading_start": 0,
+            "reading_end": 3,
+            "state": "Converted",
+            "surface": "今日",
+            "candidate_token": "candidate-a"
+          },
+          {
+            "id": 2,
+            "reading_start": 2,
+            "reading_end": 4,
+            "state": "Reading",
+            "surface": "は",
+            "candidate_token": null
+          },
+          {
+            "id": 3,
+            "reading_start": 4,
+            "reading_end": 7,
+            "state": "Converted",
+            "surface": "天気",
+            "candidate_token": "candidate-c"
+          }
+        ],
+        "sentence_token": null
+      },
+      "reason": "C1 overlap"
+    },
+    {
+      "id": "text-mismatch",
+      "expect": "reject-semantic",
+      "wire": {
+        "result": "SnapshotResult",
+        "composition": 7,
+        "revision": 12,
+        "configuration_generation": 2,
+        "connection_generation": 3,
+        "baseline": 41,
+        "conversion_revision": 5,
+        "request_id": 90,
+        "reading": "きょうはてんき",
+        "text": "今日天気",
+        "clauses": [
+          {
+            "id": 1,
+            "reading_start": 0,
+            "reading_end": 3,
+            "state": "Converted",
+            "surface": "今日",
+            "candidate_token": "candidate-a"
+          },
+          {
+            "id": 2,
+            "reading_start": 3,
+            "reading_end": 4,
+            "state": "Reading",
+            "surface": "は",
+            "candidate_token": null
+          },
+          {
+            "id": 3,
+            "reading_start": 4,
+            "reading_end": 7,
+            "state": "Converted",
+            "surface": "天気",
+            "candidate_token": "candidate-c"
+          }
+        ],
+        "sentence_token": null
+      },
+      "reason": "C1 concatenation differs"
+    },
+    {
+      "id": "missing-reading-interval",
+      "expect": "reject-semantic",
+      "wire": {
+        "method": "CommitReceipt",
+        "params": {
+          "commit_id": {
+            "client_instance": "22222222-2222-4222-8222-222222222222",
+            "sequence": 9
+          },
+          "engine_epoch": "11111111-1111-4111-8111-111111111111",
+          "learning_generation": 6,
+          "reading": "きょうはてんき",
+          "text": "今日は天気",
+          "intervals": [
+            {
+              "reading_start": 0,
+              "reading_end": 3,
+              "surface": "今日",
+              "learning": {
+                "kind": "Candidate",
+                "token": "candidate-a",
+                "explicitly_selected": false
+              }
+            },
+            {
+              "reading_start": 4,
+              "reading_end": 7,
+              "surface": "天気",
+              "learning": {
+                "kind": "Candidate",
+                "token": "candidate-c",
+                "explicitly_selected": true
+              }
+            }
+          ],
+          "sentence_token": null
+        }
+      },
+      "reason": "C7 gap must not disappear"
+    },
+    {
+      "id": "token-surface-mismatch",
+      "expect": "reject-semantic",
+      "wire": {
+        "method": "CommitReceipt",
+        "params": {
+          "commit_id": {
+            "client_instance": "22222222-2222-4222-8222-222222222222",
+            "sequence": 9
+          },
+          "engine_epoch": "11111111-1111-4111-8111-111111111111",
+          "learning_generation": 6,
+          "reading": "きょうはてんき",
+          "text": "明日は天気",
+          "intervals": [
+            {
+              "reading_start": 0,
+              "reading_end": 3,
+              "surface": "明日",
+              "learning": {
+                "kind": "Candidate",
+                "token": "candidate-a",
+                "explicitly_selected": false
+              }
+            },
+            {
+              "reading_start": 3,
+              "reading_end": 4,
+              "surface": "は",
+              "learning": {
+                "kind": "None",
+                "reason": "Reading"
+              }
+            },
+            {
+              "reading_start": 4,
+              "reading_end": 7,
+              "surface": "天気",
+              "learning": {
+                "kind": "Candidate",
+                "token": "candidate-c",
+                "explicitly_selected": true
+              }
+            }
+          ],
+          "sentence_token": null
+        }
+      },
+      "reason": "candidate-a is bound to 今日 in fixture token catalog"
+    },
+    {
+      "id": "negative-id",
+      "expect": "reject-decode",
+      "wire": {
+        "method": "ClauseCandidates",
+        "params": {
+          "key": {
+            "identity": {
+              "composition": 7,
+              "revision": 12,
+              "configuration_generation": 2,
+              "connection_generation": 3
+            },
+            "baseline": 41,
+            "conversion_revision": 5,
+            "clause_id": 1,
+            "request_id": -1
+          },
+          "reading": "きょうはてんき",
+          "reading_start": 0,
+          "reading_end": 3,
+          "preceding_surfaces": []
+        }
+      },
+      "reason": "unsigned integer"
+    },
+    {
+      "id": "u64-overflow",
+      "expect": "reject-decode",
+      "wire": {
+        "method": "ClauseCandidates",
+        "params": {
+          "key": {
+            "identity": {
+              "composition": 7,
+              "revision": 12,
+              "configuration_generation": 2,
+              "connection_generation": 3
+            },
+            "baseline": 41,
+            "conversion_revision": 5,
+            "clause_id": 1,
+            "request_id": 18446744073709551616
+          },
+          "reading": "きょうはてんき",
+          "reading_start": 0,
+          "reading_end": 3,
+          "preceding_surfaces": []
+        }
+      },
+      "reason": "greater than u64 max"
+    },
+    {
+      "id": "fractional-id",
+      "expect": "reject-decode",
+      "wire": {
+        "method": "ClauseCandidates",
+        "params": {
+          "key": {
+            "identity": {
+              "composition": 7,
+              "revision": 12,
+              "configuration_generation": 2,
+              "connection_generation": 3
+            },
+            "baseline": 41,
+            "conversion_revision": 5,
+            "clause_id": 1,
+            "request_id": 1.5
+          },
+          "reading": "きょうはてんき",
+          "reading_start": 0,
+          "reading_end": 3,
+          "preceding_surfaces": []
+        }
+      },
+      "reason": "not integer"
+    },
+    {
+      "id": "commit-local-surface",
+      "expect": "accept",
+      "wire": {
+        "method": "CommitReceipt",
+        "params": {
+          "commit_id": {
+            "client_instance": "22222222-2222-4222-8222-222222222222",
+            "sequence": 10
+          },
+          "engine_epoch": "11111111-1111-4111-8111-111111111111",
+          "learning_generation": 6,
+          "reading": "てんき",
+          "text": "天",
+          "intervals": [
+            {
+              "reading_start": 0,
+              "reading_end": 3,
+              "surface": "天",
+              "learning": {
+                "kind": "None",
+                "reason": "Invalidated"
+              }
+            }
+          ],
+          "sentence_token": null
+        }
+      }
+    }
+  ],
+  "traces": [
+    {
+      "id": "other-clause-response",
+      "response_fixture": "candidates-Ready",
+      "current_key": {
+        "identity": {
+          "composition": 7,
+          "revision": 12,
+          "configuration_generation": 2,
+          "connection_generation": 3
+        },
+        "baseline": 41,
+        "conversion_revision": 5,
+        "clause_id": 3,
+        "request_id": 102
+      },
+      "window": "Loading",
+      "expected": {
+        "cache": true,
+        "display": false
+      },
+      "setup": "A候補要求→Bへ移動して窓閉→SpaceでB候補を要求→A応答（同じconversion_revision）"
+    },
+    {
+      "id": "closed-window",
+      "response_fixture": "candidates-Ready",
+      "current_key": {
+        "identity": {
+          "composition": 7,
+          "revision": 12,
+          "configuration_generation": 2,
+          "connection_generation": 3
+        },
+        "baseline": 41,
+        "conversion_revision": 5,
+        "clause_id": 1,
+        "request_id": 100
+      },
+      "window": "Closed",
+      "expected": {
+        "cache": true,
+        "display": false
+      }
+    },
+    {
+      "id": "cancelled-boundary",
+      "response_fixture": "boundary-Ready",
+      "current_key": {
+        "identity": {
+          "composition": 7,
+          "revision": 12,
+          "configuration_generation": 2,
+          "connection_generation": 3
+        },
+        "baseline": 41,
+        "conversion_revision": 6,
+        "clause_id": 4,
+        "request_id": 101
+      },
+      "request_terminal": true,
+      "wait": "None",
+      "expected": {
+        "apply": false,
+        "reading_preserved": true
+      },
+      "setup": "Resize→SpaceでConvertClauses要求→Esc→遅延Ready"
+    },
+    {
+      "id": "old-boundary-revision",
+      "response_fixture": "boundary-Ready",
+      "current_key": {
+        "identity": {
+          "composition": 7,
+          "revision": 12,
+          "configuration_generation": 2,
+          "connection_generation": 3
+        },
+        "baseline": 41,
+        "conversion_revision": 7,
+        "clause_id": 4,
+        "request_id": 103
+      },
+      "wait": "Boundary",
+      "expected": {
+        "apply": false,
+        "boundary_preserved": true
+      },
+      "setup": "Resize→Space→期限切れ→Resize→Space→旧Ready"
+    }
+  ]
+}

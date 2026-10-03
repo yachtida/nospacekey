@@ -23,3 +23,6 @@
 
 # Tauri: auto-generated ACL schema files (regenerated from capabilities/*.json on build)
 /crates/config/gen/
+# GitHub Actions local build products and toolchain downloads.
+/.ci-downloads/
+/artifacts/

@@ -4,6 +4,12 @@
 *.cmd text eol=crlf
 *.bat text eol=crlf
 
+# These files participate in build receipts and installer checksums.
+*.ps1 text eol=lf
+# Unified diff context lines contain significant trailing spaces.
+*.patch text eol=lf -whitespace
+fixtures/*.tsv text eol=lf
+
 # Model checksum covers exact bytes, including newlines.
 crates/mixed-input/data/model.txt text eol=lf
 crates/mixed-input/data/dictionary/*.txt text eol=lf

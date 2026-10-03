@@ -11,12 +11,18 @@ import WinSDK
 /// live worker budget is the only deadline that can decide the request.
 final class GPUWorkerProcessTransportTests: XCTestCase {
     func testRankTimeoutReturnsClassicWithinLiveDeadlineAndLatchesWorker() throws {
+#if !DEBUG
+        throw XCTSkip("GPU timeout fault injection requires a debug engine build")
+#else
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let host = try XCTUnwrap(Self.findHostExecutable(packageRoot: packageRoot))
         let model = packageRoot.appendingPathComponent("models/ggml-model-Q5_K_M.gguf")
+        guard FileManager.default.fileExists(atPath: model.path) else {
+            throw XCTSkip("GPU integration requires the real model at \(model.path)")
+        }
+        let host = try XCTUnwrap(Self.findHostExecutable(packageRoot: packageRoot))
         let runtime = packageRoot.appendingPathComponent("vendor/llama/vulkan")
         let configuration = try XCTUnwrap(
             GPUWorkerRuntimeConfiguration(modelURL: model, runtimeDirectory: runtime,
@@ -78,6 +84,7 @@ final class GPUWorkerProcessTransportTests: XCTestCase {
         XCTAssertNil(latched.failure,
                      "retryPending short-circuits to classic without a failure category")
         XCTAssertLessThan(latchedMilliseconds, 50)
+#endif
     }
 
     private static func findHostExecutable(packageRoot: URL) -> URL? {
