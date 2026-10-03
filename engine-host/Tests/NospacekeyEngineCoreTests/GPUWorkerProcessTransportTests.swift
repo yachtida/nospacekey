@@ -17,6 +17,9 @@ final class GPUWorkerProcessTransportTests: XCTestCase {
             .deletingLastPathComponent()
         let host = try XCTUnwrap(Self.findHostExecutable(packageRoot: packageRoot))
         let model = packageRoot.appendingPathComponent("models/ggml-model-Q5_K_M.gguf")
+        guard FileManager.default.fileExists(atPath: model.path) else {
+            throw XCTSkip("GPU integration requires the real model at \(model.path)")
+        }
         let runtime = packageRoot.appendingPathComponent("vendor/llama/vulkan")
         let configuration = try XCTUnwrap(
             GPUWorkerRuntimeConfiguration(modelURL: model, runtimeDirectory: runtime,
@@ -81,9 +84,14 @@ final class GPUWorkerProcessTransportTests: XCTestCase {
     }
 
     private static func findHostExecutable(packageRoot: URL) -> URL? {
+#if DEBUG
+        let configuration = "debug"
+#else
+        let configuration = "release"
+#endif
         let candidates = [
-            packageRoot.appendingPathComponent(".build/x86_64-unknown-windows-msvc/debug/NospacekeyEngineHost.exe"),
-            packageRoot.appendingPathComponent(".build/debug/NospacekeyEngineHost.exe"),
+            packageRoot.appendingPathComponent(".build/x86_64-unknown-windows-msvc/\(configuration)/NospacekeyEngineHost.exe"),
+            packageRoot.appendingPathComponent(".build/\(configuration)/NospacekeyEngineHost.exe"),
         ]
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
