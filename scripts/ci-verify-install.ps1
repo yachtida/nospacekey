@@ -53,7 +53,7 @@ function Close-InstalledApplications {
         catch { if (-not $process.HasExited) { throw } }
         if (-not $process.WaitForExit(10000)) { throw 'Installed IME host did not exit' }
     }
-    $closed.ToArray() | ConvertTo-Json -Depth 3 |
+    ConvertTo-Json -InputObject @($closed.ToArray()) -Depth 3 |
         Set-Content (Join-Path $reports 'closed-applications.json') -Encoding utf8
 }
 
