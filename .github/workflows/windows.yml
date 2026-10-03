@@ -75,6 +75,16 @@ jobs:
             engine-host/vendor/llama/vulkan
             engine-host/prediction-runtime
           key: ${{ steps.runtime-cache.outputs.cache-primary-key }}
+      - name: Restore Rust and Swift build cache
+        id: native-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            target
+            engine-host/.build
+          key: windows-2022-rust-1.96-swift-6.3.2-${{ hashFiles('Cargo.lock', 'engine-host/Package.resolved') }}-${{ github.sha }}
+          restore-keys: |
+            windows-2022-rust-1.96-swift-6.3.2-${{ hashFiles('Cargo.lock', 'engine-host/Package.resolved') }}-
       - name: Assign an installable CI version
         run: ./scripts/ci-version.ps1
       - name: Build and test settings UI
@@ -88,6 +98,7 @@ jobs:
           & ./scripts/with-dev-env.ps1 @('cargo', 'test', '--locked', '--workspace')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build release binaries
+        id: release-build
         run: |
           & ./scripts/with-dev-env.ps1 @('cargo', 'build', '--locked', '--release', '--workspace')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -104,6 +115,14 @@ jobs:
             & ../scripts/with-dev-env.ps1 @('swift', 'test', '-c', 'release', '--force-resolved-versions')
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } finally { Pop-Location }
+      - name: Save Rust and Swift build cache
+        if: always() && steps.release-build.outcome == 'success' && steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            target
+            engine-host/.build
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
       - name: Stage runtime and test real IPC
         timeout-minutes: 10
         run: |
