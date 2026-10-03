@@ -1,26 +1,20 @@
 # Give each downloadable build its own install directory. The installer
 # deliberately refuses to overwrite an existing directory for the same version.
 [CmdletBinding()]
-param(
-    [string]$RunNumber = $env:GITHUB_RUN_NUMBER,
-    [string]$RunAttempt = $env:GITHUB_RUN_ATTEMPT
-)
+param()
 $ErrorActionPreference = 'Stop'
-if ($RunNumber -notmatch '^[1-9][0-9]*$' -or $RunAttempt -notmatch '^[1-9][0-9]*$') {
-    throw 'CI version requires positive run and attempt numbers'
-}
 $root = Split-Path -Parent $PSScriptRoot
 $cargoPath = Join-Path $root 'Cargo.toml'
 $cargo = [IO.File]::ReadAllText($cargoPath)
 $pattern = '(?m)^version\s*=\s*"([^"]+)"'
 $matches = [regex]::Matches($cargo, $pattern)
 if ($matches.Count -ne 1) { throw 'Expected one workspace version in Cargo.toml' }
-$baseVersion = $matches[0].Groups[1].Value
-$sha = (& git -C $root rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-f]{40}$') { throw 'Cannot determine source commit' }
-$separator = if ($baseVersion.Contains('-')) { '.' } else { '-' }
-$version = "$baseVersion${separator}ci.$RunNumber.$RunAttempt.$($sha.Substring(0, 8))"
-if ($baseVersion.Contains('+') -or $baseVersion -match '(?:-|\.)ci\.') { throw 'Source version must not already contain CI/build metadata' }
+$identityJson = & node (Join-Path $PSScriptRoot 'ci-identity.mjs') allocate
+if ($LASTEXITCODE -ne 0) { throw 'CI identity allocation failed; use a fresh workflow attempt' }
+$identity = $identityJson | ConvertFrom-Json
+$baseVersion = $identity.source_version
+$version = $identity.version
+if ($matches[0].Groups[1].Value -cne $baseVersion) { throw 'Workspace version changed during identity allocation' }
 $utf8 = [Text.UTF8Encoding]::new($false)
 $cargo = [regex]::Replace($cargo, $pattern, "version = `"$version`"")
 [IO.File]::WriteAllText($cargoPath, $cargo, $utf8)

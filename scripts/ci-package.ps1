@@ -6,15 +6,14 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 . (Join-Path $PSScriptRoot 'release-lib.ps1')
 
-$version = Get-IssVersion (Get-Content -Raw installer/version.iss)
-if (-not $version) { throw 'Installer version is missing' }
-$sha = (& git rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0) { throw 'Cannot determine source commit' }
-$suffix = if ($env:GITHUB_RUN_NUMBER) { $env:GITHUB_RUN_NUMBER } else { 'local' }
-$stem = "nospacekey-setup-$version-ci.$suffix-$($sha.Substring(0, 8))-devsigned"
+$identityJson = & node (Join-Path $PSScriptRoot 'ci-identity.mjs') begin-package
+if ($LASTEXITCODE -ne 0) { throw 'Packaging identity already used or invalid; rerun the build job for a new version' }
+$identity = $identityJson | ConvertFrom-Json
+$version = $identity.version
+$sha = $identity.commit
+$stem = [IO.Path]::GetFileNameWithoutExtension($identity.installer)
 $download = Join-Path $root 'artifacts/download'
 $verification = Join-Path $root 'artifacts/verification'
-New-Item -ItemType Directory -Force $download, $verification | Out-Null
 
 & ./scripts/sign-dist.ps1 -Testbench (Join-Path $root 'target/release/testbench.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Payload signing failed' }
@@ -35,25 +34,13 @@ if (-not $signature.SignerCertificate) { throw 'Signed installer has no certific
 # Only the public certificate leaves the ephemeral build machine.
 Export-Certificate -Cert $signature.SignerCertificate -FilePath (Join-Path $verification 'ci-signing.cer') | Out-Null
 
-$hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash
-New-Sha256SumsLine $hash "$stem.exe" | Set-Content (Join-Path $download 'SHA256SUMS.txt') -Encoding ascii
-$build = [ordered]@{
-    version = $version
-    source_version = $env:NOSPACEKEY_CI_BASE_VERSION
-    commit = $sha
-    ref = $env:GITHUB_REF
-    run_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
-    installer = "$stem.exe"
-    sha256 = $hash.ToLowerInvariant()
-    signing = 'ephemeral development certificate'
-    signer_thumbprint = $signature.SignerCertificate.Thumbprint
-    verification = 'See the separate verify-install job and windows-verification-report artifact.'
-    limitations = @('No physical GPU inference test', 'No physical keyboard or Word interaction test')
-}
-$build | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $download 'BUILD-INFO.json') -Encoding utf8
+$buildJson = & node (Join-Path $PSScriptRoot 'ci-identity.mjs') finish-package $signature.SignerCertificate.Thumbprint
+if ($LASTEXITCODE -ne 0) { throw 'Failed to seal the installer identity; do not upload incomplete outputs' }
+$build = $buildJson | ConvertFrom-Json
+$hash = $build.sha256
 if ($env:GITHUB_STEP_SUMMARY) {
     @"
-Download **nospacekey-windows-x64-$env:GITHUB_RUN_NUMBER-$env:GITHUB_RUN_ATTEMPT** from this run's Artifacts.
+Download **nospacekey-windows-x64-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT** from this run's Artifacts.
 
 - Version: $version
 - Source: $sha
