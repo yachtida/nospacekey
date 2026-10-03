@@ -140,7 +140,10 @@ test('environment context requires checkout HEAD to match the triggering source 
   const commit = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   const code = `import { contextFromEnvironment } from ${JSON.stringify(moduleUrl)}; console.log(contextFromEnvironment(${JSON.stringify(root)}).commit);`;
   const run = expected => execFileSync(process.execPath, ['--input-type=module', '-e', code], {
-    env: { ...process.env, GITHUB_ACTIONS: 'true', GITHUB_SHA: expected }, encoding: 'utf8', stdio: 'pipe',
+    // This fixture models branch push even when the suite itself runs on a tag.
+    env: { ...process.env, GITHUB_ACTIONS: 'true', GITHUB_SHA: expected,
+      GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/master', GITHUB_EVENT_PATH: '' },
+    encoding: 'utf8', stdio: 'pipe',
   });
   assert.equal(run(commit).trim(), commit);
   assert.throws(() => run('0'.repeat(40)), /Checkout HEAD differs/);
