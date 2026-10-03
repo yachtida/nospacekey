@@ -2034,7 +2034,12 @@ fn run_keymap_smoke_notation_rotate(dir: &std::path::Path) -> bool {
             for k in scenarios::typed("nihongo") {
                 let _ = host.feed_key(k.0);
             }
-            host.settle_debounce();
+            // Wait for the asynchronous live result before testing rotation.
+            // A single 60 ms debounce pump can still leave the reading on CI.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while host.store.preedit() != "日本語" && std::time::Instant::now() < deadline {
+                host.settle_debounce();
+            }
             let before = host.store.preedit();
             let _ = host.feed_key(scenarios::NONCONVERT.0); // → ひらがな（読み）
             let p1 = host.store.preedit();
