@@ -72,7 +72,7 @@ final class WindowsTextTests: XCTestCase {
         let segments = [SnapshotSegment(text: "あ", style: "direct")]
         let explicit = service.snapshot(segments, explicit: true, includeFlatCandidates: true)
         XCTAssertEqual(explicit.candidates, ["AzooKey先頭", "Windows追加A", "AzooKey次点", "Windows追加B"])
-        XCTAssertEqual(service.snapshot(segments, explicit: false).text, "AzooKey先頭")
+        XCTAssertEqual(service.snapshot(segments, explicit: false).text, "あ")
         XCTAssertEqual(explicit.clauseData.flat_candidates?.map(\.surface), explicit.candidates)
         XCTAssertTrue(service.inputPredictions(request("あ")).candidates.map(\.surface)
             .contains("予測追加"))
@@ -235,7 +235,7 @@ final class WindowsTextTests: XCTestCase {
         let restored = hybrid(.init { _, _, _ in [] })
         XCTAssertEqual(restored.snapshot(segments, explicit: true).candidates,
             ["AzooKey先頭", "辞書にない語"])
-        XCTAssertEqual(restored.snapshot(segments, explicit: false).text, "AzooKey先頭")
+        XCTAssertEqual(restored.snapshot(segments, explicit: false).text, "あ")
         XCTAssertEqual(restored.recentLearningCountForTesting, 0,
             "Microsoft-only candidates must not enter AzooKey learning")
     }
