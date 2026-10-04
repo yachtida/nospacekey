@@ -18,13 +18,29 @@ export function InputPage() {
   const [catalog, setCatalog] = useState<SymbolCatalogEntry[]>([]);
   const [symbolDraft, setSymbolDraft] = useState<string[]>([]);
   const [symbolError, setSymbolError] = useState<string>();
+  const [catalogStatus, setCatalogStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [catalogAttempt, setCatalogAttempt] = useState(0);
 
   useEffect(() => {
     if (!symbolsOpen) return;
+    let active = true;
+    setCatalog([]);
+    setCatalogStatus("loading");
+    setSymbolError(undefined);
     void command<SymbolCatalogEntry[]>("get_symbol_catalog")
-      .then(setCatalog)
-      .catch((error) => setSymbolError(errorMessage(error)));
-  }, [symbolsOpen]);
+      .then((entries) => {
+        if (!active) return;
+        if (!entries.length) throw new Error("対象の記号を取得できませんでした。再試行してください。");
+        setCatalog(entries);
+        setCatalogStatus("ready");
+      })
+      .catch((error) => {
+        if (!active) return;
+        setSymbolError(errorMessage(error));
+        setCatalogStatus("error");
+      });
+    return () => { active = false; };
+  }, [symbolsOpen, catalogAttempt]);
 
   if (!values) return null;
   return (
@@ -121,7 +137,7 @@ export function InputPage() {
         <SettingRow id="symbol-width" title="記号" description="対象に選んだ記号だけを全角にします。長音「ー」と句読点は対象外です。" effect="入力先を開き直した後">
           <div className="control-stack">
             <Switch checked={values.symbolFullWidth} onChange={(value) => save({ field: "symbol_full_width", value })} label="記号を全角にする" />
-            <button type="button" className="quiet" onClick={() => { setSymbolDraft([...values.symbolFullWidthChars]); setSymbolError(undefined); setSymbolsOpen(true); }}>対象の記号を選ぶ</button>
+            <button type="button" className="quiet" onClick={() => { setSymbolDraft([...values.symbolFullWidthChars]); setSymbolError(undefined); setCatalogStatus("loading"); setSymbolsOpen(true); }}>対象の記号を選ぶ</button>
           </div>
         </SettingRow>
       </SettingsGroup>
@@ -129,7 +145,9 @@ export function InputPage() {
 
       <EditorDialog open={symbolsOpen} title="全角にする記号" dirty={JSON.stringify(symbolDraft) !== JSON.stringify(values.symbolFullWidthChars)} onClose={() => setSymbolsOpen(false)}>
         <p className="dialog-description">選択内容は「保存」するまで設定にもIMEにも送られません。</p>
+        {catalogStatus === "loading" && <StatusMessage>記号を読み込んでいます…</StatusMessage>}
         {symbolError && <StatusMessage tone="error">{symbolError}</StatusMessage>}
+        {catalogStatus === "error" && <button type="button" onClick={() => setCatalogAttempt((attempt) => attempt + 1)}>再試行</button>}
         <div className="symbol-grid">
           {catalog.map((entry) => (
             <label key={entry.half}>
@@ -146,12 +164,12 @@ export function InputPage() {
         </div>
         <div className="dialog-actions split-actions">
           <div>
-            <button type="button" className="quiet" onClick={() => setSymbolDraft(catalog.map((item) => item.half))}>すべて選択</button>
-            <button type="button" className="quiet" onClick={() => setSymbolDraft([])}>すべて解除</button>
+            <button type="button" className="quiet" disabled={catalogStatus !== "ready"} onClick={() => setSymbolDraft(catalog.map((item) => item.half))}>すべて選択</button>
+            <button type="button" className="quiet" disabled={catalogStatus !== "ready"} onClick={() => setSymbolDraft([])}>すべて解除</button>
           </div>
           <div>
             <button type="button" onClick={() => setSymbolsOpen(false)}>キャンセル</button>
-            <button type="button" className="primary" onClick={() => { save({ field: "symbol_full_width_chars", value: symbolDraft }); setSymbolsOpen(false); }}>保存</button>
+            <button type="button" className="primary" disabled={catalogStatus !== "ready"} onClick={() => { save({ field: "symbol_full_width_chars", value: symbolDraft }); setSymbolsOpen(false); }}>保存</button>
           </div>
         </div>
       </EditorDialog>

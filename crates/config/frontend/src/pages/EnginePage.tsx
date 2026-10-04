@@ -48,7 +48,7 @@ function LatencyDetails({ runtime }: { runtime?: ZenzaiRuntimeStatus }) {
 }
 
 export function EnginePage() {
-  const { values, save, errors, acceptSnapshot } = useSettings();
+  const { values, snapshot, save, saveField, errors, acceptSnapshot } = useSettings();
   const [model, setModel] = useState<ModelStatus>();
   const [runtime, setRuntime] = useState<ZenzaiRuntimeStatus>();
   const [failure, setFailure] = useState("");
@@ -112,6 +112,7 @@ export function EnginePage() {
   }, []);
 
   if (!values) return null;
+  const confirmed = snapshot?.values ?? values;
   const downloadZenzai = async (activate: boolean) => {
     if (downloadPending.current) return;
     downloadPending.current = true;
@@ -170,8 +171,8 @@ export function EnginePage() {
         </SettingRow>
       </SettingsGroup>
       <details className="details-panel"><summary>詳細調整</summary><div className="details-body">
-        <SettingRow id="zenzai-path" title="任意GGUFパス" description="空欄では管理領域または同梱モデルを自動検出します。絶対パスだけを保存できます。" effect="次回のエンジン接続から"><CommitField value={values.weightPath} label="GGUFパス" placeholder="C:\\…\\model.gguf" onCommit={(value) => save({ field: "weight_path", value })} /><InlineError errors={errors} field="weight_path" /></SettingRow>
-        <SettingRow id="zenzai-limit" title="推論上限" description="1〜10。値が大きいほど推論回数が増えます。" effect="次回のエンジン接続から"><CommitField type="number" min={1} max={10} step={1} value={values.zenzaiInferenceLimit} label="推論上限" onCommit={(value) => save({ field: "zenzai_inference_limit", value: Number(value) })} /><InlineError errors={errors} field="zenzai_inference_limit" /></SettingRow>
+        <SettingRow id="zenzai-path" title="任意GGUFパス" description="空欄では管理領域または同梱モデルを自動検出します。絶対パスだけを保存できます。" effect="次回のエンジン接続から"><CommitField value={confirmed.weightPath} label="GGUFパス" placeholder="C:\\…\\model.gguf" onCommit={(value) => saveField({ field: "weight_path", value })} /><InlineError errors={errors} field="weight_path" /></SettingRow>
+        <SettingRow id="zenzai-limit" title="推論上限" description="1〜10。値が大きいほど推論回数が増えます。" effect="次回のエンジン接続から"><CommitField type="number" min={1} max={10} step={1} value={confirmed.zenzaiInferenceLimit} label="推論上限" onCommit={(value) => saveField({ field: "zenzai_inference_limit", value: Number(value) })} /><InlineError errors={errors} field="zenzai_inference_limit" /></SettingRow>
       </div></details>
       </>}
     </div>

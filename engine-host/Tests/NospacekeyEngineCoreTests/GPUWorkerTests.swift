@@ -1139,6 +1139,53 @@ final class GPUWorkerSupervisorTests: XCTestCase {
             model.resolvingSymlinksInPath().standardizedFileURL)
     }
 
+    func testSingleKanaLiveSnapshotSkipsAReadyProductionEnhancementWorker() throws {
+        let model = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gpu-worker-single-kana-\(UUID().uuidString).gguf")
+        try Data("model".utf8).write(to: model)
+        defer { try? FileManager.default.removeItem(at: model) }
+        let config = ZenzaiConfig(weightURL: model, inferenceLimit: 1,
+            runtimeDirectory: FileManager.default.temporaryDirectory)
+
+        for engine in ["azookey", "hybrid"] {
+            let transport = FakeGPUWorkerTransport()
+            transport.blockRequests = true
+            let supervisor = GPUWorkerSupervisor(transport: transport,
+                runtimeConfiguration: GPUWorkerRuntimeConfiguration(config: config),
+                allowsLazyStart: false)
+            defer {
+                transport.releaseRequest.signal()
+                supervisor.disable()
+            }
+            let service = ConversionService(config: config, learning: .disabled,
+                environment: ["NOSPACEKEY_CONVERSION_ENGINE": engine],
+                runtimeClient: CountingRuntimeClient(), fileSystem: .live,
+                windowsTextProvider: .init { _, _, _ in [] },
+                processRole: .mainClassicOnly, gpuWorkerSupervisor: supervisor)
+            service.startWarmUp()
+            XCTAssertTrue(waitUntil(supervisor.snapshot.state == .gpuActive), engine)
+            for (offset, width) in [1, 10].enumerated() {
+                let key = ConversionService.SnapshotEnhancementKey(composition: 9,
+                    revision: UInt64(offset + 1), configurationGeneration: 1, connectionGeneration: 1)
+                let result = service.snapshot([.init(text: "ma", style: nil)], explicit: false,
+                    enhancementKey: key, snapshotConnection: 1, liveSearchWidth: width)
+                XCTAssertEqual(result.text, "ま", engine)
+                XCTAssertNil(result.autoCommit)
+                guard case .unavailable = service.pollSnapshotEnhancement(key: key, baseline: result.baseline) else {
+                    return XCTFail("single kana must bypass a configured, ready production enhancement worker")
+                }
+                XCTAssertEqual(transport.requests.count, 0, engine)
+            }
+            // Positive control: the same production path really admits a multi-kana snapshot.
+            let key = ConversionService.SnapshotEnhancementKey(composition: 9, revision: 3,
+                configurationGeneration: 1, connectionGeneration: 1)
+            _ = service.snapshot([.init(text: "made", style: nil)], explicit: false,
+                enhancementKey: key, snapshotConnection: 1)
+            XCTAssertEqual(transport.requestStarted.wait(timeout: .now() + 1), .success, engine)
+            XCTAssertEqual(transport.requests.count, 1, engine)
+        }
+    }
+
     func testMainEndSessionDoesNotResetTheNextWorkerRank() throws {
         let model = FileManager.default.temporaryDirectory
             .appendingPathComponent("gpu-worker-session-model-\(UUID().uuidString).gguf")

@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 import type { FieldError } from "../bridge/types";
+import type { SettingSaveOutcome } from "../settings/SettingsStore";
 
 export function SettingsGroup({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -116,7 +117,7 @@ export function InlineError({ errors, field }: { errors: FieldError[]; field: st
 
 type CommitFieldProps = {
   value: string | number;
-  onCommit: (value: string) => void;
+  onCommit: (value: string) => Promise<SettingSaveOutcome>;
   label: string;
   type?: "text" | "number";
   min?: number;
@@ -140,34 +141,40 @@ export function CommitField({
   const [draft, setDraft] = useState(String(value));
   const [composing, setComposing] = useState(false);
   const dirty = useRef(false);
-  const awaitingConfirmation = useRef(false);
+  const [pending, setPending] = useState(false);
+  const submission = useRef(0);
+  const [isDirty, setIsDirty] = useState(false);
 
   const publishDirty = (value: boolean) => {
+    dirty.current = value;
+    setIsDirty(value);
     inputRef.current?.setAttribute("data-commit-dirty", String(value));
     window.dispatchEvent(new Event("settings-draft-change"));
   };
 
   useEffect(() => {
-    const confirmed = String(value);
-    if (awaitingConfirmation.current) {
-      if (confirmed === draft) awaitingConfirmation.current = false;
-      return;
-    }
-    if (!dirty.current) setDraft(confirmed);
-  }, [draft, value]);
+    if (!pending && !dirty.current) setDraft(String(value));
+  }, [pending, value]);
+
+  useEffect(() => () => { submission.current++; }, []);
 
   const commit = () => {
     if (composing || !dirty.current) return;
     if (type === "number" && (draft.trim() === "" || draft === "-" || !Number.isFinite(Number(draft)))) {
       return;
     }
-    dirty.current = false;
     publishDirty(false);
-    awaitingConfirmation.current = true;
-    onCommit(draft);
+    setPending(true);
+    const current = ++submission.current;
+    const finish = (outcome: SettingSaveOutcome) => {
+      // Earlier saves cannot settle a newer submission, even if their values match.
+      if (submission.current !== current) return;
+      if (outcome === "rejected") publishDirty(true);
+      setPending(false);
+    };
+    void onCommit(draft).then(finish, () => finish("rejected"));
   };
   const onChange = (event: ChangeEvent<HTMLInputElement>) => {
-    dirty.current = true;
     publishDirty(true);
     setDraft(event.target.value);
   };
@@ -190,7 +197,7 @@ export function CommitField({
         max={max}
         step={step}
         placeholder={placeholder}
-        data-commit-dirty="false"
+        data-commit-dirty={String(isDirty)}
         onChange={onChange}
         onBlur={onBlur}
         onKeyDown={onKeyDown}

@@ -21,12 +21,15 @@ import type {
 
 type SaveState = "loading" | "saved" | "saving" | "checking" | "blocked";
 
+export type SettingSaveOutcome = "saved" | "rejected" | "discarded";
+
 type QueueItem = {
   operationId: string;
   changes: SettingChange[];
   baseValues?: PublicSettings;
   baseRevision?: string;
   conflictRetries?: number;
+  complete?: (outcome: SettingSaveOutcome) => void;
 };
 
 type SettingsContextValue = {
@@ -38,6 +41,7 @@ type SettingsContextValue = {
   effects: EffectStatus[];
   conflict?: SettingsConflict;
   save: (change: SettingChange | SettingChange[]) => void;
+  saveField: (change: SettingChange) => Promise<SettingSaveOutcome>;
   retry: () => void;
   acceptSnapshot: (snapshot: SettingsSnapshot) => void;
   resolveConflict: (field: string, keepEdited: boolean) => void;
@@ -299,6 +303,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     if (result.kind === "saved") {
       setEffects(result.effects);
       updateSnapshot(result.snapshot);
+      item.complete?.("saved");
       void drainRef.current();
       return;
     }
@@ -345,6 +350,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       // Rejected operations are cached by Rust; an explicit retry needs a new ID.
       queue.current.unshift({ ...item, operationId: crypto.randomUUID() });
       paused.current = true;
+    } else {
+      item.complete?.("rejected");
     }
     if (result.snapshot) {
       updateSnapshot(result.snapshot);
@@ -356,9 +363,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     if (!paused.current && queue.current.length) void drainRef.current();
   };
 
-  const save = useCallback((change: SettingChange | SettingChange[]) => {
+  const enqueue = useCallback((change: SettingChange | SettingChange[], complete?: QueueItem["complete"]) => {
     const changes = Array.isArray(change) ? change : [change];
-    queue.current.push({ operationId: crypto.randomUUID(), changes });
+    queue.current.push({ operationId: crypto.randomUUID(), changes, complete });
     setValues((current) =>
       current ? changes.reduce(applyLocalChange, current) : current,
     );
@@ -366,17 +373,23 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     void drainRef.current();
   }, []);
 
+  const save = useCallback((change: SettingChange | SettingChange[]) => enqueue(change), [enqueue]);
+  const saveField = useCallback((change: SettingChange) =>
+    new Promise<SettingSaveOutcome>((complete) => enqueue(change, complete)), [enqueue]);
+
   const retry = useCallback(async () => {
     if (conflictItem.current) return;
     if (!snapshotRef.current || loadError) {
       setSaveState("loading");
       if (!await refresh()) return;
     }
+    // Validation-rejected edits have no retryable request. Keep their errors until corrected.
+    if (!active.current && !queue.current.length && errors.length) return;
     paused.current = false;
     setErrors([]);
     setSaveState("saving");
     void drainRef.current();
-  }, [loadError, refresh]);
+  }, [errors, loadError, refresh]);
 
   const resolveConflict = useCallback((field: string, keepEdited: boolean) => {
     const item = conflictItem.current;
@@ -398,11 +411,15 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     paused.current = false;
     if (changes.length) {
       queue.current.unshift({
+        ...item,
         operationId: crypto.randomUUID(),
         changes,
         baseValues: clone(latest.values),
+        baseRevision: latest.revision,
         conflictRetries: 1,
       });
+    } else {
+      item.complete?.("discarded");
     }
     setErrors([]);
     setValues(replay(latest, undefined, queue.current));
@@ -426,11 +443,12 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       effects,
       conflict,
       save,
+      saveField,
       retry,
       acceptSnapshot,
       resolveConflict,
     }),
-    [snapshot, values, saveState, errors, loadError, effects, conflict, save, retry, acceptSnapshot, resolveConflict],
+    [snapshot, values, saveState, errors, loadError, effects, conflict, save, saveField, retry, acceptSnapshot, resolveConflict],
   );
   return <SettingsContext.Provider value={context}>{children}</SettingsContext.Provider>;
 }

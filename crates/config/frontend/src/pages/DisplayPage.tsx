@@ -29,7 +29,7 @@ function Preview({ palette, font, corner }: { palette: Palette; font: string; co
 }
 
 export function DisplayPage() {
-  const { values, save, errors } = useSettings();
+  const { values, snapshot, save, saveField, errors } = useSettings();
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [tab, setTab] = useState<"light" | "dark">("light");
   const [light, setLight] = useState<Palette>(DEFAULT_LIGHT);
@@ -41,6 +41,7 @@ export function DisplayPage() {
       || JSON.stringify(values.appearance.palette_dark) !== JSON.stringify(DEFAULT_DARK)
     : false, [values]);
   if (!values) return null;
+  const confirmed = snapshot?.values ?? values;
   const theme = values.appearance.theme === "custom" ? "light" : values.appearance.theme;
   const openEditor = () => {
     setLight(structuredClone(values.appearance.palette_light));
@@ -63,8 +64,8 @@ export function DisplayPage() {
       <SettingsGroup title="文字・背景・角">
         <SettingRow id="appearance-font" title="候補のフォント" description="サイズはポイント単位です。" effect="次回の候補表示から反映予定">
           <div className="inline-fields">
-            <CommitField value={values.appearance.font_family} label="フォント名" onCommit={(value) => save({ field: "appearance_font_family", value })} />
-            <CommitField type="number" min={4} max={32} step={0.5} value={values.appearance.font_point} label="フォントサイズ" onCommit={(value) => save({ field: "appearance_font_point", value: Number(value) })} />
+            <CommitField value={confirmed.appearance.font_family} label="フォント名" onCommit={(value) => saveField({ field: "appearance_font_family", value })} />
+            <CommitField type="number" min={4} max={32} step={0.5} value={confirmed.appearance.font_point} label="フォントサイズ" onCommit={(value) => saveField({ field: "appearance_font_point", value: Number(value) })} />
           </div>
           <InlineError errors={errors} field="appearance.font_point" />
         </SettingRow>
@@ -88,7 +89,7 @@ export function DisplayPage() {
           <Switch checked={values.readingMonitorAccumulate} onChange={(value) => save({ field: "reading_monitor_accumulate", value })} label="読みの保持" />
         </SettingRow>
         <SettingRow id="reading-max" title="最大文字数" description="10〜100文字。空欄や入力途中の値は保存しません。" effect="入力先を開き直した後">
-          <CommitField type="number" min={10} max={100} step={1} value={values.readingMonitorMaxChars} label="最大文字数" onCommit={(value) => save({ field: "reading_monitor_max_chars", value: Number(value) })} />
+          <CommitField type="number" min={10} max={100} step={1} value={confirmed.readingMonitorMaxChars} label="最大文字数" onCommit={(value) => saveField({ field: "reading_monitor_max_chars", value: Number(value) })} />
           <InlineError errors={errors} field="reading_monitor_max_chars" />
         </SettingRow>
       </SettingsGroup>
