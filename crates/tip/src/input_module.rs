@@ -2698,6 +2698,79 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn single_kana_live_display_commits_hiragana_and_space_still_requests_conversion() {
+        for (roman, reading) in [("ma", "ま"), ("ka", "か"), ("ga", "が"), ("la", "ぁ"), ("nn", "ん")] {
+            let mut module = InputModule::default();
+            for ch in roman.chars() { module.handle(key(ch)); }
+            assert_eq!(module.canonical_reading(), reading);
+            apply_live_snapshot(&mut module, reading);
+            let space = module.handle(InputEvent::Key(KeyEvent::Space));
+            assert!(matches!(space.background, Some(BackgroundIntent::Convert { .. })));
+            let enter = module.handle(InputEvent::Key(KeyEvent::Enter));
+            assert!(matches!(enter.immediate,
+                Some(ImmediateOperation::Commit { text, candidate: None, .. }) if text == reading));
+            assert!(enter.background.is_none());
+        }
+    }
+
+    #[test]
+    fn deleting_to_single_kana_rejects_delayed_multicharacter_live_results() {
+        let mut module = InputModule::default();
+        for ch in "made".chars() { module.handle(key(ch)); }
+        assert_eq!(module.canonical_reading(), "まで");
+        apply_live_snapshot(&mut module, "間で");
+        let BackgroundIntent::LiveSnapshot { snapshot: old } =
+            module.live_snapshot(3, 7, None).unwrap() else { unreachable!() };
+        let deletion = module.handle(InputEvent::Key(KeyEvent::Backspace));
+        assert_eq!(module.canonical_reading(), "ま");
+        assert_eq!(deletion.immediate, Some(ImmediateOperation::SetPreedit { text: "ま".into() }));
+        apply_live_snapshot(&mut module, "ま");
+        assert_eq!(module.handle(InputEvent::Engine(EngineResult::LiveSnapshot {
+            identity: old.identity, text: "間で".into(),
+        })), ModuleOutput::default());
+        assert_eq!(module.handle(InputEvent::Engine(EngineResult::LiveAutoCommitProposal(
+            AutoCommitProposal {
+                proposal: 1, identity: old.identity, text: "間".into(),
+                consumed_reading: "ま".into(), remaining: "で".into(),
+            },
+        ))), ModuleOutput::default());
+        assert_eq!(module.immediate_display(), "ま");
+        // Enter and mode-switch/cursor settle use the displayed text without a fresh conversion.
+        assert_eq!(crate::input_state::plan_live_enter(None, &module.immediate_display(), module.canonical_reading()),
+            crate::input_state::LiveEnterPlan::DirectCommit { text: "ま".into() });
+        let enter = module.handle(InputEvent::Key(KeyEvent::Enter));
+        assert!(matches!(enter.immediate,
+            Some(ImmediateOperation::Commit { text, candidate: None, .. }) if text == "ま"));
+        assert!(enter.background.is_none());
+    }
+
+    #[test]
+    fn single_kana_space_accepts_explicit_kanji_candidates() {
+        let mut module = InputModule::default();
+        for ch in "ma".chars() { module.handle(key(ch)); }
+        apply_live_snapshot(&mut module, "ま");
+        let space = module.handle(InputEvent::Key(KeyEvent::Space));
+        let Some(BackgroundIntent::Convert { request }) = space.background else { unreachable!() };
+        module.handle(InputEvent::Engine(EngineResult::Candidates {
+            request, values: vec!["間".into(), "ま".into()],
+        }));
+        assert_eq!(module.candidates, vec!["間", "ま"]);
+        let enter = module.handle(InputEvent::Key(KeyEvent::Enter));
+        assert!(matches!(enter.background, Some(BackgroundIntent::Commit { candidate: Some(0), .. })));
+    }
+
+    #[test]
+    fn finalized_pending_n_uses_the_same_hiragana_live_commit_path() {
+        let mut module = InputModule::default();
+        module.handle(key('n'));
+        assert_eq!(module.finalize_pending_n(), Some(true));
+        apply_live_snapshot(&mut module, "ん");
+        let enter = module.handle(InputEvent::Key(KeyEvent::Enter));
+        assert!(matches!(enter.immediate,
+            Some(ImmediateOperation::Commit { text, candidate: None, .. }) if text == "ん"));
+    }
+
     fn displayed(module: &mut InputModule, event: InputEvent) -> String {
         match module.handle(event).immediate {
             Some(ImmediateOperation::SetPreedit { text }) => text,

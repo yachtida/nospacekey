@@ -1898,6 +1898,17 @@ public final class ConversionService: @unchecked Sendable {
         converterLock.lock()
         defer { converterLock.unlock() }
         bindConverter(to: session)
+        if let hiragana = Self.automaticSingleKana(rec.composing.convertTarget) {
+            rec.liveState = nil
+            let candidate = Candidate(text: hiragana, value: 0,
+                composingCount: .inputCount(rec.composing.input.count), lastMid: MIDData.一般.mid,
+                data: [DicdataElement(word: hiragana, ruby: Self.toKatakana(hiragana),
+                    cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: 0)],
+                isLearningTarget: false)
+            rec.cacheCandidates([candidate], target: rec.composing.convertTarget)
+            sessions[session] = rec
+            return (hiragana, rec.composing.convertTarget, nil)
+        }
         let (options, requestedZenzai) = makeOptionsWithZenzaiUsage(nBest: 1, leftSideContext: leftContext)
         let classicOptions = makeOptions(nBest: 1, leftSideContext: leftContext, forceClassic: true)
         let t0 = DispatchTime.now()
@@ -2747,6 +2758,18 @@ public final class ConversionService: @unchecked Sendable {
     typealias SnapshotResult = (text: String, reading: String, candidates: [String]?, candidateRemaining: [String]?, baseline: UInt64,
                                  autoCommit: SnapshotAutoCommitProposal?, clauseData: SnapshotClauseData)
 
+    private func beginSnapshotBaselineLocked(key: SnapshotEnhancementKey?, leftContext: String?) -> UInt64? {
+        guard nextClauseBaseline < UInt64.max else { return nil }
+        nextClauseBaseline += 1
+        let baseline = nextClauseBaseline
+        let now = ProcessInfo.processInfo.systemUptime
+        clauseBaselines = clauseBaselines.filter { now - $0.value.issuedAt < 60 }
+        if let key, clauseBaselines.count < 4096 {
+            clauseBaselines[baseline] = ClauseBaseline(key: key, leftContext: leftContext, issuedAt: now)
+        }
+        return baseline
+    }
+
     func snapshot(_ segments: [SnapshotSegment], explicit: Bool, includeFlatCandidates: Bool = false, leftContext: String? = nil,
                   enhancementKey: SnapshotEnhancementKey? = nil, snapshotConnection: Int = 0,
                   liveSearchWidth: Int = 1) -> SnapshotResult {
@@ -2762,6 +2785,18 @@ public final class ConversionService: @unchecked Sendable {
         guard RequestDeadline.acquire(converterLock, before: admissionDeadline) else { return nil }
         defer { converterLock.unlock() }
         stopCompositionLocked()
+        let reading = composing.convertTarget
+        if !explicit, let hiragana = Self.automaticSingleKana(reading) {
+            if let enhancementKey {
+                snapshotAutoCommitStates[SnapshotAutoCommitStream(
+                    connection: snapshotConnection, composition: enhancementKey.composition)] = nil
+            }
+            let baseline = beginSnapshotBaselineLocked(key: enhancementKey, leftContext: leftContext) ?? 0
+            let data = makeSnapshotClauseDataLocked(reading: reading, candidate: nil, key: enhancementKey)
+            clauseBaselines[baseline]?.clauses = data.clauses
+            guard admissionDeadline?.expired != true else { return nil }
+            return (hiragana, reading, nil, nil, baseline, nil, data)
+        }
         let nBest = explicit || liveSearchWidth == 10 ? 10 : 1
         let options = makeOptions(nBest: nBest, leftSideContext: leftContext, forceClassic: true)
         var classic = conversionEngine == .hybrid
@@ -2769,7 +2804,6 @@ public final class ConversionService: @unchecked Sendable {
             : requestCandidatesLocked(composing, options: options)
         guard admissionDeadline?.expired != true else { return nil }
         if let snapshotCandidatesForTesting { classic.mainResults = snapshotCandidatesForTesting }
-        let reading = composing.convertTarget
         let modelTop = classic.mainResults.first?.text
         if conversionEngine != .microsoft {
             let ranked = recentLearning.rank(
@@ -2789,17 +2823,11 @@ public final class ConversionService: @unchecked Sendable {
         } else {
             results = classic.mainResults
         }
-        guard nextClauseBaseline < UInt64.max else {
+        guard let baseline = beginSnapshotBaselineLocked(key: enhancementKey, leftContext: leftContext) else {
             let data = makeSnapshotClauseDataLocked(reading: reading, candidate: nil, key: enhancementKey)
             return (data.clauses.map(\.surface).joined(), reading, explicit ? [] : nil, explicit ? [] : nil, 0, nil, data)
         }
-        nextClauseBaseline += 1
-        let baseline = nextClauseBaseline
         let now = ProcessInfo.processInfo.systemUptime
-        clauseBaselines = clauseBaselines.filter { now - $0.value.issuedAt < 60 }
-        if let enhancementKey, clauseBaselines.count < 4096 {
-            clauseBaselines[baseline] = ClauseBaseline(key: enhancementKey, leftContext: leftContext, issuedAt: now)
-        }
         let selected = Self.snapshotCandidate(results, reading: reading)
         engineLog("ev=infer kind=\(explicit ? "explicit" : "live")_snapshot target_chars=\(reading.count)\n")
         guard explicit else {
