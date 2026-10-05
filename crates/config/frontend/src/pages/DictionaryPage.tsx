@@ -6,6 +6,7 @@ import { useSettings } from "../settings/SettingsStore";
 
 const PAGE_SIZE = 50;
 const RESULT_KEY = "nospacekey.dictionary.lastResult";
+const PARTS_OF_SPEECH = ["名詞", "人名", "姓", "名", "固有名詞", "組織", "地名", "数", "顔文字", "絵文字"];
 
 function engineMessage(engine: string) {
   switch (engine) {
@@ -31,6 +32,7 @@ export function DictionaryPage() {
 }
 
 function DictionaryEntries({ kaomoji, onLock }: { kaomoji: boolean; onLock: (value: boolean) => void }) {
+  const defaultPos = kaomoji ? "顔文字" : "名詞";
   const { values, save } = useSettings();
   const [report, setReport] = useState<DictListReport>();
   const [recentMicrosoft, setRecentMicrosoft] = useState<{ ruby: string; word: string }[]>([]);
@@ -40,7 +42,7 @@ function DictionaryEntries({ kaomoji, onLock }: { kaomoji: boolean; onLock: (val
   const [editing, setEditing] = useState<DictEntry | "new">();
   const [ruby, setRuby] = useState("");
   const [word, setWord] = useState("");
-  const [pos, setPos] = useState("名詞");
+  const [pos, setPos] = useState(defaultPos);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState(() => sessionStorage.getItem(RESULT_KEY + (kaomoji ? ".kaomoji" : "")) ?? "");
   const [failure, setFailure] = useState("");
@@ -77,7 +79,7 @@ function DictionaryEntries({ kaomoji, onLock }: { kaomoji: boolean; onLock: (val
     setEditing(entry);
     setRuby(entry === "new" ? "" : entry.ruby);
     setWord(entry === "new" ? "" : entry.word);
-    setPos(entry === "new" ? "名詞" : entry.pos ?? "名詞");
+    setPos(entry === "new" ? defaultPos : entry.pos ?? "名詞");
     setFailure("");
   };
   const openMicrosoft = (entry: { ruby: string; word: string }) => {
@@ -141,7 +143,7 @@ function DictionaryEntries({ kaomoji, onLock }: { kaomoji: boolean; onLock: (val
     finally { setBusy(false); }
   };
   const editorDirty = editing === "new"
-    ? Boolean(ruby || word || pos !== "名詞")
+    ? Boolean(ruby || word || pos !== defaultPos)
     : editing
       ? ruby !== editing.ruby || word !== editing.word || pos !== (editing.pos ?? "名詞")
       : false;
@@ -150,6 +152,7 @@ function DictionaryEntries({ kaomoji, onLock }: { kaomoji: boolean; onLock: (val
     <div className="page-stack">
 
       {kaomoji && <StatusMessage tone="neutral">顔文字・絵文字は通常の変換や予測には出ません。Ctrl+Shift+F7 でパレットを開き、読みを検索して Enter で挿入できます。</StatusMessage>}
+      {!kaomoji && <StatusMessage tone="neutral">品詞が顔文字・絵文字の単語は、AzooKeyの変換で優先度を下げます。パレットだけで使う場合は「顔文字・絵文字」タブに登録・取込してください。</StatusMessage>}
       {!kaomoji && <SettingsGroup title="辞書の利用">
         <SettingRow id="dictionary-enabled" title="ユーザー辞書を変換に使う" description="OFFでも単語の検索・追加・編集・取込・書出しはできます。登録内容は削除されません。" effect="入力先を開き直した後">
           <Switch checked={values.userDictionaryEnabled} onChange={(value) => save({ field: "user_dictionary_enabled", value })} label="ユーザー辞書" />
@@ -176,7 +179,7 @@ function DictionaryEntries({ kaomoji, onLock }: { kaomoji: boolean; onLock: (val
         <SettingRow id="learning" title="変換結果を学習する" description="OFFにしても、これまでの学習内容は削除されません。" effect="次回のエンジン接続から"><Switch checked={values.learningEnabled} onChange={(value) => save({ field: "learning_enabled", value })} label="変換学習" /></SettingRow>
       </SettingsGroup>}
       <EditorDialog open={Boolean(editing)} title={editing === "new" ? "単語を追加" : "単語を編集"} dirty={editorDirty} onClose={() => !busy && setEditing(undefined)}>
-        <div className="form-grid"><label>読み<input value={ruby} onChange={(event) => setRuby(event.target.value)} autoFocus spellCheck={false} /></label><label>単語<input value={word} onChange={(event) => setWord(event.target.value)} spellCheck={false} /></label><label>品詞<select value={pos} onChange={(event) => setPos(event.target.value)}><option>名詞</option><option>人名</option><option>姓</option><option>名</option><option>固有名詞</option><option>組織</option><option>地名</option><option>数</option></select></label></div>
+        <div className="form-grid"><label>読み<input value={ruby} onChange={(event) => setRuby(event.target.value)} autoFocus spellCheck={false} /></label><label>単語<input value={word} onChange={(event) => setWord(event.target.value)} spellCheck={false} /></label><label>品詞<select value={pos} onChange={(event) => setPos(event.target.value)}>{!PARTS_OF_SPEECH.includes(pos) && <option value={pos}>{pos || "名詞（未指定）"}</option>}{PARTS_OF_SPEECH.map((value) => <option key={value}>{value}</option>)}</select></label></div>
         {failure && <StatusMessage tone="error">{failure}</StatusMessage>}
         <div className="dialog-actions"><button type="button" disabled={busy} onClick={() => setEditing(undefined)}>キャンセル</button><button type="button" className="primary" disabled={busy || !ruby || !word} onClick={() => void mutate()}>保存</button></div>
       </EditorDialog>

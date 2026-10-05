@@ -10,6 +10,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[path = "user_dictionary_tsv.rs"]
+mod tsv;
+pub use tsv::{to_google_tsv, to_native_tsv, ExportOutput};
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserDictEntry {
     pub ruby: String,
@@ -187,11 +191,17 @@ fn is_valid_ruby_char(c: char) -> bool {
     matches!(c, '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30F6}' | '\u{30FC}')
 }
 
-/// Swift `UserDictionary.cid(for:)`(43-58行)の分岐順ミラー。変更時は両方直す。
+/// 表示・TSV書出し用の品詞。顔文字・絵文字は分類を維持し、それ以外は
+/// Swift `UserDictionary.cid(for:)` と同じ名詞分類へ正準化する。
 pub fn canonical_pos(pos: Option<&str>) -> &'static str {
     let Some(p) = pos.filter(|p| !p.is_empty()) else {
         return "名詞";
     };
+    match trim_ws(p) {
+        "顔文字" => return "顔文字",
+        "絵文字" => return "絵文字",
+        _ => {}
+    }
     if p.contains("人名") {
         if p.contains("姓") {
             return "姓";
@@ -262,7 +272,7 @@ pub fn backup_before_import(path: &Path, entries: &[UserDictEntry]) -> std::io::
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let tsv = to_google_tsv(entries);
+    let tsv = to_native_tsv(entries);
     // TSVでは表現できない既存データを黙って復旧用ファイルから落とさない。
     if tsv.skipped_control != 0 {
         return Err(std::io::Error::other(
@@ -674,7 +684,7 @@ pub fn parse_tsv(bytes: &[u8]) -> ParsedTsv {
         rows.push(UserDictEntry {
             ruby: cols[0].to_string(),
             word: cols[1].to_string(),
-            pos: cols.get(2).map(|s| s.to_string()),
+            pos: tsv::imported_pos(cols.get(2).copied(), cols.get(3).copied()),
         });
     }
     ParsedTsv {
@@ -726,47 +736,6 @@ pub fn merge_imported(
         skipped_invalid,
         encoding_hint: had_replacement || invalid_had_replacement,
     }
-}
-
-pub struct ExportOutput {
-    pub tsv: String,
-    pub written: usize,
-    pub skipped_control: usize,
-}
-
-/// Google 形式 TSV へのエクスポート（spec §6）。ソートキーは §5.1 と共通の
-/// `(normalize_key(ruby), word)`（word は生値 — normalize_word だと表示順が
-/// 正規化後の値になり、UI 一覧の並びと食い違う）。制御文字を含む行（ruby/word/pos の
-/// いずれか）は TSV の列構造を壊すため出力せずスキップする。
-pub fn to_google_tsv(entries: &[UserDictEntry]) -> ExportOutput {
-    let mut sorted: Vec<&UserDictEntry> = entries.iter().collect();
-    sorted.sort_by_cached_key(|e| (normalize_key(&e.ruby), e.word.clone()));
-    let mut tsv = String::new();
-    let mut written = 0usize;
-    let mut skipped_control = 0usize;
-    for e in sorted {
-        let pos = canonical_pos(e.pos.as_deref());
-        if has_control_char(&e.ruby) || has_control_char(&e.word) || has_control_char(pos) {
-            skipped_control += 1;
-            continue;
-        }
-        tsv.push_str(&e.ruby);
-        tsv.push('\t');
-        tsv.push_str(&e.word);
-        tsv.push('\t');
-        tsv.push_str(pos);
-        tsv.push_str("\r\n");
-        written += 1;
-    }
-    ExportOutput {
-        tsv,
-        written,
-        skipped_control,
-    }
-}
-
-fn has_control_char(s: &str) -> bool {
-    s.chars().any(|c| ('\u{0000}'..='\u{001F}').contains(&c))
 }
 
 #[cfg(test)]
@@ -860,12 +829,60 @@ mod tests {
             (Some("地名"), "地名"),
             (Some("駅"), "地名"),
             (Some("数"), "数"),
+            (Some("顔文字"), "顔文字"),
+            (Some("絵文字"), "絵文字"),
+            (Some("　顔文字 "), "顔文字"),
+            (Some("\t絵文字　"), "絵文字"),
+            (Some("絵文字名詞"), "名詞"),
         ] {
             assert_eq!(canonical_pos(input), want, "input={input:?}");
         }
     }
 
     // ---- load/save/dedup/破損隔離(spec §3.2, §8) ----
+
+    #[test]
+    fn expressive_types_survive_msime_import_save_export_and_backup() {
+        let text = "!Microsoft IME Dictionary Tool\r\n!Version:\r\n\
+            てすと\t(>_<)\t顔文字\r\n\
+            てすと\t😀\t絵文字\tcomment\r\n\
+            てすと\t辞書検証語\t名詞\r\n";
+        let bytes: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let parsed = parse_tsv(&bytes);
+        assert!(!parsed.had_replacement);
+        let (entries, report) = replace_imported(parsed.rows, false);
+        assert_eq!(report.added, 3);
+        assert_eq!(entries[0].pos.as_deref(), Some("顔文字"));
+        assert_eq!(entries[1].pos.as_deref(), Some("絵文字"));
+        assert_eq!(entries[2].pos.as_deref(), Some("名詞"));
+
+        let path = tmpfile("expressive-roundtrip", "dict.json", b"[]");
+        save_to(&path, &entries).unwrap();
+        let loaded = load_from(&path).unwrap().entries;
+        assert_eq!(loaded, entries);
+        let out = to_google_tsv(&loaded);
+        assert_eq!(out.written, 3);
+        assert!(out.tsv.contains("てすと\t(>_<)\t顔文字\r\n"));
+        assert!(out.tsv.contains("てすと\t😀\t顔文字\tnospacekey:pos=絵文字\r\n"));
+        assert!(out.tsv.contains("てすと\t辞書検証語\t名詞\r\n"));
+        let mut restored = parse_tsv(out.tsv.as_bytes()).rows;
+        restored.sort_by_key(|e| e.word.clone());
+        let mut expected = entries;
+        expected.sort_by_key(|e| e.word.clone());
+        assert_eq!(restored, expected);
+
+        let backup = backup_before_import(&path, &loaded).unwrap();
+        let backup_tsv = std::fs::read_to_string(&backup).unwrap();
+        assert!(backup_tsv.contains("てすと\t😀\t絵文字\r\n"));
+        let mut backup_rows = parse_tsv(backup_tsv.as_bytes()).rows;
+        backup_rows.sort_by_key(|e| e.word.clone());
+        assert_eq!(backup_rows, expected);
+        std::fs::remove_file(backup).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn tmpfile(case: &str, name: &str, bytes: &[u8]) -> PathBuf {
         // テストごとに専用 dir（共有すると並列実行で「.corrupt. が無い」系アサートが

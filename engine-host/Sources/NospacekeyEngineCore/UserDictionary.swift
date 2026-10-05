@@ -67,16 +67,23 @@ public enum UserDictionary {
         let ruby = ConversionService.toKatakana(e.ruby.trimmingCharacters(in: .whitespaces))
         let word = e.word.trimmingCharacters(in: .whitespaces)
         guard !ruby.isEmpty, !word.isEmpty else { return nil }
-        // value=-5 は仮値(plan Open Risk): 辞書語が上位に出すぎ/出なさすぎなら実機で調整。
+        // 通常語の既存スコアを維持し、明示された顔文字・絵文字だけを日付候補と同じ弱さにする。
+        // Microsoft IME 自体の順位は操作せず、AzooKey の動的辞書へ渡す値だけを変える。
         return DicdataElement(word: word, ruby: ruby, cid: cid(for: e.pos),
-                              mid: MIDData.一般.mid, value: -5)
+                              mid: MIDData.一般.mid, value: isExpressive(e.pos) ? -18 : -5)
+    }
+
+    private static func isExpressive(_ pos: String?) -> Bool {
+        guard let p = pos?.trimmingCharacters(in: .whitespaces) else { return false }
+        return p == "顔文字" || p == "絵文字"
     }
 
     /// Google日本語入力/MS-IME の品詞名 → CID。CIDData の名前付き case の範囲でマップし、
-    /// 未知の品詞は一般名詞(1285)へフォールバックする。
+    /// 顔文字・絵文字は記号、それ以外の未知の品詞は一般名詞(1285)へフォールバックする。
     /// 注: Google のエクスポートは「姓」「名」が単独の品詞名で現れる。「名詞」「固有名詞」も
     /// 「名」を含むため、単純な contains("名") では誤爆する — 人名系は「人名」を除いた残りで判定。
     static func cid(for pos: String?) -> Int {
+        if isExpressive(pos) { return CIDData.記号.cid }
         guard let p = pos, !p.isEmpty else { return CIDData.一般名詞.cid }
         if p.contains("人名") {
             if p.contains("姓") { return CIDData.人名姓.cid }

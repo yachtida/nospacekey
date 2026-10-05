@@ -3,6 +3,43 @@ import XCTest
 import KanaKanjiConverterModuleWithDefaultDictionary
 
 final class UserDictionaryTests: XCTestCase {
+    func testExpressiveImportsUseLowerScoresAndSymbolClass() throws {
+        let json = #"[{"ruby":"てすと","word":"(>_<)","pos":"顔文字"},{"ruby":"てすと","word":"😀","pos":"絵文字"},{"ruby":"てすと","word":"😃","pos":" 絵文字　"}]"#
+        let url = try writeTempJson(json)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let dic = UserDictionary.load(url: url)
+        XCTAssertEqual(dic.map(\.word), ["(>_<)", "😀", "😃"])
+        XCTAssertTrue(dic.allSatisfy { $0.ruby == "テスト" })
+        XCTAssertTrue(dic.allSatisfy { $0.lcid == CIDData.記号.cid && $0.rcid == CIDData.記号.cid })
+        XCTAssertTrue(dic.allSatisfy { $0.value() == -18 })
+    }
+
+    func testLexicalAndLegacyEntriesKeepTheirScoresAndClasses() throws {
+        let types: [(String?, Int)] = [
+            (nil, CIDData.一般名詞.cid), ("", CIDData.一般名詞.cid),
+            ("名詞", CIDData.一般名詞.cid), ("未知", CIDData.一般名詞.cid),
+            ("絵文字名詞", CIDData.一般名詞.cid), ("固有名詞", CIDData.固有名詞.cid),
+            ("人名", CIDData.人名一般.cid), ("姓", CIDData.人名姓.cid),
+            ("名", CIDData.人名名.cid), ("人名(姓)", CIDData.人名姓.cid),
+            ("人名(名)", CIDData.人名名.cid), ("地名", CIDData.地名一般.cid),
+            ("駅", CIDData.地名一般.cid), ("組織", CIDData.固有名詞組織.cid),
+            ("数", CIDData.数.cid),
+        ]
+        let rows: [[String: String]] = types.map { pos, _ in
+            var row = ["ruby": "てすと", "word": "辞書検証語"]
+            if let pos { row["pos"] = pos }
+            return row
+        }
+        let data = try JSONSerialization.data(withJSONObject: rows)
+        let url = try writeTempJson(String(decoding: data, as: UTF8.self))
+        defer { try? FileManager.default.removeItem(at: url) }
+        let dic = UserDictionary.load(url: url)
+        XCTAssertEqual(dic.count, types.count)
+        XCTAssertEqual(dic.map(\.lcid), types.map { $0.1 })
+        XCTAssertEqual(dic.map(\.rcid), types.map { $0.1 })
+        XCTAssertTrue(dic.allSatisfy { $0.value() == -5 && $0.mid == MIDData.一般.mid })
+    }
+
     func testLoadParsesJsonAndMapsPos() throws {
         let json = #"[{"ruby":"やちだ","word":"谷内田","pos":"人名(姓)"},{"ruby":"ほげ","word":"ホゲ株式会社","pos":"組織"},{"ruby":"ふが","word":"fuga","pos":"謎の品詞"}]"#
         let url = try writeTempJson(json)

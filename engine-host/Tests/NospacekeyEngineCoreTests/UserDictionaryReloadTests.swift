@@ -71,6 +71,27 @@ final class UserDictionaryReloadTests: XCTestCase {
         XCTAssertTrue(UserDictionary.enabled(environment: ["NOSPACEKEY_USER_DICT_ENABLED": ""]))
     }
 
+    func testExpressiveImportsDoNotDisplaceLexicalConversionAfterReload() throws {
+        let url = try writeTempJson(#"[{"ruby":"てすと","word":"(>_<)","pos":"顔文字"},{"ruby":"てすと","word":"😀","pos":"絵文字"},{"ruby":"てすと","word":"辞書検証語","pos":"名詞"}]"#)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let svc = makeService(environment: ["NOSPACEKEY_USER_DICT": url.path])
+        for _ in 0..<2 {
+            reload(svc, enabled: true)
+            let words = candidates(svc, reading: "てすと")
+            let lexical = try XCTUnwrap(words.firstIndex(of: "辞書検証語"))
+            let ordinary = try XCTUnwrap(words.firstIndex(of: "テスト"))
+            for expressive in ["(>_<)", "😀"] {
+                let index = try XCTUnwrap(words.firstIndex(of: expressive),
+                    "低優先度の語も明示変換候補には残る: \(words)")
+                XCTAssertLessThan(lexical, index)
+                XCTAssertLessThan(ordinary, index)
+            }
+            let sentence = try XCTUnwrap(candidates(svc, reading: "てすとです").first)
+            XCTAssertFalse(sentence.contains("(>_<)"))
+            XCTAssertFalse(sentence.contains("😀"))
+        }
+    }
+
     /// リロードは丸ごと置換（importDynamicUserDictionary の意味論）— 旧ファイルの語は消える。
     func testReloadSwapsDictionaryWholesale() throws {
         let url = try writeTempJson(probeJson)

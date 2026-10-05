@@ -1173,6 +1173,41 @@ mod tests {
     }
 
     #[test]
+    fn typed_dictionary_import_lists_and_exports_expressive_classes() {
+        let path = temp_dict_path("typed-import");
+        let lock = DictLock(std::sync::Mutex::new(()));
+        let report = dict_import_logic(
+            &lock,
+            &path,
+            &no_send,
+            "てすと\t(>_<)\t顔文字\nてすと\t😀\t絵文字\nてすと\t辞書検証語\t名詞\n".as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(report.added, 3);
+        let list = dict_list_logic(&lock, &path).unwrap();
+        for (word, pos) in [
+            ("(>_<)", "顔文字"),
+            ("😀", "絵文字"),
+            ("辞書検証語", "名詞"),
+        ] {
+            let row = list.entries.iter().find(|e| e.word == word).unwrap();
+            assert_eq!(row.pos.as_deref(), Some(pos));
+            assert_eq!(row.pos_display, pos);
+        }
+        dict_update_logic(
+            &lock, &path, &no_send, "てすと", "😀", "てすと", "😃", "絵文字",
+        )
+        .unwrap();
+        let (tsv, report) = dict_export_logic(&lock, &path).unwrap();
+        assert_eq!(report.written, 3);
+        assert!(tsv.contains("てすと\t😃\t顔文字\tnospacekey:pos=絵文字\r\n"));
+        assert!(tsv.contains("てすと\t(>_<)\t顔文字\r\n"));
+        for file in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+            std::fs::remove_file(file.unwrap().path()).unwrap();
+        }
+    }
+
+    #[test]
     fn dictionary_import_rejects_lossy_words_before_loading_or_saving() {
         let path = temp_dict_path("invalid-encoding");
         std::fs::write(&path, b"original bytes must survive").unwrap();

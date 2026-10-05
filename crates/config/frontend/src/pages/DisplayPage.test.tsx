@@ -149,7 +149,7 @@ it("displays a clamped successful value and follows a later reset", async () => 
   const input = await screen.findByLabelText("最大文字数") as HTMLInputElement;
   edit(input, "9");
   await waitFor(() => expect(screen.getByTestId("save-state")).toHaveTextContent("saved"));
-  expect(input).toHaveValue(10);
+  await waitFor(() => expect(input).toHaveValue(10));
   expect(input).toHaveAttribute("data-commit-dirty", "false");
   fireEvent.click(screen.getByRole("button", { name: "reset" }));
   expect(input).toHaveValue(34);

@@ -42,10 +42,52 @@ it("uses a separate store for registration and never offers engine resync", asyn
   fireEvent.change(screen.getByLabelText("読み"), {target: {value: "にこ"}});
   fireEvent.change(screen.getByLabelText("単語"), {target: {value: "(^_^)"}});
   fireEvent.click(screen.getByRole("button", {name: "保存"}));
-  await waitFor(() => expect(command).toHaveBeenCalledWith("dict_add", {ruby: "にこ", word: "(^_^)", pos: "名詞", kaomoji: true}));
+  await waitFor(() => expect(command).toHaveBeenCalledWith("dict_add", {ruby: "にこ", word: "(^_^)", pos: "顔文字", kaomoji: true}));
   await screen.findByText(/次回パレットを開くと反映/);
   expect(screen.queryByRole("button", {name: "再反映"})).not.toBeInTheDocument();
 });
+it.each(["顔文字", "絵文字"])("registers an explicitly typed %s entry in the user dictionary", async (pos) => {
+  render(<DictionaryPage />);
+  await screen.findByText("まだ単語が登録されていません");
+  fireEvent.click(screen.getByRole("button", {name: "単語を追加"}));
+  expect(screen.getByLabelText("品詞")).toHaveValue("名詞");
+  fireEvent.change(screen.getByLabelText("読み"), {target: {value: "てすと"}});
+  fireEvent.change(screen.getByLabelText("単語"), {target: {value: "😀"}});
+  fireEvent.change(screen.getByLabelText("品詞"), {target: {value: pos}});
+  fireEvent.click(screen.getByRole("button", {name: "保存"}));
+  await waitFor(() => expect(command).toHaveBeenCalledWith("dict_add", {ruby: "てすと", word: "😀", pos, kaomoji: false}));
+});
+
+it.each(["顔文字", "絵文字", "人名(姓)", "未定義品詞"])("preserves imported %s classification while editing a word", async (pos) => {
+  vi.mocked(command).mockImplementation(async (name) => {
+    if (name === "dict_list") return {entries: [{ruby: "てすと", word: "検証語", pos, pos_display: pos}], deduped: 0, corrupt: "none"};
+    if (name === "dict_recent_microsoft") return [];
+    return {engine: "applied"};
+  });
+  render(<DictionaryPage />);
+  fireEvent.click(await screen.findByRole("button", {name: "編集"}));
+  expect(screen.getByLabelText("品詞")).toHaveValue(pos);
+  fireEvent.change(screen.getByLabelText("単語"), {target: {value: "検証語改"}});
+  fireEvent.click(screen.getByRole("button", {name: "保存"}));
+  await waitFor(() => expect(command).toHaveBeenCalledWith("dict_update", {
+    oldRuby: "てすと", oldWord: "検証語", ruby: "てすと", word: "検証語改", pos, kaomoji: false,
+  }));
+});
+
+it("can choose emoji classification in the palette store", async () => {
+  render(<DictionaryPage />);
+  await screen.findByText("まだ単語が登録されていません");
+  fireEvent.click(screen.getByRole("tab", {name: "顔文字・絵文字"}));
+  await waitFor(() => expect(command).toHaveBeenCalledWith("dict_list", {kaomoji: true}));
+  fireEvent.click(screen.getByRole("button", {name: "単語を追加"}));
+  expect(screen.getByLabelText("品詞")).toHaveValue("顔文字");
+  fireEvent.change(screen.getByLabelText("読み"), {target: {value: "てすと"}});
+  fireEvent.change(screen.getByLabelText("単語"), {target: {value: "😀"}});
+  fireEvent.change(screen.getByLabelText("品詞"), {target: {value: "絵文字"}});
+  fireEvent.click(screen.getByRole("button", {name: "保存"}));
+  await waitFor(() => expect(command).toHaveBeenCalledWith("dict_add", {ruby: "てすと", word: "😀", pos: "絵文字", kaomoji: true}));
+});
+
 it("reports replacement counts for both stores", async () => {
   render(<DictionaryPage />);
   await screen.findByText("まだ単語が登録されていません");
